@@ -1,0 +1,2 @@
+# Patches must apply byte-for-byte to LF sources: never convert line endings.
+*.patch -text
