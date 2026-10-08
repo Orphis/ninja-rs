@@ -1,0 +1,39 @@
+--- a/rust/private/rustc.bzl
++++ b/rust/private/rustc.bzl
+@@ -490,6 +490,14 @@
+         variables = linker_config.variables,
+     )
+ 
++def _is_msvc_search_option(arg):
++    """Whether `arg` is a link.exe/lld-link option that locates libraries."""
++    upper = arg.upper()
++    for prefix in ("/LIBPATH:", "-LIBPATH:", "/VFSOVERLAY:", "-VFSOVERLAY:"):
++        if upper.startswith(prefix):
++            return True
++    return False
++
+ def _get_linker_args(linker_config):
+     link_args = []
+     if linker_config.variables != None:
+@@ -554,6 +562,21 @@
+                     # Keep rpath-related flags
+                 elif processed_arg.startswith("-rpath") or processed_arg.startswith("--rpath"):
+                     filtered_args.append(processed_arg)
++
++                    # Keep MSVC (link.exe / lld-link) library search options.
++                elif _is_msvc_search_option(processed_arg):
++                    filtered_args.append(processed_arg)
++
++                    # A clang-cl driver forwards linker options in pairs:
++                    # "/clang:-Xlinker" "/clang:<option>". Keep the search
++                    # options for a direct link.exe-flavor linker.
++                elif processed_arg == "/clang:-Xlinker" and i + 1 < len(link_args):
++                    forwarded = link_args[i + 1]
++                    if forwarded.startswith("/clang:"):
++                        forwarded = forwarded[len("/clang:"):]
++                    if _is_msvc_search_option(forwarded):
++                        filtered_args.append(forwarded)
++                    skip_next = True
+             link_args = filtered_args
+ 
+     link_env = _get_linker_env(linker_config)

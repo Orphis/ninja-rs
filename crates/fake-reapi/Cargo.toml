@@ -1,0 +1,20 @@
+[package]
+name = "fake-reapi"
+description = "In-process fake REAPI v2 server (CAS, AC, Execution, ByteStream) for tests"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bazel-remote-apis = { workspace = true }
+hex = { workspace = true }
+prost = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["router", "server"] }
+
+[[bin]]
+name = "fake-reapi-server"
+path = "src/main.rs"

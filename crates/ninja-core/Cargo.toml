@@ -1,0 +1,10 @@
+[package]
+name = "ninja-core"
+description = "Ninja manifest language, build graph and execution engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,9 @@
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])
+
+alias(
+    name = "ninja-rs",
+    actual = "//crates/ninja-rs",
+)

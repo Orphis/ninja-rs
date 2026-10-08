@@ -1,0 +1,48 @@
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "ninja_rs_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    crate_name = "ninja_rs",
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/ninja-core",
+        "//crates/ninja-remote",
+        "@crates//:tokio",
+    ],
+)
+
+rust_binary(
+    name = "ninja-rs",
+    srcs = ["src/main.rs"],
+    deps = [
+        ":ninja_rs_lib",
+        "//crates/ninja-core",
+        "@crates//:tokio",
+    ],
+)
+
+rust_test(
+    name = "ninja_rs_lib_test",
+    crate = ":ninja_rs_lib",
+)
+
+# End-to-end remote execution test against the in-process fake REAPI server.
+rust_test(
+    name = "remote_e2e",
+    srcs = ["tests/remote_e2e.rs"],
+    use_libtest_harness = False,
+    deps = [
+        ":ninja_rs_lib",
+        "//crates/fake-reapi",
+        "//crates/ninja-core",
+        "@crates//:tokio",
+    ],
+)

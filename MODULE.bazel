@@ -1,0 +1,79 @@
+"""ninja-rs: a ninja-compatible build executor with native REAPI v2 support."""
+
+module(
+    name = "ninja_rs",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "rules_cc", version = "0.2.26")
+
+# Hermetic LLVM C/C++ toolchain (clang, clang-cl, lld, lld-link) and sysroots.
+# https://github.com/hermeticbuild/hermetic-llvm
+bazel_dep(name = "llvm", version = "0.8.24")
+
+# Building with an MSVC exec platform on Windows hosts (needed by rules_rs'
+# MSVC-only Windows rustc) makes @llvm's SDK case-overlay generator depend on
+# itself; the patch drops the overlays from that tool's own build on Windows
+# hosts. Remove once fixed upstream.
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//third_party/patches:llvm-msvc-exec-overlay-cycle.patch"],
+    version = "0.8.24",
+)
+
+# Rust rules recommended by hermetic-llvm for Rust/CC interop. They wrap a
+# patched rules_rust and wire the Rust toolchains to @llvm.
+# https://github.com/hermeticbuild/rules_rs
+bazel_dep(name = "rules_rs", version = "0.1.0")
+
+# MSVC targets: @llvm links with the clang-cl driver, but rustc passes
+# link.exe-style arguments, so Rust links with lld-link directly (rules_rs
+# patch) and rules_rust forwards the cc toolchain's library search options to
+# it (rules_rust patch). Remove once fixed upstream.
+single_version_override(
+    module_name = "rules_rs",
+    patch_strip = 1,
+    patches = ["//third_party/patches:rules_rs-msvc-lld-link.patch"],
+    version = "0.1.0",
+)
+
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+rules_rust.patch(
+    # One file per patch: Bazel's patcher misplaces hunks in multi-file ones.
+    patches = [
+        "//third_party/patches:rules_rust-linker-preference-unset.patch",
+        "//third_party/patches:rules_rust-msvc-link-search-args.patch",
+        "//third_party/patches:rules_rust-msvc-build-script-no-vs-probe.patch",
+    ],
+    strip = 1,
+)
+use_repo(rules_rust, "rules_rust")
+
+toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+toolchains.toolchain(
+    edition = "2024",
+    version = "1.99.0",
+)
+use_repo(toolchains, "default_rust_toolchains")
+
+register_toolchains(
+    "@default_rust_toolchains//...",
+    "@llvm//toolchain:all",
+)
+
+# Third-party crates: Cargo.toml / Cargo.lock are the source of truth.
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lock = "//:Cargo.lock",
+    cargo_toml = "//:Cargo.toml",
+    platform_triples = [
+        "x86_64-pc-windows-msvc",
+        "x86_64-pc-windows-gnullvm",
+        "x86_64-unknown-linux-gnu",
+    ],
+)
+use_repo(crate, "crates")

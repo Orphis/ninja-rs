@@ -1,0 +1,5 @@
+bazel-linux-bin
+bazel-linux-out
+bazel-linux-ninja-rs
+bazel-linux-testlogs
+target

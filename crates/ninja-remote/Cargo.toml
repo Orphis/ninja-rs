@@ -1,0 +1,15 @@
+[package]
+name = "ninja-remote"
+description = "REAPI v2 remote execution for ninja-rs: policy, include scanning, path mapping, actions"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+ninja-core = { path = "../ninja-core" }
+rbe-client = { path = "../../third_party/cargo-rbe/rbe-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,355 @@
+//! The REAPI backend: execution policy, action cache lookup, upload,
+//! Execute, and output download (with depfile and /showIncludes mapping).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
+use ninja_core::depfile::parse_depfile;
+use ninja_core::runner::{ExecKind, ExitStatus, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
+use rbe_client::proto as re;
+use rbe_client::{ActionMeta, Client};
+
+use crate::action::{Prepared, Shared, prepare};
+use crate::store::Store;
+use crate::toolchains::Toolchains;
+
+#[derive(Clone, Debug)]
+pub struct BackendConfig {
+    /// Absolute build directory (where build.ninja is).
+    pub build_dir: PathBuf,
+    /// `cmake_rbe_toolchains`, relative to the build directory.
+    pub toolchains_file: Option<String>,
+    pub exec_root: Option<PathBuf>,
+    pub jobs: usize,
+    pub mnemonic_suffixes: Vec<String>,
+    pub local_fallback: bool,
+    pub verbose: bool,
+}
+
+pub struct Backend {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    client: Client,
+    shared: Shared,
+    config: BackendConfig,
+}
+
+impl Backend {
+    pub async fn new(config: BackendConfig, mut client: Client, store: Arc<Store>) -> Result<Self> {
+        let windows = cfg!(windows);
+        let toolchains = match &config.toolchains_file {
+            Some(f) => Toolchains::load(&config.build_dir.join(f), windows).map_err(anyhow::Error::msg)?,
+            None => Toolchains::default(),
+        };
+        let caps = client.capabilities().await.context("GetCapabilities")?;
+        if let Some(cc) = &caps.cache_capabilities
+            && !cc.digest_functions.is_empty()
+            && !cc.digest_functions.contains(&(re::digest_function::Value::Sha256 as i32))
+        {
+            bail!("the remote cache does not support SHA-256");
+        }
+        if caps.execution_capabilities.as_ref().is_some_and(|e| !e.exec_enabled) {
+            bail!("the remote instance does not support execution");
+        }
+        let shared = Shared {
+            build_dir: config.build_dir.clone(),
+            toolchains,
+            exec_root: config.exec_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            store,
+            windows,
+        };
+        Ok(Self { inner: Arc::new(Inner { client, shared, config }) })
+    }
+}
+
+/// The phase-1 policy: a task runs remotely if it is not marked `local = 1`
+/// and its mnemonic ends with one of the allowed suffixes (`Compile`).
+pub fn policy_wants(task: &Task, suffixes: &[String]) -> bool {
+    if task.use_console || task.binding("local") == Some("1") {
+        return false;
+    }
+    match task.binding("mnemonic") {
+        Some(m) => suffixes.iter().any(|s| m.ends_with(s.as_str())),
+        None => false,
+    }
+}
+
+impl RemoteBackend for Backend {
+    fn wants(&self, task: &Task) -> bool {
+        policy_wants(task, &self.inner.config.mnemonic_suffixes)
+    }
+
+    fn execute(&self, task: Task) -> RemoteFuture {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.execute(task).await })
+    }
+
+    fn max_jobs(&self) -> usize {
+        self.inner.config.jobs
+    }
+}
+
+enum Failure {
+    /// The action could not be prepared: run locally.
+    Prepare(String),
+    /// The remote service failed.
+    Infra(anyhow::Error),
+}
+
+impl Inner {
+    async fn execute(self: Arc<Self>, task: Task) -> RemoteOutcome {
+        match self.clone().try_execute(&task).await {
+            Ok(r) => RemoteOutcome::Done(r),
+            Err(Failure::Prepare(reason)) => RemoteOutcome::Fallback(reason),
+            Err(Failure::Infra(e)) => {
+                if self.config.local_fallback {
+                    RemoteOutcome::Fallback(format!("remote execution failed: {e:#}"))
+                } else {
+                    RemoteOutcome::Done(TaskResult {
+                        edge: task.edge,
+                        status: ExitStatus::Failure(1),
+                        output: format!("ninja-rs: remote execution failed: {e:#}\n").into_bytes(),
+                        kind: ExecKind::Remote,
+                    })
+                }
+            }
+        }
+    }
+
+    async fn try_execute(self: Arc<Self>, task: &Task) -> Result<TaskResult, Failure> {
+        let me = self.clone();
+        let t = task.clone();
+        let prepared = tokio::task::spawn_blocking(move || prepare(&t, &me.shared))
+            .await
+            .map_err(|e| Failure::Prepare(format!("internal error: {e}")))?
+            .map_err(Failure::Prepare)?;
+        let meta = ActionMeta {
+            mnemonic: task.binding("mnemonic").unwrap_or_default().to_string(),
+            target_id: task.binding("cmake_target").unwrap_or_default().to_string(),
+            configuration_id: String::new(),
+        };
+        let client = self.client.for_action(&meta, &prepared.action_digest.hash);
+        let digest = prepared.action_digest.clone();
+
+        // Action cache first.
+        let cached = client.get_action_result(&digest).await.map_err(Failure::Infra)?;
+        let (result, hit) = match cached {
+            Some(r) if r.exit_code == 0 => (r, true),
+            _ => {
+                let to_upload = self.shared.store.filter_unknown(prepared_blobs(&prepared));
+                client.upload_blobs(&to_upload).await.map_err(Failure::Infra)?;
+                self.shared.store.mark_uploaded(to_upload.0.keys());
+                let resp = client.execute(&digest, false).await.map_err(Failure::Infra)?;
+                if let Some(st) = &resp.status
+                    && st.code != 0
+                {
+                    return Err(Failure::Infra(anyhow::anyhow!("Execute returned status {}: {}", st.code, st.message)));
+                }
+                let hit = resp.cached_result;
+                (resp.result.ok_or_else(|| Failure::Infra(anyhow::anyhow!("Execute returned no result")))?, hit)
+            }
+        };
+        let output = self.download(&client, task, &prepared, &result).await.map_err(Failure::Infra)?;
+        let mut output = output;
+        if self.config.verbose {
+            let mut msg = format!(
+                "ninja-rs: {} {} ({} inputs)\n",
+                if hit { "remote cache hit" } else { "executed remotely" },
+                digest.hash,
+                prepared.input_files
+            )
+            .into_bytes();
+            for w in &prepared.warnings {
+                msg.extend_from_slice(format!("ninja-rs: warning: {w}\n").as_bytes());
+            }
+            msg.extend_from_slice(&output);
+            output = msg;
+        }
+        let status = if result.exit_code == 0 { ExitStatus::Success } else { ExitStatus::Failure(result.exit_code) };
+        Ok(TaskResult { edge: task.edge, status, output, kind: if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote } })
+    }
+
+    /// Writes the outputs (skipping files that are already up to date, so
+    /// that `restat` works) and returns the combined stdout/stderr.
+    async fn download(&self, client: &Client, task: &Task, p: &Prepared, result: &re::ActionResult) -> Result<Vec<u8>> {
+        let stdout = client.output_bytes(&result.stdout_raw, result.stdout_digest.as_ref()).await?;
+        let stderr = client.output_bytes(&result.stderr_raw, result.stderr_digest.as_ref()).await?;
+        let mut files: Vec<(PathBuf, re::OutputFile)> = Vec::new();
+        for f in &result.output_files {
+            let local = self.shared.build_dir.join(&f.path);
+            files.push((local, f.clone()));
+        }
+        // Output directories (unusual for compiles).
+        for d in &result.output_directories {
+            let tree_digest = d.tree_digest.clone().unwrap_or_default();
+            let tree = client.fetch_tree(&tree_digest).await?;
+            for (rel, f) in rbe_client::tree::tree_files(&tree)? {
+                let local = self.shared.build_dir.join(&d.path).join(rel);
+                files.push((local, re::OutputFile { path: String::new(), digest: f.digest, is_executable: f.is_executable, contents: vec![], node_properties: None }));
+            }
+        }
+        let depfile_local = p.depfile.as_ref().map(|(_, l)| l.clone());
+        let mut needed = Vec::new();
+        for (local, f) in &files {
+            let d = f.digest.clone().unwrap_or_default();
+            if Some(local) != depfile_local.as_ref() && same_content(local, &d, &self.shared.store) {
+                continue;
+            }
+            if f.contents.is_empty() || d.size_bytes == 0 {
+                needed.push(d);
+            }
+        }
+        let blobs = if needed.is_empty() { Default::default() } else { client.read_blobs(&needed).await? };
+        for (local, f) in &files {
+            let d = f.digest.clone().unwrap_or_default();
+            let is_depfile = Some(local) == depfile_local.as_ref();
+            if !is_depfile && same_content(local, &d, &self.shared.store) {
+                continue;
+            }
+            let data: Vec<u8> = if !f.contents.is_empty() {
+                f.contents.clone()
+            } else if d.size_bytes == 0 {
+                Vec::new()
+            } else {
+                blobs.get(&d.hash).cloned().with_context(|| format!("missing blob for {}", local.display()))?
+            };
+            let data = if is_depfile { self.map_depfile(&data, p) } else { data };
+            write_output(local, &data, f.is_executable)?;
+        }
+        let mut out = stdout;
+        if task.deps.as_deref() == Some("msvc") {
+            out = self.map_show_includes(&out, task, p);
+        }
+        out.extend_from_slice(&stderr);
+        Ok(out)
+    }
+
+    /// Rewrites a depfile written by the remote compiler to local paths.
+    fn map_depfile(&self, data: &[u8], p: &Prepared) -> Vec<u8> {
+        let Ok(d) = parse_depfile(data) else { return data.to_vec() };
+        let map = |s: &str| p.mapper.map_back(s, &p.tree_index);
+        let mut out = String::new();
+        let outs: Vec<String> = d.outs.iter().map(|o| map(o)).collect();
+        out.push_str(&outs.iter().map(|o| escape_make(o)).collect::<Vec<_>>().join(" "));
+        out.push(':');
+        for i in &d.ins {
+            out.push_str(" \\\n  ");
+            out.push_str(&escape_make(&map(i)));
+        }
+        out.push('\n');
+        out.into_bytes()
+    }
+
+    fn map_show_includes(&self, stdout: &[u8], task: &Task, p: &Prepared) -> Vec<u8> {
+        let prefix = if task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { task.msvc_deps_prefix.as_str() };
+        let text = String::from_utf8_lossy(stdout);
+        let mut out = String::new();
+        for line in text.split_inclusive('\n') {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[body.len()..];
+            match filter_show_includes(body, prefix) {
+                Some(path) if !path.is_empty() => {
+                    let mapped = p.mapper.map_back(path, &p.tree_index);
+                    let mapped = if !crate::paths::is_abs(&mapped, cfg!(windows)) {
+                        // Relative to the build dir: make it absolute so that
+                        // ninja's normalization sees what a local cl.exe prints.
+                        let abs = self.shared.build_dir.join(&mapped);
+                        crate::scanner::normalize(&abs).to_string_lossy().into_owned()
+                    } else {
+                        mapped
+                    };
+                    out.push_str(prefix);
+                    out.push(' ');
+                    out.push_str(&mapped);
+                    out.push_str(ending);
+                }
+                _ => out.push_str(line),
+            }
+        }
+        out.into_bytes()
+    }
+}
+
+fn prepared_blobs(p: &Prepared) -> rbe_client::BlobSet {
+    let mut b = rbe_client::BlobSet::default();
+    for (h, (d, s)) in &p.blobs.0 {
+        b.0.insert(h.clone(), (d.clone(), s.clone()));
+    }
+    b
+}
+
+fn same_content(local: &std::path::Path, d: &re::Digest, store: &Store) -> bool {
+    match std::fs::metadata(local) {
+        Ok(m) if m.is_file() && m.len() as i64 == d.size_bytes => {
+            rbe_client::tree::file_digest(local, Some(&store.digests)).map(|ld| ld.hash == d.hash).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn write_output(path: &std::path::Path, data: &[u8], executable: bool) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("{}.ninja-rs-tmp", path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()));
+    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Escapes a path for a Makefile-style depfile.
+fn escape_make(p: &str) -> String {
+    let mut out = String::new();
+    for ch in p.chars() {
+        match ch {
+            ' ' => out.push_str("\\ "),
+            '#' => out.push_str("\\#"),
+            '$' => out.push_str("$$"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(bindings: &[(&str, &str)]) -> Task {
+        Task { bindings: bindings.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..Default::default() }
+    }
+
+    #[test]
+    fn policy() {
+        let s = vec!["Compile".to_string()];
+        assert!(policy_wants(&task(&[("mnemonic", "CXXCompile")]), &s));
+        assert!(policy_wants(&task(&[("mnemonic", "CCompile"), ("cmake_target", "foo")]), &s));
+        assert!(!policy_wants(&task(&[("mnemonic", "CXXCompile"), ("local", "1")]), &s));
+        assert!(!policy_wants(&task(&[("mnemonic", "CXXLink")]), &s));
+        assert!(!policy_wants(&task(&[("mnemonic", "CXXScan")]), &s));
+        assert!(!policy_wants(&task(&[]), &s));
+        let mut t = task(&[("mnemonic", "CXXCompile")]);
+        t.use_console = true;
+        assert!(!policy_wants(&t, &s));
+        assert!(policy_wants(&task(&[("mnemonic", "CXXArchive")]), &["Compile".into(), "Archive".into()]));
+    }
+
+    #[test]
+    fn make_escaping() {
+        assert_eq!(escape_make("a b#c$d"), "a\\ b\\#c$$d");
+    }
+}

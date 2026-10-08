@@ -1,0 +1,27 @@
+[package]
+name = "ninja-rs"
+description = "A ninja-compatible build executor with native Remote Execution API (REAPI v2) support"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "ninja_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ninja-rs"
+path = "src/main.rs"
+
+[dependencies]
+ninja-core = { path = "../ninja-core" }
+ninja-remote = { path = "../ninja-remote" }
+tokio = { workspace = true }
+
+[dev-dependencies]
+fake-reapi = { path = "../fake-reapi" }
+
+[[test]]
+name = "remote_e2e"
+harness = false

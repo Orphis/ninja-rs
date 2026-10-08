@@ -1,0 +1,38 @@
+# ninja-rs Bazel configuration (Bzlmod only).
+common --enable_platform_specific_config
+common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+common --incompatible_strict_action_env
+test --test_output=errors
+# Keep native and cross builds in separate output directories.
+common --experimental_platform_in_output_dir
+
+# The hermetic clang driver warns about an unused --unwindlib flag on every
+# Rust link; rustc surfaces linker stderr as warnings.
+build --@rules_rust//rust/settings:extra_rustc_flag=-Alinker_messages
+
+# --- Windows host -----------------------------------------------------------
+# The MSVC ABI (x86_64-pc-windows-msvc) for both the target and the exec
+# tools (rules_rs only provides an MSVC rustc for Windows hosts), linked with
+# lld-link against the Microsoft VC runtime and Windows SDK that the llvm
+# module downloads. No local MSVC or clang is used. An MSVC exec platform
+# needs third_party/patches/llvm-msvc-exec-overlay-cycle.patch (MODULE.bazel).
+#
+# The llvm module only downloads the Microsoft runtime and SDK after you accept
+# their licenses. That is your decision; to accept, create user.bazelrc
+# (git-ignored) containing:
+#   common --repo_env=BAZEL_MSVC_RUNTIME_VISUAL_STUDIO_EULA=1
+#   common --repo_env=BAZEL_WINDOWS_SDK_EULA=1
+common:windows --host_platform=//platforms:win_msvc
+common:windows --platforms=//platforms:win_msvc
+
+# --- Linux host -------------------------------------------------------------
+common:linux --host_platform=//platforms:linux_x86_64_gnu_host
+common:linux --platforms=//platforms:linux_x86_64_gnu_host
+
+# --- Cross builds (from a Linux host) ---------------------------------------
+# Windows GNU ABI on LLVM (MinGW-w64 headers/CRT, no Microsoft downloads).
+common:cross_windows_gnullvm --platforms=@rules_rs//rs/platforms:x86_64-pc-windows-gnullvm
+# Windows MSVC ABI (needs the license acceptance above).
+common:cross_windows_msvc --platforms=@rules_rs//rs/platforms:x86_64-pc-windows-msvc
+
+try-import %workspace%/user.bazelrc

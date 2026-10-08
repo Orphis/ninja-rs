@@ -1,0 +1,18 @@
+--- a/cargo/private/cargo_build_script.bzl
++++ b/cargo/private/cargo_build_script.bzl
+@@ -577,6 +577,15 @@
+             action_name = ACTION_NAMES.cpp_link_static_library,
+         )
+ 
++        if toolchain.target_abi == "msvc":
++            # cc-rs finds a locally installed Visual Studio through the
++            # registry and merges its LIB/INCLUDE/PATH into any clang-cl it
++            # runs, even one given in CC, leaking host paths into the build.
++            # find-msvc-tools only considers the toolset version named by
++            # VCToolsVersion: one that cannot exist disables that probing.
++            # The cc toolchain above provides the compiler, SDK and runtime.
++            env["VCToolsVersion"] = "bazel-hermetic-cc-toolchain"
++
+         # Many C/C++ toolchains are missing an action_config for AR because
+         # one was never included in the unix_cc_toolchain_config.
+         if not env["AR"]:

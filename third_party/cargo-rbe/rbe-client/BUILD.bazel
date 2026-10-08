@@ -1,0 +1,28 @@
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "rbe-client",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "rbe_client",
+    deps = [
+        "@crates//:anyhow",
+        "@crates//:bazel-remote-apis",
+        "@crates//:hex",
+        "@crates//:prost",
+        "@crates//:prost-types",
+        "@crates//:sha2",
+        "@crates//:tokio",
+        "@crates//:tokio-stream",
+        "@crates//:tonic",
+        "@crates//:zstd",
+    ],
+)
+
+rust_test(
+    name = "rbe-client_test",
+    crate = ":rbe-client",
+    deps = ["@crates//:tempfile"],
+)

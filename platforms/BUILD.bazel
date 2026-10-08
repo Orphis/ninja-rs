@@ -1,0 +1,25 @@
+# Host platforms with the constraints rules_rs and @llvm need to pick the
+# right Rust and C/C++ toolchains. They are also used as target platforms for
+# native builds so that tests can run on the host. Cross targets come from
+# @rules_rs//rs/platforms (one per Rust target triple).
+#
+# Keep Windows platform names short: with --experimental_platform_in_output_dir
+# they appear in every output path, and deep libc++ header paths otherwise
+# exceed Windows' 260-character MAX_PATH in @llvm's tools.
+
+# Windows hosts use it as both the exec and target platform: rules_rs only has
+# an MSVC rustc there, which can only load proc macros built for MSVC. That
+# needs third_party/patches/llvm-msvc-exec-overlay-cycle.patch (see MODULE.bazel).
+platform(
+    name = "win_msvc",
+    constraint_values = ["@llvm//constraints/windows/abi:msvc"],
+    parents = ["@platforms//host"],
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "linux_x86_64_gnu_host",
+    constraint_values = ["@llvm//constraints/libc:gnu.2.28"],
+    parents = ["@platforms//host"],
+    visibility = ["//visibility:public"],
+)

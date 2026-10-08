@@ -1,0 +1,36 @@
+--- a/rs/toolchains/declare_rustc_toolchains.bzl
++++ b/rs/toolchains/declare_rustc_toolchains.bzl
+@@ -153,6 +153,17 @@
+                 "@rules_rs//rs/platforms/config:riscv32imc-unknown-none-elf": lld_label,
+                 "@platforms//cpu:wasm32": lld_label,
+                 "@platforms//cpu:wasm64": lld_label,
++                "@llvm//constraints/windows/abi:msvc": "@llvm//tools:lld-link",
++                "//conditions:default": None,
++            }),
++            # @llvm drives MSVC links with clang-cl, but rustc passes
++            # link.exe-style arguments for MSVC targets, so it must link with
++            # lld-link directly. rules_rust forwards the cc toolchain's library
++            # search paths to it. (Not rust-lld: its path in the generated
++            # sysroot exceeds Windows' MAX_PATH, which LLVM tools need to
++            # locate themselves.)
++            linker_preference = select({
++                "@llvm//constraints/windows/abi:msvc": "rust",
+                 "//conditions:default": None,
+             }),
+             linker_type = "direct",
+@@ -236,7 +247,6 @@
+         bpf_linker_label = _component(bpf_linker, triple, "@%s//:%s" % (bpf_linker_repository_name(triple), bpf_linker_binary_name(triple)))
+         rust_toolchain(
+             name = rust_toolchain_name + "_bpf",
+-            linker_preference = "rust",
+             process_wrapper = "@rules_rust//util/process_wrapper",
+             rust_std = toolchain_rust_std,
+             **(rust_toolchain_kwargs | {
+@@ -246,6 +256,7 @@
+                 # package.  BPF targets are already gated by the toolchain's
+                 # target_settings.
+                 "linker": bpf_linker_label,
++                "linker_preference": "rust",
+             })
+         )
+ 

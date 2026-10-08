@@ -1,0 +1,12 @@
+--- a/rust/private/toolchain.bzl
++++ b/rust/private/toolchain.bzl
+@@ -819,7 +819,8 @@
+         ),
+         "linker_preference": attr.string(
+             doc = "The preferred linker to use. If unspecified, `cc` is preferred and `rust` is used as a fallback whenever `linker` is provided.",
+-            values = ["cc", "rust"],
++            # "" is unspecified, e.g. the default branch of a select().
++            values = ["", "cc", "rust"],
+         ),
+         "linker_type": attr.string(
+             doc = "The type of linker invocation: 'direct' (ld, rust-lld) or 'indirect' (via compiler like clang/gcc). If unset, defaults based on linker_preference.",
