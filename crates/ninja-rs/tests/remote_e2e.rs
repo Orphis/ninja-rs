@@ -1,10 +1,11 @@
 //! End-to-end test of remote execution against the in-process fake REAPI
-//! server, with a hand-written build.ninja following the CMake interface.
+//! server, with a hand-written build.ninja following the RBE interface.
 //!
 //! The "compiler" is this test binary itself: when it runs under the name
 //! `fake-clang` it behaves like a tiny C compiler (follows `#include "..."`,
-//! writes a depfile, answers `-E -v` with an include search list). This keeps
-//! the test hermetic on every host.
+//! writes a depfile, answers `-E -v` with an include search list). Under the
+//! name `fake-cmake` it deletes and touches files (`-E rm -f`, `-E touch`),
+//! a tool declared local. This keeps the test hermetic on every host.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -108,6 +109,27 @@ fn fake_clang(args: &[String]) -> i32 {
     0
 }
 
+fn fake_cmake(args: &[String]) -> i32 {
+    match args {
+        [e, rm, f, files @ ..] if e == "-E" && rm == "rm" && f == "-f" => {
+            for p in files {
+                let _ = std::fs::remove_file(p);
+            }
+            0
+        }
+        [e, touch, files @ ..] if e == "-E" && touch == "touch" => {
+            for p in files {
+                std::fs::write(p, "").unwrap();
+            }
+            0
+        }
+        _ => {
+            eprintln!("fake-cmake: unsupported arguments {args:?}");
+            2
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
@@ -132,31 +154,57 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     let compiler = root.join("tc/bin").join(if cfg!(windows) { "fake-clang.exe" } else { "fake-clang" });
     std::fs::create_dir_all(compiler.parent().unwrap()).unwrap();
     std::fs::copy(&exe, &compiler).unwrap();
+    let cmake = root.join("cmake/bin").join(if cfg!(windows) { "fake-cmake.exe" } else { "fake-cmake" });
+    std::fs::create_dir_all(cmake.parent().unwrap()).unwrap();
+    std::fs::copy(&exe, &cmake).unwrap();
     write(&root.join("src/main.c"), "#include \"lib.h\"\nint main() { return lib(); }\n");
     write(&root.join("src/lib.c"), "#include \"lib.h\"\nint lib() { return DEEP; }\n");
     write(&root.join("include/lib.h"), "#include \"nested/deep.h\"\nint lib();\n");
     write(&root.join("include/nested/deep.h"), "#define DEEP 0\n");
     let fwd = |p: &Path| p.to_string_lossy().replace('\\', "/");
     let tc_json = format!(
-        "{{\"version\": 1, \"toolchains\": [{{\"language\": \"C\", \"compiler\": \"{}\", \"inputs\": [\"{}\"], \"platform\": {{\"OSFamily\": \"{}\"}}}}]}}",
+        "{{\"version\": 1, \"toolchains\": [{{\"language\": \"C\", \"tool\": \"{}\", \"inputs\": [\"{}\"], \"platform\": {{\"OSFamily\": \"{}\"}}}}, {{\"tool\": \"{}\", \"local\": true}}]}}",
         fwd(&compiler),
         fwd(&root.join("tc")),
-        if cfg!(windows) { "Windows" } else { "Linux" }
+        if cfg!(windows) { "Windows" } else { "Linux" },
+        fwd(&cmake),
     );
     write(&build.join("CMakeFiles/rbe_toolchains.json"), &tc_json);
+    write(
+        &build.join("CMakeFiles/rbe_targets.json"),
+        "{\"version\": 1, \"targets\": [{\"name\": \"app\", \"kind\": \"executable\"}, {\"name\": \"lib\", \"kind\": \"static_library\"}]}",
+    );
     let cc = compiler.to_string_lossy().to_string();
+    let cm = cmake.to_string_lossy().to_string();
     let inc = root.join("include").to_string_lossy().to_string();
-    let header = if rbe { "cmake_rbe = 1\ncmake_rbe_toolchains = CMakeFiles/rbe_toolchains.json\n" } else { "" };
+    let header = if rbe {
+        "rbe_version = 1\nrbe_toolchains = CMakeFiles/rbe_toolchains.json\nrbe_targets = CMakeFiles/rbe_targets.json\n"
+    } else {
+        ""
+    };
+    // Chains need a shell: cmd.exe on Windows (ninja runs commands directly
+    // there), /bin/sh elsewhere (ninja's default).
+    let chain = |steps: &[String]| {
+        if cfg!(windows) { format!("cmd.exe /C \"{}\"", steps.join(" && ")) } else { steps.join(" && ") }
+    };
+    let ar = chain(&[format!("{cm} -E rm -f $out pre.flag"), format!("{cc} --link $in -o $out"), format!("{cm} -E touch ar.stamp")]);
+    let ar2 = chain(&[format!("{cc} --link $in -o lib2.a"), format!("{cc} --link lib2.a -o lib2.copy")]);
     let manifest = format!(
         "{header}\
 rule CC\n  command = {cc} -I{inc} -MD -MF $DEP_FILE $FLAGS -c $in -o $out\n  depfile = $DEP_FILE\n  deps = gcc\n  description = CC $out\n\
 rule LINK\n  command = {cc} --link $in -o $out\n  description = LINK $out\n\
-build obj/main.o: CC {main}\n  DEP_FILE = obj/main.o.d\n  cmake_target = app\n  mnemonic = CCompile\n\
-build obj/lib.o: CC {lib}\n  DEP_FILE = obj/lib.o.d\n  cmake_target = app\n  mnemonic = CCompile\n\
-build obj/local.o: CC {lib}\n  DEP_FILE = obj/local.o.d\n  cmake_target = app\n  mnemonic = CCompile\n  local = 1\n\
-build app.bin: LINK obj/main.o obj/lib.o obj/local.o\n  cmake_target = app\n  mnemonic = CLink\n  deliverable = 1\n\
-build obj/bad.o: CC {lib}\n  DEP_FILE = obj/bad.o.d\n  FLAGS = -DFAIL\n  mnemonic = CCompile\n\
+rule AR\n  command = {ar}\n  description = AR $out\n\
+rule TOUCH\n  command = {cm} -E touch $out\n\
+rule AR2\n  command = {ar2}\n\
+build obj/main.o: CC {main}\n  DEP_FILE = obj/main.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
+build obj/lib.o: CC {lib}\n  DEP_FILE = obj/lib.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
+build obj/local.o: CC {lib}\n  DEP_FILE = obj/local.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n  rbe_local = 1\n\
+build app.bin: LINK obj/main.o obj/lib.o obj/local.o\n  rbe_target = app\n  rbe_mnemonic = CLink\n  rbe_deliverable = 1\n\
+build obj/bad.o: CC {lib}\n  DEP_FILE = obj/bad.o.d\n  FLAGS = -DFAIL\n  rbe_mnemonic = CCompile\n\
 build bad: phony obj/bad.o\n\
+build lib.a: AR obj/main.o obj/lib.o\n  rbe_target = lib\n  rbe_mnemonic = CArchive\n\
+build helper.stamp: TOUCH\n  rbe_mnemonic = CArchive\n\
+build lib2.a lib2.copy: AR2 obj/main.o\n  rbe_mnemonic = CArchive\n\
 default app.bin\n",
         main = ninja_escape_path(&root.join("src/main.c").to_string_lossy()),
         lib = ninja_escape_path(&root.join("src/lib.c").to_string_lossy()),
@@ -275,11 +323,41 @@ fn test_remote_build_and_cache() -> Result<(), String> {
     })
 }
 
-fn test_no_cmake_rbe_runs_locally() -> Result<(), String> {
+fn test_local_tool_steps() -> Result<(), String> {
+    let f = fixture("localsteps", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let archives = ["--remote_mnemonics=Compile,Archive", "lib.a", "helper.stamp"];
+        write(&f.build.join("pre.flag"), "");
+        check(run_ninja(&f, Some(&ep), &archives) == 0, "archive build failed")?;
+        // The compiles and the archive step ran remotely; the local tool's
+        // steps before and after it, and the edge running nothing else, ran
+        // locally.
+        let st = server.stats();
+        check(st.executions == 3, &format!("expected 3 remote executions, got {st:?}"))?;
+        check(std::fs::read_to_string(f.build.join("lib.a")).unwrap().starts_with("LINKED"), "lib.a")?;
+        check(!f.build.join("pre.flag").exists(), "the local step before the archive did not run")?;
+        check(f.build.join("ar.stamp").exists(), "the local step after the archive did not run")?;
+        check(f.build.join("helper.stamp").exists(), "helper.stamp missing")?;
+        for (argv, _) in server.state.executed.lock().unwrap().iter() {
+            check(!argv.iter().any(|a| a.contains("fake-cmake")), &format!("local tool in remote argv: {argv:?}"))?;
+        }
+        // Two remote steps run through the shell on POSIX hosts, locally on
+        // Windows hosts.
+        check(run_ninja(&f, Some(&ep), &["--remote_mnemonics=Compile,Archive", "lib2.a"]) == 0, "lib2.a build failed")?;
+        let expected = if cfg!(windows) { 3 } else { 4 };
+        let st = server.stats();
+        check(st.executions == expected, &format!("expected {expected} remote executions, got {st:?}"))?;
+        check(std::fs::read_to_string(f.build.join("lib2.copy")).unwrap().starts_with("LINKED\nLINKED"), "lib2.copy")?;
+        Ok(())
+    })
+}
+
+fn test_no_rbe_version_runs_locally() -> Result<(), String> {
     let f = fixture("local", false);
     with_server(&f, |server| {
         check(run_ninja(&f, Some(&server.endpoint), &[]) == 0, "local build failed")?;
-        check(server.stats().executions == 0, "nothing may run remotely without cmake_rbe = 1")?;
+        check(server.stats().executions == 0, "nothing may run remotely without rbe_version")?;
         check(f.build.join("app.bin").exists(), "app.bin missing")?;
         Ok(())
     })
@@ -300,11 +378,17 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ExitCode::from(fake_clang(&args) as u8);
     }
+    if stem.starts_with("fake-cmake") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ExitCode::from(fake_cmake(&args) as u8);
+    }
     let tests: Vec<(&str, fn() -> Result<(), String>)> = vec![
         ("remote_build_and_cache", test_remote_build_and_cache),
-        ("no_cmake_rbe_runs_locally", test_no_cmake_rbe_runs_locally),
+        ("local_tool_steps", test_local_tool_steps),
+        ("no_rbe_version_runs_locally", test_no_rbe_version_runs_locally),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
     ];
+    let count = tests.len();
     let mut failed = 0;
     for (name, t) in tests {
         match t() {
@@ -315,6 +399,6 @@ fn main() -> ExitCode {
             }
         }
     }
-    println!("test result: {} passed; {failed} failed", 3 - failed);
+    println!("test result: {} passed; {failed} failed", count - failed);
     if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }

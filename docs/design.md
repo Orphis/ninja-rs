@@ -3,8 +3,8 @@
 ## Goals
 
 `ninja-rs` reads ordinary `build.ninja` files and behaves like ninja for
-local builds. When the manifest opts in (`cmake_rbe = 1`, see
-[cmake-interface.md](cmake-interface.md)) and a REAPI endpoint is given, it
+local builds. When the manifest opts in (`rbe_version = 1`, see
+[rbe-interface.md](rbe-interface.md)) and a REAPI endpoint is given, it
 runs remote-eligible edges through the Remote Execution API v2.
 
 ## Own engine, not n2
@@ -95,8 +95,8 @@ takes 80 ms vs ninja 1.13.2's 69 ms; ~4 ms of that is process startup.
 
 The builder owns the graph (`State`) and never shares it: for each edge it
 evaluates a self-contained `Task` (command, rspfile, depfile, deps type,
-outputs, inputs, and the CMake bindings `local`, `mnemonic`,
-`cmake_target`, `deliverable`) and hands it to a `CommandRunner`. Runners
+outputs, inputs, and the RBE bindings `rbe_local`, `rbe_mnemonic`,
+`rbe_target`, `rbe_deliverable`) and hands it to a `CommandRunner`. Runners
 return a `TaskResult`; the builder then extracts deps, restats and logs
 exactly as ninja does. The build loop is `async` (tokio); runners spawn tasks
 and the loop awaits completions.
@@ -132,18 +132,23 @@ persisted wholesale later, which the daemon needs.
 ## Remote execution flow
 
 1. **Policy** (`backend::policy_wants`): remote only if the manifest has
-   `cmake_rbe = 1` (checked once when the backend is created), an executor was
-   given, the edge isn't `local = 1`, it isn't in the console pool, and its
-   `mnemonic` ends with one of `--remote_mnemonics` (default `Compile`).
+   `rbe_version = 1` (checked once when the backend is created), an executor
+   was given, the edge isn't `rbe_local = 1`, doesn't regenerate the manifest
+   (`generator = 1`), isn't in the console pool, and its `rbe_mnemonic` ends
+   with one of `--remote_mnemonics` (default `Compile`).
 2. **Unwrapping** (`cmdline::unwrap_command`): strips `[path\]cmd.exe /C "..."`
-   (Windows), splits `&&` chains outside quotes, drops `cd .`, `cd /D .`, `:`
-   and `true`, drops the archive pre-delete `cmake -E rm -f <outputs>`, and
-   tokenizes the single remaining command with `CommandLineToArgvW` rules
-   (Windows) or POSIX shell word rules. Anything needing a shell (pipes,
-   redirections, expansions, several real steps) falls back to local.
+   (Windows), splits `&&` chains outside quotes, drops the shell no-ops
+   `cd .`, `cd /D .`, `:` and `true`, and tokenizes each step with
+   `CommandLineToArgvW` rules (Windows) or POSIX shell word rules. Anything
+   needing a shell otherwise (pipes, redirections, expansions) falls back to
+   local. Steps running a tool the toolchains file declares `local` are run
+   on the host before and after the remote action (`Prepared::local_before`,
+   `local_after`); local steps between remote ones, or a command made only
+   of local steps, fall back to local. Several remote steps run through
+   `/bin/sh -c`, on POSIX hosts only.
 3. **Toolchain**: argv[0] is resolved (relative to the build dir or via
    `PATH`, 8.3 short names expanded on Windows) and looked up in
-   `rbe_toolchains.json` by `compiler` (case-insensitive on Windows). Its
+   the `rbe_toolchains` file by `tool` (case-insensitive on Windows). Its
    `inputs` are sent whole as grafted Merkle subtrees, its `platform` becomes
    the REAPI platform. Without a declaration only the executable is sent.
 4. **Include scanning** (`scanner`), see below.
@@ -160,7 +165,8 @@ persisted wholesale later, which the daemon needs.
    already identical are left untouched so `restat` keeps working. The
    depfile is rewritten to local paths before the builder reads it
    (`deps = gcc`); `/showIncludes` lines in stdout are rewritten for
-   `deps = msvc`. stdout and stderr are concatenated like a local run.
+   `deps = msvc`. stdout and stderr are concatenated like a local run, with
+   the output of the local steps run before and after.
 
 ## Include scanner
 

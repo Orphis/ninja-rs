@@ -34,7 +34,7 @@ pub struct Task {
     pub restat: bool,
     pub generator: bool,
     /// Extra edge bindings requested through `BuildConfig::task_bindings`
-    /// (e.g. `local`, `mnemonic`, `cmake_target`), evaluated; empty values
+    /// (e.g. `rbe_local`, `rbe_mnemonic`, `rbe_target`), evaluated; empty values
     /// are omitted.
     pub bindings: Vec<(String, String)>,
 }

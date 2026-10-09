@@ -28,8 +28,12 @@ use crate::exec_runner::ExecRunner;
 use crate::options::Options;
 use crate::tools::{ToolCtx, When};
 
-/// Edge bindings from the CMake interface that runners need.
-pub const CMAKE_BINDINGS: &[&str] = &["local", "mnemonic", "cmake_target", "deliverable"];
+/// Edge bindings of the RBE interface (docs/rbe-interface.md) that runners
+/// need.
+pub const RBE_BINDINGS: &[&str] = &["rbe_local", "rbe_mnemonic", "rbe_target", "rbe_deliverable"];
+
+/// The version of the RBE interface this executor implements.
+pub const RBE_VERSION: &str = "1";
 
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_FAILURE: i32 = 1;
@@ -247,7 +251,7 @@ impl Service {
                 explain: opts.explain,
                 keep_rsp: opts.keep_rsp,
                 keep_depfile: opts.keep_depfile,
-                task_bindings: CMAKE_BINDINGS.iter().map(|s| s.to_string()).collect(),
+                task_bindings: RBE_BINDINGS.iter().map(|s| s.to_string()).collect(),
                 cwd: ".".into(),
             };
 
@@ -306,7 +310,7 @@ impl Service {
         code
     }
 
-    /// Creates the remote backend when the manifest opts in (`cmake_rbe = 1`)
+    /// Creates the remote backend when the manifest opts in (`rbe_version`)
     /// and an executor was given.
     async fn remote_backend(
         &mut self,
@@ -318,11 +322,20 @@ impl Service {
         if opts.dry_run {
             return Ok(None);
         }
-        if state.lookup_variable(ROOT_SCOPE, "cmake_rbe") != "1" {
-            if opts.remote.verbose {
-                status.info("remote execution disabled: the manifest does not set cmake_rbe = 1");
+        match state.lookup_variable(ROOT_SCOPE, "rbe_version").as_str() {
+            RBE_VERSION => {}
+            "" => {
+                if opts.remote.verbose {
+                    status.info("remote execution disabled: the manifest does not set rbe_version");
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            other => {
+                status.warning(&format!(
+                    "remote execution disabled: the manifest uses RBE interface version {other}, this executor supports {RBE_VERSION}"
+                ));
+                return Ok(None);
+            }
         }
         let key = format!("{endpoint}|{}|{:?}", opts.remote.instance_name, opts.remote.headers);
         if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -337,11 +350,12 @@ impl Service {
         }
         let client = self.remote_client.as_ref().expect("connected").1.clone();
         let build_dir = std::env::current_dir().map_err(|e| e.to_string())?;
-        let toolchains = state.lookup_variable(ROOT_SCOPE, "cmake_rbe_toolchains");
+        let file_var = |name: &str| Some(state.lookup_variable(ROOT_SCOPE, name)).filter(|v| !v.is_empty());
         let backend = ninja_remote::Backend::new(
             ninja_remote::BackendConfig {
                 build_dir,
-                toolchains_file: if toolchains.is_empty() { None } else { Some(toolchains) },
+                toolchains_file: file_var("rbe_toolchains"),
+                targets_file: file_var("rbe_targets"),
                 exec_root: opts.remote.exec_root.clone().map(Into::into),
                 jobs: opts.remote.jobs,
                 mnemonic_suffixes: opts.remote.mnemonic_suffixes.clone(),

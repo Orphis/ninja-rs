@@ -1,6 +1,6 @@
-//! Command line tokenizing and unwrapping (see docs/cmake-interface.md:
-//! `cmd.exe /C "... && ..."` chains, `cd .` / `:` no-ops, and the archive
-//! `cmake -E rm -f <output>` pre-delete step).
+//! Command line tokenizing and unwrapping: `cmd.exe /C "..."` wrappers,
+//! `&&` chains and the shell no-ops generators put around commands (`:`,
+//! `true`, `cd .`), see docs/rbe-interface.md.
 
 /// Splits a Windows command line into arguments following the
 /// `CommandLineToArgvW` / MSVC CRT rules. `first_is_program` applies the
@@ -208,74 +208,36 @@ pub fn split_and_chain(cmd: &str) -> Vec<String> {
     parts
 }
 
-// Single quotes are not quotes for cmd.exe; but CMake never emits single
-// quotes on Windows command lines either, so treating them as quotes is
-// harmless and keeps POSIX behavior correct.
+// Single quotes are not quotes for cmd.exe, but Windows command lines rarely
+// contain them, so treating them as quotes keeps POSIX behavior correct.
 fn cfg_windows_quotes() -> bool {
     false
 }
 
-/// Whether a chain segment is a no-op CMake inserts (`cd .`, `:`, `true`).
+/// Whether a chain segment is a shell no-op (`:`, `true`, `cd .`), which
+/// generators put around commands (CMake for empty pre- and post-steps).
 fn is_noop(seg: &str) -> bool {
     let s = seg.trim();
     s.is_empty() || s == ":" || s == "cd ." || s == "cd /D ." || s == "true"
 }
 
-fn basename_lower(p: &str) -> String {
-    let b = p.rsplit(['/', '\\']).next().unwrap_or(p).to_ascii_lowercase();
-    b.strip_suffix(".exe").map(str::to_string).unwrap_or(b)
-}
-
-fn norm_path(p: &str) -> String {
-    let s = p.replace('\\', "/");
-    let (c, _) = ninja_core::canon::canonicalize_path_with(&s, false);
-    c
-}
-
-/// Whether `argv` is `<cmake> -E rm -f <outputs...>` (or `remove -f`) where
-/// every path is one of `outputs`.
-fn is_archive_predelete(argv: &[String], outputs: &[String], build_dir: Option<&str>) -> bool {
-    if argv.len() < 5 || basename_lower(&argv[0]) != "cmake" || argv[1] != "-E" {
-        return false;
-    }
-    if !(argv[2] == "rm" || argv[2] == "remove") || argv[3] != "-f" {
-        return false;
-    }
-    let outs: Vec<String> = outputs.iter().map(|o| norm_path(o)).collect();
-    argv[4..].iter().all(|p| {
-        let n = norm_path(p);
-        let rel = match build_dir {
-            Some(b) => {
-                let b = norm_path(b);
-                n.strip_prefix(&format!("{b}/")).map(str::to_string).unwrap_or(n.clone())
-            }
-            None => n.clone(),
-        };
-        let eq = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
-        outs.iter().any(|o| eq(o, &n) || eq(o, &rel))
-    })
-}
-
+/// The commands a command line runs, in order: each an argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unwrapped {
-    pub argv: Vec<String>,
-    /// Whether the archive pre-delete step was dropped.
-    pub dropped_predelete: bool,
+    pub steps: Vec<Vec<String>>,
 }
 
-/// Turns a ninja command into the argv of the single real command it runs,
-/// following the CMake interface contract. `windows` selects cmd.exe vs
-/// POSIX shell semantics (the host's). `outputs` are the edge outputs (for
-/// recognizing the archive pre-delete step).
-pub fn unwrap_command(command: &str, windows: bool, outputs: &[String], build_dir: Option<&str>) -> Result<Unwrapped, String> {
+/// Turns a command line into the argv of each command it runs: a
+/// `cmd.exe /C` wrapper is removed (`windows`, the host's syntax), `&&`
+/// chains are split and shell no-ops dropped. Commands that need a shell
+/// otherwise (pipes, redirections, variables) are an error.
+pub fn unwrap_command(command: &str, windows: bool) -> Result<Unwrapped, String> {
     let mut cmd = command.trim().to_string();
     if windows && let Some(rest) = strip_cmd_exe(&cmd) {
         cmd = rest;
     }
-    let segments = split_and_chain(&cmd);
-    let mut real: Vec<Vec<String>> = Vec::new();
-    let mut dropped = false;
-    for seg in segments {
+    let mut steps: Vec<Vec<String>> = Vec::new();
+    for seg in split_and_chain(&cmd) {
         if is_noop(&seg) {
             continue;
         }
@@ -287,20 +249,20 @@ pub fn unwrap_command(command: &str, windows: bool, outputs: &[String], build_di
         } else {
             split_posix(&seg).ok_or_else(|| format!("command needs a shell: {seg}"))?
         };
-        if argv.is_empty() {
-            continue;
+        if !argv.is_empty() {
+            steps.push(argv);
         }
-        if is_archive_predelete(&argv, outputs, build_dir) {
-            dropped = true;
-            continue;
-        }
-        real.push(argv);
     }
-    match real.len() {
-        0 => Err("empty command".into()),
-        1 => Ok(Unwrapped { argv: real.pop().unwrap(), dropped_predelete: dropped }),
-        n => Err(format!("command runs {n} steps")),
+    if steps.is_empty() {
+        return Err("empty command".into());
     }
+    Ok(Unwrapped { steps })
+}
+
+/// Joins commands into one POSIX shell command line (`a && b`).
+pub fn join_posix_chain(steps: &[Vec<String>]) -> String {
+    let cmds: Vec<String> = steps.iter().map(|argv| argv.iter().map(|a| quote_posix(a)).collect::<Vec<_>>().join(" ")).collect();
+    cmds.join(" && ")
 }
 
 /// For `[path\]cmd[.exe] [/S] /C <rest>` (any case), returns `<rest>` with
@@ -439,68 +401,58 @@ mod tests {
         assert_eq!(split_posix("cc -o a#b x~y"), Some(s(&["cc", "-o", "a#b", "x~y"])));
     }
 
+    fn steps(cmd: &str, windows: bool) -> Vec<Vec<String>> {
+        unwrap_command(cmd, windows).unwrap().steps
+    }
+
     #[test]
     fn unwrap_plain() {
-        let u = unwrap_command("/usr/bin/cc -c a.c -o a.o", false, &[], None).unwrap();
-        assert_eq!(u.argv, s(&["/usr/bin/cc", "-c", "a.c", "-o", "a.o"]));
+        assert_eq!(steps("/usr/bin/cc -c a.c -o a.o", false), vec![s(&["/usr/bin/cc", "-c", "a.c", "-o", "a.o"])]);
     }
 
     #[test]
     fn unwrap_unix_chain() {
-        let u = unwrap_command(
-            ": && /usr/bin/cmake -E rm -f libfoo.a && /usr/bin/ar qc libfoo.a a.o b.o && :",
-            false,
-            &["libfoo.a".to_string()],
-            None,
-        )
-        .unwrap();
-        assert_eq!(u.argv, s(&["/usr/bin/ar", "qc", "libfoo.a", "a.o", "b.o"]));
-        assert!(u.dropped_predelete);
+        assert_eq!(
+            steps(": && /usr/bin/ar qc libfoo.a a.o b.o && /usr/bin/ranlib libfoo.a && :", false),
+            vec![s(&["/usr/bin/ar", "qc", "libfoo.a", "a.o", "b.o"]), s(&["/usr/bin/ranlib", "libfoo.a"])]
+        );
     }
 
     #[test]
     fn unwrap_windows_chain() {
-        let u = unwrap_command(
-            r#"cmd.exe /C "cd . && "C:\Program Files\CMake\bin\cmake.exe" -E rm -f lib\foo.lib && C:\llvm\bin\llvm-ar.exe qc lib\foo.lib a.obj && cd .""#,
-            true,
-            &["lib/foo.lib".to_string()],
-            None,
-        )
-        .unwrap();
-        assert_eq!(u.argv, s(&[r"C:\llvm\bin\llvm-ar.exe", "qc", r"lib\foo.lib", "a.obj"]));
-        assert!(u.dropped_predelete);
-    }
-
-    #[test]
-    fn unwrap_real_cmake_windows_commands() {
-        // Archive rule as written by CMake's Ninja generator on Windows:
-        // after dropping the pre-delete, ar and ranlib remain (2 steps).
-        let archive = r#"C:\WINDOWS\system32\cmd.exe /C "cd . && C:\cmake\bin\cmake.exe -E rm -f greet.lib && "C:\Program Files\LLVM\bin\llvm-ar.exe" qc greet.lib  CMakeFiles/greet.dir/src/greet.cpp.obj && "C:\Program Files\LLVM\bin\llvm-ranlib.exe" greet.lib && cd .""#;
-        assert_eq!(unwrap_command(archive, true, &["greet.lib".to_string()], None).unwrap_err(), "command runs 2 steps");
-        // Without ranlib, the archive step alone remains.
-        let archive1 = r#"C:\WINDOWS\system32\cmd.exe /C "cd . && C:\cmake\bin\cmake.exe -E rm -f greet.lib && "C:\Program Files\LLVM\bin\llvm-ar.exe" qc greet.lib a.obj && cd .""#;
-        let u = unwrap_command(archive1, true, &["greet.lib".to_string()], None).unwrap();
-        assert_eq!(u.argv, s(&[r"C:\Program Files\LLVM\bin\llvm-ar.exe", "qc", "greet.lib", "a.obj"]));
-        // A dependency scan with redirection needs a shell.
-        let scan = r#"C:\WINDOWS\system32\cmd.exe /C ""C:/Program Files/LLVM/bin/clang-scan-deps.exe" -format=p1689 -- "C:\Program Files\LLVM\bin\clang++.exe" -c a.cpp > a.ddi.tmp && "C:/cmake/bin/cmake.exe" -E rename a.ddi.tmp a.ddi""#;
-        assert!(unwrap_command(scan, true, &[], None).is_err());
+        // A link as written by CMake's Ninja generator on Windows.
+        assert_eq!(
+            steps(r#"C:\WINDOWS\system32\cmd.exe /C "cd . && "C:\Program Files\LLVM\bin\clang++.exe" a.obj -o a.exe && cd .""#, true),
+            vec![s(&[r"C:\Program Files\LLVM\bin\clang++.exe", "a.obj", "-o", "a.exe"])]
+        );
+        assert_eq!(
+            steps(r#""C:\Program Files\LLVM\bin\llvm-ar.exe" qc greet.lib a.obj && "C:\Program Files\LLVM\bin\llvm-ranlib.exe" greet.lib"#, true),
+            vec![
+                s(&[r"C:\Program Files\LLVM\bin\llvm-ar.exe", "qc", "greet.lib", "a.obj"]),
+                s(&[r"C:\Program Files\LLVM\bin\llvm-ranlib.exe", "greet.lib"])
+            ]
+        );
         // A plain compile.
         let cc = r#""C:\Program Files\LLVM\bin\clang++.exe" -IC:/src -MD -MT a.obj -MF a.obj.d -o a.obj -c C:/src/a.cpp"#;
-        assert_eq!(unwrap_command(cc, true, &[], None).unwrap().argv[0], r"C:\Program Files\LLVM\bin\clang++.exe");
-    }
-
-    #[test]
-    fn unwrap_keeps_rm_of_other_files() {
-        let e = unwrap_command(": && cmake -E rm -f other.a && ar qc libfoo.a a.o", false, &["libfoo.a".to_string()], None);
-        assert_eq!(e.unwrap_err(), "command runs 2 steps");
+        assert_eq!(steps(cc, true)[0][0], r"C:\Program Files\LLVM\bin\clang++.exe");
     }
 
     #[test]
     fn unwrap_rejects_shell_features() {
-        assert!(unwrap_command("cc a.c | tee x", false, &[], None).is_err());
-        assert!(unwrap_command(r#"cmd.exe /C "a.exe > x.txt""#, true, &[], None).is_err());
+        assert!(unwrap_command("cc a.c | tee x", false).is_err());
+        assert!(unwrap_command(r#"cmd.exe /C "a.exe > x.txt""#, true).is_err());
+        let scan = r#"C:\WINDOWS\system32\cmd.exe /C ""C:/LLVM/bin/clang-scan-deps.exe" -format=p1689 -- clang++.exe -c a.cpp > a.ddi.tmp && cmake.exe -E rename a.ddi.tmp a.ddi""#;
+        assert!(unwrap_command(scan, true).is_err());
+        assert!(unwrap_command(": && :", false).is_err());
         // Quoted metacharacters are fine.
-        assert!(unwrap_command(r#"cl.exe "-DX=a>b" a.c"#, true, &[], None).is_ok());
+        assert!(unwrap_command(r#"cl.exe "-DX=a>b" a.c"#, true).is_ok());
+    }
+
+    #[test]
+    fn posix_chain() {
+        let chain = vec![s(&["ar", "qc", "lib a.a", "a.o"]), s(&["ranlib", "lib a.a"])];
+        assert_eq!(join_posix_chain(&chain), "ar qc 'lib a.a' a.o && ranlib 'lib a.a'");
+        assert_eq!(steps(&join_posix_chain(&chain), false), chain);
     }
 
     #[test]

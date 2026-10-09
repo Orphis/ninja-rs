@@ -1,4 +1,4 @@
-//! `CMakeFiles/rbe_toolchains.json` (see docs/cmake-interface.md).
+//! The toolchains file named by `rbe_toolchains` (see docs/rbe-interface.md).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,11 @@ use serde::Deserialize;
 pub struct Toolchain {
     #[serde(default)]
     pub language: String,
-    pub compiler: String,
+    /// Absolute path of the executable.
+    pub tool: String,
+    /// The tool only runs locally: steps invoking it are run on the host.
+    #[serde(default)]
+    pub local: bool,
     #[serde(default)]
     pub inputs: Vec<String>,
     #[serde(default)]
@@ -51,11 +55,11 @@ impl Toolchains {
         Self::parse(&text, windows)
     }
 
-    /// Finds the toolchain whose `compiler` is `exe` (an absolute path).
+    /// Finds the toolchain whose `tool` is `exe` (an absolute path).
     pub fn find(&self, exe: &Path) -> Option<&Toolchain> {
         let key = compare_key(&exe.to_string_lossy(), self.windows);
         self.toolchains.iter().find(|t| {
-            let k = compare_key(&t.compiler, self.windows);
+            let k = compare_key(&t.tool, self.windows);
             k == key || (self.windows && (format!("{k}.exe") == key || k == format!("{key}.exe")))
         })
     }
@@ -116,11 +120,12 @@ mod tests {
       "toolchains": [
         {
           "language": "CXX",
-          "compiler": "C:/llvm/bin/clang-cl.exe",
+          "tool": "C:/llvm/bin/clang-cl.exe",
           "inputs": ["C:/llvm/bin", "C:/llvm/lib/clang"],
           "platform": { "OSFamily": "Windows", "container-image": "docker://x" }
         },
-        { "language": "C", "compiler": "/usr/bin/cc" }
+        { "language": "C", "tool": "/usr/bin/cc" },
+        { "tool": "/usr/bin/cmake", "local": true }
       ]
     }"#;
 
@@ -142,6 +147,8 @@ mod tests {
         assert!(t.find(Path::new("/usr/bin/../bin/cc")).is_some());
         assert!(t.find(Path::new("/USR/bin/cc")).is_none());
         assert!(t.find(Path::new("/usr/bin/cc")).unwrap().inputs.is_empty());
+        assert!(!t.find(Path::new("/usr/bin/cc")).unwrap().local);
+        assert!(t.find(Path::new("/usr/bin/cmake")).unwrap().local);
     }
 
     #[test]

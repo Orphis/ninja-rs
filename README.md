@@ -1,17 +1,20 @@
 # ninja-rs
 
 A ninja-compatible build executor written in Rust, with native Remote
-Execution API (REAPI v2) support for `build.ninja` files written by CMake's
-RBE mode ([docs/cmake-interface.md](docs/cmake-interface.md)).
+Execution API (REAPI v2) support for `build.ninja` files annotated with the
+generator-neutral RBE interface ([docs/rbe-interface.md](docs/rbe-interface.md)),
+such as those CMake's Ninja generators write with `CMAKE_NINJA_RBE`.
 
 - Reads `build.ninja` unchanged and builds locally exactly like ninja
   (own port of ninja's parser and build engine, including dyndep).
-- When the manifest has `cmake_rbe = 1` and `--remote_executor` is given,
-  edges whose `mnemonic` ends in `Compile` and that aren't `local = 1` run
-  through REAPI: C/C++ includes are scanned (no separate scan step), inputs
-  become a Merkle tree, the action cache is checked, the action executed and
-  the outputs downloaded. Depfiles and `/showIncludes` output are mapped back
-  to local paths.
+- When the manifest has `rbe_version = 1` and `--remote_executor` is given,
+  edges whose `rbe_mnemonic` ends in `Compile` and that aren't
+  `rbe_local = 1` run through REAPI: C/C++ includes are scanned (no separate
+  scan step), inputs become a Merkle tree, the action cache is checked, the
+  action executed and the outputs downloaded. Depfiles and `/showIncludes`
+  output are mapped back to local paths. Steps of a command running a tool
+  declared local (such as `cmake -E rm -f` before archiving) run on the
+  host around the remote action.
 
 Design: [docs/design.md](docs/design.md) · path mapping:
 [docs/paths.md](docs/paths.md) · build/toolchain notes:
@@ -49,7 +52,7 @@ ninja-rs [options] [targets...]
   -d explain|keepdepfile|keeprsp|stats|nostatcache  -w phonycycle=err|warn  --version
   -t list|targets|commands|inputs|query|deps|rules|clean|cleandead|recompact|restat
 
-remote execution (only for manifests with cmake_rbe = 1):
+remote execution (only for manifests with rbe_version = 1):
   --remote_executor=grpc://host:port | grpcs://host:port
   --remote_instance_name=NAME
   --remote_header=K=V            (repeatable)

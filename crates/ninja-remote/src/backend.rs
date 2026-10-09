@@ -13,14 +13,17 @@ use rbe_client::{ActionMeta, Client};
 
 use crate::action::{Prepared, Shared, prepare};
 use crate::store::Store;
+use crate::targets::Targets;
 use crate::toolchains::Toolchains;
 
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     /// Absolute build directory (where build.ninja is).
     pub build_dir: PathBuf,
-    /// `cmake_rbe_toolchains`, relative to the build directory.
+    /// `rbe_toolchains`, relative to the build directory.
     pub toolchains_file: Option<String>,
+    /// `rbe_targets`, relative to the build directory.
+    pub targets_file: Option<String>,
     pub exec_root: Option<PathBuf>,
     pub jobs: usize,
     pub mnemonic_suffixes: Vec<String>,
@@ -35,6 +38,7 @@ pub struct Backend {
 struct Inner {
     client: Client,
     shared: Shared,
+    targets: Targets,
     config: BackendConfig,
 }
 
@@ -44,6 +48,10 @@ impl Backend {
         let toolchains = match &config.toolchains_file {
             Some(f) => Toolchains::load(&config.build_dir.join(f), windows).map_err(anyhow::Error::msg)?,
             None => Toolchains::default(),
+        };
+        let targets = match &config.targets_file {
+            Some(f) => Targets::load(&config.build_dir.join(f)).map_err(anyhow::Error::msg)?,
+            None => Targets::default(),
         };
         let caps = client.capabilities().await.context("GetCapabilities")?;
         if let Some(cc) = &caps.cache_capabilities
@@ -62,17 +70,18 @@ impl Backend {
             store,
             windows,
         };
-        Ok(Self { inner: Arc::new(Inner { client, shared, config }) })
+        Ok(Self { inner: Arc::new(Inner { client, shared, targets, config }) })
     }
 }
 
-/// The phase-1 policy: a task runs remotely if it is not marked `local = 1`
-/// and its mnemonic ends with one of the allowed suffixes (`Compile`).
+/// The phase-1 policy: a task runs remotely if it is not marked
+/// `rbe_local = 1`, does not regenerate the manifest (`generator = 1`), and
+/// its mnemonic ends with one of the allowed suffixes (`Compile`).
 pub fn policy_wants(task: &Task, suffixes: &[String]) -> bool {
-    if task.use_console || task.binding("local") == Some("1") {
+    if task.use_console || task.generator || task.binding("rbe_local") == Some("1") {
         return false;
     }
-    match task.binding("mnemonic") {
+    match task.binding("rbe_mnemonic") {
         Some(m) => suffixes.iter().any(|s| m.ends_with(s.as_str())),
         None => false,
     }
@@ -128,12 +137,18 @@ impl Inner {
             .map_err(|e| Failure::Prepare(format!("internal error: {e}")))?
             .map_err(Failure::Prepare)?;
         let meta = ActionMeta {
-            mnemonic: task.binding("mnemonic").unwrap_or_default().to_string(),
-            target_id: task.binding("cmake_target").unwrap_or_default().to_string(),
+            mnemonic: task.binding("rbe_mnemonic").unwrap_or_default().to_string(),
+            target_id: task.binding("rbe_target").unwrap_or_default().to_string(),
             configuration_id: String::new(),
         };
         let client = self.client.for_action(&meta, &prepared.action_digest.hash);
         let digest = prepared.action_digest.clone();
+
+        // Local steps first (e.g. deleting an archive before re-creating it).
+        let mut output = Vec::new();
+        if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
+            return Ok(failed);
+        }
 
         // Action cache first.
         let cached = client.get_action_result(&digest).await.map_err(Failure::Infra)?;
@@ -153,11 +168,24 @@ impl Inner {
                 (resp.result.ok_or_else(|| Failure::Infra(anyhow::anyhow!("Execute returned no result")))?, hit)
             }
         };
-        let output = self.download(&client, task, &prepared, &result).await.map_err(Failure::Infra)?;
-        let mut output = output;
+        output.extend(self.download(&client, task, &prepared, &result).await.map_err(Failure::Infra)?);
+        let kind = if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote };
+        if result.exit_code == 0
+            && let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await
+        {
+            failed.kind = kind;
+            return Ok(failed);
+        }
         if self.config.verbose {
+            let target = match task.binding("rbe_target") {
+                Some(name) => match self.targets.get(name) {
+                    Some(t) if !t.kind.is_empty() => format!(", {} {name}", t.kind),
+                    _ => format!(", target {name}"),
+                },
+                None => String::new(),
+            };
             let mut msg = format!(
-                "ninja-rs: {} {} ({} inputs)\n",
+                "ninja-rs: {} {} ({} inputs{target})\n",
                 if hit { "remote cache hit" } else { "executed remotely" },
                 digest.hash,
                 prepared.input_files
@@ -170,7 +198,38 @@ impl Inner {
             output = msg;
         }
         let status = if result.exit_code == 0 { ExitStatus::Success } else { ExitStatus::Failure(result.exit_code) };
-        Ok(TaskResult { edge: task.edge, status, output, kind: if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote } })
+        Ok(TaskResult { edge: task.edge, status, output, kind })
+    }
+
+    /// Runs steps on the host, in the build directory, appending their
+    /// output. Returns the result of the task if a step fails.
+    async fn run_local_steps(&self, task: &Task, steps: &[Vec<String>], output: &mut Vec<u8>) -> Option<TaskResult> {
+        for argv in steps {
+            let program = argv[0].clone();
+            let args = argv[1..].to_vec();
+            let dir = self.shared.build_dir.clone();
+            let r = tokio::task::spawn_blocking(move || std::process::Command::new(program).args(args).current_dir(dir).output()).await;
+            let code = match r {
+                Ok(Ok(out)) => {
+                    output.extend_from_slice(&out.stdout);
+                    output.extend_from_slice(&out.stderr);
+                    if out.status.success() {
+                        continue;
+                    }
+                    out.status.code().unwrap_or(1)
+                }
+                Ok(Err(e)) => {
+                    output.extend_from_slice(format!("ninja-rs: running {}: {e}\n", argv[0]).as_bytes());
+                    1
+                }
+                Err(e) => {
+                    output.extend_from_slice(format!("ninja-rs: internal error: {e}\n").as_bytes());
+                    1
+                }
+            };
+            return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(code), output: std::mem::take(output), kind: ExecKind::Remote });
+        }
+        None
     }
 
     /// Writes the outputs (skipping files that are already up to date, so
@@ -336,16 +395,19 @@ mod tests {
     #[test]
     fn policy() {
         let s = vec!["Compile".to_string()];
-        assert!(policy_wants(&task(&[("mnemonic", "CXXCompile")]), &s));
-        assert!(policy_wants(&task(&[("mnemonic", "CCompile"), ("cmake_target", "foo")]), &s));
-        assert!(!policy_wants(&task(&[("mnemonic", "CXXCompile"), ("local", "1")]), &s));
-        assert!(!policy_wants(&task(&[("mnemonic", "CXXLink")]), &s));
-        assert!(!policy_wants(&task(&[("mnemonic", "CXXScan")]), &s));
+        assert!(policy_wants(&task(&[("rbe_mnemonic", "CXXCompile")]), &s));
+        assert!(policy_wants(&task(&[("rbe_mnemonic", "CCompile"), ("rbe_target", "foo")]), &s));
+        assert!(!policy_wants(&task(&[("rbe_mnemonic", "CXXCompile"), ("rbe_local", "1")]), &s));
+        assert!(!policy_wants(&task(&[("rbe_mnemonic", "CXXLink")]), &s));
+        assert!(!policy_wants(&task(&[("rbe_mnemonic", "CXXScan")]), &s));
+        let mut regen = task(&[("rbe_mnemonic", "CXXCompile")]);
+        regen.generator = true;
+        assert!(!policy_wants(&regen, &s));
         assert!(!policy_wants(&task(&[]), &s));
-        let mut t = task(&[("mnemonic", "CXXCompile")]);
+        let mut t = task(&[("rbe_mnemonic", "CXXCompile")]);
         t.use_console = true;
         assert!(!policy_wants(&t, &s));
-        assert!(policy_wants(&task(&[("mnemonic", "CXXArchive")]), &["Compile".into(), "Archive".into()]));
+        assert!(policy_wants(&task(&[("rbe_mnemonic", "CXXArchive")]), &["Compile".into(), "Archive".into()]));
     }
 
     #[test]

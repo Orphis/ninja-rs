@@ -4,10 +4,11 @@
 //!   execution policy, action cache lookups, uploads, `Execute` and output
 //!   downloads.
 //! - [`action`] turns a ninja task into a REAPI action.
-//! - [`cmdline`] unwraps CMake's command chains into a plain argv.
+//! - [`cmdline`] splits command lines into the commands they run.
 //! - [`scanner`] finds the headers a C/C++ compile reads.
 //! - [`paths`] maps local paths into the remote input root and back.
-//! - [`toolchains`] reads `rbe_toolchains.json`.
+//! - [`toolchains`] reads the `rbe_toolchains` file.
+//! - [`targets`] reads the `rbe_targets` file.
 //! - [`store::Store`] holds the caches shared across actions and builds.
 
 pub mod action;
@@ -16,6 +17,7 @@ pub mod cmdline;
 pub mod paths;
 pub mod scanner;
 pub mod store;
+pub mod targets;
 pub mod toolchains;
 
 pub use backend::{Backend, BackendConfig};

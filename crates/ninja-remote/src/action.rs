@@ -9,7 +9,7 @@ use ninja_core::runner::Task;
 use rbe_client::proto as re;
 use rbe_client::{BlobSet, BlobSource, InputTree};
 
-use crate::cmdline::{join_rsp, split_rsp, unwrap_command};
+use crate::cmdline::{join_posix_chain, join_rsp, split_rsp, unwrap_command};
 use crate::paths::{ExecRoot, PathMapper, TreeIndex, normalize_abs};
 use crate::scanner::{self, Scanner, Style, decode_rsp, expand_response_files, parse_compile, search_path};
 use crate::store::Store;
@@ -35,6 +35,10 @@ pub struct Prepared {
     pub depfile: Option<(String, PathBuf)>,
     pub warnings: Vec<String>,
     pub input_files: usize,
+    /// Steps of the command that run on the host (local tools), before and
+    /// after the remote action, as argv.
+    pub local_before: Vec<Vec<String>>,
+    pub local_after: Vec<Vec<String>>,
 }
 
 fn to_s(p: &Path) -> String {
@@ -46,15 +50,36 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     let windows = shared.windows;
     let build_dir = &shared.build_dir;
     let build_dir_s = to_s(build_dir);
-    let unwrapped = unwrap_command(&task.command, windows, &task.outputs, Some(&build_dir_s))?;
-    let argv = unwrapped.argv;
-    let exe = resolve_program(&argv[0], build_dir, windows).ok_or_else(|| format!("cannot find program '{}'", argv[0]))?;
-    let exe = long_path(&exe);
-    let toolchain = shared.toolchains.find(&exe).cloned();
+    let mut steps = unwrap_command(&task.command, windows)?.steps;
+    let mut exes = Vec::new();
+    for argv in &steps {
+        let exe = resolve_program(&argv[0], build_dir, windows).ok_or_else(|| format!("cannot find program '{}'", argv[0]))?;
+        exes.push(long_path(&exe));
+    }
+    // Steps running local tools run on the host, before or after the others.
+    let is_local = |e: &PathBuf| shared.toolchains.find(e).is_some_and(|t| t.local);
+    let first = exes.iter().position(|e| !is_local(e)).ok_or("the command only runs local tools")?;
+    let last = exes.iter().rposition(|e| !is_local(e)).unwrap_or(first);
+    if exes[first..=last].iter().any(is_local) {
+        return Err("the command runs local tools between other steps".into());
+    }
+    let local_after = steps.split_off(last + 1);
+    let local_before: Vec<Vec<String>> = steps.drain(..first).collect();
+    exes.truncate(last + 1);
+    exes.drain(..first);
+    if steps.len() > 1 && windows {
+        // cmd.exe's quoting does not survive a remote worker's own quoting.
+        return Err(format!("the command runs {} steps remotely", steps.len()));
+    }
+    let argv = &steps[0];
+    let exe = &exes[0];
+    let toolchains: Vec<_> = exes.iter().filter_map(|e| shared.toolchains.find(e).cloned()).collect();
+    let toolchain = shared.toolchains.find(exe).cloned().or_else(|| toolchains.first().cloned());
     let mut warnings = Vec::new();
 
-    let style = scanner::compiler_style(&exe.to_string_lossy(), &argv);
-    let is_compile = task.binding("mnemonic").is_some_and(|m| m.ends_with("Compile"));
+    // Only a single compiler invocation is scanned for includes.
+    let style = if steps.len() == 1 { scanner::compiler_style(&exe.to_string_lossy(), argv) } else { None };
+    let is_compile = task.binding("rbe_mnemonic").is_some_and(|m| m.ends_with("Compile"));
     if is_compile && style.is_none() {
         return Err(format!("unrecognized compiler '{}'", argv[0]));
     }
@@ -63,8 +88,11 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut whole_dirs: Vec<PathBuf> = Vec::new();
     let mut rsp_files: Vec<PathBuf> = Vec::new();
-    let (expanded, rsps) = expand_response_files(&argv, build_dir, windows);
+    let (expanded, rsps) = expand_response_files(argv, build_dir, windows);
     rsp_files.extend(rsps);
+    for later in &steps[1..] {
+        rsp_files.extend(expand_response_files(later, build_dir, windows).1);
+    }
     if style.is_some() {
         let info = parse_compile(&expanded, build_dir);
         let scanner = Scanner { cache: &shared.store.scan, windows, volatile_roots: vec![build_dir.clone()] };
@@ -104,24 +132,21 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     }
 
     // Toolchain inputs are sent whole; without a declaration, just the
-    // executable.
+    // executables.
     let mut toolchain_dirs: Vec<PathBuf> = Vec::new();
-    match &toolchain {
-        Some(tc) if !tc.inputs.is_empty() => {
-            for i in &tc.inputs {
-                let p = PathBuf::from(i);
-                if p.is_dir() {
-                    toolchain_dirs.push(scanner::normalize(&p));
-                } else if p.is_file() {
-                    files.push(scanner::normalize(&p));
-                } else {
-                    warnings.push(format!("toolchain input {i} does not exist"));
-                }
+    for tc in &toolchains {
+        for i in &tc.inputs {
+            let p = PathBuf::from(i);
+            if p.is_dir() {
+                toolchain_dirs.push(scanner::normalize(&p));
+            } else if p.is_file() {
+                files.push(scanner::normalize(&p));
+            } else {
+                warnings.push(format!("toolchain input {i} does not exist"));
             }
-            files.push(scanner::normalize(&exe));
         }
-        _ => files.push(scanner::normalize(&exe)),
     }
+    files.extend(exes.iter().map(|e| scanner::normalize(e)));
 
     // Exec root.
     let exec_root = match &shared.exec_root {
@@ -221,18 +246,27 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     let work_dir = mapper.work_dir.clone();
     tree.ensure_dir(&work_dir).map_err(|e| format!("{e:#}"))?;
 
-    // Command line.
-    let mut arguments: Vec<String> = argv.iter().map(|a| mapper.rewrite_arg(a)).collect();
-    if let Some(rel) = mapper.tree_path(&to_s(&exe)) {
-        let mut p = mapper.rel_from_work_dir(&rel);
-        if !p.contains('/') {
-            p = format!("./{p}");
+    // Command line: one command, or a chain run by the shell.
+    let mut remote_steps: Vec<Vec<String>> = Vec::new();
+    for (argv, exe) in steps.iter().zip(&exes) {
+        let mut arguments: Vec<String> = argv.iter().map(|a| mapper.rewrite_arg(a)).collect();
+        if let Some(rel) = mapper.tree_path(&to_s(exe)) {
+            let mut p = mapper.rel_from_work_dir(&rel);
+            if !p.contains('/') {
+                p = format!("./{p}");
+            }
+            if windows {
+                p = p.replace('/', "\\");
+            }
+            arguments[0] = p;
         }
-        if windows {
-            p = p.replace('/', "\\");
-        }
-        arguments[0] = p;
+        remote_steps.push(arguments);
     }
+    let arguments = if remote_steps.len() == 1 {
+        remote_steps.pop().unwrap()
+    } else {
+        vec!["/bin/sh".to_string(), "-c".to_string(), join_posix_chain(&remote_steps)]
+    };
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     if style == Some(Style::Msvc)
         && let Ok(inc) = std::env::var("INCLUDE")
@@ -288,7 +322,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     };
     let action_digest = blobs.insert_message(&action);
     let tree_index = TreeIndex::new(tree_files, windows);
-    Ok(Prepared { action_digest, blobs, mapper, tree_index, outputs, depfile, warnings, input_files })
+    Ok(Prepared { action_digest, blobs, mapper, tree_index, outputs, depfile, warnings, input_files, local_before, local_after })
 }
 
 fn output_rel(mapper: &mut PathMapper, o: &str) -> Result<String, String> {

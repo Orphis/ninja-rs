@@ -75,7 +75,7 @@ options:
     terminates toplevel options; further flags are passed to the tool
   -w FLAG  adjust warnings (use '-w list' to list warnings)
 
-remote execution (REAPI v2; only for build.ninja files with cmake_rbe = 1):
+remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --remote_executor=URL      grpc://host:port or grpcs://host:port
   --remote_instance_name=S   REAPI instance name
   --remote_header=K=V        extra gRPC header (repeatable)
