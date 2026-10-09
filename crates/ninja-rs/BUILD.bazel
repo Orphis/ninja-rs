@@ -1,3 +1,4 @@
+load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
 load("@rules_rs//rs:rust_test.bzl", "rust_test")
@@ -19,10 +20,17 @@ rust_library(
     ],
 )
 
+# Embeds the Windows long path manifest (MSVC targets; see build.rs).
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+)
+
 rust_binary(
     name = "ninja-rs",
     srcs = ["src/main.rs"],
     deps = [
+        ":build_script",
         ":ninja_rs_lib",
         "//crates/ninja-core",
         "@crates//:tokio",

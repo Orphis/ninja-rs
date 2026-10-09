@@ -73,12 +73,24 @@ deep libc++ header paths otherwise exceed `MAX_PATH` in `@llvm` tools.
   project there. A gnullvm *host* build is not possible (no gnullvm rustc
   exec toolchain in rules_rs).
 
-## mt.exe
+## Windows manifest (long paths)
 
-The earlier "lld-link: unable to find mt.exe" came from C/C++ executables
-linked with `/MANIFEST:EMBED` through CMake. Rust binaries built by rules_rs
-don't request manifest embedding, and the Windows MSVC Bazel build links
-without `mt.exe`.
+`ninja-rs.exe` embeds an application manifest declaring `longPathAware`,
+like upstream ninja: without it Windows keeps the 260-character `MAX_PATH`
+limit for the process even with long paths enabled system-wide (e.g. `-C`
+into a deeper directory fails). `crates/ninja-rs/build.rs` writes the
+manifest as a compiled resource (`.res`) that the linker takes as an input,
+for Cargo and Bazel alike (MSVC targets only).
+
+This avoids linker-side manifest embedding (`/MANIFEST:EMBED
+/MANIFESTINPUT`), which needs a manifest merger: lld-link then runs `mt.exe`
+from `PATH` unless it was built with libxml2. The `llvm` module's `llvm-mt`
+(LLVM 23.1.2) can merge manifests, but neither it nor `mt.exe` is needed
+for a `.res` file.
+
+Windows still limits the *working directory of a new process* to
+`MAX_PATH`, manifest or not (ninja behaves the same): commands fail to start
+from deeper directories.
 
 ## WSL notes
 
