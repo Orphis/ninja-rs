@@ -5,6 +5,7 @@
 //! builds in-process. The CLI creates one and runs one build; a future daemon
 //! would keep it alive across builds. There is no global state.
 
+pub mod bes;
 pub mod exec_runner;
 pub mod options;
 pub mod tools;
@@ -24,13 +25,14 @@ use ninja_core::runner::{CommandRunner, DryRunRunner, RemoteBackend};
 use ninja_core::status::{Status, StatusPrinter, Verbosity};
 use ninja_core::subprocess::Interrupt;
 
+use crate::bes::{Bes, InvocationIds, ReportingStatus};
 use crate::exec_runner::ExecRunner;
 use crate::options::Options;
 use crate::tools::{ToolCtx, When};
 
 /// Edge bindings of the RBE interface (docs/rbe-interface.md) that runners
 /// need.
-pub const RBE_BINDINGS: &[&str] = &["rbe_local", "rbe_mnemonic", "rbe_target", "rbe_deliverable"];
+pub const RBE_BINDINGS: &[&str] = &["rbe_local", "rbe_mnemonic", "rbe_target", "rbe_config", "rbe_artifact", "rbe_deliverable"];
 
 /// The version of the RBE interface this executor implements.
 pub const RBE_VERSION: &str = "1";
@@ -50,6 +52,9 @@ pub struct Service {
     metrics: Vec<(&'static str, u64, Duration)>,
     stat_counters: Option<Arc<StatCounters>>,
     stat_cache: bool,
+    /// The current invocation's ids, shared by build events and remote
+    /// execution requests.
+    ids: InvocationIds,
     /// Set by a one-shot CLI process: skip freeing per-build data at the end
     /// of a build. A long-lived service must leave it unset.
     pub skip_teardown: bool,
@@ -66,6 +71,7 @@ impl Service {
             metrics: Vec::new(),
             stat_counters: None,
             stat_cache: true,
+            ids: InvocationIds::default(),
             skip_teardown: false,
         }
     }
@@ -119,7 +125,24 @@ impl Service {
 
     async fn run_invocation(&mut self, opts: &Options) -> i32 {
         self.remote_verbose = opts.remote.verbose;
-        let mut status = StatusPrinter::new(opts.verbosity);
+        self.ids = InvocationIds::new(&opts.bes);
+        // Build events cover builds, not tools.
+        let bes = if opts.bes.enabled() && opts.tool.is_none() {
+            let bytestream = opts.remote.executor.as_ref().map(|e| bes::bytestream_prefix(e, &opts.remote.instance_name));
+            Some(Bes::start(&opts.bes, &self.ids, &opts.argv, &opts.targets, bytestream, self.store.clone()).await)
+        } else {
+            None
+        };
+        let mut printer = StatusPrinter::new(opts.verbosity);
+        let mut status = ReportingStatus { printer: &mut printer, bes: bes.clone() };
+        let code = self.run_build_invocation(opts, &mut status).await;
+        if let Some(b) = bes {
+            b.finish(code).await;
+        }
+        code
+    }
+
+    async fn run_build_invocation(&mut self, opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
         if let Some(tool) = &opts.tool
             && tool == "list"
         {
@@ -224,7 +247,8 @@ impl Service {
                 }
             }
 
-            let remote = match self.remote_backend(&state, opts, &mut status).await {
+            let targets = Arc::new(self.load_targets(&state, status));
+            let remote = match self.remote_backend(&state, opts, targets.clone(), status).await {
                 Ok(r) => r,
                 Err(e) => {
                     status.error(&e);
@@ -257,7 +281,7 @@ impl Service {
 
             // Attempt to rebuild the manifest before building anything else.
             match self
-                .rebuild_manifest(&opts.input_file, &mut state, &mut build_log, &mut deps_log, &config, &mut status, remote.clone())
+                .rebuild_manifest(&opts.input_file, &mut state, &mut build_log, &mut deps_log, &config, status, remote.clone())
                 .await
             {
                 Ok(true) => {
@@ -283,12 +307,12 @@ impl Service {
             };
             let use_remote = remote.is_some();
             let code = self
-                .run_build(&opts.targets, &mut state, &mut build_log, &mut deps_log, &config, &mut status, remote)
+                .run_build(&opts.targets, &mut state, &mut build_log, &mut deps_log, &config, status, remote, targets)
                 .await;
             if use_remote && let Err(e) = self.store.save_digests(std::path::Path::new(&digests_file)) {
                 status.warning(&format!("saving {digests_file}: {e}"));
             }
-            let (remote_n, hits) = status.remote_counts();
+            let (remote_n, hits) = status.printer.remote_counts();
             if remote_n > 0 && opts.verbosity != Verbosity::Quiet {
                 status.info(&format!("{remote_n} remote actions ({hits} remote cache hits)."));
             }
@@ -316,6 +340,7 @@ impl Service {
         &mut self,
         state: &State,
         opts: &Options,
+        targets: Arc<ninja_remote::targets::Targets>,
         status: &mut dyn Status,
     ) -> Result<Option<Arc<dyn RemoteBackend>>, String> {
         let Some(endpoint) = &opts.remote.executor else { return Ok(None) };
@@ -348,14 +373,23 @@ impl Service {
             .map_err(|e| format!("connecting to {endpoint}: {e:#}"))?;
             self.remote_client = Some((key, client));
         }
-        let client = self.remote_client.as_ref().expect("connected").1.clone();
+        // Requests carry the invocation's ids, which build events report too.
+        let client = self.remote_client.as_ref().expect("connected").1.clone().with_request_metadata(rbe_client::proto::RequestMetadata {
+            tool_details: Some(rbe_client::proto::ToolDetails {
+                tool_name: "ninja-rs".into(),
+                tool_version: env!("CARGO_PKG_VERSION").into(),
+            }),
+            tool_invocation_id: self.ids.invocation_id.clone(),
+            correlated_invocations_id: self.ids.build_request_id.clone(),
+            ..Default::default()
+        });
         let build_dir = std::env::current_dir().map_err(|e| e.to_string())?;
         let file_var = |name: &str| Some(state.lookup_variable(ROOT_SCOPE, name)).filter(|v| !v.is_empty());
         let backend = ninja_remote::Backend::new(
             ninja_remote::BackendConfig {
                 build_dir,
                 toolchains_file: file_var("rbe_toolchains"),
-                targets_file: file_var("rbe_targets"),
+                targets,
                 exec_root: opts.remote.exec_root.clone().map(Into::into),
                 jobs: opts.remote.jobs,
                 mnemonic_suffixes: opts.remote.mnemonic_suffixes.clone(),
@@ -368,6 +402,19 @@ impl Service {
         .await
         .map_err(|e| format!("remote execution: {e:#}"))?;
         Ok(Some(Arc::new(backend)))
+    }
+
+    /// The `rbe_targets` file of an RBE manifest (empty otherwise, or when it
+    /// can't be read).
+    fn load_targets(&self, state: &State, status: &mut dyn Status) -> ninja_remote::targets::Targets {
+        let file = state.lookup_variable(ROOT_SCOPE, "rbe_targets");
+        if file.is_empty() || state.lookup_variable(ROOT_SCOPE, "rbe_version") != RBE_VERSION {
+            return Default::default();
+        }
+        ninja_remote::targets::Targets::load(std::path::Path::new(&file)).unwrap_or_else(|e| {
+            status.warning(&e);
+            Default::default()
+        })
     }
 
     fn make_runner(&self, config: &BuildConfig, remote: Option<Arc<dyn RemoteBackend>>, verbose_remote: bool) -> Box<dyn CommandRunner> {
@@ -426,9 +473,11 @@ impl Service {
         build_log: &mut BuildLog,
         deps_log: &mut DepsLog,
         config: &BuildConfig,
-        status: &mut StatusPrinter,
+        status: &mut ReportingStatus<'_>,
         remote: Option<Arc<dyn RemoteBackend>>,
+        targets_file: Arc<ninja_remote::targets::Targets>,
     ) -> i32 {
+        let bes = status.bes.clone();
         let nodes = match tools::collect_targets(state, Some(deps_log), targets) {
             Ok(n) => n,
             Err(e) => {
@@ -451,6 +500,9 @@ impl Service {
             }
         }
         disk.allow_stat_cache(false);
+        if let Some(b) = &bes {
+            b.plan(builder.state, &builder.plan, targets_file, targets);
+        }
         if builder.already_up_to_date() {
             if config.verbosity != Verbosity::NoStatusUpdate {
                 builder.status.info("no work to do.");

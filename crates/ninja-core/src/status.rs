@@ -5,7 +5,8 @@
 use std::io::{IsTerminal, Write};
 use std::time::Instant;
 
-use crate::runner::ExecKind;
+use crate::graph::EdgeId;
+use crate::runner::{CasOutput, ExecKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Verbosity {
@@ -16,13 +17,25 @@ pub enum Verbosity {
     Verbose,
 }
 
-/// What the status printer needs to know about an edge.
+/// What the status printer (and build event reporting) needs to know about
+/// an edge.
 #[derive(Clone, Debug, Default)]
 pub struct EdgeInfo {
+    pub edge: EdgeId,
     pub description: String,
     pub command: String,
     pub outputs: Vec<String>,
     pub use_console: bool,
+    /// `BuildConfig::task_bindings`, as in `Task::bindings`.
+    pub bindings: Vec<(String, String)>,
+    /// When finished: outputs a remote execution left in the CAS.
+    pub cas_outputs: Vec<CasOutput>,
+}
+
+impl EdgeInfo {
+    pub fn binding(&self, key: &str) -> Option<&str> {
+        self.bindings.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
 }
 
 pub trait Status {

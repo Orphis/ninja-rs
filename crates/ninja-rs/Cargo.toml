@@ -17,6 +17,10 @@ path = "src/main.rs"
 [dependencies]
 ninja-core = { path = "../ninja-core" }
 ninja-remote = { path = "../ninja-remote" }
+prost = { workspace = true }
+prost-types = { workspace = true }
+rbe-bes = { path = "../../third_party/cargo-rbe/rbe-bes" }
+rbe-client = { path = "../../third_party/cargo-rbe/rbe-client" }
 tokio = { workspace = true }
 
 [dev-dependencies]

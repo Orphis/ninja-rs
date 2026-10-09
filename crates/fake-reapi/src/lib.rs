@@ -4,6 +4,9 @@
 //!
 //! It is deliberately simple (no compression, no output directories) but
 //! follows the protocol closely enough to exercise a real client.
+//!
+//! It is also a Build Event Service: it records the build events it
+//! receives (decoded) and acks each one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +21,8 @@ use bazel_remote_apis::google::longrunning::{Operation, operation};
 use bazel_remote_apis::google::protobuf::Any;
 use bazel_remote_apis::google::rpc::Status as RpcStatus;
 use prost::Message;
+use rbe_bes::proto::build_event_stream as bep;
+use rbe_bes::proto::google::devtools::build::v1 as bes;
 use sha2::{Digest as _, Sha256};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
@@ -39,6 +44,13 @@ pub struct State {
     pub stats: Mutex<Stats>,
     /// Actions as executed: (argv, working directory).
     pub executed: Mutex<Vec<(Vec<String>, String)>>,
+    /// The `RequestMetadata` of each `Execute` call.
+    pub request_metadata: Mutex<Vec<re::RequestMetadata>>,
+    /// Build events received, in order, and the lifecycle events.
+    pub build_events: Mutex<Vec<bep::BuildEvent>>,
+    pub lifecycle_events: Mutex<Vec<bes::PublishLifecycleEventRequest>>,
+    /// Whether a build event stream ended with `ComponentStreamFinished`.
+    pub bes_streams_finished: Mutex<u32>,
     base: PathBuf,
     counter: AtomicU64,
 }
@@ -304,6 +316,12 @@ impl Svc {
 impl re::execution_server::Execution for Svc {
     type ExecuteStream = BoxStream<Operation>;
     async fn execute(&self, r: Request<re::ExecuteRequest>) -> Result<Response<Self::ExecuteStream>, Status> {
+        if let Some(m) = r.metadata().get_bin("build.bazel.remote.execution.v2.requestmetadata-bin")
+            && let Ok(bytes) = m.to_bytes()
+            && let Ok(meta) = re::RequestMetadata::decode(bytes)
+        {
+            self.0.request_metadata.lock().unwrap().push(meta);
+        }
         let r = r.into_inner();
         let d = r.action_digest.unwrap_or_default();
         let cached = if r.skip_cache_lookup { None } else { self.0.ac.lock().unwrap().get(&d.hash).cloned() };
@@ -341,6 +359,47 @@ impl re::execution_server::Execution for Svc {
     }
 }
 
+#[tonic::async_trait]
+impl bes::publish_build_event_server::PublishBuildEvent for Svc {
+    async fn publish_lifecycle_event(&self, request: Request<bes::PublishLifecycleEventRequest>) -> Result<Response<()>, Status> {
+        self.0.lifecycle_events.lock().unwrap().push(request.into_inner());
+        Ok(Response::new(()))
+    }
+
+    type PublishBuildToolEventStreamStream = BoxStream<bes::PublishBuildToolEventStreamResponse>;
+
+    async fn publish_build_tool_event_stream(
+        &self,
+        request: Request<Streaming<bes::PublishBuildToolEventStreamRequest>>,
+    ) -> Result<Response<Self::PublishBuildToolEventStreamStream>, Status> {
+        let mut input = request.into_inner();
+        let state = self.0.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            while let Some(Ok(req)) = input.next().await {
+                let Some(ordered) = req.ordered_build_event else { continue };
+                match ordered.event.as_ref().and_then(|e| e.event.as_ref()) {
+                    Some(bes::build_event::Event::BazelEvent(any)) => {
+                        if let Ok(e) = bep::BuildEvent::decode(any.value.as_slice()) {
+                            state.build_events.lock().unwrap().push(e);
+                        }
+                    }
+                    Some(bes::build_event::Event::ComponentStreamFinished(_)) => *state.bes_streams_finished.lock().unwrap() += 1,
+                    _ => {}
+                }
+                let ack = bes::PublishBuildToolEventStreamResponse {
+                    stream_id: ordered.stream_id.clone(),
+                    sequence_number: ordered.sequence_number,
+                };
+                if tx.send(Ok(ack)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
+    }
+}
+
 /// A running fake server.
 pub struct FakeServer {
     pub endpoint: String,
@@ -370,7 +429,8 @@ impl FakeServer {
                 .add_service(re::action_cache_server::ActionCacheServer::new(svc.clone()))
                 .add_service(re::capabilities_server::CapabilitiesServer::new(svc.clone()))
                 .add_service(re::execution_server::ExecutionServer::new(svc.clone()))
-                .add_service(bs::byte_stream_server::ByteStreamServer::new(svc))
+                .add_service(bs::byte_stream_server::ByteStreamServer::new(svc.clone()))
+                .add_service(bes::publish_build_event_server::PublishBuildEventServer::new(svc))
                 .serve_with_incoming_shutdown(incoming, async {
                     let _ = rx.await;
                 })

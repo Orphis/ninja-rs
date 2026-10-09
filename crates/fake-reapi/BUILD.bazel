@@ -8,6 +8,7 @@ rust_library(
     srcs = ["src/lib.rs"],
     crate_name = "fake_reapi",
     deps = [
+        "//third_party/cargo-rbe/rbe-bes",
         "@crates//:bazel-remote-apis",
         "@crates//:hex",
         "@crates//:prost",

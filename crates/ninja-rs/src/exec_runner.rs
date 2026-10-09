@@ -49,7 +49,7 @@ impl ExecRunner {
 async fn run_local(task: &Task, slots: &Semaphore) -> TaskResult {
     let _permit = slots.acquire().await;
     let (status, output) = run_local_command(&task.command, task.use_console).await;
-    TaskResult { edge: task.edge, status, output, kind: ExecKind::Local }
+    TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new() }
 }
 
 impl CommandRunner for ExecRunner {
@@ -101,7 +101,7 @@ impl CommandRunner for ExecRunner {
                 r = self.tasks.join_next_with_id() => r,
                 _ = interrupt.wait() => {
                     let edge = self.active.iter().next().copied().unwrap_or_default();
-                    return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local });
+                    return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new() });
                 }
             };
             match joined? {
@@ -118,6 +118,7 @@ impl CommandRunner for ExecRunner {
                         status: ExitStatus::Failure(1),
                         output: format!("ninja-rs: internal error: {e}\n").into_bytes(),
                         kind: ExecKind::Local,
+                        cas_outputs: Vec::new(),
                     })
                 }
             }

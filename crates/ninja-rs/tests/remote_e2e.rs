@@ -172,7 +172,8 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     write(&build.join("CMakeFiles/rbe_toolchains.json"), &tc_json);
     write(
         &build.join("CMakeFiles/rbe_targets.json"),
-        "{\"version\": 1, \"targets\": [{\"name\": \"app\", \"kind\": \"executable\"}, {\"name\": \"lib\", \"kind\": \"static_library\"}]}",
+        "{\"version\": 1, \"configurations\": [{\"name\": \"Release\", \"mnemonic\": \"x86_64-test-Release\", \"variables\": {\"CMAKE_BUILD_TYPE\": \"Release\"}}], \
+          \"targets\": [{\"name\": \"app\", \"kind\": \"executable\", \"label\": \"//src:app\"}, {\"name\": \"lib\", \"kind\": \"static_library\", \"label\": \"//src:lib\"}]}",
     );
     let cc = compiler.to_string_lossy().to_string();
     let cm = cmake.to_string_lossy().to_string();
@@ -199,12 +200,14 @@ rule AR2\n  command = {ar2}\n\
 build obj/main.o: CC {main}\n  DEP_FILE = obj/main.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
 build obj/lib.o: CC {lib}\n  DEP_FILE = obj/lib.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
 build obj/local.o: CC {lib}\n  DEP_FILE = obj/local.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n  rbe_local = 1\n\
-build app.bin: LINK obj/main.o obj/lib.o obj/local.o\n  rbe_target = app\n  rbe_mnemonic = CLink\n  rbe_deliverable = 1\n\
+build app.bin: LINK obj/main.o obj/lib.o obj/local.o\n  rbe_target = app\n  rbe_mnemonic = CLink\n  rbe_artifact = 1\n  rbe_deliverable = 1\n\
 build obj/bad.o: CC {lib}\n  DEP_FILE = obj/bad.o.d\n  FLAGS = -DFAIL\n  rbe_mnemonic = CCompile\n\
 build bad: phony obj/bad.o\n\
-build lib.a: AR obj/main.o obj/lib.o\n  rbe_target = lib\n  rbe_mnemonic = CArchive\n\
+build lib.a: AR obj/main.o obj/lib.o\n  rbe_target = lib\n  rbe_mnemonic = CArchive\n  rbe_artifact = 1\n\
 build helper.stamp: TOUCH\n  rbe_mnemonic = CArchive\n\
 build lib2.a lib2.copy: AR2 obj/main.o\n  rbe_mnemonic = CArchive\n\
+build obj/broken.o: CC {lib}\n  DEP_FILE = obj/broken.o.d\n  FLAGS = -DFAIL\n  rbe_target = broken\n  rbe_mnemonic = CCompile\n\
+build user.bin: LINK obj/broken.o\n  rbe_target = user\n  rbe_mnemonic = CLink\n  rbe_deliverable = 1\n\
 default app.bin\n",
         main = ninja_escape_path(&root.join("src/main.c").to_string_lossy()),
         lib = ninja_escape_path(&root.join("src/lib.c").to_string_lossy()),
@@ -363,6 +366,144 @@ fn test_no_rbe_version_runs_locally() -> Result<(), String> {
     })
 }
 
+fn test_build_events() -> Result<(), String> {
+    use rbe_bes::proto::build_event_stream as bep;
+    use bep::build_event::Payload;
+    use bep::build_event_id::Id;
+    fn id_of(e: &bep::BuildEvent) -> Option<Id> {
+        e.id.as_ref().and_then(|i| i.id.clone())
+    }
+    let f = fixture("bes", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let inv = "11111111-2222-4333-8444-555555555555";
+        let file = f.root.join("events.bin");
+        let args = [
+            format!("--bes_backend={ep}"),
+            format!("--invocation_id={inv}"),
+            format!("--build_event_binary_file={}", file.to_string_lossy()),
+            "--bes_results_url=https://ui.example/invocation/".to_string(),
+            "app.bin".to_string(),
+            "lib.a".to_string(),
+        ];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        check(run_ninja(&f, Some(&ep), &args) == 0, "build with build events failed")?;
+
+        // 1. The uploaded stream is valid, and the file holds the same events.
+        let events = server.state.build_events.lock().unwrap().clone();
+        rbe_bes::events::validate(&events)?;
+        let from_file = ninja_rs::bes::read_binary_file(&file).map_err(|e| e.to_string())?;
+        check(from_file == events, "the binary file differs from the uploaded events")?;
+        check(server.state.lifecycle_events.lock().unwrap().len() == 4, "expected 4 lifecycle events")?;
+        check(*server.state.bes_streams_finished.lock().unwrap() == 1, "the event stream wasn't finished")?;
+        let started = events.iter().find_map(|e| match &e.payload {
+            Some(Payload::Started(s)) => Some(s.clone()),
+            _ => None,
+        });
+        check(started.is_some_and(|s| s.uuid == inv), "BuildStarted with the invocation id")?;
+
+        // 2. The configuration, the target and its completion with its output.
+        let config_id = events
+            .iter()
+            .find_map(|e| match (id_of(e), &e.payload) {
+                (Some(Id::Configuration(c)), Some(Payload::Configuration(p))) if p.mnemonic == "x86_64-test-Release" => Some(c.id),
+                _ => None,
+            })
+            .ok_or("no Configuration event")?;
+        let kind = events.iter().find_map(|e| match (id_of(e), &e.payload) {
+            (Some(Id::TargetConfigured(t)), Some(Payload::Configured(c))) if t.label == "//src:app" => Some(c.target_kind.clone()),
+            _ => None,
+        });
+        check(kind.as_deref() == Some("executable rule"), &format!("TargetConfigured //src:app: {kind:?}"))?;
+        let completed = events
+            .iter()
+            .find_map(|e| match (id_of(e), &e.payload) {
+                (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) if t.label == "//src:app" => {
+                    Some((t.configuration.map(|c| c.id).unwrap_or_default(), c.clone()))
+                }
+                _ => None,
+            })
+            .ok_or("no TargetCompleted //src:app")?;
+        check(completed.0 == config_id && completed.1.success, "//src:app completed successfully in its configuration")?;
+        let set = completed.1.output_group.first().and_then(|g| g.file_sets.first()).map(|s| s.id.clone()).ok_or("no output set")?;
+        let files = events
+            .iter()
+            .find_map(|e| match (id_of(e), &e.payload) {
+                (Some(Id::NamedSet(n)), Some(Payload::NamedSetOfFiles(s))) if n.id == set => Some(s.files.clone()),
+                _ => None,
+            })
+            .ok_or("no NamedSetOfFiles")?;
+        let uri = match files.first().and_then(|f| f.file.clone()) {
+            Some(bep::file::File::Uri(u)) => u,
+            other => return Err(format!("app.bin entry: {other:?}")),
+        };
+        check(files[0].name == "app.bin" && uri.starts_with("file://") && files[0].digest.len() == 64, &format!("app.bin entry: {:?}", files[0]))?;
+        // A static library's artifact is its output too, deliverable or not.
+        let lib_set = events
+            .iter()
+            .find_map(|e| match (id_of(e), &e.payload) {
+                (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) if t.label == "//src:lib" && c.success => {
+                    c.output_group.first().and_then(|g| g.file_sets.first()).map(|s| s.id.clone())
+                }
+                _ => None,
+            })
+            .ok_or("no TargetCompleted //src:lib with outputs")?;
+        let lib_files: Vec<String> = events
+            .iter()
+            .find_map(|e| match (id_of(e), &e.payload) {
+                (Some(Id::NamedSet(n)), Some(Payload::NamedSetOfFiles(s))) if n.id == lib_set => Some(s.files.iter().map(|f| f.name.clone()).collect()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        check(lib_files == ["lib.a"], &format!("//src:lib outputs: {lib_files:?}"))?;
+        let finished = events.iter().find_map(|e| match &e.payload {
+            Some(Payload::Finished(f)) => f.exit_code.clone(),
+            _ => None,
+        });
+        check(finished.is_some_and(|c| c.code == 0 && c.name == "SUCCESS"), "BuildFinished SUCCESS")?;
+
+        // 3. Remote executions carry the same ids.
+        let metas = server.state.request_metadata.lock().unwrap().clone();
+        check(!metas.is_empty(), "no request metadata")?;
+        for m in &metas {
+            check(
+                m.tool_invocation_id == inv && m.target_id == "//src:app" && m.configuration_id == config_id && m.action_mnemonic == "CCompile",
+                &format!("request metadata: {m:?}"),
+            )?;
+        }
+
+        // 4. A failing build (events to the file only): the failed action,
+        //    its target failed, and the target depending on it skipped.
+        let file2 = f.root.join("events2.bin");
+        let flag = format!("--build_event_binary_file={}", file2.to_string_lossy());
+        check(run_ninja(&f, Some(&ep), &[&flag, "user.bin"]) == 1, "the failing build should fail")?;
+        let events = ninja_rs::bes::read_binary_file(&file2).map_err(|e| e.to_string())?;
+        rbe_bes::events::validate(&events)?;
+        let action = events.iter().find_map(|e| match &e.payload {
+            Some(Payload::Action(a)) => Some(a.clone()),
+            _ => None,
+        });
+        #[allow(deprecated)]
+        let ok = action.is_some_and(|a| !a.success && a.exit_code == 1 && a.r#type == "CCompile" && a.label == "//:broken");
+        check(ok, "ActionExecuted for the failed compile")?;
+        let broken = events.iter().any(|e| {
+            matches!((id_of(e), &e.payload), (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) if t.label == "//:broken" && !c.success)
+        });
+        check(broken, "//:broken completed as failed")?;
+        let skipped = events.iter().any(|e| {
+            matches!((id_of(e), &e.payload), (Some(Id::TargetCompleted(t)), Some(Payload::Aborted(a)))
+                if t.label == "//:user" && a.reason == bep::aborted::AbortReason::Skipped as i32)
+        });
+        check(skipped, "//:user aborted as skipped")?;
+        let finished = events.iter().find_map(|e| match &e.payload {
+            Some(Payload::Finished(f)) => f.exit_code.clone(),
+            _ => None,
+        });
+        check(finished.is_some_and(|c| c.code == 1), "BuildFinished BUILD_FAILURE")?;
+        Ok(())
+    })
+}
+
 fn test_without_executor_runs_locally() -> Result<(), String> {
     let f = fixture("noexec", true);
     check(run_ninja(&f, None, &[]) == 0, "local build failed")?;
@@ -386,6 +527,7 @@ fn main() -> ExitCode {
         ("remote_build_and_cache", test_remote_build_and_cache),
         ("local_tool_steps", test_local_tool_steps),
         ("no_rbe_version_runs_locally", test_no_rbe_version_runs_locally),
+        ("build_events", test_build_events),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
     ];
     let count = tests.len();

@@ -61,6 +61,14 @@ remote execution (only for manifests with rbe_version = 1):
   --remote_mnemonics=Compile     (comma-separated mnemonic suffixes)
   --[no]remote_local_fallback    (default on)
   --remote_verbose               (log cache hits and local fallbacks)
+
+build events (Bazel's Build Event Protocol, flags named as in Bazel):
+  --bes_backend=grpc://host:port | grpcs://host:port
+  --bes_instance_name=NAME  --bes_header=K=V  --bes_results_url=URL
+  --bes_keywords=A,B  --[no]bes_lifecycle_events  --bes_timeout=SECONDS
+  --build_event_binary_file=PATH
+  --build_event_publish_all_actions
+  --build_metadata=K=V  --invocation_id=UUID  --build_request_id=UUID
 ```
 
 It can be used as CMake's make program:
@@ -96,7 +104,10 @@ left alone) and `.ninja_rs_digests` (file digest cache for remote builds).
 | 4. Include scanner | Done (gcc/clang/cl/clang-cl flags, rsp files, conservative directive following, built-in dirs via `-v`, caches, parallel per action). |
 | 5. Integration | Done: fake REAPI server e2e test (Windows + Linux, also in Bazel) and NativeLink 1.7.4 e2e (Linux/WSL). Also verified manually: the RBE-mode CMake fork's output for a C++20 modules project built remotely on Windows through the fake server. Docker was not used. |
 
-Not done yet (later phases): minimal-download mode, BES, daemon mode; jobserver.
+Build events (BES/BEP) are reported with targets, configurations and
+outputs from the RBE interface (see docs/design.md, "Build events").
+
+Not done yet (later phases): minimal-download mode, daemon mode; jobserver.
 
 ## Layout
 

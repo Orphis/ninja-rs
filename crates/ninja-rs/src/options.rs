@@ -24,6 +24,57 @@ pub struct Options {
     pub tool_args: Vec<String>,
     pub targets: Vec<String>,
     pub remote: RemoteFlags,
+    pub bes: BesFlags,
+    /// The whole command line (for build events).
+    pub argv: Vec<String>,
+}
+
+/// Build event reporting, with Bazel's flag names.
+#[derive(Clone, Debug)]
+pub struct BesFlags {
+    /// `grpc://host:port` or `grpcs://host:port` of a Build Event Service.
+    pub backend: Option<String>,
+    /// BES project / instance name.
+    pub instance_name: String,
+    pub headers: Vec<(String, String)>,
+    /// Printed with the invocation id appended.
+    pub results_url: Option<String>,
+    /// Writes the events, length-delimited, to this file.
+    pub binary_file: Option<String>,
+    pub keywords: Vec<String>,
+    pub lifecycle_events: bool,
+    /// Report every action, not only failed ones.
+    pub publish_all_actions: bool,
+    /// How long to wait for the upload at the end of the build.
+    pub timeout_secs: u64,
+    pub build_metadata: Vec<(String, String)>,
+    pub invocation_id: Option<String>,
+    pub build_request_id: Option<String>,
+}
+
+impl Default for BesFlags {
+    fn default() -> Self {
+        Self {
+            backend: None,
+            instance_name: String::new(),
+            headers: Vec::new(),
+            results_url: None,
+            binary_file: None,
+            keywords: Vec::new(),
+            lifecycle_events: true,
+            publish_all_actions: false,
+            timeout_secs: 60,
+            build_metadata: Vec::new(),
+            invocation_id: None,
+            build_request_id: None,
+        }
+    }
+}
+
+impl BesFlags {
+    pub fn enabled(&self) -> bool {
+        self.backend.is_some() || self.binary_file.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -84,6 +135,20 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --remote_mnemonics=A,B     mnemonic suffixes allowed to run remotely [default=Compile]
   --[no]remote_local_fallback  run locally when remote execution fails [default=on]
   --remote_verbose           log remote decisions and cache hits
+
+build events (Bazel's Build Event Protocol):
+  --bes_backend=URL          grpc://host:port or grpcs://host:port of a Build Event Service
+  --bes_instance_name=S      BES project / instance name
+  --bes_header=K=V           extra gRPC header (repeatable)
+  --bes_results_url=URL      printed with the invocation id appended
+  --bes_keywords=A,B         notification keywords
+  --[no]bes_lifecycle_events send lifecycle events [default=on]
+  --bes_timeout=SECONDS      wait at most this long for the upload at the end [default=60]
+  --build_event_binary_file=PATH  also write the events to PATH (length-delimited)
+  --build_event_publish_all_actions  report every action, not only failed ones
+  --build_metadata=K=V       extra build metadata (repeatable)
+  --invocation_id=UUID       [default: random]
+  --build_request_id=UUID    groups invocations [default: random]
 ";
 
 pub fn usage() -> String {
@@ -114,6 +179,11 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         tool_args: Vec::new(),
         targets: Vec::new(),
         remote: RemoteFlags { jobs: 50, mnemonic_suffixes: vec!["Compile".into()], local_fallback: true, ..Default::default() },
+        bes: BesFlags::default(),
+        argv: std::iter::once("ninja-rs".to_string()).chain(args.iter().cloned()).collect(),
+    };
+    let key_value = |flag: &str, v: &str| -> Result<(String, String), String> {
+        v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or_else(|| format!("--{flag} expects KEY=VALUE, got '{v}'"))
     };
     let mut i = 0;
     let mut positional = Vec::new();
@@ -165,6 +235,22 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_local_fallback" => o.remote.local_fallback = true,
                 "noremote_local_fallback" => o.remote.local_fallback = false,
                 "remote_verbose" => o.remote.verbose = true,
+                "bes_backend" => o.bes.backend = Some(value(&mut i)?),
+                "bes_instance_name" => o.bes.instance_name = value(&mut i)?,
+                "bes_header" => o.bes.headers.push(key_value(name, &value(&mut i)?)?),
+                "bes_results_url" => o.bes.results_url = Some(value(&mut i)?),
+                "bes_keywords" => o.bes.keywords.extend(value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
+                "bes_lifecycle_events" => o.bes.lifecycle_events = true,
+                "nobes_lifecycle_events" => o.bes.lifecycle_events = false,
+                "bes_timeout" => {
+                    let v = value(&mut i)?;
+                    o.bes.timeout_secs = parse_int("--bes_timeout", &v)?.max(0) as u64;
+                }
+                "build_event_binary_file" => o.bes.binary_file = Some(value(&mut i)?),
+                "build_event_publish_all_actions" => o.bes.publish_all_actions = true,
+                "build_metadata" => o.bes.build_metadata.push(key_value(name, &value(&mut i)?)?),
+                "invocation_id" => o.bes.invocation_id = Some(value(&mut i)?),
+                "build_request_id" => o.bes.build_request_id = Some(value(&mut i)?),
                 _ => return Err(format!("unrecognized option '--{name}'")),
             }
             continue;

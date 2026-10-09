@@ -96,8 +96,8 @@ takes 80 ms vs ninja 1.13.2's 69 ms; ~4 ms of that is process startup.
 The builder owns the graph (`State`) and never shares it: for each edge it
 evaluates a self-contained `Task` (command, rspfile, depfile, deps type,
 outputs, inputs, and the RBE bindings `rbe_local`, `rbe_mnemonic`,
-`rbe_target`, `rbe_deliverable`) and hands it to a `CommandRunner`. Runners
-return a `TaskResult`; the builder then extracts deps, restats and logs
+`rbe_target`, `rbe_config`, `rbe_artifact`, `rbe_deliverable`) and hands it
+to a `CommandRunner`. Runners return a `TaskResult`; the builder then extracts deps, restats and logs
 exactly as ninja does. The build loop is `async` (tokio); runners spawn tasks
 and the loop awaits completions.
 
@@ -190,18 +190,49 @@ directory whole with a warning. Files under toolchain input directories are
 not added individually (the grafted subtree has them). Declared edge inputs
 (including deps from earlier builds) are always sent.
 
+## Build events (BES)
+
+`crates/ninja-rs/src/bes.rs` reports a build in Bazel's Build Event
+Protocol, to a Build Event Service (`--bes_backend`) through `rbe-bes`
+(copied from cargo-rbe: ordered stream with acks, retries and lifecycle
+events) and/or to a file (`--build_event_binary_file`):
+
+- `ReportingStatus` wraps the status printer: every edge start/finish and
+  message goes to both. `EdgeInfo` carries the edge's `rbe_*` bindings and,
+  when it ran remotely, the digests of its outputs (`TaskResult::cas_outputs`,
+  filled by the backend from the `ActionResult`).
+- `Bes::plan` runs once the requested targets are in the builder's plan
+  (before `already_up_to_date`, so no-op builds report too): the edges in
+  `Plan::want` give the targets (`rbe_target`, `rbe_config`), their
+  artifacts, and how many edges each still has to run (`Want::ToStart`).
+  It posts the configurations, the pattern's expansion and one
+  `TargetConfigured` per label; targets with nothing to run complete at once.
+- A target completes when its last edge finishes, or fails with its first
+  failed edge. Its outputs are CAS references (`bytestream://` from
+  `--remote_executor`) when built remotely, `file://` with a digest (cached
+  in `Store`) otherwise. At the end, targets that never completed are
+  `Aborted` (`SKIPPED` after a failure, `USER_INTERRUPTED`), then come
+  `BuildFinished`, `BuildMetrics` (per mnemonic and runner) and
+  `BuildToolLogs`.
+- Failed edges are `ActionExecuted` events (all of them with
+  `--build_event_publish_all_actions`); the status lines and command output
+  are `Progress`.
+- The invocation id (`--invocation_id`, else random) is also the
+  `tool_invocation_id` of every remote request, whose `target_id` is the
+  label and `configuration_id` the configuration's id.
+
+Build events never fail the build. Edges a dyndep file adds during the
+build are not counted in their target's remaining edges.
+
 ## Later phases (designed for, not built)
 
 - **Minimal download**: the builder's state is already behind
   `CommandRunner` results; a digest-based output state (path → digest,
-  in `Store`) can replace mtimes for remote outputs. `deliverable = 1` is
-  passed through in `Task::bindings`, so only those outputs would be
-  fetched; local edges would request their inputs on demand (the runner
-  sees every input path). Lease extension / action rewinding would hang off
+  in `Store`) can replace mtimes for remote outputs. `rbe_deliverable = 1` is
+  passed through in `Task::bindings`, so only those outputs, and what the
+  command line names, would be fetched; local edges would request their
+  inputs on demand (the runner sees every input path). Lease extension / action rewinding would hang off
   `Store::uploaded` (already the set of blobs we believe the CAS has).
-- **BES**: `ActionMeta` (mnemonic, target) is already sent in
-  `RequestMetadata`; `cargo-rbe`'s `rbe-bes` crate (ordered BES stream with
-  acks and retries) can be reused, with targets from the File API codemodel.
 - **Daemon with file watching**: `Service` is already reusable across
   builds; the remaining work is keeping `State` between builds (it has
   `reset()`), invalidating `Store` entries from file watcher events, and

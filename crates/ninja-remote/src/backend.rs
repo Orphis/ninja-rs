@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
 use ninja_core::depfile::parse_depfile;
-use ninja_core::runner::{ExecKind, ExitStatus, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
+use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
 use rbe_client::proto as re;
 use rbe_client::{ActionMeta, Client};
 
@@ -22,8 +22,9 @@ pub struct BackendConfig {
     pub build_dir: PathBuf,
     /// `rbe_toolchains`, relative to the build directory.
     pub toolchains_file: Option<String>,
-    /// `rbe_targets`, relative to the build directory.
-    pub targets_file: Option<String>,
+    /// The `rbe_targets` file's contents: labels and configurations for the
+    /// actions' request metadata.
+    pub targets: Arc<Targets>,
     pub exec_root: Option<PathBuf>,
     pub jobs: usize,
     pub mnemonic_suffixes: Vec<String>,
@@ -38,7 +39,6 @@ pub struct Backend {
 struct Inner {
     client: Client,
     shared: Shared,
-    targets: Targets,
     config: BackendConfig,
 }
 
@@ -48,10 +48,6 @@ impl Backend {
         let toolchains = match &config.toolchains_file {
             Some(f) => Toolchains::load(&config.build_dir.join(f), windows).map_err(anyhow::Error::msg)?,
             None => Toolchains::default(),
-        };
-        let targets = match &config.targets_file {
-            Some(f) => Targets::load(&config.build_dir.join(f)).map_err(anyhow::Error::msg)?,
-            None => Targets::default(),
         };
         let caps = client.capabilities().await.context("GetCapabilities")?;
         if let Some(cc) = &caps.cache_capabilities
@@ -70,7 +66,7 @@ impl Backend {
             store,
             windows,
         };
-        Ok(Self { inner: Arc::new(Inner { client, shared, targets, config }) })
+        Ok(Self { inner: Arc::new(Inner { client, shared, config }) })
     }
 }
 
@@ -123,6 +119,7 @@ impl Inner {
                         status: ExitStatus::Failure(1),
                         output: format!("ninja-rs: remote execution failed: {e:#}\n").into_bytes(),
                         kind: ExecKind::Remote,
+                        cas_outputs: Vec::new(),
                     })
                 }
             }
@@ -138,8 +135,8 @@ impl Inner {
             .map_err(Failure::Prepare)?;
         let meta = ActionMeta {
             mnemonic: task.binding("rbe_mnemonic").unwrap_or_default().to_string(),
-            target_id: task.binding("rbe_target").unwrap_or_default().to_string(),
-            configuration_id: String::new(),
+            target_id: task.binding("rbe_target").map(|t| self.config.targets.label(t)).unwrap_or_default(),
+            configuration_id: self.config.targets.configuration(task.binding("rbe_config")).map(|c| c.id()).unwrap_or_default(),
         };
         let client = self.client.for_action(&meta, &prepared.action_digest.hash);
         let digest = prepared.action_digest.clone();
@@ -178,7 +175,7 @@ impl Inner {
         }
         if self.config.verbose {
             let target = match task.binding("rbe_target") {
-                Some(name) => match self.targets.get(name) {
+                Some(name) => match self.config.targets.get(name) {
                     Some(t) if !t.kind.is_empty() => format!(", {} {name}", t.kind),
                     _ => format!(", target {name}"),
                 },
@@ -198,7 +195,17 @@ impl Inner {
             output = msg;
         }
         let status = if result.exit_code == 0 { ExitStatus::Success } else { ExitStatus::Failure(result.exit_code) };
-        Ok(TaskResult { edge: task.edge, status, output, kind })
+        // The outputs are in the CAS now: build events can point there.
+        let cas_outputs = result
+            .output_files
+            .iter()
+            .filter_map(|f| {
+                let i = prepared.outputs.iter().position(|(rel, _)| *rel == f.path)?;
+                let d = f.digest.as_ref()?;
+                Some(CasOutput { path: task.outputs.get(i)?.clone(), hash: d.hash.clone(), size: d.size_bytes })
+            })
+            .collect();
+        Ok(TaskResult { edge: task.edge, status, output, kind, cas_outputs })
     }
 
     /// Runs steps on the host, in the build directory, appending their
@@ -227,7 +234,7 @@ impl Inner {
                     1
                 }
             };
-            return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(code), output: std::mem::take(output), kind: ExecKind::Remote });
+            return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(code), output: std::mem::take(output), kind: ExecKind::Remote, cas_outputs: Vec::new() });
         }
         None
     }

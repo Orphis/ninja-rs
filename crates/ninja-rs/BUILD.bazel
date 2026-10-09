@@ -16,6 +16,10 @@ rust_library(
     deps = [
         "//crates/ninja-core",
         "//crates/ninja-remote",
+        "//third_party/cargo-rbe/rbe-bes",
+        "//third_party/cargo-rbe/rbe-client",
+        "@crates//:prost",
+        "@crates//:prost-types",
         "@crates//:tokio",
     ],
 )
@@ -42,7 +46,8 @@ rust_test(
     crate = ":ninja_rs_lib",
 )
 
-# End-to-end remote execution test against the in-process fake REAPI server.
+# End-to-end remote execution and build event tests against the in-process
+# fake REAPI and BES server.
 rust_test(
     name = "remote_e2e",
     srcs = ["tests/remote_e2e.rs"],
@@ -51,6 +56,7 @@ rust_test(
         ":ninja_rs_lib",
         "//crates/fake-reapi",
         "//crates/ninja-core",
+        "//third_party/cargo-rbe/rbe-bes",
         "@crates//:tokio",
     ],
 )

@@ -43,10 +43,29 @@ Bindings are written on `build` edges only (ninja rejects unknown variables on
 | `rbe_target`      | target name      | The target owning the edge (see the targets file). |
 | `rbe_mnemonic`    | free-form        | Action kind, such as `CXXCompile`; used for REAPI `action_mnemonic`, build events and the executor's policy. |
 | `rbe_local`       | `1` / absent     | The edge must run locally as a whole. Unmarked edges may run remotely. |
-| `rbe_deliverable` | `1` / absent     | The edge's explicit outputs are final artifacts (downloaded when only top-level outputs are). |
+| `rbe_artifact`    | `1` / absent     | The edge creates its target's artifacts (an executable, a library): the outputs build events report for the target. |
+| `rbe_deliverable` | `1` / absent     | The edge's outputs are in the minimal set the executor downloads (see Downloads). |
+| `rbe_config`      | configuration name | The configuration (in the targets file) the edge builds for. Without it, the file's first configuration. Usually set once at file scope. |
 
 Edges with `generator = 1` (manifest regeneration) and edges in the `console`
 pool always run locally.
+
+### Downloads
+
+Outputs of remote actions stay in the CAS unless the executor downloads
+them. In ninja-rs (planned modes, all outputs are downloaded today):
+
+- **all**: every output.
+- **minimal**: the outputs of the `rbe_deliverable` edges the build runs.
+
+In both modes, what the command line names is downloaded, whatever it is (a
+target, a library, an object file): no annotation is needed for that. Local
+edges get their inputs downloaded before they run.
+
+CMake marks the artifacts of executables, shared libraries and module
+libraries deliverable, not those of static libraries; its `RBE_DELIVERABLE`
+target property changes that per target (off for a code generator only used
+during the build, on for a static library the project distributes).
 
 Example:
 
@@ -126,18 +145,41 @@ toolchain file) and declares itself a local tool.
 ```json
 {
   "version": 1,
+  "configurations": [
+    {
+      "name": "Release",
+      "mnemonic": "x86_64-linux-clang-Release",
+      "platform": "Linux",
+      "cpu": "x86_64",
+      "variables": { "CMAKE_BUILD_TYPE": "Release", "CMAKE_CXX_COMPILER_ID": "Clang" }
+    }
+  ],
   "targets": [
-    { "name": "foo", "kind": "static_library" },
-    { "name": "app", "kind": "executable" }
+    { "name": "foo", "kind": "static_library", "label": "//src/foo:foo" },
+    { "name": "app", "kind": "executable", "label": "//:app" }
   ]
 }
 ```
 
-The targets named by `rbe_target`, with a free-form `kind`. Build event
-streams report them (`TargetConfigured` / `TargetComplete`, with the
-`rbe_deliverable` outputs). CMake writes its targets with their lowercased
-type: `executable`, `static_library`, `shared_library`, `module_library`,
-`object_library`, `utility`.
+- `targets`: the targets named by `rbe_target`, with a free-form `kind`
+  and the `label` build events use (default `//:<name>`).
+- `configurations`: the build configurations edges name in `rbe_config`.
+  Everything in an entry describes the configuration: the executor derives
+  its id from all of it (a digest), so configurations that differ in any
+  setting, the toolchain included, never share an id. Without any, the
+  executor uses one default configuration.
+
+Build event streams (BES) report the targets (`TargetConfigured`, then
+`TargetCompleted` per configuration, with the `rbe_artifact` outputs) and
+the configurations; remote actions carry the same label and configuration
+id in their `RequestMetadata`.
+
+CMake writes its targets with their lowercased type (`executable`,
+`static_library`, `shared_library`, `module_library`, `object_library`,
+`utility`) and the label `//<source dir>:<name>`, the source directory
+relative to the top one. Its configurations are the build types, with the
+target system, processor and compilers in their variables; the multi-config
+generator sets `rbe_config` at the top of each configuration's file.
 
 ## CMake specifics
 
@@ -154,6 +196,17 @@ Mnemonics (`<LANG>` is the CMake language name, such as `C`, `CXX`, `RC`,
 | `CustomCommand`    | `add_custom_command` / `add_custom_target` edges |
 | `CMakeRegenerate`  | The `build.ninja` regeneration edge (`rbe_local = 1`) |
 | `CMakeHelper`      | Other edges running `cmake` itself (copy, symlink, clean, …) |
+
+Statements that only exist because of modules (C++20 or Fortran: dependency
+scanning, dyndep collation, BMI-only compilations of imported module
+targets) belong to an implicit target, `<target>@modules` (kind `modules`,
+label `//<source dir>:<target>@modules`), so that a target's own actions
+compare between builds with and without modules. Compilations, which also
+produce BMIs, stay with their target. The BMIs CMake builds for an imported
+module target (such as `std`, for `import std`) belong to
+`<imported target>@modules.<digest>` (`::` replaced by `__`), the digest
+being of the settings they are built with: the name stays the same from one
+build to the next, and differs for each variant.
 
 CMake marks `rbe_local = 1` on custom commands, dyndep collation,
 regeneration and its other utilities (clean, help), edges running `PRE_LINK`

@@ -96,7 +96,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     if style.is_some() {
         let info = parse_compile(&expanded, build_dir);
         let scanner = Scanner { cache: &shared.store.scan, windows, volatile_roots: vec![build_dir.clone()] };
-        let builtin = match scanner.builtin_dirs(&exe, &info) {
+        let builtin = match scanner.builtin_dirs(exe, &info) {
             Ok(d) => d,
             Err(e) => {
                 warnings.push(format!("include scanning: {e}; using sysroot defaults"));

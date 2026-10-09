@@ -1089,11 +1089,26 @@ impl<'a> Builder<'a> {
 
     fn edge_info(&self, edge: EdgeId) -> EdgeInfo {
         EdgeInfo {
+            edge,
             description: self.state.edge_binding(edge, "description").unwrap_or_default(),
             command: self.state.evaluate_command(edge, false).unwrap_or_default(),
             outputs: self.state.edge(edge).outputs.iter().map(|&o| self.state.path(o).to_string()).collect(),
             use_console: self.state.use_console(edge),
+            bindings: self.task_bindings(edge).unwrap_or_default(),
+            cas_outputs: Vec::new(),
         }
+    }
+
+    /// The edge's `BuildConfig::task_bindings`, evaluated; empty ones left out.
+    fn task_bindings(&self, edge: EdgeId) -> Result<Vec<(String, String)>, String> {
+        let mut bindings = Vec::new();
+        for k in &self.config.task_bindings {
+            let v = self.state.edge_binding(edge, k)?;
+            if !v.is_empty() {
+                bindings.push((k.clone(), v));
+            }
+        }
+        Ok(bindings)
     }
 
     /// Runs the build. `runner` executes commands.
@@ -1227,13 +1242,7 @@ impl<'a> Builder<'a> {
         }
 
         let e = self.state.edge(edge);
-        let mut bindings = Vec::new();
-        for k in &self.config.task_bindings {
-            let v = self.state.edge_binding(edge, k)?;
-            if !v.is_empty() {
-                bindings.push((k.clone(), v));
-            }
-        }
+        let bindings = self.task_bindings(edge)?;
         let deps = self.state.edge_binding(edge, "deps")?;
         let task = Task {
             edge,
@@ -1283,7 +1292,8 @@ impl<'a> Builder<'a> {
 
         let start_ms = self.running.remove(&edge).unwrap_or(0);
         let end_ms = self.elapsed_ms();
-        let info = self.edge_info(edge);
+        let mut info = self.edge_info(edge);
+        info.cas_outputs = std::mem::take(&mut result.cas_outputs);
         let code = match result.status {
             ExitStatus::Success => None,
             ExitStatus::Failure(c) => Some(c),

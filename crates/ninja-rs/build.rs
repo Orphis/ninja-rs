@@ -47,7 +47,7 @@ fn push_resource(res: &mut Vec<u8>, type_id: u16, name_id: u16, flags: u16, lang
     res.extend_from_slice(&0u32.to_le_bytes()); // Version
     res.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
     res.extend_from_slice(data);
-    while res.len() % 4 != 0 {
+    while !res.len().is_multiple_of(4) {
         res.push(0);
     }
 }

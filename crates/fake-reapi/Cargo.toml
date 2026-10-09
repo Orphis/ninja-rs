@@ -10,6 +10,7 @@ publish = false
 bazel-remote-apis = { workspace = true }
 hex = { workspace = true }
 prost = { workspace = true }
+rbe-bes = { path = "../../third_party/cargo-rbe/rbe-bes" }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["net", "signal"] }
 tokio-stream = { workspace = true, features = ["net"] }

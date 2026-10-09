@@ -72,7 +72,7 @@ impl CommandRunner for FakeRunner<'_> {
             && (last.rule == "interrupt" || last.rule == "touch-interrupt")
         {
             let edge = last.edge;
-            return Box::pin(async move { Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local }) });
+            return Box::pin(async move { Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new() }) });
         }
         let now = self.fs.now();
         let r = self.active.pop().map(|task| {
@@ -95,7 +95,7 @@ impl CommandRunner for FakeRunner<'_> {
                 }
                 _ => ExitStatus::Success,
             };
-            TaskResult { edge: task.edge, status, output, kind: ExecKind::Local }
+            TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new() }
         });
         Box::pin(async move { r })
     }

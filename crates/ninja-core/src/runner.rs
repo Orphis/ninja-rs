@@ -75,6 +75,17 @@ pub struct TaskResult {
     /// Combined stdout/stderr.
     pub output: Vec<u8>,
     pub kind: ExecKind,
+    /// Outputs a remote execution left in the CAS (for build events).
+    pub cas_outputs: Vec<CasOutput>,
+}
+
+/// An output file stored in a content-addressable store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CasOutput {
+    /// As in `Task::outputs`.
+    pub path: String,
+    pub hash: String,
+    pub size: i64,
 }
 
 pub type WaitFuture<'a> = Pin<Box<dyn Future<Output = Option<TaskResult>> + Send + 'a>>;
@@ -134,6 +145,7 @@ impl CommandRunner for DryRunRunner {
             status: ExitStatus::Success,
             output: Vec::new(),
             kind: ExecKind::DryRun,
+            cas_outputs: Vec::new(),
         });
         Box::pin(async move { r })
     }

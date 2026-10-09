@@ -189,7 +189,7 @@ impl CommandRunner for LocalRunner {
         self.active.insert(task.edge);
         self.tasks.spawn(async move {
             let (status, output) = run_local_command(&task.command, task.use_console).await;
-            TaskResult { edge: task.edge, status, output, kind: ExecKind::Local }
+            TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new() }
         });
         Ok(())
     }
@@ -203,7 +203,7 @@ impl CommandRunner for LocalRunner {
                         r = self.tasks.join_next() => r,
                         _ = i.wait() => {
                             let edge = self.active.iter().next().copied().unwrap_or_default();
-                            return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local });
+                            return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new() });
                         }
                     }
                 }
@@ -218,7 +218,7 @@ impl CommandRunner for LocalRunner {
                     // A panicking task: report it as a failure of some edge.
                     let edge = self.active.iter().next().copied().unwrap_or_default();
                     self.active.remove(&edge);
-                    Some(TaskResult { edge, status: ExitStatus::Failure(1), output: format!("internal error: {e}\n").into_bytes(), kind: ExecKind::Local })
+                    Some(TaskResult { edge, status: ExitStatus::Failure(1), output: format!("internal error: {e}\n").into_bytes(), kind: ExecKind::Local, cas_outputs: Vec::new() })
                 }
             }
         })
