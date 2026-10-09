@@ -111,8 +111,9 @@ outputs from the RBE interface (see docs/design.md, "Build events").
 
 A local disk cache (`--disk_cache`) caches the actions remote execution
 would run, with or without a remote service; large blobs are stored as
-content-defined chunks, which similar outputs share (see docs/design.md,
-"Disk cache").
+content-defined chunks, which similar outputs share, and travel as the
+chunks the other side lacks with a remote that splits and splices blobs
+(see docs/design.md, "Disk cache").
 
 Not done yet (later phases): minimal-download mode, daemon mode; jobserver.
 

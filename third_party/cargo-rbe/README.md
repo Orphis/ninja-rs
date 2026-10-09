@@ -23,8 +23,12 @@ Local changes:
   `add_file_with_digest` / `contains` were added.
 - `Cargo.toml` uses the ninja-rs workspace dependencies; a Bazel
   `BUILD.bazel` was added; an unused-variable warning on Windows was fixed.
-- Content-defined chunking: `chunking.rs`, FastCDC 2020 through the
-  `fastcdc` crate (REAPI's reference implementation).
+- Content-defined chunking (`chunking.rs`: FastCDC 2020 through the
+  `fastcdc` crate, and the server's split/splice support from its
+  capabilities); `Client::split_blob` / `splice_blob` (`GetChunkMapping` /
+  `RegisterChunkMapping` from RE API v2.13, `SplitBlob` / `SpliceBlob`
+  before); `upload_blobs` uploads large blobs as their missing chunks and
+  splices them when the server supports it, and returns the bytes sent.
 
 ## rbe-bes (copied)
 

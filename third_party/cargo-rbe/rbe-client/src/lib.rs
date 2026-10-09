@@ -30,7 +30,7 @@ pub use bazel_remote_apis::google::protobuf as pb;
 
 pub mod chunking;
 pub mod tree;
-pub use chunking::FastCdc;
+pub use chunking::{Chunking, FastCdc};
 pub use tree::{BlobSet, BlobSource, DigestCache, InputTree};
 
 /// gRPC messages are capped at 4 MiB by default; stay well below for batches.
@@ -54,6 +54,8 @@ pub struct Client {
     instance: String,
     max_batch_bytes: i64,
     zstd: bool,
+    /// What the server supports of split and spliced blobs.
+    chunking: Arc<Chunking>,
     wire_read: Arc<AtomicU64>,
     /// Sent with every call. Per-action fields are set by [`Client::for_action`].
     metadata: Option<Arc<re::RequestMetadata>>,
@@ -142,6 +144,7 @@ impl Client {
             instance: instance.to_string(),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             zstd: false,
+            chunking: Default::default(),
             wire_read: Default::default(),
             metadata: None,
             headers: Arc::new(Vec::new()),
@@ -208,7 +211,14 @@ impl Client {
             .cache_capabilities
             .as_ref()
             .is_some_and(|c| c.supported_compressors.contains(&(re::compressor::Value::Zstd as i32)));
+        self.chunking = Arc::new(Chunking::from_capabilities(&caps));
         Ok(caps)
+    }
+
+    /// What the server supports of split and spliced blobs (known after
+    /// [`Client::capabilities`]).
+    pub fn chunking(&self) -> &Chunking {
+        &self.chunking
     }
 
     fn cas(&self) -> ContentAddressableStorageClient<Channel> {
@@ -233,34 +243,130 @@ impl Client {
     }
 
     /// Uploads every blob the server doesn't already have. Small blobs are
-    /// batched, large ones go through ByteStream. Returns (count, bytes) uploaded.
+    /// batched, large ones go through ByteStream, or, when the server
+    /// splices blobs, as their chunks (only those it lacks), then spliced.
+    /// Returns the number of blobs uploaded and the bytes sent.
     pub async fn upload_blobs(&self, blobs: &BlobSet) -> Result<(usize, u64)> {
         let digests = blobs.0.values().map(|(d, _)| d.clone()).collect();
         let missing = self.find_missing(digests).await?;
-        let mut batch: Vec<re::batch_update_blobs_request::Request> = Vec::new();
-        let mut batch_bytes = 0i64;
-        let mut total = 0u64;
+        let mut up = Uploader::new(self);
+        let mut spliced = Vec::new();
         for d in &missing {
             let (_, src) = &blobs.0[&d.hash];
             let data = src.load()?;
-            total += data.len() as u64;
-            if d.size_bytes > self.max_batch_bytes - 1024 {
-                self.bytestream_write(d, &data).await?;
+            if let Some(cdc) = self.chunking.splice_chunker(d) {
+                let chunks: Vec<(re::Digest, &[u8])> = cdc.chunks(&data).map(|c| (digest_of(c), c)).collect();
+                let mut lacking: HashSet<String> =
+                    self.find_missing(chunks.iter().map(|(cd, _)| cd.clone()).collect()).await?.into_iter().map(|cd| cd.hash).collect();
+                for (cd, c) in &chunks {
+                    if lacking.remove(&cd.hash) {
+                        up.add(cd, c.to_vec()).await?;
+                    }
+                }
+                spliced.push((d.clone(), chunks.into_iter().map(|(cd, _)| cd).collect::<Vec<_>>()));
                 continue;
             }
-            if batch_bytes + d.size_bytes > self.max_batch_bytes - 1024 {
-                self.flush_batch(std::mem::take(&mut batch)).await?;
-                batch_bytes = 0;
-            }
-            batch_bytes += d.size_bytes;
-            batch.push(re::batch_update_blobs_request::Request {
-                digest: Some(d.clone()),
-                data,
-                compressor: 0,
-            });
+            up.add(d, data).await?;
         }
-        self.flush_batch(batch).await?;
-        Ok((missing.len(), total))
+        up.flush().await?;
+        // Once all the chunks are in the CAS. A server refusing the splice
+        // gets the whole blob.
+        for (d, chunks) in spliced {
+            if self.splice_blob(&d, &chunks).await.is_err() {
+                up.add(&d, blobs.0[&d.hash].1.load()?).await?;
+            }
+        }
+        up.flush().await?;
+        Ok((missing.len(), up.sent))
+    }
+
+    /// The chunks a blob is made of, from the server (`GetChunkMapping`, or
+    /// `SplitBlob` before RE API v2.13), and the function that split it.
+    /// `None` when it doesn't split blobs or can't split this one.
+    pub async fn split_blob(&self, d: &re::Digest) -> Result<Option<re::SplitBlobResponse>> {
+        if !self.chunking.split {
+            return Ok(None);
+        }
+        let not_found = |s: &tonic::Status| s.code() == tonic::Code::NotFound;
+        let split = if self.chunking.v2_13 {
+            let request = re::GetChunkMappingRequest {
+                instance_name: self.instance.clone(),
+                blob_digest: Some(d.clone()),
+                digest_function: re::digest_function::Value::Sha256 as i32,
+                chunking_function: self.chunking.function(),
+            };
+            let mut stream = match self.cas().get_chunk_mapping(self.req(request)).await {
+                Ok(r) => r.into_inner(),
+                Err(s) if not_found(&s) => return Ok(None),
+                Err(s) => return Err(anyhow::Error::from(s).context(format!("GetChunkMapping {}", digest_str(d)))),
+            };
+            let mut split = re::SplitBlobResponse::default();
+            let mut first = true;
+            loop {
+                match stream.message().await {
+                    Ok(Some(m)) => {
+                        // The function comes with the first message.
+                        if std::mem::take(&mut first) {
+                            split.chunking_function = m.chunking_function;
+                        }
+                        split.chunk_digests.extend(m.chunk_digests);
+                    }
+                    Ok(None) => break,
+                    Err(s) if not_found(&s) => return Ok(None),
+                    Err(s) => return Err(anyhow::Error::from(s).context(format!("GetChunkMapping {}", digest_str(d)))),
+                }
+            }
+            split
+        } else {
+            let request = re::SplitBlobRequest {
+                instance_name: self.instance.clone(),
+                blob_digest: Some(d.clone()),
+                digest_function: re::digest_function::Value::Sha256 as i32,
+                chunking_function: self.chunking.function(),
+            };
+            match self.cas().split_blob(self.req(request)).await {
+                Ok(r) => r.into_inner(),
+                Err(s) if not_found(&s) => return Ok(None),
+                Err(s) => return Err(anyhow::Error::from(s).context(format!("SplitBlob {}", digest_str(d)))),
+            }
+        };
+        if split.chunk_digests.iter().map(|c| c.size_bytes).sum::<i64>() != d.size_bytes {
+            bail!("the chunks of {} don't add up to its size", digest_str(d));
+        }
+        Ok(Some(split))
+    }
+
+    /// Tells the server that a blob is the concatenation of chunks it holds
+    /// (`RegisterChunkMapping`, or `SpliceBlob` before RE API v2.13).
+    pub async fn splice_blob(&self, d: &re::Digest, chunks: &[re::Digest]) -> Result<()> {
+        let context = || format!("splicing {}", digest_str(d));
+        if self.chunking.v2_13 {
+            // The list may be long: spread it over messages, the first one
+            // naming the blob.
+            let mut requests: Vec<re::RegisterChunkMappingRequest> = chunks
+                .chunks(10_000)
+                .map(|part| re::RegisterChunkMappingRequest { chunk_digests: part.to_vec(), ..Default::default() })
+                .collect();
+            if requests.is_empty() {
+                requests.push(Default::default());
+            }
+            let first = &mut requests[0];
+            first.instance_name = self.instance.clone();
+            first.blob_digest = Some(d.clone());
+            first.digest_function = re::digest_function::Value::Sha256 as i32;
+            first.chunking_function = self.chunking.function();
+            self.cas().register_chunk_mapping(self.req(tokio_stream::iter(requests))).await.with_context(context)?;
+        } else {
+            let request = re::SpliceBlobRequest {
+                instance_name: self.instance.clone(),
+                blob_digest: Some(d.clone()),
+                chunk_digests: chunks.to_vec(),
+                digest_function: re::digest_function::Value::Sha256 as i32,
+                chunking_function: self.chunking.function(),
+            };
+            self.cas().splice_blob(self.req(request)).await.with_context(context)?;
+        }
+        Ok(())
     }
 
     pub async fn fetch_tree(&self, d: &re::Digest) -> Result<re::Tree> {
@@ -539,6 +645,40 @@ fn upload_id() -> String {
 }
 
 /// Helpers to build `Platform` and `Command` with the canonical ordering REAPI requires.
+/// Uploads blobs: small ones batched, large ones through ByteStream.
+struct Uploader<'a> {
+    client: &'a Client,
+    batch: Vec<re::batch_update_blobs_request::Request>,
+    batch_bytes: i64,
+    /// Bytes uploaded.
+    sent: u64,
+}
+
+impl<'a> Uploader<'a> {
+    fn new(client: &'a Client) -> Self {
+        Self { client, batch: Vec::new(), batch_bytes: 0, sent: 0 }
+    }
+
+    async fn add(&mut self, d: &re::Digest, data: Vec<u8>) -> Result<()> {
+        self.sent += data.len() as u64;
+        let limit = self.client.max_batch_bytes - 1024;
+        if d.size_bytes > limit {
+            return self.client.bytestream_write(d, &data).await;
+        }
+        if self.batch_bytes + d.size_bytes > limit {
+            self.flush().await?;
+        }
+        self.batch_bytes += d.size_bytes;
+        self.batch.push(re::batch_update_blobs_request::Request { digest: Some(d.clone()), data, compressor: 0 });
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        self.batch_bytes = 0;
+        self.client.flush_batch(std::mem::take(&mut self.batch)).await
+    }
+}
+
 pub fn platform(props: &[(String, String)]) -> re::Platform {
     let mut properties: Vec<_> = props
         .iter()

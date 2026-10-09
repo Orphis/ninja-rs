@@ -161,6 +161,7 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     write(&root.join("src/lib.c"), "#include \"lib.h\"\nint lib() { return DEEP; }\n");
     write(&root.join("include/lib.h"), "#include \"nested/deep.h\"\nint lib();\n");
     write(&root.join("include/nested/deep.h"), "#define DEEP 0\n");
+    write(&root.join("src/big.c"), "int big;\n");
     let fwd = |p: &Path| p.to_string_lossy().replace('\\', "/");
     let tc_json = format!(
         "{{\"version\": 1, \"toolchains\": [{{\"language\": \"C\", \"tool\": \"{}\", \"inputs\": [\"{}\"], \"platform\": {{\"OSFamily\": \"{}\"}}}}, {{\"tool\": \"{}\", \"local\": true}}]}}",
@@ -208,9 +209,11 @@ build helper.stamp: TOUCH\n  rbe_mnemonic = CArchive\n\
 build lib2.a lib2.copy: AR2 obj/main.o\n  rbe_mnemonic = CArchive\n\
 build obj/broken.o: CC {lib}\n  DEP_FILE = obj/broken.o.d\n  FLAGS = -DFAIL\n  rbe_target = broken\n  rbe_mnemonic = CCompile\n\
 build user.bin: LINK obj/broken.o\n  rbe_target = user\n  rbe_mnemonic = CLink\n  rbe_deliverable = 1\n\
+build obj/big.o: CC {big}\n  DEP_FILE = obj/big.o.d\n  rbe_mnemonic = CCompile\n\
 default app.bin\n",
         main = ninja_escape_path(&root.join("src/main.c").to_string_lossy()),
         lib = ninja_escape_path(&root.join("src/lib.c").to_string_lossy()),
+        big = ninja_escape_path(&root.join("src/big.c").to_string_lossy()),
     );
     write(&build.join("build.ninja"), &manifest);
     Fixture { root, build, compiler }
@@ -562,6 +565,63 @@ fn test_build_events() -> Result<(), String> {
     })
 }
 
+/// Lines of incompressible C (xorshift noise), for large sources.
+fn noise_lines(count: usize, mut state: u64) -> Vec<String> {
+    (0..count)
+        .map(|i| {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            format!("static const char *s{i} = \"{:016x}{:016x}\";", next(), next())
+        })
+        .collect()
+}
+
+/// With a remote that splits and splices blobs (as RE API 2.`minor`), a
+/// large input is uploaded as the chunks the server lacks, and a large
+/// output downloaded as the chunks the disk cache lacks.
+fn test_split_and_splice(minor: u32) -> Result<(), String> {
+    let f = fixture(&format!("chunks{minor}"), true);
+    with_server(&f, |server| {
+        server.state.set_chunking(Some(minor));
+        let ep = server.endpoint.clone();
+        let flag = format!("--disk_cache={}", f.root.join("disk-cache").to_string_lossy());
+        let mut lines = noise_lines(160_000, u64::from(minor));
+        let source = |lines: &[String]| format!("#include \"lib.h\"\n{}\n", lines.join("\n"));
+        write(&f.root.join("src/big.c"), &source(&lines));
+        let size = source(&lines).len() as u64;
+
+        // 1. Nothing is known yet: all the chunks travel.
+        check(run_ninja(&f, Some(&ep), &[&flag, "obj/big.o"]) == 0, "first build failed")?;
+        let st = server.stats();
+        // The source is spliced, and so is the compiler if it's large (it's
+        // this test's binary).
+        check(st.executions == 1 && st.splices >= 1 && st.splits == 1, &format!("expected splices and one split, got {st:?}"))?;
+        let big_o = std::fs::read_to_string(f.build.join("obj/big.o")).map_err(|e| e.to_string())?;
+        check(big_o.contains("#define DEEP 0") && big_o.ends_with(&format!("{}\n", lines.last().unwrap())), "obj/big.o content")?;
+
+        // 2. After an edit in the middle, only the chunks around it do.
+        lines.insert(80_000, "int edited;".into());
+        write(&f.root.join("src/big.c"), &source(&lines));
+        check(run_ninja(&f, Some(&ep), &[&flag, "obj/big.o"]) == 0, "rebuild failed")?;
+        let after = server.stats();
+        check(
+            after.executions == 2 && after.splices == st.splices + 1 && after.splits == 2,
+            &format!("expected another splice and split, got {after:?}"),
+        )?;
+        let (up, down) = (after.bytes_uploaded - st.bytes_uploaded, after.bytes_read - st.bytes_read);
+        println!("after the edit: {up} bytes uploaded, {down} downloaded, of {size}");
+        check(up < size / 4, &format!("uploaded {up} of {size} bytes"))?;
+        check(down < size / 4, &format!("downloaded {down} of {size} bytes"))?;
+        let big_o = std::fs::read_to_string(f.build.join("obj/big.o")).map_err(|e| e.to_string())?;
+        check(big_o.contains("\nint edited;\n") && big_o.ends_with(&format!("{}\n", lines.last().unwrap())), "obj/big.o content after the edit")?;
+        Ok(())
+    })
+}
+
 fn test_without_executor_runs_locally() -> Result<(), String> {
     let f = fixture("noexec", true);
     check(run_ninja(&f, None, &[]) == 0, "local build failed")?;
@@ -589,6 +649,8 @@ fn main() -> ExitCode {
         ("disk_cache_alone", test_disk_cache_alone),
         ("disk_cache_with_remote", test_disk_cache_with_remote),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
+        ("split_and_splice_v2_12", || test_split_and_splice(12)),
+        ("split_and_splice_v2_13", || test_split_and_splice(13)),
     ];
     let count = tests.len();
     let mut failed = 0;

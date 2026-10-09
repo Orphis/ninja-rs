@@ -55,7 +55,10 @@ impl Backend {
             Some(f) => Toolchains::load(&config.build_dir.join(f), windows).map_err(anyhow::Error::msg)?,
             None => Toolchains::default(),
         };
-        if let Some(mut client) = client.clone() {
+        // The capabilities also configure the client (batch sizes,
+        // compression, split and spliced blobs): keep that one.
+        let mut client = client;
+        if let Some(client) = &mut client {
             let caps = client.capabilities().await.context("GetCapabilities")?;
             if let Some(cc) = &caps.cache_capabilities
                 && !cc.digest_functions.is_empty()
@@ -365,7 +368,8 @@ impl Inner {
     }
 
     /// Blobs from the disk cache, else from the remote CAS (stored on disk
-    /// then).
+    /// then). A large blob is fetched as its chunks when the remote splits
+    /// blobs, downloading only those the disk cache lacks.
     async fn fetch_blobs(&self, client: Option<&Client>, needed: &[re::Digest]) -> Result<std::collections::HashMap<String, Vec<u8>>> {
         let mut blobs = std::collections::HashMap::new();
         let mut missing = Vec::new();
@@ -381,6 +385,31 @@ impl Inner {
             return Ok(blobs);
         }
         let Some(client) = client else { bail!("{} blobs are missing from the disk cache", missing.len()) };
+        if let Some(disk) = &self.disk
+            && client.chunking().split
+        {
+            let mut whole = Vec::new();
+            for d in missing {
+                if !crate::disk_cache::is_chunked(&d) {
+                    whole.push(d);
+                    continue;
+                }
+                match fetch_chunked(client, disk, &d).await {
+                    Ok(Some(data)) => {
+                        blobs.insert(d.hash.clone(), data);
+                    }
+                    // Not split by the server: fetch it whole.
+                    Ok(None) => whole.push(d),
+                    Err(e) => {
+                        if self.config.verbose {
+                            eprintln!("ninja-rs: fetching {} as chunks: {e:#}", rbe_client::digest_str(&d));
+                        }
+                        whole.push(d);
+                    }
+                }
+            }
+            missing = whole;
+        }
         for (hash, data) in client.read_blobs(&missing).await? {
             if let Some(disk) = &self.disk {
                 disk.put_bytes(&re::Digest { hash: hash.clone(), size_bytes: data.len() as i64 }, &data)?;
@@ -537,6 +566,35 @@ fn is_executable(p: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_: &std::path::Path) -> bool {
     false
+}
+
+/// Fetches a large blob as the chunks the remote splits it into, downloading
+/// only those the disk cache lacks, and stores it there in those chunks.
+/// `None` when the remote can't split it.
+async fn fetch_chunked(client: &Client, disk: &DiskCache, d: &re::Digest) -> Result<Option<Vec<u8>>> {
+    let Some(split) = client.split_blob(d).await? else { return Ok(None) };
+    let lacking: Vec<re::Digest> = split.chunk_digests.iter().filter(|c| !disk.contains_chunk(c)).cloned().collect();
+    let fetched = client.read_blobs(&lacking).await?;
+    let mut data = Vec::with_capacity(d.size_bytes as usize);
+    for c in &split.chunk_digests {
+        match fetched.get(&c.hash) {
+            Some(chunk) => {
+                // Checked before it's stored under that digest.
+                if rbe_client::digest_of(chunk) != *c {
+                    bail!("chunk {} has other contents", rbe_client::digest_str(c));
+                }
+                disk.put_chunk_bytes(c, chunk)?;
+                data.extend_from_slice(chunk);
+            }
+            None => data.extend_from_slice(&disk.read_chunk(c).with_context(|| format!("chunk {} was evicted", rbe_client::digest_str(c)))?),
+        }
+    }
+    // REAPI asks clients to check the assembled blob.
+    if rbe_client::digest_of(&data) != *d {
+        bail!("the chunks don't make up the blob");
+    }
+    disk.put_chunked(d, split)?;
+    Ok(Some(data))
 }
 
 fn prepared_blobs(p: &Prepared) -> rbe_client::BlobSet {

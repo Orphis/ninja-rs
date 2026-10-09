@@ -7,6 +7,11 @@
 //!
 //! It is also a Build Event Service: it records the build events it
 //! receives (decoded) and acks each one.
+//!
+//! Split and spliced blobs are off by default; [`State::set_chunking`]
+//! turns them on, as in RE API v2.12 (`SplitBlob` / `SpliceBlob`) or v2.13
+//! (`GetChunkMapping` / `RegisterChunkMapping`), with FastCDC 2020 and
+//! REAPI's recommended parameters.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +32,8 @@ use sha2::{Digest as _, Sha256};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
+const FAST_CDC: i32 = re::chunking_function::Value::FastCdc2020 as i32;
+
 type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 #[derive(Default, Debug, Clone)]
@@ -35,6 +42,13 @@ pub struct Stats {
     pub action_cache_hits: u64,
     pub blobs_uploaded: u64,
     pub bytestream_writes: u64,
+    /// Blob bytes received (batches and ByteStream).
+    pub bytes_uploaded: u64,
+    /// Blob bytes sent (batches and ByteStream).
+    pub bytes_read: u64,
+    /// Blobs split, and blobs spliced.
+    pub splits: u64,
+    pub splices: u64,
 }
 
 #[derive(Default)]
@@ -51,6 +65,8 @@ pub struct State {
     pub lifecycle_events: Mutex<Vec<bes::PublishLifecycleEventRequest>>,
     /// Whether a build event stream ended with `ComponentStreamFinished`.
     pub bes_streams_finished: Mutex<u32>,
+    /// The RE API minor version whose split/splice RPCs are served, if any.
+    chunking: Mutex<Option<u32>>,
     base: PathBuf,
     counter: AtomicU64,
 }
@@ -72,6 +88,40 @@ impl State {
     }
     pub fn clear_cas(&self) {
         self.cas.lock().unwrap().clear();
+    }
+    /// Serves split and spliced blobs as RE API 2.`minor` does (12 or 13),
+    /// or not at all. Clients see it in the capabilities they fetch next.
+    pub fn set_chunking(&self, minor: Option<u32>) {
+        *self.chunking.lock().unwrap() = minor;
+    }
+    fn chunking_api(&self, minor: u32) -> Result<(), Status> {
+        if *self.chunking.lock().unwrap() == Some(minor) { Ok(()) } else { Err(Status::unimplemented("not with this API version")) }
+    }
+    /// Splits a blob it holds with FastCDC 2020 (512 KiB on average),
+    /// storing the chunks.
+    fn split(&self, d: Option<re::Digest>) -> Result<Vec<re::Digest>, Status> {
+        let d = d.unwrap_or_default();
+        let data = self.get(&d).ok_or_else(|| Status::not_found("blob not found"))?;
+        let avg = 512 * 1024;
+        let chunks = fastcdc::v2020::FastCDC::with_level(&data, avg / 4, avg, avg * 4, fastcdc::v2020::Normalization::Level2)
+            .map(|c| self.put(data[c.offset..c.offset + c.length].to_vec()))
+            .collect();
+        self.stats.lock().unwrap().splits += 1;
+        Ok(chunks)
+    }
+    /// Stores a blob made of chunks it holds, after checking its digest.
+    fn splice(&self, d: Option<re::Digest>, chunks: &[re::Digest]) -> Result<re::Digest, Status> {
+        let d = d.ok_or_else(|| Status::invalid_argument("no blob digest"))?;
+        let mut data = Vec::new();
+        for c in chunks {
+            data.extend(self.get(c).ok_or_else(|| Status::not_found(format!("chunk {} not found", c.hash)))?);
+        }
+        if digest_of(&data) != d {
+            return Err(Status::invalid_argument("the chunks don't make up the blob"));
+        }
+        self.put(data);
+        self.stats.lock().unwrap().splices += 1;
+        Ok(d)
     }
 }
 
@@ -99,8 +149,10 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
         for req in r.into_inner().requests {
             let d = req.digest.unwrap_or_default();
             let st = if digest_of(&req.data) == d {
+                let mut stats = self.0.stats.lock().unwrap();
+                stats.blobs_uploaded += 1;
+                stats.bytes_uploaded += req.data.len() as u64;
                 self.0.cas.lock().unwrap().insert(d.hash.clone(), req.data);
-                self.0.stats.lock().unwrap().blobs_uploaded += 1;
                 status(0, "")
             } else {
                 status(3, "digest mismatch")
@@ -114,7 +166,10 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
         let mut responses = Vec::new();
         for d in r.into_inner().digests {
             let (data, st) = match self.0.get(&d) {
-                Some(data) => (data, status(0, "")),
+                Some(data) => {
+                    self.0.stats.lock().unwrap().bytes_read += data.len() as u64;
+                    (data, status(0, ""))
+                }
                 None => (vec![], status(5, "not found")),
             };
             responses.push(re::batch_read_blobs_response::Response { digest: Some(d), data, compressor: 0, status: Some(st) });
@@ -126,21 +181,48 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
     async fn get_tree(&self, _r: Request<re::GetTreeRequest>) -> Result<Response<Self::GetTreeStream>, Status> {
         Err(Status::unimplemented("GetTree"))
     }
-    async fn split_blob(&self, _r: Request<re::SplitBlobRequest>) -> Result<Response<re::SplitBlobResponse>, Status> {
-        Err(Status::unimplemented("SplitBlob"))
+    async fn split_blob(&self, r: Request<re::SplitBlobRequest>) -> Result<Response<re::SplitBlobResponse>, Status> {
+        self.0.chunking_api(12)?;
+        let chunk_digests = self.0.split(r.into_inner().blob_digest)?;
+        Ok(Response::new(re::SplitBlobResponse { chunk_digests, chunking_function: FAST_CDC }))
     }
     type GetChunkMappingStream = BoxStream<re::GetChunkMappingResponse>;
-    async fn get_chunk_mapping(&self, _r: Request<re::GetChunkMappingRequest>) -> Result<Response<Self::GetChunkMappingStream>, Status> {
-        Err(Status::unimplemented("GetChunkMapping"))
+    async fn get_chunk_mapping(&self, r: Request<re::GetChunkMappingRequest>) -> Result<Response<Self::GetChunkMappingStream>, Status> {
+        self.0.chunking_api(13)?;
+        let chunks = self.0.split(r.into_inner().blob_digest)?;
+        // Streamed a few digests at a time, the function in the first
+        // message only.
+        let responses: Vec<Result<re::GetChunkMappingResponse, Status>> = chunks
+            .chunks(3)
+            .enumerate()
+            .map(|(i, part)| {
+                Ok(re::GetChunkMappingResponse { chunk_digests: part.to_vec(), chunking_function: if i == 0 { FAST_CDC } else { 0 } })
+            })
+            .collect();
+        Ok(Response::new(Box::pin(tokio_stream::iter(responses))))
     }
-    async fn splice_blob(&self, _r: Request<re::SpliceBlobRequest>) -> Result<Response<re::SpliceBlobResponse>, Status> {
-        Err(Status::unimplemented("SpliceBlob"))
+    async fn splice_blob(&self, r: Request<re::SpliceBlobRequest>) -> Result<Response<re::SpliceBlobResponse>, Status> {
+        self.0.chunking_api(12)?;
+        let r = r.into_inner();
+        let d = self.0.splice(r.blob_digest, &r.chunk_digests)?;
+        Ok(Response::new(re::SpliceBlobResponse { blob_digest: Some(d) }))
     }
     async fn register_chunk_mapping(
         &self,
-        _r: Request<Streaming<re::RegisterChunkMappingRequest>>,
+        r: Request<Streaming<re::RegisterChunkMappingRequest>>,
     ) -> Result<Response<re::RegisterChunkMappingResponse>, Status> {
-        Err(Status::unimplemented("RegisterChunkMapping"))
+        self.0.chunking_api(13)?;
+        let mut stream = r.into_inner();
+        let (mut blob, mut chunks) = (None, Vec::new());
+        while let Some(m) = stream.next().await {
+            let m = m?;
+            if blob.is_none() {
+                blob = m.blob_digest;
+            }
+            chunks.extend(m.chunk_digests);
+        }
+        let d = self.0.splice(blob, &chunks)?;
+        Ok(Response::new(re::RegisterChunkMappingResponse { blob_digest: Some(d) }))
     }
 }
 
@@ -168,11 +250,15 @@ impl re::action_cache_server::ActionCache for Svc {
 impl re::capabilities_server::Capabilities for Svc {
     async fn get_capabilities(&self, _r: Request<re::GetCapabilitiesRequest>) -> Result<Response<re::ServerCapabilities>, Status> {
         let sha = re::digest_function::Value::Sha256 as i32;
+        let chunking = *self.0.chunking.lock().unwrap();
         Ok(Response::new(re::ServerCapabilities {
             cache_capabilities: Some(re::CacheCapabilities {
                 digest_functions: vec![sha],
                 action_cache_update_capabilities: Some(re::ActionCacheUpdateCapabilities { update_enabled: true }),
                 max_batch_total_size_bytes: 4 * 1024 * 1024,
+                split_blob_support: chunking.is_some(),
+                splice_blob_support: chunking.is_some(),
+                fast_cdc_2020_params: chunking.map(|_| re::FastCdc2020Params { avg_chunk_size_bytes: 512 * 1024, seed: 0 }),
                 ..Default::default()
             }),
             execution_capabilities: Some(re::ExecutionCapabilities {
@@ -182,7 +268,7 @@ impl re::capabilities_server::Capabilities for Svc {
                 ..Default::default()
             }),
             low_api_version: Some(SemVer { major: 2, minor: 0, patch: 0, prerelease: String::new() }),
-            high_api_version: Some(SemVer { major: 2, minor: 3, patch: 0, prerelease: String::new() }),
+            high_api_version: Some(SemVer { major: 2, minor: chunking.unwrap_or(3) as i32, patch: 0, prerelease: String::new() }),
             ..Default::default()
         }))
     }
@@ -204,6 +290,7 @@ impl bs::byte_stream_server::ByteStream for Svc {
         let d = parse_resource(&r.resource_name).ok_or_else(|| Status::invalid_argument("bad resource name"))?;
         let data = self.0.get(&d).ok_or_else(|| Status::not_found("blob not found"))?;
         let start = (r.read_offset as usize).min(data.len());
+        self.0.stats.lock().unwrap().bytes_read += (data.len() - start) as u64;
         let chunks: Vec<Result<bs::ReadResponse, Status>> =
             data[start..].chunks(64 * 1024).map(|c| Ok(bs::ReadResponse { data: c.to_vec() })).collect();
         Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
@@ -229,7 +316,9 @@ impl bs::byte_stream_server::ByteStream for Svc {
         }
         let len = data.len() as i64;
         self.0.cas.lock().unwrap().insert(d.hash, data);
-        self.0.stats.lock().unwrap().bytestream_writes += 1;
+        let mut stats = self.0.stats.lock().unwrap();
+        stats.bytestream_writes += 1;
+        stats.bytes_uploaded += len as u64;
         Ok(Response::new(bs::WriteResponse { committed_size: len }))
     }
 

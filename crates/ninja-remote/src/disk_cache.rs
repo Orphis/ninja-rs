@@ -21,7 +21,8 @@
 //! same way), each a blob of `cas/`, plus its layout, the list of their
 //! digests, in `chunked/`. Blobs that differ by a few edits, such as two
 //! builds of an executable, then share most of their chunks, and the cache
-//! stores those once. Every blob goes through [`DiskCache::read_blob`] and
+//! stores those once. A blob downloaded from a remote cache that splits
+//! blobs keeps the remote's chunks ([`DiskCache::put_chunked`]). Every blob goes through [`DiskCache::read_blob`] and
 //! the `put_*` methods, which split and reassemble them: callers don't see
 //! chunks. A blob is present when it is stored whole or when its layout and
 //! all its chunks are, so a layout may outlive some of its chunks.
@@ -256,6 +257,34 @@ impl DiskCache {
     /// Records a blob's layout. Its chunks must be stored first.
     fn put_layout(&self, d: &re::Digest, layout: re::SplitBlobResponse) -> std::io::Result<()> {
         self.write_atomic(&self.layout_path(&d.hash), &layout.encode_to_vec())
+    }
+
+    // Chunks of a blob split elsewhere (by a remote cache), for downloads
+    // that only fetch the chunks the cache lacks.
+
+    /// Whether the cache holds a chunk (marking it used).
+    pub fn contains_chunk(&self, d: &re::Digest) -> bool {
+        d.size_bytes == 0 || self.contains_whole(d)
+    }
+
+    /// A chunk's contents.
+    pub fn read_chunk(&self, d: &re::Digest) -> Option<Vec<u8>> {
+        if d.size_bytes == 0 { Some(Vec::new()) } else { self.read_whole(d) }
+    }
+
+    /// Stores a chunk, whatever its size. Its digest must have been checked.
+    pub fn put_chunk_bytes(&self, d: &re::Digest, data: &[u8]) -> std::io::Result<()> {
+        if self.contains_chunk(d) {
+            return Ok(());
+        }
+        self.write_atomic(&self.blob_path(&d.hash), data)
+    }
+
+    /// Records how a large blob (see [`is_chunked`]) was split. Its chunks
+    /// must be stored first, and have been checked to make it up.
+    pub fn put_chunked(&self, d: &re::Digest, split: re::SplitBlobResponse) -> std::io::Result<()> {
+        debug_assert!(is_chunked(d));
+        self.put_layout(d, split)
     }
 
     /// The action's result, if cached and if the CAS still holds all its

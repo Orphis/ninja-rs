@@ -195,6 +195,7 @@ name = "fake-reapi"
 version = "0.1.0"
 dependencies = [
  "bazel-remote-apis",
+ "fastcdc",
  "hex",
  "prost",
  "rbe-bes",

@@ -160,7 +160,9 @@ persisted wholesale later, which the daemon needs.
    with rewritten contents.
 7. **Cache, upload, execute**: `GetActionResult` first (only successful
    results are reused); otherwise `FindMissingBlobs` + `BatchUpdateBlobs`
-   (ByteStream for large blobs, via `rbe-client`) and `Execute`.
+   (ByteStream for large blobs, via `rbe-client`) and `Execute`. When the
+   server splices blobs, a large one is uploaded as its chunks instead
+   (see "Split and spliced blobs").
 8. **Download**: outputs are written atomically; files whose content is
    already identical are left untouched so `restat` keeps working. The
    depfile is rewritten to local paths before the builder reads it
@@ -275,10 +277,33 @@ directory), so they are interchangeable with a remote cache's.
   `ac/<hh>/<hash>`, `size`, `gc/lock`, `tmp/` (atomic writes); a version
   mismatch disables the cache with a warning.
 
-Next for chunking: with a remote advertising `split_blob_support` and the
-same `FastCdc2020Params`, download a large blob through `SplitBlob` and
-fetch only the chunks the disk cache lacks, and upload through
-`SpliceBlob` the same way.
+### Split and spliced blobs
+
+With a remote cache that advertises them (`CacheCapabilities`), large blobs
+travel as content-defined chunks, so a blob that differs from one seen
+before by a few edits only sends the chunks around them:
+
+- **Download** (`split_blob_support`, needs `--disk_cache`): a missing blob
+  larger than the disk cache's chunk limit is split by the server
+  (`GetChunkMapping` from RE API v2.13, `SplitBlob` before, picked from
+  `high_api_version`); only the chunks the disk cache lacks are fetched,
+  each checked against its digest before it's stored, and the assembled
+  blob against its own, as REAPI asks. The disk cache keeps the server's
+  chunks and its `SplitBlobResponse` as the layout. A server that can't
+  split the blob, or any failure, falls back to fetching it whole.
+- **Upload** (`splice_blob_support`): a missing input larger than four
+  times the average chunk is chunked with the server's
+  `FastCdc2020Params` (REAPI's recommended ones if it advertises none, the
+  request then naming no chunking function), the chunks it lacks are
+  uploaded (one `FindMissingBlobs` per blob), then
+  `RegisterChunkMapping` (v2.13) or `SpliceBlob` composes the blob. A
+  refused splice uploads the blob whole.
+- Chunking lives in `rbe-client` (`chunking.rs`, the `fastcdc` crate's
+  `v2020` module, REAPI's reference), shared by the disk cache, uploads
+  and the fake server. The fake REAPI server serves either API version
+  (`State::set_chunking`), and the end-to-end tests check that after an
+  edit in the middle of a 10 MB source, about 6% of it is uploaded and of
+  its object downloaded.
 
 ## Later phases (designed for, not built)
 

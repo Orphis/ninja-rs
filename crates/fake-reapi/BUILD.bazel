@@ -10,6 +10,7 @@ rust_library(
     deps = [
         "//third_party/cargo-rbe/rbe-bes",
         "@crates//:bazel-remote-apis",
+        "@crates//:fastcdc",
         "@crates//:hex",
         "@crates//:prost",
         "@crates//:sha2",
