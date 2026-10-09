@@ -28,7 +28,9 @@ pub const REQUEST_METADATA_HEADER: &str = "build.bazel.remote.execution.v2.reque
 pub use bazel_remote_apis::build::bazel::remote::execution::v2 as proto;
 pub use bazel_remote_apis::google::protobuf as pb;
 
+pub mod chunking;
 pub mod tree;
+pub use chunking::FastCdc;
 pub use tree::{BlobSet, BlobSource, DigestCache, InputTree};
 
 /// gRPC messages are capped at 4 MiB by default; stay well below for batches.

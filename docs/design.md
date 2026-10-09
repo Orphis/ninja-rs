@@ -254,17 +254,31 @@ directory), so they are interchangeable with a remote cache's.
   estimate is updated; the walk runs when the estimate passes the limit,
   and rewrites it with the real size. `gc/lock` lets one process collect
   at a time (the others skip and count their writes next time); a file
-  used during the walk is kept, and action results go before blobs of the
-  same age.
-- **Layout:** `VERSION`, `cas/<hh>/<hash>`, `ac/<hh>/<hash>`, `size`,
-  `gc/lock`, `tmp/` (atomic writes); a version mismatch disables the cache
-  with a warning.
+  used during the walk is kept, and of files of the same age, action
+  results go first, then chunk layouts, then blobs.
+- **Content-defined chunking:** a blob larger than 2 MiB is stored as its
+  FastCDC 2020 chunks (REAPI `FAST_CDC_2020` with the recommended
+  parameters: 512 KiB average, 128 KiB to 2 MiB, normalization level 2,
+  seed 0, using the `fastcdc` crate REAPI names as the reference), each a
+  blob of `cas/`, plus a layout in `chunked/<hh>/<hash>`: a
+  `SplitBlobResponse` listing their digests. Two builds of a large output
+  differing by a few edits share most chunks, which are stored once.
+  `read_blob` / `put_*` split and reassemble, so callers never see chunks;
+  `put_file` streams a large file through the chunker (checking its hash
+  again, in case it changed since it was digested). A blob is present when
+  it is stored whole or when its layout and all its chunks are, so evicting
+  a chunk turns the blobs using it into misses, and using a blob marks its
+  layout and chunks, so a shared chunk lives as long as one of its blobs is
+  used. Blobs stored whole by earlier versions are still read, so the
+  format version is unchanged.
+- **Layout:** `VERSION`, `cas/<hh>/<hash>`, `chunked/<hh>/<hash>`,
+  `ac/<hh>/<hash>`, `size`, `gc/lock`, `tmp/` (atomic writes); a version
+  mismatch disables the cache with a warning.
 
-All blob reads and writes go through `DiskCache::read_blob` / `put_*`, so
-content-defined chunking can be added there: a large blob stored as the
-list of its chunks (themselves CAS blobs), split on write and reassembled
-on read, with REAPI `SplitBlob`/`SpliceBlob` to transfer only the chunks a
-side lacks, and eviction working on chunks.
+Next for chunking: with a remote advertising `split_blob_support` and the
+same `FastCdc2020Params`, download a large blob through `SplitBlob` and
+fetch only the chunks the disk cache lacks, and upload through
+`SpliceBlob` the same way.
 
 ## Later phases (designed for, not built)
 

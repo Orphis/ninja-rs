@@ -23,6 +23,8 @@ Local changes:
   `add_file_with_digest` / `contains` were added.
 - `Cargo.toml` uses the ninja-rs workspace dependencies; a Bazel
   `BUILD.bazel` was added; an unused-variable warning on Windows was fixed.
+- Content-defined chunking: `chunking.rs`, FastCDC 2020 through the
+  `fastcdc` crate (REAPI's reference implementation).
 
 ## rbe-bes (copied)
 

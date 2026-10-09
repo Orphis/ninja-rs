@@ -10,6 +10,7 @@ rust_library(
     deps = [
         "@crates//:anyhow",
         "@crates//:bazel-remote-apis",
+        "@crates//:fastcdc",
         "@crates//:hex",
         "@crates//:prost",
         "@crates//:prost-types",

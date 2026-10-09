@@ -10,6 +10,8 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1"
+# FastCDC 2020, the reference implementation of REAPI content-defined chunking.
+fastcdc = "3.2.1"
 bazel-remote-apis = { version = "0.30", default-features = false }
 hex = "0.4"
 prost = "0.14"

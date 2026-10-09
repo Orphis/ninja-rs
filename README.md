@@ -110,8 +110,9 @@ Build events (BES/BEP) are reported with targets, configurations and
 outputs from the RBE interface (see docs/design.md, "Build events").
 
 A local disk cache (`--disk_cache`) caches the actions remote execution
-would run, with or without a remote service (see docs/design.md, "Disk
-cache").
+would run, with or without a remote service; large blobs are stored as
+content-defined chunks, which similar outputs share (see docs/design.md,
+"Disk cache").
 
 Not done yet (later phases): minimal-download mode, daemon mode; jobserver.
 
