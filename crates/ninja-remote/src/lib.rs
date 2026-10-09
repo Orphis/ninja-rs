@@ -10,10 +10,12 @@
 //! - [`toolchains`] reads the `rbe_toolchains` file.
 //! - [`targets`] reads the `rbe_targets` file.
 //! - [`store::Store`] holds the caches shared across actions and builds.
+//! - [`disk_cache::DiskCache`] is the local action cache and CAS.
 
 pub mod action;
 pub mod backend;
 pub mod cmdline;
+pub mod disk_cache;
 pub mod paths;
 pub mod scanner;
 pub mod store;

@@ -647,6 +647,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "ninja-core",
+ "prost",
  "rbe-client",
  "serde",
  "serde_json",

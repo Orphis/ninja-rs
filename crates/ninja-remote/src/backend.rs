@@ -1,5 +1,7 @@
-//! The REAPI backend: execution policy, action cache lookup, upload,
-//! Execute, and output download (with depfile and /showIncludes mapping).
+//! The REAPI backend: execution policy, action cache lookups (the local
+//! disk cache, then the remote one), upload, Execute, and output download
+//! (with depfile and /showIncludes mapping). With only a disk cache, cache
+//! misses run locally and their results are stored.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,11 +9,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
 use ninja_core::depfile::parse_depfile;
-use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
+use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, LocalCapture, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
 use rbe_client::proto as re;
 use rbe_client::{ActionMeta, Client};
 
 use crate::action::{Prepared, Shared, prepare};
+use crate::disk_cache::DiskCache;
 use crate::store::Store;
 use crate::targets::Targets;
 use crate::toolchains::Toolchains;
@@ -37,27 +40,32 @@ pub struct Backend {
 }
 
 struct Inner {
-    client: Client,
+    /// The remote service; without it, the disk cache alone.
+    client: Option<Client>,
+    disk: Option<Arc<DiskCache>>,
     shared: Shared,
     config: BackendConfig,
 }
 
 impl Backend {
-    pub async fn new(config: BackendConfig, mut client: Client, store: Arc<Store>) -> Result<Self> {
+    /// A backend with a remote service, a disk cache, or both.
+    pub async fn new(config: BackendConfig, client: Option<Client>, disk: Option<Arc<DiskCache>>, store: Arc<Store>) -> Result<Self> {
         let windows = cfg!(windows);
         let toolchains = match &config.toolchains_file {
             Some(f) => Toolchains::load(&config.build_dir.join(f), windows).map_err(anyhow::Error::msg)?,
             None => Toolchains::default(),
         };
-        let caps = client.capabilities().await.context("GetCapabilities")?;
-        if let Some(cc) = &caps.cache_capabilities
-            && !cc.digest_functions.is_empty()
-            && !cc.digest_functions.contains(&(re::digest_function::Value::Sha256 as i32))
-        {
-            bail!("the remote cache does not support SHA-256");
-        }
-        if caps.execution_capabilities.as_ref().is_some_and(|e| !e.exec_enabled) {
-            bail!("the remote instance does not support execution");
+        if let Some(mut client) = client.clone() {
+            let caps = client.capabilities().await.context("GetCapabilities")?;
+            if let Some(cc) = &caps.cache_capabilities
+                && !cc.digest_functions.is_empty()
+                && !cc.digest_functions.contains(&(re::digest_function::Value::Sha256 as i32))
+            {
+                bail!("the remote cache does not support SHA-256");
+            }
+            if caps.execution_capabilities.as_ref().is_some_and(|e| !e.exec_enabled) {
+                bail!("the remote instance does not support execution");
+            }
         }
         let shared = Shared {
             build_dir: config.build_dir.clone(),
@@ -66,7 +74,7 @@ impl Backend {
             store,
             windows,
         };
-        Ok(Self { inner: Arc::new(Inner { client, shared, config }) })
+        Ok(Self { inner: Arc::new(Inner { client, disk, shared, config }) })
     }
 }
 
@@ -103,6 +111,9 @@ enum Failure {
     Prepare(String),
     /// The remote service failed.
     Infra(anyhow::Error),
+    /// A disk cache miss without a remote service: run locally, then store
+    /// the result.
+    RunLocally(Box<Prepared>),
 }
 
 impl Inner {
@@ -110,6 +121,7 @@ impl Inner {
         match self.clone().try_execute(&task).await {
             Ok(r) => RemoteOutcome::Done(r),
             Err(Failure::Prepare(reason)) => RemoteOutcome::Fallback(reason),
+            Err(Failure::RunLocally(prepared)) => RemoteOutcome::RunLocally(Box::new(Capture { inner: self, prepared, task })),
             Err(Failure::Infra(e)) => {
                 if self.config.local_fallback {
                     RemoteOutcome::Fallback(format!("remote execution failed: {e:#}"))
@@ -138,8 +150,35 @@ impl Inner {
             target_id: task.binding("rbe_target").map(|t| self.config.targets.label(t)).unwrap_or_default(),
             configuration_id: self.config.targets.configuration(task.binding("rbe_config")).map(|c| c.id()).unwrap_or_default(),
         };
-        let client = self.client.for_action(&meta, &prepared.action_digest.hash);
         let digest = prepared.action_digest.clone();
+
+        // The disk cache first.
+        let disk_hit = match &self.disk {
+            Some(disk) => {
+                let (disk, d) = (disk.clone(), digest.clone());
+                tokio::task::spawn_blocking(move || disk.get_action_result(&d)).await.ok().flatten().filter(|r| r.exit_code == 0)
+            }
+            None => None,
+        };
+        if let Some(result) = disk_hit {
+            let mut output = Vec::new();
+            if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
+                return Ok(failed);
+            }
+            output.extend(self.download(None, task, &prepared, &result, false).await.map_err(Failure::Infra)?);
+            if let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await {
+                failed.kind = ExecKind::DiskCacheHit;
+                return Ok(failed);
+            }
+            if self.config.verbose {
+                let mut msg = format!("ninja-rs: disk cache hit {}\n", digest.hash).into_bytes();
+                msg.extend_from_slice(&output);
+                output = msg;
+            }
+            return Ok(TaskResult { edge: task.edge, status: ExitStatus::Success, output, kind: ExecKind::DiskCacheHit, cas_outputs: Vec::new() });
+        }
+        let Some(client) = &self.client else { return Err(Failure::RunLocally(Box::new(prepared))) };
+        let client = client.for_action(&meta, &prepared.action_digest.hash);
 
         // Local steps first (e.g. deleting an archive before re-creating it).
         let mut output = Vec::new();
@@ -147,7 +186,7 @@ impl Inner {
             return Ok(failed);
         }
 
-        // Action cache first.
+        // Then the remote action cache.
         let cached = client.get_action_result(&digest).await.map_err(Failure::Infra)?;
         let (result, hit) = match cached {
             Some(r) if r.exit_code == 0 => (r, true),
@@ -165,7 +204,8 @@ impl Inner {
                 (resp.result.ok_or_else(|| Failure::Infra(anyhow::anyhow!("Execute returned no result")))?, hit)
             }
         };
-        output.extend(self.download(&client, task, &prepared, &result).await.map_err(Failure::Infra)?);
+        let keep = self.disk.is_some() && result.exit_code == 0;
+        output.extend(self.download(Some(&client), task, &prepared, &result, keep).await.map_err(Failure::Infra)?);
         let kind = if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote };
         if result.exit_code == 0
             && let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await
@@ -239,11 +279,19 @@ impl Inner {
         None
     }
 
-    /// Writes the outputs (skipping files that are already up to date, so
-    /// that `restat` works) and returns the combined stdout/stderr.
-    async fn download(&self, client: &Client, task: &Task, p: &Prepared, result: &re::ActionResult) -> Result<Vec<u8>> {
-        let stdout = client.output_bytes(&result.stdout_raw, result.stdout_digest.as_ref()).await?;
-        let stderr = client.output_bytes(&result.stderr_raw, result.stderr_digest.as_ref()).await?;
+    /// Writes the outputs of an action result, from the disk cache or the
+    /// remote one (skipping files that are already up to date, so that
+    /// `restat` works) and returns the combined stdout/stderr. With `keep`,
+    /// the result and its outputs are stored in the disk cache.
+    async fn download(&self, client: Option<&Client>, task: &Task, p: &Prepared, result: &re::ActionResult, keep: bool) -> Result<Vec<u8>> {
+        let (stdout, stderr) = match client {
+            Some(c) => (
+                c.output_bytes(&result.stdout_raw, result.stdout_digest.as_ref()).await?,
+                c.output_bytes(&result.stderr_raw, result.stderr_digest.as_ref()).await?,
+            ),
+            // Disk cache entries hold their output inline.
+            None => (result.stdout_raw.clone(), result.stderr_raw.clone()),
+        };
         let mut files: Vec<(PathBuf, re::OutputFile)> = Vec::new();
         for f in &result.output_files {
             let local = self.shared.build_dir.join(&f.path);
@@ -251,6 +299,7 @@ impl Inner {
         }
         // Output directories (unusual for compiles).
         for d in &result.output_directories {
+            let Some(client) = client else { bail!("output directories need a remote cache") };
             let tree_digest = d.tree_digest.clone().unwrap_or_default();
             let tree = client.fetch_tree(&tree_digest).await?;
             for (rel, f) in rbe_client::tree::tree_files(&tree)? {
@@ -269,7 +318,7 @@ impl Inner {
                 needed.push(d);
             }
         }
-        let blobs = if needed.is_empty() { Default::default() } else { client.read_blobs(&needed).await? };
+        let blobs = self.fetch_blobs(client, &needed).await?;
         for (local, f) in &files {
             let d = f.digest.clone().unwrap_or_default();
             let is_depfile = Some(local) == depfile_local.as_ref();
@@ -286,12 +335,59 @@ impl Inner {
             let data = if is_depfile { self.map_depfile(&data, p) } else { data };
             write_output(local, &data, f.is_executable)?;
         }
+        if keep
+            && result.output_directories.is_empty()
+            && let Some(disk) = &self.disk
+        {
+            // Fetched blobs are stored already; the others are the local
+            // files they matched, or inline.
+            for (local, f) in &files {
+                let d = f.digest.clone().unwrap_or_default();
+                if !f.contents.is_empty() {
+                    disk.put_bytes(&d, &f.contents)?;
+                } else if !disk.contains_blob(&d) {
+                    disk.put_file(local, Some(&self.shared.store.digests))?;
+                }
+            }
+            let mut stored = result.clone();
+            stored.stdout_raw = stdout.clone();
+            stored.stderr_raw = stderr.clone();
+            stored.stdout_digest = None;
+            stored.stderr_digest = None;
+            disk.put_action_result(&p.action_digest, &stored)?;
+        }
         let mut out = stdout;
         if task.deps.as_deref() == Some("msvc") {
             out = self.map_show_includes(&out, task, p);
         }
         out.extend_from_slice(&stderr);
         Ok(out)
+    }
+
+    /// Blobs from the disk cache, else from the remote CAS (stored on disk
+    /// then).
+    async fn fetch_blobs(&self, client: Option<&Client>, needed: &[re::Digest]) -> Result<std::collections::HashMap<String, Vec<u8>>> {
+        let mut blobs = std::collections::HashMap::new();
+        let mut missing = Vec::new();
+        for d in needed {
+            match self.disk.as_ref().and_then(|disk| disk.read_blob(d)) {
+                Some(data) => {
+                    blobs.insert(d.hash.clone(), data);
+                }
+                None => missing.push(d.clone()),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(blobs);
+        }
+        let Some(client) = client else { bail!("{} blobs are missing from the disk cache", missing.len()) };
+        for (hash, data) in client.read_blobs(&missing).await? {
+            if let Some(disk) = &self.disk {
+                disk.put_bytes(&re::Digest { hash: hash.clone(), size_bytes: data.len() as i64 }, &data)?;
+            }
+            blobs.insert(hash, data);
+        }
+        Ok(blobs)
     }
 
     /// Rewrites a depfile written by the remote compiler to local paths.
@@ -338,6 +434,109 @@ impl Inner {
         }
         out.into_bytes()
     }
+}
+
+/// Stores the result of an action that ran locally after a disk cache miss,
+/// in the form a remote execution would have given (paths relative to the
+/// working directory), so that both kinds of entries are interchangeable.
+struct Capture {
+    inner: Arc<Inner>,
+    prepared: Box<Prepared>,
+    task: Task,
+}
+
+impl LocalCapture for Capture {
+    fn capture(mut self: Box<Self>, result: &TaskResult) {
+        if !result.status.success() {
+            return;
+        }
+        if let Err(e) = self.store(&result.output)
+            && self.inner.config.verbose
+        {
+            eprintln!("ninja-rs: not cached: {e:#}");
+        }
+    }
+}
+
+impl Capture {
+    fn store(&mut self, output: &[u8]) -> Result<()> {
+        let Some(disk) = self.inner.disk.clone() else { return Ok(()) };
+        let digests = Some(&self.inner.shared.store.digests as &dyn rbe_client::tree::DigestCache);
+        let mut files = Vec::new();
+        for (rel, local) in &self.prepared.outputs {
+            if !local.is_file() {
+                bail!("{} was not produced", local.display());
+            }
+            let digest = disk.put_file(local, digests)?;
+            files.push(re::OutputFile { path: rel.clone(), digest: Some(digest), is_executable: is_executable(local), ..Default::default() });
+        }
+        if let Some((rel, local)) = self.prepared.depfile.clone()
+            && let Ok(data) = std::fs::read(&local)
+        {
+            let data = self.depfile_to_remote(&data);
+            let digest = rbe_client::digest_of(&data);
+            disk.put_bytes(&digest, &data)?;
+            files.push(re::OutputFile { path: rel, digest: Some(digest), ..Default::default() });
+        }
+        let stdout = if self.task.deps.as_deref() == Some("msvc") { self.show_includes_to_remote(output) } else { output.to_vec() };
+        let result = re::ActionResult {
+            output_files: files,
+            exit_code: 0,
+            stdout_raw: stdout,
+            execution_metadata: Some(re::ExecutedActionMetadata { worker: "local".into(), ..Default::default() }),
+            ..Default::default()
+        };
+        disk.put_action_result(&self.prepared.action_digest, &result)?;
+        Ok(())
+    }
+
+    /// The opposite of `Inner::map_depfile`: local paths to remote ones.
+    fn depfile_to_remote(&mut self, data: &[u8]) -> Vec<u8> {
+        let Ok(d) = parse_depfile(data) else { return data.to_vec() };
+        let mapper = &mut self.prepared.mapper;
+        let mut out = String::new();
+        let outs: Vec<String> = d.outs.iter().map(|o| escape_make(&mapper.rewrite_arg(o))).collect();
+        out.push_str(&outs.join(" "));
+        out.push(':');
+        for i in &d.ins {
+            out.push_str(" \\\n  ");
+            out.push_str(&escape_make(&mapper.rewrite_arg(i)));
+        }
+        out.push('\n');
+        out.into_bytes()
+    }
+
+    /// The opposite of `Inner::map_show_includes`.
+    fn show_includes_to_remote(&mut self, stdout: &[u8]) -> Vec<u8> {
+        let prefix = if self.task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { self.task.msvc_deps_prefix.as_str() };
+        let text = String::from_utf8_lossy(stdout);
+        let mut out = String::new();
+        for line in text.split_inclusive('\n') {
+            let body = line.trim_end_matches(['\r', '\n']);
+            let ending = &line[body.len()..];
+            match filter_show_includes(body, prefix) {
+                Some(path) if !path.is_empty() => {
+                    out.push_str(prefix);
+                    out.push(' ');
+                    out.push_str(&self.prepared.mapper.rewrite_arg(path));
+                    out.push_str(ending);
+                }
+                _ => out.push_str(line),
+            }
+        }
+        out.into_bytes()
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &std::path::Path) -> bool {
+    false
 }
 
 fn prepared_blobs(p: &Prepared) -> rbe_client::BlobSet {

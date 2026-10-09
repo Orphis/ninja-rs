@@ -460,7 +460,7 @@ impl Bes {
             let start = inner.starts.remove(&info.edge).unwrap_or(end);
             let m = inner.mnemonics.entry(mnemonic.clone()).or_default();
             m.created += 1;
-            if *kind != ExecKind::RemoteCacheHit {
+            if !matches!(kind, ExecKind::RemoteCacheHit | ExecKind::DiskCacheHit) {
                 m.executed += 1;
             }
             m.first_ms = if m.first_ms == 0 { millis(start) } else { m.first_ms.min(millis(start)) };
@@ -468,6 +468,7 @@ impl Bes {
             let runner = match kind {
                 ExecKind::Remote => ("remote", "Remote"),
                 ExecKind::RemoteCacheHit => ("remote cache hit", "Remote"),
+                ExecKind::DiskCacheHit => ("disk cache hit", "Local"),
                 _ => ("local", "Local"),
             };
             inner.runners.entry(runner.0).or_insert((0, runner.1)).0 += 1;

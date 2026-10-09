@@ -366,6 +366,64 @@ fn test_no_rbe_version_runs_locally() -> Result<(), String> {
     })
 }
 
+/// The action cache entries in a disk cache.
+fn disk_cache_entries(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("ac")).map(|shards| shards.flatten().map(|s| std::fs::read_dir(s.path()).map_or(0, |e| e.count())).sum()).unwrap_or(0)
+}
+
+fn test_disk_cache_alone() -> Result<(), String> {
+    let f = fixture("disk", true);
+    let disk = f.root.join("disk-cache");
+    let flag = format!("--disk_cache={}", disk.to_string_lossy());
+    // 1. A miss runs locally and stores the two compiles (not the
+    //    rbe_local one, nor the link, which isn't a cached mnemonic).
+    check(run_ninja(&f, None, &[&flag]) == 0, "first build failed")?;
+    check(disk_cache_entries(&disk) == 2, &format!("expected 2 cached actions, got {}", disk_cache_entries(&disk)))?;
+    let main_o = std::fs::read(f.build.join("obj/main.o")).map_err(|e| e.to_string())?;
+
+    // 2. After a clean, the compiles come from the cache. To tell, the
+    //    cached object is altered (same size, which is all a read checks).
+    let blob = rbe_client::digest_of(&main_o);
+    let blob_path = disk.join("cas").join(&blob.hash[..2]).join(&blob.hash);
+    let mut altered = main_o.clone();
+    altered[0] ^= 0x20;
+    std::fs::write(&blob_path, &altered).map_err(|e| e.to_string())?;
+    check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+    check(run_ninja(&f, None, &[&flag]) == 0, "rebuild from the disk cache failed")?;
+    check(std::fs::read(f.build.join("obj/main.o")).ok() == Some(altered), "obj/main.o was not restored from the disk cache")?;
+    check(std::fs::read_to_string(f.build.join("app.bin")).is_ok_and(|s| s.starts_with("LINKED")), "app.bin")?;
+    // The depfile was stored with relative paths and mapped back.
+    let deep = f.root.join("include/nested/deep.h").to_string_lossy().replace('\\', "/");
+    let deps = deps_of(&f, "obj/main.o");
+    check(deps.iter().any(|d| d.replace('\\', "/").eq_ignore_ascii_case(&deep)), &format!("deps of obj/main.o: {deps:?}"))?;
+    Ok(())
+}
+
+fn test_disk_cache_with_remote() -> Result<(), String> {
+    let f = fixture("diskremote", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let disk = f.root.join("disk-cache");
+        let flag = format!("--disk_cache={}", disk.to_string_lossy());
+        // 1. Remote executions are kept in the disk cache too.
+        check(run_ninja(&f, Some(&ep), &[&flag]) == 0, "remote build failed")?;
+        check(server.stats().executions == 2, "expected 2 remote executions")?;
+        check(disk_cache_entries(&disk) == 2, "remote results not stored in the disk cache")?;
+        // 2. With the remote cache emptied, a rebuild after a clean still
+        //    needs nothing remote: the disk cache has it all.
+        server.state.clear_action_cache();
+        server.state.clear_cas();
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        check(run_ninja(&f, Some(&ep), &[&flag]) == 0, "rebuild failed")?;
+        check(server.stats().executions == 2, &format!("the rebuild executed remotely: {:?}", server.stats()))?;
+        check(f.build.join("obj/main.o").exists() && f.build.join("app.bin").exists(), "outputs missing")?;
+        let deep = f.root.join("include/nested/deep.h").to_string_lossy().replace('\\', "/");
+        let deps = deps_of(&f, "obj/main.o");
+        check(deps.iter().any(|d| d.replace('\\', "/").eq_ignore_ascii_case(&deep)), &format!("deps of obj/main.o: {deps:?}"))?;
+        Ok(())
+    })
+}
+
 fn test_build_events() -> Result<(), String> {
     use rbe_bes::proto::build_event_stream as bep;
     use bep::build_event::Payload;
@@ -528,6 +586,8 @@ fn main() -> ExitCode {
         ("local_tool_steps", test_local_tool_steps),
         ("no_rbe_version_runs_locally", test_no_rbe_version_runs_locally),
         ("build_events", test_build_events),
+        ("disk_cache_alone", test_disk_cache_alone),
+        ("disk_cache_with_remote", test_disk_cache_with_remote),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
     ];
     let count = tests.len();

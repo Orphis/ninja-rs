@@ -87,7 +87,14 @@ pub struct RemoteFlags {
     pub mnemonic_suffixes: Vec<String>,
     pub local_fallback: bool,
     pub verbose: bool,
+    /// `--disk_cache`: the local action cache and CAS (absolute).
+    pub disk_cache: Option<String>,
+    /// Bytes the disk cache may take before old entries are evicted.
+    pub disk_cache_max_size: u64,
 }
+
+/// `--disk_cache_max_size` default: 10 GiB.
+pub const DEFAULT_DISK_CACHE_MAX_SIZE: u64 = 10 << 30;
 
 pub enum ParseOutcome {
     Run(Box<Options>),
@@ -135,6 +142,8 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --remote_mnemonics=A,B     mnemonic suffixes allowed to run remotely [default=Compile]
   --[no]remote_local_fallback  run locally when remote execution fails [default=on]
   --remote_verbose           log remote decisions and cache hits
+  --disk_cache=DIR           local action cache and CAS (also without --remote_executor)
+  --disk_cache_max_size=SIZE evict least recently used entries above SIZE [default=10G]
 
 build events (Bazel's Build Event Protocol):
   --bes_backend=URL          grpc://host:port or grpcs://host:port of a Build Event Service
@@ -178,7 +187,13 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         tool: None,
         tool_args: Vec::new(),
         targets: Vec::new(),
-        remote: RemoteFlags { jobs: 50, mnemonic_suffixes: vec!["Compile".into()], local_fallback: true, ..Default::default() },
+        remote: RemoteFlags {
+            jobs: 50,
+            mnemonic_suffixes: vec!["Compile".into()],
+            local_fallback: true,
+            disk_cache_max_size: DEFAULT_DISK_CACHE_MAX_SIZE,
+            ..Default::default()
+        },
         bes: BesFlags::default(),
         argv: std::iter::once("ninja-rs".to_string()).chain(args.iter().cloned()).collect(),
     };
@@ -235,6 +250,17 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_local_fallback" => o.remote.local_fallback = true,
                 "noremote_local_fallback" => o.remote.local_fallback = false,
                 "remote_verbose" => o.remote.verbose = true,
+                "disk_cache" => {
+                    // Relative to where ninja-rs was started, not to -C.
+                    let v = value(&mut i)?;
+                    let abs = std::path::absolute(&v).map_err(|e| format!("--disk_cache={v}: {e}"))?;
+                    o.remote.disk_cache = Some(abs.to_string_lossy().into_owned());
+                }
+                "disk_cache_max_size" => {
+                    let v = value(&mut i)?;
+                    o.remote.disk_cache_max_size =
+                        ninja_remote::disk_cache::parse_size(&v).ok_or_else(|| format!("invalid --disk_cache_max_size '{v}'"))?;
+                }
                 "bes_backend" => o.bes.backend = Some(value(&mut i)?),
                 "bes_instance_name" => o.bes.instance_name = value(&mut i)?,
                 "bes_header" => o.bes.headers.push(key_value(name, &value(&mut i)?)?),

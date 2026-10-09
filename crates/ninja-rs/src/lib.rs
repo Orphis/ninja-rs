@@ -46,6 +46,8 @@ pub struct Service {
     interrupt: Arc<Interrupt>,
     /// Remote connection, kept across builds (keyed by endpoint/instance).
     remote_client: Option<(String, ninja_remote::Client)>,
+    /// The disk cache, kept across builds (keyed by its directory).
+    disk_cache: Option<(String, Arc<ninja_remote::disk_cache::DiskCache>)>,
     digests_loaded: bool,
     remote_verbose: bool,
     /// `-d stats` metrics of the current invocation: name, count, total time.
@@ -66,6 +68,7 @@ impl Service {
             store: ninja_remote::Store::new(),
             interrupt,
             remote_client: None,
+            disk_cache: None,
             digests_loaded: false,
             remote_verbose: false,
             metrics: Vec::new(),
@@ -316,6 +319,11 @@ impl Service {
             if remote_n > 0 && opts.verbosity != Verbosity::Quiet {
                 status.info(&format!("{remote_n} remote actions ({hits} remote cache hits)."));
             }
+            let disk_hits = status.printer.disk_cache_hits();
+            if disk_hits > 0 && opts.verbosity != Verbosity::Quiet {
+                status.info(&format!("{disk_hits} disk cache hits."));
+            }
+            self.evict_disk_cache(opts, status);
             return self.finish(code, state, build_log, deps_log);
         }
         status.error(&format!("manifest '{}' still dirty after {CYCLE_LIMIT} tries", opts.input_file));
@@ -343,7 +351,9 @@ impl Service {
         targets: Arc<ninja_remote::targets::Targets>,
         status: &mut dyn Status,
     ) -> Result<Option<Arc<dyn RemoteBackend>>, String> {
-        let Some(endpoint) = &opts.remote.executor else { return Ok(None) };
+        if opts.remote.executor.is_none() && opts.remote.disk_cache.is_none() {
+            return Ok(None);
+        }
         if opts.dry_run {
             return Ok(None);
         }
@@ -362,27 +372,39 @@ impl Service {
                 return Ok(None);
             }
         }
-        let key = format!("{endpoint}|{}|{:?}", opts.remote.instance_name, opts.remote.headers);
-        if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
-            let client = ninja_remote::connect(&ninja_remote::ConnectOptions {
-                endpoint: endpoint.clone(),
-                instance_name: opts.remote.instance_name.clone(),
-                headers: opts.remote.headers.clone(),
-            })
-            .await
-            .map_err(|e| format!("connecting to {endpoint}: {e:#}"))?;
-            self.remote_client = Some((key, client));
+        let disk = self.open_disk_cache(opts, status);
+        let client = match &opts.remote.executor {
+            Some(endpoint) => {
+                let key = format!("{endpoint}|{}|{:?}", opts.remote.instance_name, opts.remote.headers);
+                if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
+                    let client = ninja_remote::connect(&ninja_remote::ConnectOptions {
+                        endpoint: endpoint.clone(),
+                        instance_name: opts.remote.instance_name.clone(),
+                        headers: opts.remote.headers.clone(),
+                    })
+                    .await
+                    .map_err(|e| format!("connecting to {endpoint}: {e:#}"))?;
+                    self.remote_client = Some((key, client));
+                }
+                // Requests carry the invocation's ids, which build events
+                // report too.
+                Some(self.remote_client.as_ref().expect("connected").1.clone().with_request_metadata(
+                    rbe_client::proto::RequestMetadata {
+                        tool_details: Some(rbe_client::proto::ToolDetails {
+                            tool_name: "ninja-rs".into(),
+                            tool_version: env!("CARGO_PKG_VERSION").into(),
+                        }),
+                        tool_invocation_id: self.ids.invocation_id.clone(),
+                        correlated_invocations_id: self.ids.build_request_id.clone(),
+                        ..Default::default()
+                    },
+                ))
+            }
+            None => None,
+        };
+        if client.is_none() && disk.is_none() {
+            return Ok(None);
         }
-        // Requests carry the invocation's ids, which build events report too.
-        let client = self.remote_client.as_ref().expect("connected").1.clone().with_request_metadata(rbe_client::proto::RequestMetadata {
-            tool_details: Some(rbe_client::proto::ToolDetails {
-                tool_name: "ninja-rs".into(),
-                tool_version: env!("CARGO_PKG_VERSION").into(),
-            }),
-            tool_invocation_id: self.ids.invocation_id.clone(),
-            correlated_invocations_id: self.ids.build_request_id.clone(),
-            ..Default::default()
-        });
         let build_dir = std::env::current_dir().map_err(|e| e.to_string())?;
         let file_var = |name: &str| Some(state.lookup_variable(ROOT_SCOPE, name)).filter(|v| !v.is_empty());
         let backend = ninja_remote::Backend::new(
@@ -397,11 +419,53 @@ impl Service {
                 verbose: opts.remote.verbose,
             },
             client,
+            disk,
             self.store.clone(),
         )
         .await
         .map_err(|e| format!("remote execution: {e:#}"))?;
         Ok(Some(Arc::new(backend)))
+    }
+
+    /// The `--disk_cache`, opened once per directory. A cache that can't be
+    /// opened is a warning: the build goes on without it.
+    fn open_disk_cache(&mut self, opts: &Options, status: &mut dyn Status) -> Option<Arc<ninja_remote::disk_cache::DiskCache>> {
+        let dir = opts.remote.disk_cache.as_ref()?;
+        if let Some((d, cache)) = &self.disk_cache
+            && d == dir
+        {
+            return Some(cache.clone());
+        }
+        match ninja_remote::disk_cache::DiskCache::open(std::path::Path::new(dir)) {
+            Ok(cache) => {
+                let cache = Arc::new(cache);
+                self.disk_cache = Some((dir.clone(), cache.clone()));
+                Some(cache)
+            }
+            Err(e) => {
+                status.warning(&format!("disk cache {dir} disabled: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Keeps the disk cache within `--disk_cache_max_size` (down to 90% of
+    /// it, so that eviction doesn't run after every build), once a build
+    /// wrote to it. The cache is only walked when its size estimate passes
+    /// the limit.
+    fn evict_disk_cache(&self, opts: &Options, status: &mut dyn Status) {
+        let Some((_, cache)) = &self.disk_cache else { return };
+        if cache.bytes_written() == 0 {
+            return;
+        }
+        let max = opts.remote.disk_cache_max_size;
+        match cache.collect_garbage(max, max / 10 * 9) {
+            Ok(Some((files, bytes))) if files > 0 && opts.remote.verbose => {
+                status.info(&format!("disk cache: evicted {files} entries ({} MiB).", bytes >> 20));
+            }
+            Ok(_) => {}
+            Err(e) => status.warning(&format!("disk cache eviction: {e}")),
+        }
     }
 
     /// The `rbe_targets` file of an RBE manifest (empty otherwise, or when it

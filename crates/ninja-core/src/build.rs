@@ -1463,6 +1463,7 @@ pub fn exec_kind_name(k: &ExecKind) -> &'static str {
         ExecKind::Local => "local",
         ExecKind::Remote => "remote",
         ExecKind::RemoteCacheHit => "remote-cache-hit",
+        ExecKind::DiskCacheHit => "disk-cache-hit",
         ExecKind::DryRun => "dry-run",
     }
 }

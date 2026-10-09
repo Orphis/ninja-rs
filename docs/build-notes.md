@@ -15,7 +15,7 @@
 `Cargo.toml` / `Cargo.lock` are the source of truth for crates; Bazel
 consumes them through `rules_rs`' `crate.from_cargo` (hub `@crates`). The
 lock file was generated with the local cargo 1.91, so it is MSRV-compatible
-with 1.88+ (`rust-version`), which lets `cargo build/test` work as a
+with 1.89+ (`rust-version`), which lets `cargo build/test` work as a
 development convenience; the Bazel build uses Rust 1.99.
 
 ## Why rules_rs

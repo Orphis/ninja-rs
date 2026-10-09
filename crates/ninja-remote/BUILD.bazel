@@ -11,6 +11,7 @@ rust_library(
         "//crates/ninja-core",
         "//third_party/cargo-rbe/rbe-client",
         "@crates//:anyhow",
+        "@crates//:prost",
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:tokio",

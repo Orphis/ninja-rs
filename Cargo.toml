@@ -6,7 +6,7 @@ resolver = "3"
 edition = "2024"
 version = "0.1.0"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -224,6 +224,48 @@ events) and/or to a file (`--build_event_binary_file`):
 Build events never fail the build. Edges a dyndep file adds during the
 build are not counted in their target's remaining edges.
 
+## Disk cache
+
+`--disk_cache=DIR` (`ninja-remote/src/disk_cache.rs`) is a local action cache
+and CAS with REAPI's keys: the action digest `prepare()` computes, and blob
+digests. Entries are in remote form (paths relative to the action's working
+directory), so they are interchangeable with a remote cache's.
+
+- **Lookup order:** disk, then the remote action cache. A disk hit runs the
+  edge's local-tool steps, restores the outputs through the same code as a
+  download (depfile and `/showIncludes` mapped back to local paths) and
+  reports `ExecKind::DiskCacheHit`.
+- **With a remote:** blobs come from the disk when it has them, else from
+  the remote CAS, and are kept on disk; successful results are stored with
+  their stdout/stderr inline.
+- **Without a remote:** a miss returns `RemoteOutcome::RunLocally` with a
+  `LocalCapture`: the runner runs the command locally (within `-j`), then the
+  capture stores its declared outputs, its depfile and `/showIncludes` lines
+  rewritten to remote form (`PathMapper::rewrite_arg`), and its output. A
+  missing output or a failure stores nothing.
+- Only cacheable actions use it: those the execution policy would send
+  remotely (`rbe_version` manifests, not `rbe_local`, mnemonic suffixes from
+  `--remote_mnemonics`), since the key needs the scanned inputs.
+- **Eviction**, as in Bazel's disk cache: reads and hits update files'
+  modification times, and the least recently used files are removed while
+  the cache exceeds `--disk_cache_max_size` (down to 90% of it). Finding
+  them walks the whole cache, which takes time (about 190 ms for 120k
+  files), so after a build that wrote to the cache only the `size`
+  estimate is updated; the walk runs when the estimate passes the limit,
+  and rewrites it with the real size. `gc/lock` lets one process collect
+  at a time (the others skip and count their writes next time); a file
+  used during the walk is kept, and action results go before blobs of the
+  same age.
+- **Layout:** `VERSION`, `cas/<hh>/<hash>`, `ac/<hh>/<hash>`, `size`,
+  `gc/lock`, `tmp/` (atomic writes); a version mismatch disables the cache
+  with a warning.
+
+All blob reads and writes go through `DiskCache::read_blob` / `put_*`, so
+content-defined chunking can be added there: a large blob stored as the
+list of its chunks (themselves CAS blobs), split on write and reassembled
+on read, with REAPI `SplitBlob`/`SpliceBlob` to transfer only the chunks a
+side lacks, and eviction working on chunks.
+
 ## Later phases (designed for, not built)
 
 - **Minimal download**: the builder's state is already behind

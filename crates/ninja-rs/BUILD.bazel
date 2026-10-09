@@ -57,6 +57,7 @@ rust_test(
         "//crates/fake-reapi",
         "//crates/ninja-core",
         "//third_party/cargo-rbe/rbe-bes",
+        "//third_party/cargo-rbe/rbe-client",
         "@crates//:tokio",
     ],
 )

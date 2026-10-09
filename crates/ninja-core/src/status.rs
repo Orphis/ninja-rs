@@ -254,6 +254,7 @@ pub struct StatusPrinter {
     running_edges: usize,
     remote_edges: usize,
     cache_hits: usize,
+    disk_cache_hits: usize,
     progress_status_format: String,
     start: Instant,
     time_millis: i64,
@@ -276,6 +277,7 @@ impl StatusPrinter {
             running_edges: 0,
             remote_edges: 0,
             cache_hits: 0,
+            disk_cache_hits: 0,
             progress_status_format: fmt,
             start: Instant::now(),
             time_millis: 0,
@@ -284,6 +286,10 @@ impl StatusPrinter {
 
     pub fn remote_counts(&self) -> (usize, usize) {
         (self.remote_edges, self.cache_hits)
+    }
+
+    pub fn disk_cache_hits(&self) -> usize {
+        self.disk_cache_hits
     }
 
     pub fn format_progress_status(&self, fmt: &str, time_millis: i64) -> String {
@@ -325,9 +331,11 @@ impl StatusPrinter {
                     };
                     out.push_str(&format!("{:02}:{:02}", s / 60, s % 60));
                 }
-                // ninja-rs extension: remote actions and remote cache hits.
+                // ninja-rs extension: remote actions, remote and disk
+                // cache hits.
                 Some('R') => out.push_str(&self.remote_edges.to_string()),
                 Some('H') => out.push_str(&self.cache_hits.to_string()),
+                Some('D') => out.push_str(&self.disk_cache_hits.to_string()),
                 Some(other) => {
                     out.push('%');
                     out.push(other);
@@ -380,6 +388,7 @@ impl Status for StatusPrinter {
                 self.remote_edges += 1;
                 self.cache_hits += 1
             }
+            ExecKind::DiskCacheHit => self.disk_cache_hits += 1,
             _ => {}
         }
         if info.use_console {

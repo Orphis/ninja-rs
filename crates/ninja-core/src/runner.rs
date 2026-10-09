@@ -65,6 +65,8 @@ pub enum ExecKind {
     Local,
     Remote,
     RemoteCacheHit,
+    /// Outputs restored from the local disk cache.
+    DiskCacheHit,
     DryRun,
 }
 
@@ -98,6 +100,15 @@ pub enum RemoteOutcome {
     /// can't be turned into an argv, or the service failed and local
     /// fallback is allowed): run it locally. The string says why.
     Fallback(String),
+    /// Run the task locally, then give its result to the capture (e.g. to
+    /// store its outputs in a cache).
+    RunLocally(Box<dyn LocalCapture>),
+}
+
+/// Receives the result of a task a backend had run locally.
+pub trait LocalCapture: Send {
+    /// Called after the command ran, before the engine reads its depfile.
+    fn capture(self: Box<Self>, result: &TaskResult);
 }
 
 pub type RemoteFuture = Pin<Box<dyn Future<Output = RemoteOutcome> + Send>>;

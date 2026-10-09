@@ -61,6 +61,8 @@ remote execution (only for manifests with rbe_version = 1):
   --remote_mnemonics=Compile     (comma-separated mnemonic suffixes)
   --[no]remote_local_fallback    (default on)
   --remote_verbose               (log cache hits and local fallbacks)
+  --disk_cache=DIR               (local action cache + CAS, with or without a remote)
+  --disk_cache_max_size=SIZE     (LRU eviction above SIZE, default 10G)
 
 build events (Bazel's Build Event Protocol, flags named as in Bazel):
   --bes_backend=grpc://host:port | grpcs://host:port
@@ -106,6 +108,10 @@ left alone) and `.ninja_rs_digests` (file digest cache for remote builds).
 
 Build events (BES/BEP) are reported with targets, configurations and
 outputs from the RBE interface (see docs/design.md, "Build events").
+
+A local disk cache (`--disk_cache`) caches the actions remote execution
+would run, with or without a remote service (see docs/design.md, "Disk
+cache").
 
 Not done yet (later phases): minimal-download mode, daemon mode; jobserver.
 

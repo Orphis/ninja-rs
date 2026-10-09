@@ -86,6 +86,13 @@ impl CommandRunner for ExecRunner {
                             }
                             r
                         }
+                        RemoteOutcome::RunLocally(capture) => {
+                            let r = run_local(&task, &local_slots).await;
+                            // Storing outputs reads files: off the async threads.
+                            let result = r.clone();
+                            let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;
+                            r
+                        }
                     }
                 });
                 self.ids.insert(h.id(), edge);
