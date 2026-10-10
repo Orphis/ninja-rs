@@ -103,6 +103,9 @@ pub struct Edge {
     // Build-time state.
     pub outputs_ready: bool,
     pub deps_loaded: bool,
+    /// The discovered deps (depfile or deps log) are in `inputs`. They
+    /// aren't for an edge the scan found dirty before reading them.
+    pub deps_added: bool,
     pub deps_missing: bool,
     pub mark: VisitMark,
     pub command_start_time: TimeStamp,
@@ -313,6 +316,7 @@ impl State {
             dyndep: None,
             outputs_ready: false,
             deps_loaded: false,
+            deps_added: false,
             deps_missing: false,
             mark: VisitMark::None,
             command_start_time: 0,
@@ -431,6 +435,7 @@ impl State {
         for e in &mut self.edges {
             e.outputs_ready = false;
             e.deps_loaded = false;
+            e.deps_added = false;
             e.mark = VisitMark::None;
         }
     }

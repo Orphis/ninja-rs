@@ -69,10 +69,15 @@ deps), 26 depfile parser tests, plus dyndep, lexer, canonicalization and
   affected, the builder scans them again and adds what became dirty to the
   plan. Still as in ninja: a dyndep output named directly (`ninja g.h`)
   whose dyndep file the scan never reaches is taken for a source.
-- Not yet from ninja 1.14: an edge already dirty doesn't load its depfile
-  or deps log entry (ninja `0b115d8`), so stale discovered inputs can't
-  order the build or form cycles. `$^` doesn't require
-  `ninja_required_version = 1.14`, since `--version` is 1.13.1.
+- As in ninja 1.14 (`0b115d8`): an edge the scan already found dirty
+  doesn't load its depfile or deps log entry into the graph, only checks
+  that it exists, so stale discovered inputs can't order the build or form
+  cycles. When a restat leaves such an edge's inputs clean, its deps are
+  loaded then and decide (ninja PR 2842, open). Unlike ninja, the edge's
+  task still lists them, as hints: remote actions send them, local ones
+  download them first, and missing ones are skipped.
+- `$^` doesn't require `ninja_required_version = 1.14`, since `--version`
+  is 1.13.1.
 
 ### Jobserver
 

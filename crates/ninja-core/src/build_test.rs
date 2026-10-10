@@ -41,6 +41,15 @@ impl CommandRunner for FakeRunner<'_> {
                     fs.write_file(&task.outputs[0], &c).unwrap();
                 }
             }
+            // Like cp, and also writes the input to `d.d`.
+            "cp-deps" => {
+                if let Some(c) = fs.read_file(&task.inputs[0]).unwrap() {
+                    fs.write_file(&task.outputs[0], &c).unwrap();
+                    fs.write_file("d.d", &c).unwrap();
+                }
+            }
+            // Writes the task's inputs to its output.
+            "list-inputs" => fs.create(&task.outputs[0], &task.inputs.join(" ")),
             "touch-implicit-dep-out" => {
                 let dep = task.binding("test_dependency").unwrap_or_default().to_string();
                 fs.tick();
@@ -1296,4 +1305,145 @@ fn dyndep_output_to_dyndep_input_in_any_order() {
         t.build(targets).unwrap();
         assert_eq!(t.commands(), vec!["touch stamp1", "touch stamp2"], "targets {targets:?}");
     }
+}
+
+/// ninja 0b115d8: a dirty edge doesn't read its depfile into the graph.
+#[test]
+fn manifest_input_dirty_no_depfile_load() {
+    let mut t = BuildTest::empty();
+    t.parse("rule deprule
+  depfile = dep.d
+  command = unused
+build a b: deprule input
+");
+    t.fs.create("dep.d", "a: input_deps
+");
+    t.fs.create("input", "");
+    t.fs.create("input_deps", "");
+    assert!(!t.add(&["a"]).unwrap());
+    let a = t.state.lookup_node("a").unwrap();
+    let edge = t.state.node(a).in_edge.unwrap();
+    let inputs: Vec<&str> = t.state.edge(edge).inputs.iter().map(|&i| t.state.path(i)).collect();
+    assert_eq!(inputs, vec!["input"]);
+}
+
+/// ninja issue 2666: a stale depfile doesn't make a dependency cycle.
+#[test]
+fn cycle_with_old_depfile() {
+    let mut t = BuildTest::empty();
+    t.parse("rule cp
+  command = cp $in $out
+rule cp-deps
+  command = cp-deps $in $out
+build b: cp-deps a
+  depfile = d.d
+build c: cp b
+build d: cp c
+");
+    // The depfile this run generates, and last run's: d -> c -> b -> d.
+    t.fs.create("a", "b: X");
+    t.fs.create("d.d", "b: d");
+    t.fs.create("X", "");
+    t.build(&["d"]).unwrap();
+    assert_eq!(t.commands(), vec!["cp-deps a b", "cp b c", "cp c d"]);
+    assert_eq!(t.fs.read_file("d.d").unwrap().unwrap(), b"b: X");
+}
+
+/// The deps of an edge the scan found dirty still reach its command, as
+/// hints (remote actions send them).
+#[test]
+fn dirty_edge_gets_discovered_deps_as_hints() {
+    let mut t = BuildTest::empty();
+    t.parse("rule list-inputs
+  command = list $in
+  depfile = $out.d
+build out: list-inputs in
+");
+    t.fs.create("out", "");
+    t.fs.create("out.d", "out: h1.h sub/../h2.h
+");
+    t.fs.tick();
+    t.fs.create("in", "");
+    t.build(&["out"]).unwrap();
+    assert_eq!(t.fs.read_file("out").unwrap().unwrap(), b"in h1.h h2.h");
+}
+
+const RESTAT_STALE_DEPFILE: &str = "rule true
+  command = true $in $out
+  restat = 1
+rule cp
+  command = cp $in $out
+  depfile = $out.d
+build B: true A
+";
+
+/// ninja PR 2842: C is dirty only because of B, whose restat command
+/// leaves it unchanged; C's depfile then decides, and its input X is newer.
+#[test]
+fn restat_pseudo_stale_depfile() {
+    let mut t = BuildTest::empty();
+    t.parse(RESTAT_STALE_DEPFILE);
+    t.parse("build C: cp B
+");
+    t.fs.create("B", "");
+    t.fs.create("C", "");
+    t.fs.create("C.d", "C: X
+");
+    t.fs.tick();
+    t.fs.create("A", "");
+    t.fs.create("X", "");
+    t.build(&["C"]).unwrap();
+    assert_eq!(t.commands(), vec!["true A B", "cp B C"]);
+
+    // B is restatted unchanged again, and C is up to date with X: C is
+    // cleaned.
+    t.clear();
+    t.fs.tick();
+    t.fs.create("A", "");
+    t.fs.tick();
+    t.build(&["C"]).unwrap();
+    assert_eq!(t.commands(), vec!["true A B"]);
+}
+
+/// Like `restat_pseudo_stale_depfile`, with X built by the manifest: its
+/// edge joins the plan before C.
+#[test]
+fn restat_pseudo_stale_depfile_generated() {
+    let mut t = BuildTest::empty();
+    t.parse(RESTAT_STALE_DEPFILE);
+    t.parse("build X: cat in_X
+build C: cp B
+");
+    t.fs.create("B", "");
+    t.fs.create("C", "");
+    t.fs.create("C.d", "C: X
+");
+    t.fs.tick();
+    t.fs.create("A", "");
+    t.fs.tick();
+    t.fs.create("in_X", "");
+    t.build(&["C"]).unwrap();
+    assert_eq!(t.commands(), vec!["true A B", "cat in_X > X", "cp B C"]);
+}
+
+/// A cycle through C that only its depfile closes is found when the
+/// depfile is read after the restat.
+#[test]
+fn restat_pseudo_stale_depfile_cycle() {
+    let mut t = BuildTest::empty();
+    t.parse(RESTAT_STALE_DEPFILE);
+    t.parse("build X: cat in_X
+build C: cp B
+build in_X: cat C
+");
+    t.fs.create("B", "");
+    t.fs.create("C", "");
+    t.fs.create("C.d", "C: X
+");
+    t.fs.tick();
+    t.fs.create("A", "");
+    t.fs.tick();
+    t.fs.create("in_X", "");
+    let err = t.build(&["C"]).unwrap_err();
+    assert!(err.starts_with("dependency cycle: "), "{err}");
 }

@@ -103,16 +103,17 @@ impl Scanner<'_> {
         self.state.edge_mut(edge).mark = VisitMark::InStack;
         stack.push(node);
 
-        let mut dirty = false;
         {
             let e = self.state.edge_mut(edge);
             e.outputs_ready = true;
             e.deps_missing = false;
         }
 
-        if !self.state.edge(edge).deps_loaded {
-            // This is our first encounter with this edge. If there is a
-            // pending dyndep file, visit it now.
+        let first_visit = !self.state.edge(edge).deps_loaded;
+        if first_visit {
+            // This is our first encounter with this edge.
+            self.state.edge_mut(edge).deps_loaded = true;
+            // If there is a pending dyndep file, visit it now.
             if let Some(dd) = self.state.edge(edge).dyndep
                 && self.state.node(dd).dyndep_pending
             {
@@ -135,58 +136,36 @@ impl Scanner<'_> {
             self.stat_if_necessary(o)?;
         }
 
-        if !self.state.edge(edge).deps_loaded {
-            // This is our first encounter with this edge. Load discovered deps.
-            self.state.edge_mut(edge).deps_loaded = true;
-            if !self.load_deps(edge)? {
-                // Failed to load dependency info: rebuild to regenerate it.
-                dirty = true;
-                self.state.edge_mut(edge).deps_missing = true;
-            }
-        }
-
-        // Visit all inputs before checking if any of them is ready: newly
-        // encountered edges may load dyndep files and gain outputs that
-        // correspond to some of our inputs. Such a load may also send inputs
-        // already visited back to unvisited (see `invalidate_consumers`), or
-        // give one a producer not visited yet: visit those again.
-        loop {
-            let inputs = self.state.edge(edge).inputs.clone();
-            for &i in &inputs {
-                self.recompute_node_dirty(i, stack, validation_nodes)?;
-            }
-            let unvisited = |i: &NodeId| self.state.node(*i).in_edge.is_some_and(|e| self.state.edge(e).mark == VisitMark::None);
-            if !inputs.iter().any(unvisited) {
-                break;
-            }
-        }
-        let inputs = self.state.edge(edge).inputs.clone();
-        let mut most_recent_input: Option<NodeId> = None;
-        for (idx, &i) in inputs.iter().enumerate() {
-            // If an input is not ready, neither are our outputs.
-            if let Some(ie) = self.state.node(i).in_edge
-                && !self.state.edge(ie).outputs_ready
-            {
-                self.state.edge_mut(edge).outputs_ready = false;
-            }
-            if !self.state.edge(edge).is_order_only(idx) {
-                // If a regular input is dirty (or missing), we're dirty.
-                // Otherwise consider mtime.
-                if self.state.node(i).dirty {
-                    let (np, ip) = (self.state.path(node).to_string(), self.state.path(i).to_string());
-                    let _ = np;
-                    self.explain(|| format!("{ip} is dirty"));
-                    dirty = true;
-                } else if most_recent_input.is_none_or(|m| self.state.node(i).mtime > self.state.node(m).mtime) {
-                    most_recent_input = Some(i);
-                }
-            }
-        }
+        self.visit_inputs(edge, stack, validation_nodes)?;
+        let (mut dirty, most_recent_input) = self.check_inputs(edge);
 
         // We may also be dirty due to output state: missing outputs, out of
         // date outputs, etc.
         if !dirty {
             dirty = self.recompute_outputs_dirty(edge, most_recent_input)?;
+        }
+
+        if first_visit {
+            // Discovered deps (depfile or deps log) only matter to an edge
+            // that is clean so far. A dirty edge's are stale: in the graph
+            // they could order the build around files it no longer reads, or
+            // form cycles (ninja 1.14). Then only whether they exist counts.
+            if !dirty {
+                self.state.edge_mut(edge).deps_added = true;
+                if self.load_deps(edge)?.is_none() {
+                    // Failed to load dependency info: rebuild to regenerate it.
+                    dirty = true;
+                    self.state.edge_mut(edge).deps_missing = true;
+                } else {
+                    // Visit what they added. Only a newer input can make the
+                    // edge dirty now, so only times are compared again.
+                    self.visit_inputs(edge, stack, validation_nodes)?;
+                    let (inputs_dirty, newest) = self.check_inputs(edge);
+                    dirty = inputs_dirty || (newest != most_recent_input && self.outputs_older_than(edge, newest));
+                }
+            } else if !self.deps_available(edge)? {
+                self.state.edge_mut(edge).deps_missing = true;
+            }
         }
 
         // Finally, visit each output and update their dirty state if necessary.
@@ -210,6 +189,54 @@ impl Scanner<'_> {
         debug_assert_eq!(stack.last(), Some(&node));
         stack.pop();
         Ok(())
+    }
+
+    /// Visits all of `edge`'s inputs before checking if any of them is
+    /// ready: newly encountered edges may load dyndep files and gain outputs
+    /// that correspond to some of our inputs. Such a load may also send
+    /// inputs already visited back to unvisited (see
+    /// `invalidate_consumers`), or give one a producer not visited yet:
+    /// those are visited again.
+    fn visit_inputs(&mut self, edge: EdgeId, stack: &mut Vec<NodeId>, validation_nodes: &mut Vec<NodeId>) -> Result<(), String> {
+        loop {
+            let inputs = self.state.edge(edge).inputs.clone();
+            for &i in &inputs {
+                self.recompute_node_dirty(i, stack, validation_nodes)?;
+            }
+            let unvisited = |i: &NodeId| self.state.node(*i).in_edge.is_some_and(|e| self.state.edge(e).mark == VisitMark::None);
+            if !inputs.iter().any(unvisited) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Whether one of `edge`'s regular inputs is dirty (or missing), and the
+    /// most recent of the others. An input that isn't ready makes the
+    /// edge's outputs not ready.
+    fn check_inputs(&mut self, edge: EdgeId) -> (bool, Option<NodeId>) {
+        let inputs = self.state.edge(edge).inputs.clone();
+        let mut dirty = false;
+        let mut most_recent_input: Option<NodeId> = None;
+        for (idx, &i) in inputs.iter().enumerate() {
+            // If an input is not ready, neither are our outputs.
+            if let Some(ie) = self.state.node(i).in_edge
+                && !self.state.edge(ie).outputs_ready
+            {
+                self.state.edge_mut(edge).outputs_ready = false;
+            }
+            if !self.state.edge(edge).is_order_only(idx) {
+                // If a regular input is dirty (or missing), we're dirty.
+                // Otherwise consider mtime.
+                if self.state.node(i).dirty {
+                    let ip = self.state.path(i).to_string();
+                    self.explain(|| format!("{ip} is dirty"));
+                    dirty = true;
+                } else if most_recent_input.is_none_or(|m| self.state.node(i).mtime > self.state.node(m).mtime) {
+                    most_recent_input = Some(i);
+                }
+            }
+        }
+        (dirty, most_recent_input)
     }
 
     /// A dyndep file loaded during the scan gave producers to its implicit
@@ -263,14 +290,23 @@ impl Scanner<'_> {
         let command = if self.state.is_phony(edge) { String::new() } else { self.state.evaluate_command(edge, true)? };
         let outputs = self.state.edge(edge).outputs.clone();
         for o in outputs {
-            if self.recompute_output_dirty(edge, most_recent_input, &command, o) {
+            if self.recompute_output_dirty(edge, most_recent_input, Some(&command), o) {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    fn recompute_output_dirty(&mut self, edge: EdgeId, most_recent_input: Option<NodeId>, command: &str, output: NodeId) -> bool {
+    /// `recompute_outputs_dirty` for outputs already found clean, with a
+    /// newer `most_recent_input`: compares times only.
+    fn outputs_older_than(&mut self, edge: EdgeId, most_recent_input: Option<NodeId>) -> bool {
+        let outputs = self.state.edge(edge).outputs.clone();
+        outputs.into_iter().any(|o| self.recompute_output_dirty(edge, most_recent_input, None, o))
+    }
+
+    /// Whether `output` is dirty. Without `command`, the checks that don't
+    /// depend on `most_recent_input` are skipped.
+    fn recompute_output_dirty(&mut self, edge: EdgeId, most_recent_input: Option<NodeId>, command: Option<&str>, output: NodeId) -> bool {
         let mri_mtime = most_recent_input.map(|m| self.state.node(m).mtime);
         let out_path = self.state.path(output).to_string();
         if self.state.is_phony(edge) {
@@ -321,7 +357,10 @@ impl Scanner<'_> {
         if self.build_log.is_some() {
             let generator = self.state.edge_binding_bool(edge, "generator");
             if let Some(entry) = &entry {
-                if !generator && hash_command(command) != entry.command_hash {
+                if let Some(command) = command
+                    && !generator
+                    && hash_command(command) != entry.command_hash
+                {
                     // May also be dirty due to the command changing since the
                     // last build. But if this is a generator rule, the command
                     // changing does not make us dirty.
@@ -342,7 +381,7 @@ impl Scanner<'_> {
                     return true;
                 }
             }
-            if entry.is_none() && !generator {
+            if entry.is_none() && !generator && command.is_some() {
                 self.explain(|| format!("command line not found in log for {out_path}"));
                 return true;
             }
@@ -350,9 +389,10 @@ impl Scanner<'_> {
         false
     }
 
-    /// Loads implicit deps from the deps log or depfile. `Ok(false)` if they
-    /// are missing or stale (the edge must be rebuilt).
-    pub fn load_deps(&mut self, edge: EdgeId) -> Result<bool, String> {
+    /// Adds implicit deps from the deps log or depfile to `edge`'s inputs,
+    /// and returns them. `None` if they are missing or stale (the edge must
+    /// be rebuilt).
+    pub fn load_deps(&mut self, edge: EdgeId) -> Result<Option<Vec<NodeId>>, String> {
         let deps_type = self.state.edge_binding(edge, "deps")?;
         if !deps_type.is_empty() {
             return self.load_deps_from_log(edge);
@@ -361,10 +401,56 @@ impl Scanner<'_> {
         if !depfile.is_empty() {
             return self.load_dep_file(edge, &depfile);
         }
+        Ok(Some(Vec::new()))
+    }
+
+    /// ninja's `LoadDepsTry`: whether `load_deps` would find deps for
+    /// `edge`, without adding them to the graph.
+    fn deps_available(&mut self, edge: EdgeId) -> Result<bool, String> {
+        let deps_type = self.state.edge_binding(edge, "deps")?;
+        if !deps_type.is_empty() {
+            let output = self.state.edge(edge).outputs[0];
+            let out_path = self.state.path(output).to_string();
+            let Some(deps_mtime) = self.deps_log.and_then(|l| l.get(&out_path)).map(|d| d.mtime) else {
+                self.explain(|| format!("deps for '{out_path}' are missing"));
+                return Ok(false);
+            };
+            self.stat_if_necessary(output)?;
+            let omtime = self.state.node(output).mtime;
+            if omtime > deps_mtime {
+                self.explain(|| format!("stored deps info out of date for '{out_path}' ({deps_mtime} vs {omtime})"));
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        let depfile = self.state.unescaped_depfile(edge);
+        if !depfile.is_empty() {
+            let mtime = self.disk.stat(&depfile).map_err(|e| format!("loading '{depfile}': {e}"))?;
+            return Ok(mtime > 0);
+        }
         Ok(true)
     }
 
-    fn load_dep_file(&mut self, edge: EdgeId, path: &str) -> Result<bool, String> {
+    /// The paths of the deps earlier builds discovered for `edge`, without
+    /// adding them to the graph or checking that they are up to date. Empty
+    /// when there are none or they can't be read.
+    pub fn discovered_dep_paths(&mut self, edge: EdgeId) -> Vec<String> {
+        let Ok(deps_type) = self.state.edge_binding(edge, "deps") else { return Vec::new() };
+        if !deps_type.is_empty() {
+            let out_path = self.state.path(self.state.edge(edge).outputs[0]);
+            return self.deps_log.and_then(|l| l.get(out_path)).map(|d| d.paths().map(str::to_string).collect()).unwrap_or_default();
+        }
+        let depfile = self.state.unescaped_depfile(edge);
+        if depfile.is_empty() {
+            return Vec::new();
+        }
+        match self.disk.read_file(&depfile) {
+            Ok(Some(content)) => parse_depfile(&content).map(|d| d.ins.iter().map(|i| canonicalize_path(i).0).collect()).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn load_dep_file(&mut self, edge: EdgeId, path: &str) -> Result<Option<Vec<NodeId>>, String> {
         let content = match self.disk.read_file(path) {
             Ok(Some(c)) => c,
             Ok(None) => Vec::new(),
@@ -373,7 +459,7 @@ impl Scanner<'_> {
         let first_output = self.state.edge(edge).outputs[0];
         if content.is_empty() {
             self.explain(|| format!("depfile '{path}' is missing"));
-            return Ok(false);
+            return Ok(None);
         }
         let depfile = parse_depfile(&content).map_err(|e| format!("{path}: {e}"))?;
         if depfile.outs.is_empty() {
@@ -385,7 +471,7 @@ impl Scanner<'_> {
         let opath = self.state.path(first_output).to_string();
         if primary != opath {
             self.explain(|| format!("expected depfile '{path}' to mention '{opath}', got '{primary}'"));
-            return Ok(false);
+            return Ok(None);
         }
         // Ensure that all mentioned outputs are outputs of the edge.
         for o in &depfile.outs {
@@ -400,7 +486,7 @@ impl Scanner<'_> {
             nodes.push(self.state.get_node(&p, bits));
         }
         self.add_implicit_deps(edge, &nodes);
-        Ok(true)
+        Ok(Some(nodes))
     }
 
     fn add_implicit_deps(&mut self, edge: EdgeId, nodes: &[NodeId]) {
@@ -415,18 +501,18 @@ impl Scanner<'_> {
         }
     }
 
-    fn load_deps_from_log(&mut self, edge: EdgeId) -> Result<bool, String> {
+    fn load_deps_from_log(&mut self, edge: EdgeId) -> Result<Option<Vec<NodeId>>, String> {
         // Deps are only supported for single-target edges.
         let output = self.state.edge(edge).outputs[0];
         let out_path = self.state.path(output).to_string();
         // Copy the log reference out, so the deps borrow the log, not `self`.
         let Some(log) = self.deps_log else {
             self.explain(|| format!("deps for '{out_path}' are missing"));
-            return Ok(false);
+            return Ok(None);
         };
         let Some(deps) = log.get(&out_path) else {
             self.explain(|| format!("deps for '{out_path}' are missing"));
-            return Ok(false);
+            return Ok(None);
         };
         // Deps are invalid if the output is newer than the deps.
         self.stat_if_necessary(output)?;
@@ -434,7 +520,7 @@ impl Scanner<'_> {
         if omtime > deps.mtime {
             let dm = deps.mtime;
             self.explain(|| format!("stored deps info out of date for '{out_path}' ({dm} vs {omtime})"));
-            return Ok(false);
+            return Ok(None);
         }
         let mut nodes = Vec::with_capacity(deps.len());
         match self.deps_node_cache.as_deref_mut() {
@@ -456,7 +542,39 @@ impl Scanner<'_> {
             }
         }
         self.add_implicit_deps(edge, &nodes);
-        Ok(true)
+        Ok(Some(nodes))
+    }
+
+    /// After a restat left `edge`'s inputs clean: loads the discovered deps
+    /// the scan skipped because the edge was dirty, visits them, and tells
+    /// whether they make it dirty. `None` if they are missing (the edge
+    /// stays dirty; ninja PR 2842).
+    pub fn load_deps_after_restat(&mut self, edge: EdgeId, validation_nodes: &mut Vec<NodeId>) -> Result<Option<(Vec<NodeId>, bool)>, String> {
+        self.state.edge_mut(edge).deps_added = true;
+        let Some(deps) = self.load_deps(edge)? else {
+            self.state.edge_mut(edge).deps_missing = true;
+            return Ok(None);
+        };
+        let before = self.most_recent_input_except(edge, &deps);
+        // Visit them with the edge on the stack, to catch cycles through it.
+        let mark = std::mem::replace(&mut self.state.edge_mut(edge).mark, VisitMark::InStack);
+        let mut stack = vec![self.state.edge(edge).outputs[0]];
+        let visited = deps.iter().try_for_each(|&i| self.recompute_node_dirty(i, &mut stack, validation_nodes));
+        self.state.edge_mut(edge).mark = mark;
+        visited?;
+        let (dirty, newest) = self.check_inputs(edge);
+        Ok(Some((deps, dirty || (newest != before && self.outputs_older_than(edge, newest)))))
+    }
+
+    /// The most recent of `edge`'s regular inputs, ignoring `skip`.
+    fn most_recent_input_except(&self, edge: EdgeId, skip: &[NodeId]) -> Option<NodeId> {
+        let mut most_recent_input: Option<NodeId> = None;
+        for &i in self.state.edge(edge).non_order_only_inputs() {
+            if !skip.contains(&i) && most_recent_input.is_none_or(|m| self.state.node(i).mtime > self.state.node(m).mtime) {
+                most_recent_input = Some(i);
+            }
+        }
+        most_recent_input
     }
 
     /// Loads a dyndep file and applies it to the edges that use it.
@@ -938,7 +1056,35 @@ impl<'a> Builder<'a> {
             // Now, this edge is dirty if any of the outputs are dirty. If the
             // edge isn't dirty, clean the outputs and mark the edge as not
             // wanted.
-            let outputs_dirty = self.scanner().recompute_outputs_dirty(oe, most_recent_input)?;
+            let mut outputs_dirty = self.scanner().recompute_outputs_dirty(oe, most_recent_input)?;
+            if !outputs_dirty && !self.state.edge(oe).deps_added {
+                // The scan found the edge dirty, so it didn't read its
+                // discovered deps: they decide now.
+                let mut validation_nodes = Vec::new();
+                let Some((deps, deps_dirty)) = self.scanner().load_deps_after_restat(oe, &mut validation_nodes)? else {
+                    // Don't attempt to clean an edge if it failed to load deps.
+                    continue;
+                };
+                for v in validation_nodes {
+                    if self.state.node(v).in_edge.is_some_and(|ve| !self.state.edge(ve).outputs_ready) {
+                        self.plan_add_target(v)?;
+                    }
+                }
+                if deps_dirty {
+                    // Build what the edge's new inputs need first.
+                    let out0 = self.state.edge(oe).outputs[0];
+                    let mut walk = BTreeSet::new();
+                    for d in deps {
+                        self.add_sub_target(d, Some(out0), Some(&mut walk))?;
+                    }
+                    for e in walk {
+                        if self.plan.want.contains_key(&e) {
+                            self.edge_maybe_ready(e)?;
+                        }
+                    }
+                }
+                outputs_dirty = deps_dirty;
+            }
             if !outputs_dirty {
                 let outputs = self.state.edge(oe).outputs.clone();
                 for o in outputs {
@@ -1340,7 +1486,16 @@ impl<'a> Builder<'a> {
             rsp = Some((rspfile, content));
         }
 
-        let e = self.state.edge(edge);
+        let mut inputs: Vec<String> = self.state.edge(edge).non_order_only_inputs().iter().map(|&i| self.state.path(i).to_string()).collect();
+        if !self.state.edge(edge).deps_added && !self.config.dry_run {
+            // Deps an earlier build discovered, as hints: remote actions
+            // send them, local ones download them first.
+            for p in self.scanner().discovered_dep_paths(edge) {
+                if !inputs.contains(&p) {
+                    inputs.push(p);
+                }
+            }
+        }
         let bindings = self.task_bindings(edge)?;
         let deps = self.state.edge_binding(edge, "deps")?;
         let task = Task {
@@ -1354,7 +1509,7 @@ impl<'a> Builder<'a> {
             deps: if deps.is_empty() { None } else { Some(deps) },
             msvc_deps_prefix: self.state.edge_binding(edge, "msvc_deps_prefix")?,
             outputs: outputs.iter().map(|&o| self.state.path(o).to_string()).collect(),
-            inputs: e.non_order_only_inputs().iter().map(|&i| self.state.path(i).to_string()).collect(),
+            inputs,
             restat: self.state.edge_binding_bool(edge, "restat"),
             generator: self.state.edge_binding_bool(edge, "generator"),
             bindings,

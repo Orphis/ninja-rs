@@ -29,7 +29,10 @@ pub struct Task {
     pub msvc_deps_prefix: String,
     /// All outputs (explicit then implicit), canonical paths.
     pub outputs: Vec<String>,
-    /// Explicit and implicit inputs (no order-only), canonical paths.
+    /// Explicit and implicit inputs (no order-only), canonical paths, and
+    /// the deps earlier builds discovered. Those of an edge that was dirty
+    /// before reading them aren't in the graph; they are hints, and may name
+    /// files that are gone.
     pub inputs: Vec<String>,
     pub restat: bool,
     pub generator: bool,
