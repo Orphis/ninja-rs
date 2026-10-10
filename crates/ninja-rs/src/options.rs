@@ -99,6 +99,14 @@ pub struct RemoteFlags {
     pub exec_root: Option<String>,
     pub mnemonic_suffixes: Vec<String>,
     pub local_fallback: bool,
+    /// `--remote_strict`: actions the policy sends remotely run there or
+    /// fail, instead of running locally.
+    pub strict: bool,
+    /// `--remote_max_fallbacks`: local runs after remote failures allowed.
+    pub max_fallbacks: Option<usize>,
+    /// `--remote_max_fallback_ratio`: largest share of remote actions that
+    /// may run locally after remote failures.
+    pub max_fallback_ratio: Option<f64>,
     pub verbose: bool,
     /// `--disk_cache`: the local action cache and CAS (absolute).
     pub disk_cache: Option<String>,
@@ -182,6 +190,12 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --exec_root=DIR            fixed exec root for remote actions (default: per action)
   --remote_mnemonics=A,B     mnemonic suffixes allowed to run remotely [default=Compile]
   --[no]remote_local_fallback  run locally when remote execution fails [default=on]
+  --remote_strict            actions sent remotely run there or fail: no local runs
+                             for actions that can't be sent or remote failures
+  --remote_max_fallbacks=N   after N local runs on remote failures, fail instead
+  --remote_max_fallback_ratio=R  fail instead once more than R (0 to 1) of the
+                             remote actions ran locally on remote failures
+                             (checked from 20 actions on)
   --remote_verbose           log remote decisions and cache hits
   --disk_cache=DIR           local action cache and CAS (also without --remote_executor)
   --remote_download_outputs=all|minimal
@@ -304,6 +318,20 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 }
                 "remote_local_fallback" => o.remote.local_fallback = true,
                 "noremote_local_fallback" => o.remote.local_fallback = false,
+                "remote_strict" => o.remote.strict = true,
+                "remote_max_fallbacks" => {
+                    let v = value(&mut i)?;
+                    let n = parse_int("--remote_max_fallbacks", &v)?;
+                    if n < 0 {
+                        return Err("invalid --remote_max_fallbacks parameter".into());
+                    }
+                    o.remote.max_fallbacks = Some(n as usize);
+                }
+                "remote_max_fallback_ratio" => {
+                    let v = value(&mut i)?;
+                    let r: f64 = v.parse().ok().filter(|r| (0.0..=1.0).contains(r)).ok_or("invalid --remote_max_fallback_ratio parameter (0 to 1)")?;
+                    o.remote.max_fallback_ratio = Some(r);
+                }
                 "remote_verbose" => o.remote.verbose = true,
                 "remote_download_outputs" => {
                     o.remote.download_minimal = match value(&mut i)?.as_str() {
@@ -513,6 +541,17 @@ mod tests {
         assert!(!o.remote.cache_only());
         let v: Vec<String> = ["--remote_executor=grpc://e:1", "--remote_cache=grpc://c:1"].iter().map(|s| s.to_string()).collect();
         assert!(parse_args(&v).is_err());
+    }
+
+    #[test]
+    fn fallback_flags() {
+        let o = p(&["--remote_strict", "--remote_max_fallbacks=5", "--remote_max_fallback_ratio", "0.25"]);
+        assert!(o.remote.strict);
+        assert_eq!(o.remote.max_fallbacks, Some(5));
+        assert_eq!(o.remote.max_fallback_ratio, Some(0.25));
+        for bad in ["--remote_max_fallback_ratio=1.5", "--remote_max_fallback_ratio=x", "--remote_max_fallbacks=-1"] {
+            assert!(parse_args(&[bad.to_string()]).is_err(), "{bad}");
+        }
     }
 
     #[test]

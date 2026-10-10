@@ -33,6 +33,14 @@ pub struct BackendConfig {
     pub jobs: usize,
     pub mnemonic_suffixes: Vec<String>,
     pub local_fallback: bool,
+    /// Actions the policy sends remotely run there or fail: no local run
+    /// for one that can't be sent, nor after a remote failure.
+    pub strict: bool,
+    /// Local runs after remote failures allowed before they fail instead.
+    pub max_fallbacks: Option<usize>,
+    /// Largest share of remote actions that may run locally after remote
+    /// failures, checked from `FALLBACK_RATIO_MIN_ACTIONS` actions on.
+    pub max_fallback_ratio: Option<f64>,
     /// The remote service is a cache without execution: a miss runs the
     /// command locally.
     pub cache_only: bool,
@@ -69,6 +77,48 @@ struct Inner {
     /// Held while downloading remote-only inputs, so that two tasks
     /// reading the same file don't both write it.
     materializing: tokio::sync::Mutex<()>,
+    fallbacks: Fallbacks,
+}
+
+/// Remote actions that ran locally instead, with the first reason of each
+/// kind.
+#[derive(Default)]
+struct Fallbacks {
+    /// Actions the policy sent remotely.
+    started: std::sync::atomic::AtomicUsize,
+    /// Actions that couldn't be sent (`prepare` refused them).
+    unsent: std::sync::Mutex<(usize, Option<String>)>,
+    /// Actions run locally after a remote failure.
+    failed: std::sync::Mutex<(usize, Option<String>)>,
+    /// Why remote failures no longer fall back, once a limit is crossed.
+    stopped: std::sync::Mutex<Option<String>>,
+}
+
+/// `--remote_max_fallback_ratio` applies from this many remote actions on,
+/// so that a failure among the first few doesn't stop a build.
+pub const FALLBACK_RATIO_MIN_ACTIONS: usize = 20;
+
+/// Why the `count`th local run after a remote failure, out of `started`
+/// remote actions, exceeds the limits, if it does.
+fn fallback_limit(count: usize, started: usize, max: Option<usize>, ratio: Option<f64>) -> Option<String> {
+    if let Some(max) = max
+        && count > max
+    {
+        let actions = if max == 1 { "action already ran locally after a remote failure" } else { "actions already ran locally after remote failures" };
+        return Some(format!("{max} {actions} (--remote_max_fallbacks={max})"));
+    }
+    if let Some(r) = ratio
+        && started >= FALLBACK_RATIO_MIN_ACTIONS
+        && count as f64 > r * started as f64
+    {
+        return Some(format!("{count} of {started} remote actions failed remotely (--remote_max_fallback_ratio={r})"));
+    }
+    None
+}
+
+/// The first line of a reason, for summaries.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or_default().trim().to_string()
 }
 
 impl Backend {
@@ -107,12 +157,32 @@ impl Backend {
             remote_outputs: config.remote_outputs.clone(),
             log_inputs: config.execution_log.is_some(),
         };
-        Ok(Self { inner: Arc::new(Inner { client, upload, disk, shared, config, materializing: Default::default() }) })
+        Ok(Self { inner: Arc::new(Inner { client, upload, disk, shared, config, materializing: Default::default(), fallbacks: Fallbacks::default() }) })
     }
 
     /// Whether results of commands run locally go to the remote cache.
     pub fn uploads_local_results(&self) -> bool {
         self.inner.upload
+    }
+
+    /// How many remote actions ran locally instead, and why: a line for
+    /// the end of the build, and whether some did after remote failures.
+    pub fn fallback_summary(&self) -> Option<(String, bool)> {
+        let f = &self.inner.fallbacks;
+        let (unsent, unsent_reason) = f.unsent.lock().unwrap().clone();
+        let (failed, failed_reason) = f.failed.lock().unwrap().clone();
+        if unsent + failed == 0 {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if unsent > 0 {
+            parts.push(format!("{unsent} couldn't be sent (first: {})", unsent_reason.unwrap_or_default()));
+        }
+        if failed > 0 {
+            parts.push(format!("{failed} after remote failures (first: {})", failed_reason.unwrap_or_default()));
+        }
+        let started = f.started.load(std::sync::atomic::Ordering::Relaxed);
+        Some((format!("{} of {started} remote actions ran locally: {}.", unsent + failed, parts.join("; ")), failed > 0))
     }
 }
 
@@ -191,25 +261,59 @@ enum Failure {
 
 impl Inner {
     async fn execute(self: Arc<Self>, task: Task) -> RemoteOutcome {
+        self.fallbacks.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let failed = |output: String| {
+            RemoteOutcome::Done(TaskResult {
+                edge: task.edge,
+                status: ExitStatus::Failure(1),
+                output: output.into_bytes(),
+                kind: ExecKind::Remote,
+                cas_outputs: Vec::new(),
+                lost_inputs: Vec::new(),
+            })
+        };
         match self.clone().try_execute(&task).await {
             Ok(r) => RemoteOutcome::Done(r),
-            Err(Failure::Prepare(reason)) => RemoteOutcome::Fallback(reason),
+            Err(Failure::Prepare(reason)) => {
+                if self.config.strict {
+                    return failed(format!("ninja-rs: the action can't run remotely (--remote_strict): {reason}\n"));
+                }
+                let mut unsent = self.fallbacks.unsent.lock().unwrap();
+                unsent.0 += 1;
+                unsent.1.get_or_insert_with(|| first_line(&reason));
+                drop(unsent);
+                RemoteOutcome::Fallback(reason)
+            }
             Err(Failure::RunLocally(prepared)) => RemoteOutcome::RunLocally(Box::new(Capture { inner: self, prepared, task })),
             Err(Failure::Infra(e)) => {
-                if self.config.local_fallback {
-                    RemoteOutcome::Fallback(format!("remote execution failed: {e:#}"))
-                } else {
-                    RemoteOutcome::Done(TaskResult {
-                        edge: task.edge,
-                        status: ExitStatus::Failure(1),
-                        output: format!("ninja-rs: remote execution failed: {e:#}\n").into_bytes(),
-                        kind: ExecKind::Remote,
-                        cas_outputs: Vec::new(),
-                        lost_inputs: Vec::new(),
-                    })
+                let reason = format!("remote execution failed: {e:#}");
+                if !self.config.local_fallback || self.config.strict {
+                    return failed(format!("ninja-rs: {reason}\n"));
+                }
+                match self.allow_fallback(&reason) {
+                    Ok(()) => RemoteOutcome::Fallback(reason),
+                    Err(why) => failed(format!("ninja-rs: {reason}\nninja-rs: not running it locally: {why}\n")),
                 }
             }
         }
+    }
+
+    /// Counts a local run after a remote failure, unless it crosses a
+    /// limit: from then on, remote failures fail their action.
+    fn allow_fallback(&self, reason: &str) -> Result<(), String> {
+        let mut stopped = self.fallbacks.stopped.lock().unwrap();
+        if let Some(why) = &*stopped {
+            return Err(why.clone());
+        }
+        let mut failed = self.fallbacks.failed.lock().unwrap();
+        let started = self.fallbacks.started.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(why) = fallback_limit(failed.0 + 1, started, self.config.max_fallbacks, self.config.max_fallback_ratio) {
+            *stopped = Some(why.clone());
+            return Err(why);
+        }
+        failed.0 += 1;
+        failed.1.get_or_insert_with(|| first_line(reason));
+        Ok(())
     }
 
     async fn try_execute(self: Arc<Self>, task: &Task) -> Result<TaskResult, Failure> {
@@ -992,6 +1096,20 @@ fn escape_make(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_limits() {
+        // No limits.
+        assert_eq!(fallback_limit(1000, 1000, None, None), None);
+        // At most 2.
+        assert_eq!(fallback_limit(2, 10, Some(2), None), None);
+        assert!(fallback_limit(3, 10, Some(2), None).unwrap().contains("--remote_max_fallbacks=2"));
+        assert!(fallback_limit(1, 10, Some(0), None).is_some());
+        // A ratio: not before enough actions started, then above it.
+        assert_eq!(fallback_limit(5, FALLBACK_RATIO_MIN_ACTIONS - 1, None, Some(0.1)), None);
+        assert_eq!(fallback_limit(2, 20, None, Some(0.1)), None);
+        assert!(fallback_limit(3, 20, None, Some(0.1)).unwrap().contains("3 of 20"));
+    }
 
     fn task(bindings: &[(&str, &str)]) -> Task {
         Task { bindings: bindings.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..Default::default() }

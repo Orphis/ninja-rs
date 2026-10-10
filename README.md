@@ -64,6 +64,9 @@ remote execution (only for manifests with rbe_version = 1):
   --exec_root=DIR                (default: per-action common ancestor)
   --remote_mnemonics=Compile     (comma-separated mnemonic suffixes)
   --[no]remote_local_fallback    (default on)
+  --remote_strict                (actions sent remotely run there or fail)
+  --remote_max_fallbacks=N  --remote_max_fallback_ratio=R
+                                 (cap local runs after remote failures)
   --remote_verbose               (log cache hits and local fallbacks)
   --remote_mnemonics=Compile,Link,Archive  (also links and archives)
   --remote_download_outputs=all|minimal    (minimal: deliverables, named targets,

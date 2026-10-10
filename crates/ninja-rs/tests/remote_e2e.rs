@@ -198,6 +198,8 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     };
     let ar = chain(&[format!("{cm} -E rm -f $out pre.flag"), format!("{cc} --link $in -o $out"), format!("{cm} -E touch ar.stamp")]);
     let ar2 = chain(&[format!("{cc} --link $in -o lib2.a"), format!("{cc} --link lib2.a -o lib2.copy")]);
+    // A local tool between two compiler steps: can't be sent remotely.
+    let sandwich = chain(&[format!("{cc} -I{inc} -c $in -o $out"), format!("{cm} -E touch sandwich.flag"), format!("{cc} -I{inc} -c $in -o $out")]);
     let manifest = format!(
         "{header}\
 rule CC\n  command = {cc} -I{inc} -MD -MF $DEP_FILE $FLAGS -c $in -o $out\n  depfile = $DEP_FILE\n  deps = gcc\n  description = CC $out\n\
@@ -206,6 +208,8 @@ rule AR\n  command = {ar}\n  description = AR $out\n\
 rule TOUCH\n  command = {cm} -E touch $out\n\
 rule COPY\n  command = {cm} -E copy $in $out\n\
 rule AR2\n  command = {ar2}\n\
+rule SANDWICH\n  command = {sandwich}\n\
+build sandwich.o: SANDWICH {lib}\n  rbe_mnemonic = CCompile\n\
 build obj/main.o: CC {main}\n  DEP_FILE = obj/main.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
 build obj/lib.o: CC {lib}\n  DEP_FILE = obj/lib.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
 build obj/local.o: CC {lib}\n  DEP_FILE = obj/local.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n  rbe_local = 1\n\
@@ -443,6 +447,38 @@ int lib() { return DEEP + 1; }
         check(run_ninja(&g, None, &[&flag, "--noremote_upload_local_results"]) == 0, "read-only build failed")?;
         let st = server.stats();
         check(st.executions == 0 && st.action_cache_updates == 2, &format!("a read-only build stored results: {st:?}"))?;
+        Ok(())
+    })
+}
+
+/// An action that can't be sent runs locally, unless --remote_strict.
+/// Remote failures run locally too, until --remote_max_fallbacks is
+/// reached, and not at all with --remote_strict.
+fn test_fallback_guards() -> Result<(), String> {
+    let f = fixture("fallbacks", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let exists = |p: &str| f.build.join(p).exists();
+        let clean = || check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed");
+        check(run_ninja(&f, Some(&ep), &["sandwich.o"]) == 0, "sandwich.o failed")?;
+        check(exists("sandwich.o") && exists("sandwich.flag"), "sandwich.o wasn't built locally")?;
+        clean()?;
+        check(run_ninja(&f, Some(&ep), &["--remote_strict", "sandwich.o"]) != 0, "--remote_strict ran an action that can't be sent")?;
+        check(!exists("sandwich.o"), "sandwich.o built with --remote_strict")?;
+
+        server.state.set_fail_executions(true);
+        let objs = ["obj/main.o", "obj/lib.o"];
+        check(run_ninja(&f, Some(&ep), &["-j1", objs[0], objs[1]]) == 0, "remote failures didn't run locally")?;
+        check(objs.iter().all(|o| exists(o)), "objects missing after local runs")?;
+        clean()?;
+        // The first failure runs locally, the second fails.
+        check(run_ninja(&f, Some(&ep), &["-j1", "-k", "0", "--remote_max_fallbacks=1", objs[0], objs[1]]) != 0, "the limit didn't apply")?;
+        let built = objs.iter().filter(|o| exists(o)).count();
+        check(built == 1, &format!("expected one object built locally, got {built}"))?;
+        clean()?;
+        check(run_ninja(&f, Some(&ep), &["--remote_strict", objs[0]]) != 0, "--remote_strict ran a remote failure locally")?;
+        check(!exists(objs[0]), "obj/main.o built with --remote_strict")?;
+        server.state.set_fail_executions(false);
         Ok(())
     })
 }
@@ -782,6 +818,7 @@ fn main() -> ExitCode {
         ("disk_cache_alone", test_disk_cache_alone),
         ("disk_cache_with_remote", test_disk_cache_with_remote),
         ("remote_cache_only", test_remote_cache_only),
+        ("fallback_guards", test_fallback_guards),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
         ("minimal_downloads", test_minimal_downloads),
         ("action_rewinding", test_action_rewinding),

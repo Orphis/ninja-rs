@@ -72,6 +72,8 @@ pub struct State {
     /// Empties the CAS when the next Execute arrives (an eviction during a
     /// build).
     evict_on_execute: std::sync::atomic::AtomicBool,
+    /// Execute fails with INTERNAL (a broken remote).
+    fail_executions: std::sync::atomic::AtomicBool,
     base: PathBuf,
     counter: AtomicU64,
 }
@@ -95,6 +97,10 @@ impl State {
     /// client's checks of what the CAS holds.
     pub fn evict_on_next_execute(&self) {
         self.evict_on_execute.store(true, Ordering::SeqCst);
+    }
+    /// Makes every Execute fail, as a broken remote service would.
+    pub fn set_fail_executions(&self, on: bool) {
+        self.fail_executions.store(on, Ordering::SeqCst);
     }
     pub fn clear_cas(&self) {
         self.cas.lock().unwrap().clear();
@@ -424,6 +430,9 @@ impl re::execution_server::Execution for Svc {
         }
         if self.0.evict_on_execute.swap(false, Ordering::SeqCst) {
             self.0.clear_cas();
+        }
+        if self.0.fail_executions.load(Ordering::SeqCst) {
+            return Err(Status::internal("injected failure"));
         }
         let r = r.into_inner();
         let d = r.action_digest.unwrap_or_default();

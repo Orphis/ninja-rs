@@ -5,7 +5,7 @@
 # inside each checkout, and CMake's Ninja generator in RBE mode
 # (CMAKE_NINJA_RBE). Two checkouts at different paths share every action:
 #
-#   1. checkout 1 executes remotely;
+#   1. checkout 1 executes remotely, strictly (no action runs locally);
 #   2. checkout 2 builds with --remote_cache alone: every action is a hit;
 #   3. a change in checkout 2 misses, runs locally, and its results are
 #      stored;
@@ -101,7 +101,8 @@ checkout "$A"
 checkout "$B"
 
 COMMON=(--remote_instance_name=main --remote_verbose --remote_mnemonics=Compile,Archive,Link)
-EXEC=(--remote_executor=grpc://127.0.0.1:$PORT "${COMMON[@]}")
+# Strict: every action the policy sends remotely must run there.
+EXEC=(--remote_executor=grpc://127.0.0.1:$PORT --remote_strict "${COMMON[@]}")
 CACHE=(--remote_cache=grpc://127.0.0.1:$PORT "${COMMON[@]}")
 
 build() {  # $1 = checkout, $2 = log name, rest = flags

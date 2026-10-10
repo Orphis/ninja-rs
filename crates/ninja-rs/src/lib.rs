@@ -357,7 +357,7 @@ impl Service {
                     status,
                     remote,
                     targets,
-                    backend,
+                    backend.clone(),
                     remote_outputs.clone(),
                     &requested,
                     &jobserver_settings,
@@ -374,6 +374,17 @@ impl Service {
             let (remote_n, hits) = status.printer.remote_counts();
             if remote_n > 0 && opts.verbosity != Verbosity::Quiet {
                 status.info(&format!("{remote_n} remote actions ({hits} remote cache hits)."));
+            }
+            // Remote actions that ran locally, which is otherwise silent.
+            if let Some(b) = &backend
+                && let Some((summary, after_failures)) = b.fallback_summary()
+                && opts.verbosity != Verbosity::Quiet
+            {
+                if after_failures {
+                    status.warning(&summary);
+                } else {
+                    status.info(&summary);
+                }
             }
             let disk_hits = status.printer.disk_cache_hits();
             if disk_hits > 0 && opts.verbosity != Verbosity::Quiet {
@@ -478,6 +489,9 @@ impl Service {
                 jobs: opts.remote.jobs,
                 mnemonic_suffixes: opts.remote.mnemonic_suffixes.clone(),
                 local_fallback: opts.remote.local_fallback,
+                strict: opts.remote.strict,
+                max_fallbacks: opts.remote.max_fallbacks,
+                max_fallback_ratio: opts.remote.max_fallback_ratio,
                 cache_only: opts.remote.cache_only(),
                 upload_local_results: opts.remote.upload_local_results,
                 verbose: opts.remote.verbose,

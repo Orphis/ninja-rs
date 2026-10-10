@@ -164,6 +164,23 @@ A backend may answer `Fallback(reason)` to have the task run locally (command
 not unwrappable, unknown compiler, or a service failure with
 `--remote_local_fallback`).
 
+Fallbacks are guarded, so that a broken remote setup doesn't quietly turn
+builds local:
+
+- **Summary.** After the build, `N of M remote actions ran locally`, split
+  into those that couldn't be sent and those after remote failures (a
+  warning), each with its first reason.
+- **Limits.** `--remote_max_fallbacks=N` and `--remote_max_fallback_ratio=R`
+  (checked from 20 remote actions on) cap local runs after remote
+  failures; past them, a remote failure fails its action, saying which
+  limit, and the build stops as for any failure. Actions that couldn't be
+  sent aren't counted: they don't depend on the service, and some setups
+  have them by design (multi-step commands on Windows hosts).
+- **Strict.** `--remote_strict`: an action the policy sends remotely runs
+  there or fails with the reason, for checking a remote setup. Cache
+  misses of `--remote_cache` still run locally: that's the mode, not a
+  fallback.
+
 ### Service and caches
 
 `Service` holds the remote connection and an `Arc<Store>` across builds; the
