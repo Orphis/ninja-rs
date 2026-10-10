@@ -208,6 +208,9 @@ pub struct State {
     pub scopes: Vec<Scope>,
     pub paths: HashMap<String, NodeId>,
     pub defaults: Vec<NodeId>,
+    /// Edges the dirty scan visited and had to visit again, because a
+    /// dyndep file loaded later gave a producer to one of their inputs.
+    pub scan_invalidations: u64,
 }
 
 impl Default for State {
@@ -227,6 +230,7 @@ impl State {
             scopes: vec![Scope::default()],
             paths: HashMap::default(),
             defaults: Vec::new(),
+            scan_invalidations: 0,
         };
         s.rules.push(Rule { name: "phony".into(), bindings: HashMap::default(), phony: true });
         s.scopes[0].rules.insert("phony".into(), PHONY_RULE);

@@ -123,7 +123,8 @@ impl Scanner<'_> {
                 };
                 if ready {
                     // The dyndep file is ready, so load it now.
-                    self.load_dyndeps(dd)?;
+                    let ddf = self.load_dyndeps(dd)?;
+                    self.invalidate_consumers(&ddf);
                 }
             }
         }
@@ -146,10 +147,18 @@ impl Scanner<'_> {
 
         // Visit all inputs before checking if any of them is ready: newly
         // encountered edges may load dyndep files and gain outputs that
-        // correspond to some of our inputs.
-        let inputs = self.state.edge(edge).inputs.clone();
-        for &i in &inputs {
-            self.recompute_node_dirty(i, stack, validation_nodes)?;
+        // correspond to some of our inputs. Such a load may also send inputs
+        // already visited back to unvisited (see `invalidate_consumers`), or
+        // give one a producer not visited yet: visit those again.
+        loop {
+            let inputs = self.state.edge(edge).inputs.clone();
+            for &i in &inputs {
+                self.recompute_node_dirty(i, stack, validation_nodes)?;
+            }
+            let unvisited = |i: &NodeId| self.state.node(*i).in_edge.is_some_and(|e| self.state.edge(e).mark == VisitMark::None);
+            if !inputs.iter().any(unvisited) {
+                break;
+            }
         }
         let inputs = self.state.edge(edge).inputs.clone();
         let mut most_recent_input: Option<NodeId> = None;
@@ -201,6 +210,24 @@ impl Scanner<'_> {
         debug_assert_eq!(stack.last(), Some(&node));
         stack.pop();
         Ok(())
+    }
+
+    /// A dyndep file loaded during the scan gave producers to its implicit
+    /// outputs. Edges the scan already visited may read them, taking them
+    /// for sources (ninja issues 2653 and 2743): send those edges, and the
+    /// ones downstream, back to unvisited so their dirty state is computed
+    /// again. Edges still on the stack visit their inputs again instead.
+    fn invalidate_consumers(&mut self, ddf: &DyndepFile) {
+        let mut nodes: Vec<NodeId> = ddf.values().flat_map(|d| d.implicit_outputs.iter().copied()).collect();
+        while let Some(n) = nodes.pop() {
+            for e in self.state.node(n).out_edges.clone() {
+                if self.state.edge(e).mark == VisitMark::Done {
+                    self.state.edge_mut(e).mark = VisitMark::None;
+                    self.state.scan_invalidations += 1;
+                    nodes.extend(self.state.edge(e).outputs.iter().copied());
+                }
+            }
+        }
     }
 
     fn verify_dag(&mut self, node: NodeId, stack: &mut [NodeId]) -> Result<(), String> {
@@ -554,6 +581,8 @@ pub struct Builder<'a> {
     deps_node_cache: Vec<Option<NodeId>>,
     /// How many times each edge was rewound (see `rewind`).
     rewinds: HashMap<EdgeId, u32>,
+    /// Targets and validation nodes given to the dirty scan so far.
+    scanned: Vec<NodeId>,
 }
 
 /// How many times an edge may wait again for lost inputs before it fails.
@@ -583,6 +612,7 @@ impl<'a> Builder<'a> {
             lock_file_path,
             deps_node_cache: Vec::new(),
             rewinds: HashMap::default(),
+            scanned: Vec::new(),
         }
     }
 
@@ -604,8 +634,16 @@ impl<'a> Builder<'a> {
     }
 
     pub fn add_target(&mut self, target: NodeId) -> Result<(), String> {
+        let invalidations = self.state.scan_invalidations;
         let mut validation_nodes = Vec::new();
         self.scanner().recompute_dirty(target, &mut validation_nodes)?;
+        self.scanned.push(target);
+        self.scanned.extend(validation_nodes.iter().copied());
+        if self.state.scan_invalidations != invalidations {
+            // A dyndep file loaded by this scan changed what earlier scans
+            // found clean.
+            return self.rescan_targets();
+        }
         let in_edge = self.state.node(target).in_edge;
         if in_edge.is_none_or(|e| !self.state.edge(e).outputs_ready) {
             self.plan_add_target(target)?;
@@ -618,6 +656,61 @@ impl<'a> Builder<'a> {
             {
                 self.plan_add_target(v)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Scans every target again, after dyndep files sent edges earlier
+    /// scans had visited back to unvisited, and adds what is now dirty to
+    /// the plan.
+    fn rescan_targets(&mut self) -> Result<(), String> {
+        loop {
+            let invalidations = self.state.scan_invalidations;
+            for t in self.scanned.clone() {
+                let mut validation_nodes = Vec::new();
+                self.scanner().recompute_dirty(t, &mut validation_nodes)?;
+                for v in validation_nodes {
+                    if !self.scanned.contains(&v) {
+                        self.scanned.push(v);
+                    }
+                }
+            }
+            if self.state.scan_invalidations == invalidations {
+                break;
+            }
+        }
+        let mut seen = BTreeSet::new();
+        for t in self.scanned.clone() {
+            if self.state.node(t).in_edge.is_some_and(|e| self.state.edge(e).outputs_ready) {
+                continue;
+            }
+            if !self.plan.targets.contains(&t) {
+                self.plan.targets.push(t);
+            }
+            self.replan(t, None, &mut seen)?;
+        }
+        Ok(())
+    }
+
+    /// `add_sub_target` for a graph whose dirty state grew after edges were
+    /// added to the plan: walks every edge that isn't ready, also below
+    /// edges already in the plan.
+    fn replan(&mut self, node: NodeId, dependent: Option<NodeId>, seen: &mut BTreeSet<EdgeId>) -> Result<(), String> {
+        let Some(edge) = self.state.node(node).in_edge else {
+            // A leaf: let `add_sub_target` report missing sources.
+            self.add_sub_target(node, dependent, None)?;
+            return Ok(());
+        };
+        if self.state.edge(edge).outputs_ready || !seen.insert(edge) {
+            return Ok(());
+        }
+        let want = *self.plan.want.entry(edge).or_insert(Want::Nothing);
+        if self.state.node(node).dirty && want == Want::Nothing {
+            self.plan.want.insert(edge, Want::ToStart);
+            self.edge_wanted(edge);
+        }
+        for i in self.state.edge(edge).inputs.clone() {
+            self.replan(i, Some(node), seen)?;
         }
         Ok(())
     }

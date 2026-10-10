@@ -58,6 +58,17 @@ deps), 26 depfile parser tests, plus dyndep, lexer, canonicalization and
 - Not implemented: `-l` (accepted, ignored),
   `-t browse/graph/msvc/wincodepage/multi-inputs/urtle`.
 - Tools write `\n` line endings on Windows too (ninja writes `\r\n`).
+- Dyndep outputs met as sources (ninja issues 2653 and 2743, open). When
+  the dirty scan loads a dyndep file, its implicit outputs gain a producer,
+  but edges already scanned may read them and took them for sources. ninja
+  leaves those edges clean and builds them on the next run; with C++20
+  modules, a consumer scanned before the target exporting the module is
+  compiled against the old BMI. ninja-rs sends those edges and everything
+  downstream back to unvisited: edges still on the scan's stack visit their
+  inputs again, and when earlier targets of the same command line are
+  affected, the builder scans them again and adds what became dirty to the
+  plan. Still as in ninja: a dyndep output named directly (`ninja g.h`)
+  whose dyndep file the scan never reaches is taken for a source.
 - Not yet from ninja 1.14: an edge already dirty doesn't load its depfile
   or deps log entry (ninja `0b115d8`), so stale discovered inputs can't
   order the build or form cycles. `$^` doesn't require

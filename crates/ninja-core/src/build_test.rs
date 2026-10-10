@@ -1237,3 +1237,63 @@ fn rewinding_needs_a_producer_and_stops() {
     assert!(t.build(&["b"]).is_err());
     assert_eq!(t.commands().iter().filter(|c| c.starts_with("lose")).count(), 4);
 }
+
+/// ninja issue 2743: `g.h` is an output a dyndep file adds to `out`'s edge.
+/// `a.o` reads it; `out` is missing. Built in either order, or through a
+/// phony, `a.o` must be rebuilt after `out`, even though the scan meets
+/// `g.h` as a source before loading the dyndep file.
+fn dyndep_output_consumed_earlier(targets: &[&str], phony: bool) -> Vec<String> {
+    let mut t = BuildTest::empty();
+    t.parse("rule touch\n  command = touch $out\nrule cp\n  command = cp $in $out\nbuild dd: cp dd-in\nbuild out: touch || dd\n  dyndep = dd\nbuild a.o: touch a.c g.h || dd\n");
+    if phony {
+        t.parse("build all: phony a.o out\n");
+    }
+    t.fs.create("dd-in", "ninja_dyndep_version = 1\nbuild out | g.h: dyndep\n");
+    t.fs.create("a.c", "");
+    t.fs.tick();
+    t.fs.create("dd", "ninja_dyndep_version = 1\nbuild out | g.h: dyndep\n");
+    t.fs.tick();
+    t.fs.create("g.h", "");
+    t.fs.tick();
+    t.fs.create("a.o", "");
+    t.fs.tick();
+    t.build(targets).unwrap();
+    t.commands()
+}
+
+#[test]
+fn dyndep_output_consumed_by_edge_scanned_earlier() {
+    let want = vec!["touch out".to_string(), "touch a.o".to_string()];
+    assert_eq!(dyndep_output_consumed_earlier(&["out", "a.o"], false), want);
+    assert_eq!(dyndep_output_consumed_earlier(&["a.o", "out"], false), want);
+    assert_eq!(dyndep_output_consumed_earlier(&["all"], true), want);
+}
+
+/// ninja issue 2653: `out1` is a dyndep output of `stamp1` and a dyndep
+/// input of `stamp2`, whose build statement comes first. When `source`
+/// changes, `stamp2` must be rebuilt after `stamp1`.
+#[test]
+fn dyndep_output_to_dyndep_input_in_any_order() {
+    for targets in [&["stamp2", "stamp1"][..], &["stamp1", "stamp2"][..], &["all"][..]] {
+        let mut t = BuildTest::empty();
+        t.parse("rule touch\n  command = touch $out\nrule cp\n  command = cp $in $out\nbuild dd1: cp dd1-in\nbuild dd2: cp dd2-in\nbuild stamp2: touch || dd1 dd2\n  dyndep = dd2\nbuild stamp1: touch || dd1\n  dyndep = dd1\nbuild all: phony stamp2 stamp1\n");
+        let dd1 = "ninja_dyndep_version = 1\nbuild stamp1 | out1: dyndep | source\n";
+        let dd2 = "ninja_dyndep_version = 1\nbuild stamp2 | out2: dyndep | out1\n";
+        t.fs.create("dd1-in", dd1);
+        t.fs.create("dd2-in", dd2);
+        t.fs.create("dd1", dd1);
+        t.fs.create("dd2", dd2);
+        t.fs.create("source", "");
+        t.fs.tick();
+        t.fs.create("out1", "");
+        t.fs.create("stamp1", "");
+        t.fs.tick();
+        t.fs.create("out2", "");
+        t.fs.create("stamp2", "");
+        t.fs.tick();
+        t.fs.create("source", "");
+        t.fs.tick();
+        t.build(targets).unwrap();
+        assert_eq!(t.commands(), vec!["touch stamp1", "touch stamp2"], "targets {targets:?}");
+    }
+}
