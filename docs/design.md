@@ -181,6 +181,44 @@ builds local:
   misses of `--remote_cache` still run locally: that's the mode, not a
   fallback.
 
+Every local run of an action the backend prepared (a cache miss of
+`--remote_cache` or `--disk_cache`, a fallback after a remote failure, a
+raced local run) runs the remote action's command (`LocalCommand`): its
+argv, with paths relative to the working directory (locally, the build
+directory), and its rewritten response files. It writes the bytes remote
+execution would, rather than ones with the checkout's absolute paths (in
+debug info, say): stored results, and the inputs of later actions, don't
+depend on the checkout. Its depfile and `/showIncludes` lines are mapped
+back to local paths as a download's are. Actions that couldn't be
+prepared, and commands with steps on the host, run as the build file has
+them.
+
+### Racing
+
+`--remote_racing` runs an action the policy sends remotely locally too,
+and the first branch to finish wins (`run_raced` in `exec_runner.rs`):
+
+- **Gated on local capacity.** After `--remote_racing_delay` (250 ms by
+  default, so that most remote cache hits don't start a local command),
+  and once the action is prepared, the local branch takes a local slot
+  only if one is free: it never queues ahead of local tasks (the
+  semaphore gives released slots to its waiters; jobserver tokens are
+  tried the same way). When the remote branch gives up (a fallback, a
+  cache miss without remote execution), it queues like any local task.
+- **One writer.** Whichever branch first needs to write the outputs
+  claims them (`Race`). The remote one claims before restoring a cache
+  hit or downloading a result; when the local command is running, the
+  claim stops it and every process it started (a process group on POSIX,
+  a job object on Windows) and waits until they have exited. A local
+  command that finished first claims its result, and the remote branch
+  stops without writing. A command with steps on the host isn't raced:
+  the remote branch claims before running them.
+- **Same bytes.** The local branch runs the remote action's command (see
+  above), so the winner doesn't change the outputs, nor the keys of the
+  actions that read them.
+- After the build: `racing: N actions finished first locally, M remotely`.
+  `--remote_strict` excludes racing.
+
 ### Service and caches
 
 `Service` holds the remote connection and an `Arc<Store>` across builds; the

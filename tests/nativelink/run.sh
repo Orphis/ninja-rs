@@ -9,7 +9,11 @@
 #   2. checkout 2 builds with --remote_cache alone: every action is a hit;
 #   3. a change in checkout 2 misses, runs locally, and its results are
 #      stored;
-#   4. the same change in checkout 1, executing remotely, is all hits.
+#   4. the same change in checkout 1, executing remotely, is all hits;
+#   5. checkout 1 again, racing local runs that start at once: whichever
+#      wins, the outputs stay identical;
+#   6. a change raced in checkout 1, executed remotely in checkout 2: local
+#      runs of the remote command write the same bytes.
 #
 # Each step's outputs (objects included) must be byte-identical between the
 # checkouts. Linux only.
@@ -127,6 +131,16 @@ same_outputs() {
   echo "  $n outputs identical"
 }
 
+# Local runs of prepared actions use the remote command (relative paths), so
+# no output names the checkout it was built in.
+no_checkout_paths() {  # $1 = checkout
+  while read -r out; do
+    [[ -f $1/build/$out ]] || continue
+    if grep -q "$1" "$1/build/$out"; then echo "  $out names $1"; exit 1; fi
+  done < <("$NINJA_RS" -C "$1/build" -t targets all | grep -E ': [A-Z]+_(COMPILER|STATIC_LIBRARY_LINKER|SHARED_LIBRARY_LINKER|EXECUTABLE_LINKER)__' | cut -d: -f1)
+  echo "  no output names the checkout's path"
+}
+
 echo "=== 1. checkout 1 executes remotely"
 build "$A" exec1 "${EXEC[@]}"
 executed=$(count 'ninja-rs: executed remotely' exec1)
@@ -145,11 +159,29 @@ echo 'const char* ninja_rs_rbe_change = "changed";' >> "$B/hello.c"
 build "$B" cache2 "${CACHE[@]}"
 [[ $(count 'ninja-rs: remote cache hit' cache2) -eq 0 ]]
 "$B/build/hello_c" > /dev/null
+no_checkout_paths "$B"
 
 echo "=== 4. the same change in checkout 1, executing remotely: all hits"
 cp "$B/hello.c" "$A/hello.c"
 build "$A" exec2 "${EXEC[@]}"
 [[ $(count 'ninja-rs: executed remotely' exec2) -eq 0 ]]
 [[ $(count 'ninja-rs: remote cache hit' exec2) -gt 0 ]]
+same_outputs
+
+echo "=== 5. racing in checkout 1, local runs starting at once: outputs still identical"
+"$NINJA_RS" -C "$A/build" -t clean > /dev/null
+build "$A" race --remote_executor=grpc://127.0.0.1:$PORT --remote_racing --remote_racing_delay=0 "${COMMON[@]}"
+grep "racing:" "$WORK/race.log" | sed 's/^/  /'
+"$A/build/hello_c" > /dev/null
+same_outputs
+no_checkout_paths "$A"
+
+echo "=== 6. a change raced in checkout 1 (local runs may win), executed remotely in checkout 2: identical"
+echo 'const char* ninja_rs_rbe_race = "raced";' >> "$A/hello.c"
+build "$A" race2 --remote_executor=grpc://127.0.0.1:$PORT --remote_racing --remote_racing_delay=0 "${COMMON[@]}"
+grep "racing:" "$WORK/race2.log" | sed 's/^/  /'
+no_checkout_paths "$A"
+cp "$A/hello.c" "$B/hello.c"
+build "$B" exec3 "${EXEC[@]}"
 same_outputs
 echo "PASS"

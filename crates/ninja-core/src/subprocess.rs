@@ -137,40 +137,104 @@ pub async fn run_local_command(command: &str, use_console: bool) -> (ExitStatus,
     run_local_command_env(command, use_console, &[]).await
 }
 
+/// Builds the command to run `command` locally, with `env` added.
+fn local_command(command: &str, direct: bool, env: &[(String, String)]) -> tokio::process::Command {
+    let mut cmd = build_command(command, direct);
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
+    cmd.kill_on_drop(true);
+    cmd
+}
+
 /// [`run_local_command`] with extra environment variables.
 pub async fn run_local_command_env(command: &str, use_console: bool, env: &[(String, String)]) -> (ExitStatus, Vec<u8>) {
+    if !use_console {
+        return run_piped(Spec::Shell(command), env, None::<std::future::Pending<()>>).await.expect("never cancelled");
+    }
     let direct = cfg!(not(windows)) && simple_argv(command).is_some();
-    let make = |direct: bool| {
-        let mut cmd = build_command(command, direct);
-        cmd.envs(env.iter().map(|(k, v)| (k, v)));
-        cmd.kill_on_drop(true);
-        cmd
-    };
     // A program run directly that can't start (missing, not executable)
     // runs through the shell instead, for the shell's message and status.
-    if use_console {
-        let spawn = |direct: bool| make(direct).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn();
-        let spawned = match spawn(direct) {
-            Err(_) if direct => spawn(false),
-            r => r,
-        };
-        return match spawned {
-            Ok(mut child) => match child.wait().await {
-                Ok(st) => (exit_status(st), Vec::new()),
-                Err(e) => (ExitStatus::Failure(1), format!("waiting for command: {e}\n").into_bytes()),
-            },
-            Err(e) => (ExitStatus::Failure(1), format!("{e}\n").into_bytes()),
-        };
+    let spawn = |direct: bool| local_command(command, direct, env).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn();
+    let spawned = match spawn(direct) {
+        Err(_) if direct => spawn(false),
+        r => r,
+    };
+    match spawned {
+        Ok(mut child) => match child.wait().await {
+            Ok(st) => (exit_status(st), Vec::new()),
+            Err(e) => (ExitStatus::Failure(1), format!("waiting for command: {e}\n").into_bytes()),
+        },
+        Err(e) => (ExitStatus::Failure(1), format!("{e}\n").into_bytes()),
     }
+}
+
+/// Runs one command (not a console one) like [`run_local_command_env`],
+/// until `cancel` resolves: then the command and every process it started
+/// are stopped, and `None` is returned once they have exited. They run in
+/// their own process group on POSIX (Ctrl-C reaches ninja-rs, which stops
+/// them) and in a job object on Windows. Racing uses it: a remote result
+/// replaces the outputs only once nothing local writes them.
+pub async fn run_local_command_cancellable(
+    command: &str,
+    env: &[(String, String)],
+    cancel: impl std::future::Future<Output = ()>,
+) -> Option<(ExitStatus, Vec<u8>)> {
+    run_piped(Spec::Shell(command), env, Some(cancel)).await
+}
+
+/// Runs an argv in `dir`, like [`run_local_command_env`].
+pub async fn run_argv(argv: &[String], dir: &std::path::Path, env: &[(String, String)]) -> (ExitStatus, Vec<u8>) {
+    run_piped(Spec::Argv { argv, dir }, env, None::<std::future::Pending<()>>).await.expect("never cancelled")
+}
+
+/// [`run_local_command_cancellable`] for an argv, run in `dir`.
+pub async fn run_argv_cancellable(
+    argv: &[String],
+    dir: &std::path::Path,
+    env: &[(String, String)],
+    cancel: impl std::future::Future<Output = ()>,
+) -> Option<(ExitStatus, Vec<u8>)> {
+    run_piped(Spec::Argv { argv, dir }, env, Some(cancel)).await
+}
+
+/// What to run: a build file's command, or an argv in a directory.
+#[derive(Clone, Copy)]
+enum Spec<'a> {
+    Shell(&'a str),
+    Argv { argv: &'a [String], dir: &'a std::path::Path },
+}
+
+/// Runs a command with stdout and stderr on one pipe. With `cancel`, the
+/// command's processes are tracked as a tree that `cancel` stops.
+async fn run_piped<F: std::future::Future<Output = ()>>(spec: Spec<'_>, env: &[(String, String)], cancel: Option<F>) -> Option<(ExitStatus, Vec<u8>)> {
+    let tree = cancel.is_some();
+    let direct = match spec {
+        Spec::Shell(command) => cfg!(not(windows)) && simple_argv(command).is_some(),
+        Spec::Argv { .. } => false,
+    };
     let (mut reader, writer) = match std::io::pipe() {
         Ok(p) => p,
-        Err(e) => return (ExitStatus::Failure(1), format!("pipe: {e}\n").into_bytes()),
+        Err(e) => return Some((ExitStatus::Failure(1), format!("pipe: {e}\n").into_bytes())),
     };
     // The command's copies of the write end close when it is dropped, at the
     // end of `spawn`, so the reader sees EOF.
     let spawn = |direct: bool| -> std::io::Result<tokio::process::Child> {
-        make(direct).stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer.try_clone()?).spawn()
+        let mut cmd = match spec {
+            Spec::Shell(command) => local_command(command, direct, env),
+            Spec::Argv { argv, dir } => {
+                // Relative programs are relative to `dir`.
+                let program = dir.join(&argv[0]);
+                let mut c = tokio::process::Command::new(program);
+                c.args(&argv[1..]).current_dir(dir).envs(env.iter().map(|(k, v)| (k, v))).kill_on_drop(true);
+                c
+            }
+        };
+        if tree {
+            ProcessTree::prepare(&mut cmd);
+        }
+        cmd.stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer.try_clone()?).spawn()
     };
+    // A program run directly that can't start (missing, not executable)
+    // runs through the shell instead, for the shell's message and status.
     let spawned = match spawn(direct) {
         Err(_) if direct => spawn(false),
         r => r,
@@ -179,19 +243,202 @@ pub async fn run_local_command_env(command: &str, use_console: bool, env: &[(Str
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
-            return (ExitStatus::Failure(1), format!("CreateProcess failed: {e}\n").into_bytes());
+            return Some((ExitStatus::Failure(1), format!("CreateProcess failed: {e}\n").into_bytes()));
         }
     };
+    let mut processes = tree.then(|| ProcessTree::attach(&child));
     let read = tokio::task::spawn_blocking(move || {
         let mut buf = Vec::new();
         let _ = reader.read_to_end(&mut buf);
         buf
     });
-    let status = child.wait().await;
+    let status = match cancel {
+        None => child.wait().await,
+        Some(cancel) => {
+            tokio::select! {
+                st = child.wait() => st,
+                _ = cancel => {
+                    if let Some(p) = &mut processes {
+                        p.kill(&mut child).await;
+                    }
+                    let _ = read.await;
+                    return None;
+                }
+            }
+        }
+    };
+    if let Some(p) = &mut processes {
+        p.finished();
+    }
     let output = read.await.unwrap_or_default();
-    match status {
+    Some(match status {
         Ok(st) => (exit_status(st), output),
         Err(e) => (ExitStatus::Failure(1), format!("waiting for command: {e}\n").into_bytes()),
+    })
+}
+
+/// Every process a command starts, so that all can be stopped: its own
+/// process group on POSIX, a job object on Windows. Dropped before the
+/// command finished (a build interrupted), it stops them too.
+struct ProcessTree {
+    #[cfg(unix)]
+    group: Option<i32>,
+    #[cfg(windows)]
+    job: Option<job::Job>,
+}
+
+impl ProcessTree {
+    fn prepare(cmd: &mut tokio::process::Command) {
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(not(unix))]
+        let _ = cmd;
+    }
+
+    fn attach(child: &tokio::process::Child) -> Self {
+        #[cfg(unix)]
+        {
+            Self { group: child.id().and_then(|p| i32::try_from(p).ok()) }
+        }
+        #[cfg(windows)]
+        {
+            Self { job: child.raw_handle().and_then(job::Job::with_process) }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = child;
+            Self {}
+        }
+    }
+
+    fn signal(&self) {
+        #[cfg(unix)]
+        if let Some(g) = self.group {
+            // SAFETY: plain system call; the group is the command's own.
+            unsafe { libc::killpg(g, libc::SIGKILL) };
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
+
+    /// Stops every process and waits until they have exited.
+    async fn kill(&mut self, child: &mut tokio::process::Child) {
+        self.signal();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            // Job processes are terminated asynchronously.
+            for _ in 0..500 {
+                if job.active_processes() == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        self.finished();
+    }
+
+    /// The command ended: nothing left to stop (its group id may be reused).
+    fn finished(&mut self) {
+        #[cfg(unix)]
+        {
+            self.group = None;
+        }
+        #[cfg(windows)]
+        {
+            self.job = None;
+        }
+    }
+}
+
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        self.signal();
+    }
+}
+
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+    /// `JobObjectBasicAccountingInformation`.
+    const BASIC_ACCOUNTING: i32 = 1;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicAccounting {
+        total_user_time: i64,
+        total_kernel_time: i64,
+        this_period_total_user_time: i64,
+        this_period_total_kernel_time: i64,
+        total_page_fault_count: u32,
+        total_processes: u32,
+        active_processes: u32,
+        total_terminated_processes: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
+        fn QueryInformationJobObject(job: Handle, class: i32, info: *mut c_void, length: u32, returned: *mut u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    /// A job object holding a command's processes.
+    pub struct Job(Handle);
+
+    // SAFETY: job handles may be used from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        pub fn with_process(process: std::os::windows::io::RawHandle) -> Option<Job> {
+            // SAFETY: a new anonymous job, and a valid process handle.
+            unsafe {
+                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+                if job.is_null() {
+                    return None;
+                }
+                if AssignProcessToJobObject(job, process as Handle) == 0 {
+                    CloseHandle(job);
+                    return None;
+                }
+                Some(Job(job))
+            }
+        }
+
+        pub fn terminate(&self) {
+            // SAFETY: the handle is open.
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+
+        pub fn active_processes(&self) -> u32 {
+            let mut info = BasicAccounting::default();
+            // SAFETY: the handle is open; the buffer has the class's size.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    BASIC_ACCOUNTING,
+                    (&mut info as *mut BasicAccounting).cast(),
+                    std::mem::size_of::<BasicAccounting>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 { 0 } else { info.active_processes }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle is open and owned.
+            unsafe { CloseHandle(self.0) };
+        }
     }
 }
 
@@ -340,6 +587,31 @@ mod tests {
         let (st, out) = run_local_command("ninja-rs-no-such-program x", false).await;
         assert_eq!(st, ExitStatus::Failure(127));
         assert!(String::from_utf8_lossy(&out).contains("not found"), "{}", String::from_utf8_lossy(&out));
+    }
+
+    #[tokio::test]
+    async fn cancelling_stops_every_process() {
+        // A shell starting a child that would write a file later.
+        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-cancel", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("late.txt");
+        let cmd = if cfg!(windows) {
+            format!("cmd /c \"ping -n 3 127.0.0.1 >nul & echo late> {}\"", marker.display())
+        } else {
+            format!("sh -c 'sleep 2; echo late > {}'", marker.display())
+        };
+        let cancel = tokio::time::sleep(std::time::Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        assert!(run_local_command_cancellable(&cmd, &[], cancel).await.is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(!marker.exists(), "a process of the command kept running");
+        // Not cancelled: the command's result.
+        let ok = if cfg!(windows) { "cmd /c echo done" } else { "echo done" };
+        let (st, out) = run_local_command_cancellable(ok, &[], std::future::pending()).await.unwrap();
+        assert_eq!((st, String::from_utf8_lossy(&out).trim().to_string()), (ExitStatus::Success, "done".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

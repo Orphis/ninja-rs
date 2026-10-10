@@ -5,38 +5,98 @@
 //! by `--remote_jobs`. Tasks are started immediately and wait for a slot of
 //! their kind inside their own tokio task, so the engine may have up to
 //! `-j + --remote_jobs` tasks in flight.
+//!
+//! With racing (`--remote_racing`), a task sent remotely also runs locally
+//! when a local slot is free: the first branch to finish wins (see
+//! `run_raced`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use ninja_core::graph::EdgeId;
-use ninja_core::runner::{CommandRunner, ExecKind, ExitStatus, RemoteBackend, RemoteOutcome, Task, TaskResult, WaitFuture};
-use ninja_core::subprocess::{Interrupt, run_local_command_env};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use ninja_core::runner::{CommandRunner, ExecKind, ExitStatus, LocalCapture, LocalCommand, Race, RemoteBackend, RemoteOutcome, Side, Task, TaskResult, WaitFuture};
+use ninja_core::subprocess::{Interrupt, run_argv, run_argv_cancellable, run_local_command_cancellable, run_local_command_env};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
 use crate::jobserver;
 
 /// Where local tasks get their slot.
-enum LocalSlots {
+struct LocalSlots {
+    kind: SlotKind,
+    /// Notified when a slot is given back: raced local runs wait for a free
+    /// one this way, without queueing ahead of local tasks.
+    released: Notify,
+}
+
+enum SlotKind {
     Count(Semaphore),
     Jobserver(Arc<jobserver::Client>),
 }
 
 /// Held while the task runs; dropping it gives the slot back.
+struct LocalSlot<'a> {
+    held: Option<Held<'a>>,
+    released: &'a Notify,
+}
+
 #[allow(dead_code)]
-enum LocalSlot<'a> {
+enum Held<'a> {
     Count(SemaphorePermit<'a>),
     Jobserver(jobserver::Slot),
 }
 
-impl LocalSlots {
-    async fn acquire(&self) -> Option<LocalSlot<'_>> {
-        match self {
-            LocalSlots::Count(s) => s.acquire().await.ok().map(LocalSlot::Count),
-            LocalSlots::Jobserver(c) => Some(LocalSlot::Jobserver(c.acquire().await)),
-        }
+impl Drop for LocalSlot<'_> {
+    fn drop(&mut self) {
+        // Given back first, so that the waiters notified find it.
+        drop(self.held.take());
+        self.released.notify_waiters();
     }
+}
+
+impl LocalSlots {
+    fn new(kind: SlotKind) -> Self {
+        Self { kind, released: Notify::new() }
+    }
+
+    fn slot<'a>(&'a self, held: Held<'a>) -> LocalSlot<'a> {
+        LocalSlot { held: Some(held), released: &self.released }
+    }
+
+    async fn acquire(&self) -> Option<LocalSlot<'_>> {
+        let held = match &self.kind {
+            SlotKind::Count(s) => Held::Count(s.acquire().await.ok()?),
+            SlotKind::Jobserver(c) => Held::Jobserver(c.acquire().await),
+        };
+        Some(self.slot(held))
+    }
+
+    /// A slot only if one is free now: tasks waiting for one keep it (the
+    /// semaphore hands released permits to its waiters first).
+    fn try_acquire(&self) -> Option<LocalSlot<'_>> {
+        let held = match &self.kind {
+            SlotKind::Count(s) => Held::Count(s.try_acquire().ok()?),
+            SlotKind::Jobserver(c) => Held::Jobserver(c.try_acquire()?),
+        };
+        Some(self.slot(held))
+    }
+}
+
+/// `--remote_racing`: a task sent remotely also runs locally, after
+/// `delay`, when a local slot is free.
+#[derive(Clone)]
+pub struct Racing {
+    pub delay: Duration,
+    pub stats: Arc<RaceStats>,
+}
+
+/// Raced tasks, by the branch that finished first.
+#[derive(Default)]
+pub struct RaceStats {
+    pub local: AtomicUsize,
+    pub remote: AtomicUsize,
 }
 
 pub struct ExecRunner {
@@ -52,6 +112,8 @@ pub struct ExecRunner {
     interrupt: Arc<Interrupt>,
     /// Messages about fallbacks, printed by the caller.
     pub verbose_remote: bool,
+    /// Race tasks sent remotely with local runs.
+    pub racing: Option<Racing>,
 }
 
 impl ExecRunner {
@@ -59,7 +121,7 @@ impl ExecRunner {
         let parallelism = parallelism.max(1);
         let remote_jobs = remote.as_ref().map(|r| r.max_jobs().max(1)).unwrap_or(0);
         Self {
-            local_slots: Arc::new(LocalSlots::Count(Semaphore::new(parallelism.min(Semaphore::MAX_PERMITS)))),
+            local_slots: Arc::new(LocalSlots::new(SlotKind::Count(Semaphore::new(parallelism.min(Semaphore::MAX_PERMITS))))),
             env: Arc::default(),
             remote_slots: Arc::new(Semaphore::new(remote_jobs.max(1))),
             capacity: parallelism.saturating_add(remote_jobs),
@@ -69,12 +131,13 @@ impl ExecRunner {
             remote,
             interrupt,
             verbose_remote: false,
+            racing: None,
         }
     }
 
     /// Local tasks take a jobserver token instead of a `-j` slot.
     pub fn use_jobserver(&mut self, client: Arc<jobserver::Client>) {
-        self.local_slots = Arc::new(LocalSlots::Jobserver(client));
+        self.local_slots = Arc::new(LocalSlots::new(SlotKind::Jobserver(client)));
     }
 
     /// Sets environment variables for local commands.
@@ -84,8 +147,9 @@ impl ExecRunner {
 }
 
 /// Runs a task on the host, once its inputs that only exist remotely are
-/// downloaded.
-async fn run_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], remote: Option<&Arc<dyn RemoteBackend>>) -> TaskResult {
+/// downloaded: the remote action's `command` when the backend prepared
+/// one, else the build file's.
+async fn run_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], remote: Option<&Arc<dyn RemoteBackend>>, command: Option<&LocalCommand>) -> TaskResult {
     if let Some(backend) = remote
         && let Err(e) = backend.materialize(task).await
     {
@@ -93,8 +157,199 @@ async fn run_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], re
         return TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: e.lost };
     }
     let _permit = slots.acquire().await;
-    let (status, output) = run_local_command_env(&task.command, task.use_console, env).await;
-    TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() }
+    let (status, output) = match command {
+        Some(cmd) => {
+            write_files(cmd);
+            run_argv(&cmd.argv, &cmd.dir, &with_env(env, cmd)).await
+        }
+        None => run_local_command_env(&task.command, task.use_console, env).await,
+    };
+    let mut r = TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() };
+    map_back(task, command, &mut r);
+    r
+}
+
+/// After a local run of a prepared command: its depfile and `/showIncludes`
+/// lines with local paths.
+fn map_back(task: &Task, command: Option<&LocalCommand>, result: &mut TaskResult) {
+    if result.status.success()
+        && let Some(m) = command.and_then(|c| c.map_back.as_ref())
+    {
+        m.map_back(task, result);
+    }
+}
+
+/// Writes the files a prepared command reads (rewritten response files).
+fn write_files(cmd: &LocalCommand) {
+    for (path, data) in &cmd.files {
+        let _ = std::fs::write(path, data);
+    }
+}
+
+/// The local environment, plus the prepared command's variables.
+fn with_env(env: &[(String, String)], cmd: &LocalCommand) -> Vec<(String, String)> {
+    env.iter().cloned().chain(cmd.env.iter().cloned()).collect()
+}
+
+/// The local branch of a raced task. After `delay`, and once the remote
+/// branch prepared the action (a local run uses its command, so that both
+/// write the same bytes), it starts when a local slot is free, without
+/// queueing for one (local tasks keep priority); when the remote branch
+/// gave up, it queues like any local task, with the task's own command if
+/// the action couldn't be prepared. `None` when the remote branch won, or
+/// the inputs couldn't be fetched while the remote branch still runs.
+async fn race_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], backend: &Arc<dyn RemoteBackend>, race: &Race, delay: Duration) -> Option<TaskResult> {
+    let mut rx = race.subscribe();
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = rx.wait_for(|s| s.local_needed || s.winner.is_some()) => {}
+    }
+    let _ = rx.wait_for(|s| s.command.is_some() || s.local_needed || s.winner.is_some()).await;
+    let _slot = loop {
+        let state = race.state();
+        if state.winner.is_some() {
+            return None;
+        }
+        if state.local_needed {
+            break slots.acquire().await?;
+        }
+        if let Some(slot) = slots.try_acquire() {
+            break slot;
+        }
+        // Jobserver tokens other processes give back aren't signalled.
+        tokio::select! {
+            _ = slots.released.notified() => {}
+            _ = rx.changed() => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    };
+    if let Err(e) = backend.materialize(task).await {
+        if !race.state().local_needed {
+            return None;
+        }
+        let output = format!("ninja-rs: fetching inputs: {}\n", e.message).into_bytes();
+        return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: e.lost });
+    }
+    if !race.start_local() {
+        return None;
+    }
+    let cancel = async {
+        let _ = race.subscribe().wait_for(|s| s.winner == Some(Side::Remote)).await;
+    };
+    let ran = match race.state().command {
+        Some(cmd) => {
+            write_files(&cmd);
+            run_argv_cancellable(&cmd.argv, &cmd.dir, &with_env(env, &cmd), cancel).await
+        }
+        None => run_local_command_cancellable(&task.command, env, cancel).await,
+    };
+    let won = ran.is_some() && race.claim_local();
+    race.local_stopped();
+    let (status, output) = ran?;
+    if !won {
+        return None;
+    }
+    let mut r = TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() };
+    map_back(task, race.state().command.as_deref(), &mut r);
+    Some(r)
+}
+
+/// A task sent remotely, raced by a local run: whichever branch finishes
+/// first wins. Only one writes the outputs: the remote one claims them
+/// before writing, which stops a local command already running; a local
+/// command that finished first claims them, and the remote branch stops.
+#[allow(clippy::too_many_arguments)]
+async fn run_raced(
+    task: Task,
+    backend: Arc<dyn RemoteBackend>,
+    local_slots: Arc<LocalSlots>,
+    remote_slots: Arc<Semaphore>,
+    env: Arc<Vec<(String, String)>>,
+    racing: Racing,
+    verbose: bool,
+) -> TaskResult {
+    let race = Race::new();
+    let remote = async {
+        let _permit = remote_slots.acquire().await;
+        backend.execute_raced(task.clone(), race.clone()).await
+    };
+    let local = race_local(&task, &local_slots, &env, &backend, &race, racing.delay);
+    tokio::pin!(remote, local);
+    let (mut remote_done, mut local_done) = (false, false);
+    // A remote result that wrote nothing, while a local command runs.
+    let mut pending: Option<TaskResult> = None;
+    let mut reason: Option<String> = None;
+    let mut capture: Option<Box<dyn LocalCapture>> = None;
+    loop {
+        tokio::select! {
+            outcome = &mut remote, if !remote_done => {
+                remote_done = true;
+                match outcome {
+                    RemoteOutcome::Done(r) => {
+                        if race.state().winner == Some(Side::Remote) {
+                            racing.stats.remote.fetch_add(1, Ordering::Relaxed);
+                            return r;
+                        }
+                        // It wrote nothing (a failure): a running local
+                        // command decides, else it's the result.
+                        if local_done || !race.state().local_running && race.claim_remote().await {
+                            return r;
+                        }
+                        pending = Some(r);
+                    }
+                    RemoteOutcome::Lost => {}
+                    // The race has the prepared command, if any.
+                    RemoteOutcome::Fallback(why, _) => {
+                        reason = Some(why);
+                        race.need_local();
+                    }
+                    RemoteOutcome::RunLocally(c, _) => {
+                        capture = Some(c);
+                        race.need_local();
+                    }
+                }
+                if local_done {
+                    // The local branch gave up before running.
+                    let command = race.state().command;
+                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref()).await;
+                    return finish_local(r, capture, reason, verbose).await;
+                }
+            }
+            ran = &mut local, if !local_done => {
+                local_done = true;
+                if let Some(r) = ran {
+                    if reason.is_none() && capture.is_none() {
+                        racing.stats.local.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return finish_local(r, capture, reason, verbose).await;
+                }
+                if remote_done {
+                    if let Some(r) = pending.take() {
+                        return r;
+                    }
+                    let command = race.state().command;
+                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref()).await;
+                    return finish_local(r, capture, reason, verbose).await;
+                }
+            }
+        }
+    }
+}
+
+/// The result of a local run of a task the remote branch gave up on: given
+/// to the capture, explained in verbose mode.
+async fn finish_local(mut r: TaskResult, capture: Option<Box<dyn LocalCapture>>, reason: Option<String>, verbose: bool) -> TaskResult {
+    if let Some(capture) = capture {
+        // Storing outputs reads files: off the async threads.
+        let result = r.clone();
+        let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;
+    }
+    if verbose && let Some(reason) = reason {
+        let mut msg = format!("ninja-rs: running locally ({reason})\n").into_bytes();
+        msg.extend_from_slice(&r.output);
+        r.output = msg;
+    }
+    r
 }
 
 impl CommandRunner for ExecRunner {
@@ -112,7 +367,13 @@ impl CommandRunner for ExecRunner {
         let verbose = self.verbose_remote;
         match remote {
             None => {
-                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, &env, inputs_from.as_ref()).await });
+                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, &env, inputs_from.as_ref(), None).await });
+                self.ids.insert(h.id(), edge);
+            }
+            Some(backend) if self.racing.is_some() => {
+                let remote_slots = self.remote_slots.clone();
+                let racing = self.racing.clone().expect("racing");
+                let h = self.tasks.spawn(run_raced(task, backend, local_slots, remote_slots, env, racing, verbose));
                 self.ids.insert(h.id(), edge);
             }
             Some(backend) => {
@@ -124,8 +385,17 @@ impl CommandRunner for ExecRunner {
                     };
                     match outcome {
                         RemoteOutcome::Done(r) => r,
-                        RemoteOutcome::Fallback(reason) => {
-                            let mut r = run_local(&task, &local_slots, &env, Some(&backend)).await;
+                        // Only raced tasks lose.
+                        RemoteOutcome::Lost => TaskResult {
+                            edge: task.edge,
+                            status: ExitStatus::Failure(1),
+                            output: b"ninja-rs: internal error: a task that wasn't raced lost\n".to_vec(),
+                            kind: ExecKind::Remote,
+                            cas_outputs: Vec::new(),
+                            lost_inputs: Vec::new(),
+                        },
+                        RemoteOutcome::Fallback(reason, command) => {
+                            let mut r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref()).await;
                             if verbose {
                                 let mut msg = format!("ninja-rs: running locally ({reason})\n").into_bytes();
                                 msg.extend_from_slice(&r.output);
@@ -133,8 +403,8 @@ impl CommandRunner for ExecRunner {
                             }
                             r
                         }
-                        RemoteOutcome::RunLocally(capture) => {
-                            let r = run_local(&task, &local_slots, &env, Some(&backend)).await;
+                        RemoteOutcome::RunLocally(capture, command) => {
+                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref()).await;
                             // Storing outputs reads files: off the async threads.
                             let result = r.clone();
                             let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;
@@ -188,5 +458,31 @@ impl CommandRunner for ExecRunner {
         self.tasks.abort_all();
         self.ids.clear();
         self.active.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn raced_runs_only_take_free_slots() {
+        let slots = Arc::new(LocalSlots::new(SlotKind::Count(Semaphore::new(1))));
+        let held = slots.try_acquire().expect("a free slot");
+        assert!(slots.try_acquire().is_none());
+        // A local task waits for the slot: it gets it when it's given back,
+        // not a raced run trying at the same time.
+        let s = slots.clone();
+        let waiter = tokio::spawn(async move {
+            let _slot = s.acquire().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let released = slots.released.notified();
+        drop(held);
+        released.await;
+        assert!(slots.try_acquire().is_none(), "a raced run took the slot a local task waits for");
+        waiter.await.unwrap();
+        assert!(slots.try_acquire().is_some());
     }
 }

@@ -74,6 +74,8 @@ pub struct State {
     evict_on_execute: std::sync::atomic::AtomicBool,
     /// Execute fails with INTERNAL (a broken remote).
     fail_executions: std::sync::atomic::AtomicBool,
+    /// Milliseconds Execute waits first (a slow remote).
+    execute_delay_ms: AtomicU64,
     base: PathBuf,
     counter: AtomicU64,
 }
@@ -97,6 +99,10 @@ impl State {
     /// client's checks of what the CAS holds.
     pub fn evict_on_next_execute(&self) {
         self.evict_on_execute.store(true, Ordering::SeqCst);
+    }
+    /// Makes every Execute wait first, as a slow or busy remote would.
+    pub fn set_execute_delay(&self, delay: std::time::Duration) {
+        self.execute_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
     }
     /// Makes every Execute fail, as a broken remote service would.
     pub fn set_fail_executions(&self, on: bool) {
@@ -433,6 +439,10 @@ impl re::execution_server::Execution for Svc {
         }
         if self.0.fail_executions.load(Ordering::SeqCst) {
             return Err(Status::internal("injected failure"));
+        }
+        let delay = self.0.execute_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
         let r = r.into_inner();
         let d = r.action_digest.unwrap_or_default();

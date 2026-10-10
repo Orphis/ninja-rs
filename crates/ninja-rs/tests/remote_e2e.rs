@@ -74,6 +74,11 @@ fn fake_clang(args: &[String]) -> i32 {
         return 0;
     }
     let src = src.expect("-c");
+    // Racing tests: files in the working directory, which only local runs
+    // see (remote ones run elsewhere), make them slow, or mark their outputs.
+    if let Ok(ms) = std::fs::read_to_string("race-local-sleep-ms") {
+        std::thread::sleep(std::time::Duration::from_millis(ms.trim().parse().unwrap_or(0)));
+    }
     let mut deps = vec![src.clone()];
     let mut text = String::new();
     fn expand(file: &Path, dirs: &[PathBuf], deps: &mut Vec<String>, text: &mut String) -> Result<(), String> {
@@ -103,6 +108,9 @@ fn fake_clang(args: &[String]) -> i32 {
     if let Some(d) = depfile {
         let body: Vec<String> = deps.iter().map(|d| d.replace(' ', "\\ ")).collect();
         std::fs::write(&d, format!("{out}: {}\n", body.join(" "))).unwrap();
+    }
+    if Path::new("race-local-mark").exists() {
+        text.push_str("RACE-LOCAL\n");
     }
     std::fs::write(&out, text).unwrap();
     println!("fake-clang: compiled {src}");
@@ -483,6 +491,43 @@ fn test_fallback_guards() -> Result<(), String> {
     })
 }
 
+/// --remote_racing: a slow remote execution loses to a local run when a
+/// local slot is free; a slow local run is stopped when the remote result
+/// arrives first, and the remote outputs are written.
+fn test_racing() -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    let f = fixture("racing", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let objs = ["obj/main.o", "obj/lib.o"];
+        let local_made = |o: &str| std::fs::read_to_string(f.build.join(o)).is_ok_and(|s| s.contains("RACE-LOCAL"));
+        let race = ["--remote_racing", "--remote_racing_delay=0", "-j4", objs[0], objs[1]];
+        write(&f.build.join("race-local-mark"), "");
+
+        // 1. The remote side is slow: the local runs win.
+        server.state.set_execute_delay(Duration::from_secs(4));
+        let start = Instant::now();
+        check(run_ninja(&f, Some(&ep), &race) == 0, "racing build failed")?;
+        check(start.elapsed() < Duration::from_secs(4), &format!("waited for the remote side: {:?}", start.elapsed()))?;
+        check(objs.iter().all(|o| local_made(o)), "outputs not from the local runs")?;
+
+        // 2. The local side is slow: the remote results win, the local
+        //    commands are stopped and don't overwrite them.
+        server.state.set_execute_delay(Duration::ZERO);
+        server.state.clear_action_cache();
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        write(&f.build.join("race-local-sleep-ms"), "4000");
+        let start = Instant::now();
+        check(run_ninja(&f, Some(&ep), &race) == 0, "racing build failed")?;
+        check(start.elapsed() < Duration::from_secs(4), &format!("waited for the local side: {:?}", start.elapsed()))?;
+        std::thread::sleep(Duration::from_secs(5));
+        check(objs.iter().all(|o| f.build.join(o).exists() && !local_made(o)), "outputs not from the remote side")?;
+        let _ = std::fs::remove_file(f.build.join("race-local-sleep-ms"));
+        let _ = std::fs::remove_file(f.build.join("race-local-mark"));
+        Ok(())
+    })
+}
+
 fn test_disk_cache_with_remote() -> Result<(), String> {
     let f = fixture("diskremote", true);
     with_server(&f, |server| {
@@ -819,6 +864,7 @@ fn main() -> ExitCode {
         ("disk_cache_with_remote", test_disk_cache_with_remote),
         ("remote_cache_only", test_remote_cache_only),
         ("fallback_guards", test_fallback_guards),
+        ("racing", test_racing),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
         ("minimal_downloads", test_minimal_downloads),
         ("action_rewinding", test_action_rewinding),

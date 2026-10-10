@@ -107,6 +107,11 @@ pub struct RemoteFlags {
     /// `--remote_max_fallback_ratio`: largest share of remote actions that
     /// may run locally after remote failures.
     pub max_fallback_ratio: Option<f64>,
+    /// `--remote_racing`: actions sent remotely also run locally when a
+    /// local slot is free; the first to finish wins.
+    pub racing: bool,
+    /// `--remote_racing_delay`: how long the local branch waits first.
+    pub racing_delay_ms: u64,
     pub verbose: bool,
     /// `--disk_cache`: the local action cache and CAS (absolute).
     pub disk_cache: Option<String>,
@@ -130,6 +135,10 @@ impl RemoteFlags {
         self.executor.is_none() && self.cache.is_some()
     }
 }
+
+/// `--remote_racing_delay` default: long enough for most remote cache hits,
+/// which then don't start local commands.
+pub const DEFAULT_RACING_DELAY_MS: u64 = 250;
 
 /// `--disk_cache_max_size` default: 10 GiB.
 pub const DEFAULT_DISK_CACHE_MAX_SIZE: u64 = 10 << 30;
@@ -196,6 +205,9 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --remote_max_fallback_ratio=R  fail instead once more than R (0 to 1) of the
                              remote actions ran locally on remote failures
                              (checked from 20 actions on)
+  --remote_racing            also run actions sent remotely locally, when a local
+                             slot is free; the first to finish wins
+  --remote_racing_delay=MS   wait this long before a local run starts [default=250]
   --remote_verbose           log remote decisions and cache hits
   --disk_cache=DIR           local action cache and CAS (also without --remote_executor)
   --remote_download_outputs=all|minimal
@@ -255,6 +267,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
             mnemonic_suffixes: vec!["Compile".into()],
             local_fallback: true,
             upload_local_results: true,
+            racing_delay_ms: DEFAULT_RACING_DELAY_MS,
             disk_cache_max_size: DEFAULT_DISK_CACHE_MAX_SIZE,
             ..Default::default()
         },
@@ -319,6 +332,15 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_local_fallback" => o.remote.local_fallback = true,
                 "noremote_local_fallback" => o.remote.local_fallback = false,
                 "remote_strict" => o.remote.strict = true,
+                "remote_racing" => o.remote.racing = true,
+                "remote_racing_delay" => {
+                    let v = value(&mut i)?;
+                    let n = parse_int("--remote_racing_delay", &v)?;
+                    if n < 0 {
+                        return Err("invalid --remote_racing_delay parameter".into());
+                    }
+                    o.remote.racing_delay_ms = n as u64;
+                }
                 "remote_max_fallbacks" => {
                     let v = value(&mut i)?;
                     let n = parse_int("--remote_max_fallbacks", &v)?;
@@ -469,6 +491,9 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         positional.push(a.clone());
     }
     o.targets = positional;
+    if o.remote.racing && o.remote.strict {
+        return Err("--remote_racing runs actions locally, which --remote_strict forbids".into());
+    }
     if let (Some(e), Some(c)) = (&o.remote.executor, &o.remote.cache)
         && e != c
     {
@@ -552,6 +577,15 @@ mod tests {
         for bad in ["--remote_max_fallback_ratio=1.5", "--remote_max_fallback_ratio=x", "--remote_max_fallbacks=-1"] {
             assert!(parse_args(&[bad.to_string()]).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn racing_flags() {
+        let o = p(&["--remote_racing"]);
+        assert!(o.remote.racing);
+        assert_eq!(o.remote.racing_delay_ms, DEFAULT_RACING_DELAY_MS);
+        assert_eq!(p(&["--remote_racing_delay=0"]).remote.racing_delay_ms, 0);
+        assert!(parse_args(&["--remote_racing".to_string(), "--remote_strict".to_string()]).is_err());
     }
 
     #[test]

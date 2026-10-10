@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::graph::EdgeId;
 
@@ -105,11 +106,154 @@ pub enum RemoteOutcome {
     Done(TaskResult),
     /// The task can't or shouldn't run remotely after all (e.g. its command
     /// can't be turned into an argv, or the service failed and local
-    /// fallback is allowed): run it locally. The string says why.
-    Fallback(String),
-    /// Run the task locally, then give its result to the capture (e.g. to
-    /// store its outputs in a cache).
-    RunLocally(Box<dyn LocalCapture>),
+    /// fallback is allowed): run it locally. The string says why; the
+    /// command, when the action was prepared, is the one to run.
+    Fallback(String, Option<LocalCommand>),
+    /// Run the task locally (with the command, when given), then give its
+    /// result to the capture (e.g. to store its outputs in a cache).
+    RunLocally(Box<dyn LocalCapture>, Option<LocalCommand>),
+    /// Racing: the local branch claimed the outputs first; the remote
+    /// branch stopped without writing anything.
+    Lost,
+}
+
+/// Which branch of a raced task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Local,
+    Remote,
+}
+
+/// The command a local run of a prepared action uses: the remote action's,
+/// so that it writes the bytes remote execution would (paths relative to
+/// the working directory, which locally is the build directory, rather than
+/// the absolute paths a build file may have). Results stored in caches and
+/// the inputs of later actions then don't depend on the checkout.
+#[derive(Clone)]
+pub struct LocalCommand {
+    pub argv: Vec<String>,
+    pub dir: std::path::PathBuf,
+    pub env: Vec<(String, String)>,
+    /// Files to write first: response files as the remote action reads them.
+    pub files: Vec<(std::path::PathBuf, Vec<u8>)>,
+    /// After a successful run: maps what the command wrote with the remote
+    /// action's paths (its depfile, `/showIncludes` lines) to local ones,
+    /// as for a remote result.
+    pub map_back: Option<Arc<dyn MapBack>>,
+}
+
+impl std::fmt::Debug for LocalCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalCommand").field("argv", &self.argv).field("dir", &self.dir).finish_non_exhaustive()
+    }
+}
+
+/// See `LocalCommand::map_back`.
+pub trait MapBack: Send + Sync {
+    fn map_back(&self, task: &Task, result: &mut TaskResult);
+}
+
+/// The state two racing branches share.
+#[derive(Clone, Debug, Default)]
+pub struct RaceState {
+    /// The branch that claimed the task's outputs: only it writes them.
+    pub winner: Option<Side>,
+    /// The local command is running.
+    pub local_running: bool,
+    /// The remote branch gave up (a fallback): the local branch must run.
+    pub local_needed: bool,
+    /// The remote action's command, once prepared. Without it (the action
+    /// couldn't be prepared), a local run uses the task's command.
+    pub command: Option<Arc<LocalCommand>>,
+}
+
+/// A task run locally and remotely at once: whichever branch first needs
+/// to write the task's outputs claims them, and the other stops. A remote
+/// claim stops a local command already running (all its processes) and
+/// waits until it has exited, so outputs are never written by both.
+pub struct Race {
+    state: tokio::sync::watch::Sender<RaceState>,
+}
+
+impl Race {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { state: tokio::sync::watch::Sender::new(RaceState::default()) })
+    }
+
+    pub fn state(&self) -> RaceState {
+        self.state.borrow().clone()
+    }
+
+    /// Remote: the action is prepared; a local run uses its command.
+    pub fn set_command(&self, command: LocalCommand) {
+        self.state.send_modify(|s| s.command = Some(Arc::new(command)));
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<RaceState> {
+        self.state.subscribe()
+    }
+
+    /// Remote: about to write outputs (or run steps on the host). False if
+    /// the local branch won; otherwise, once a running local command has
+    /// stopped.
+    pub async fn claim_remote(&self) -> bool {
+        let mut won = false;
+        self.state.send_if_modified(|s| match s.winner {
+            Some(Side::Local) => false,
+            Some(Side::Remote) => {
+                won = true;
+                false
+            }
+            None => {
+                s.winner = Some(Side::Remote);
+                won = true;
+                true
+            }
+        });
+        if won {
+            let _ = self.state.subscribe().wait_for(|s| !s.local_running).await;
+        }
+        won
+    }
+
+    /// Local: about to start the command. False if the remote branch won.
+    pub fn start_local(&self) -> bool {
+        let mut started = false;
+        self.state.send_if_modified(|s| {
+            started = s.winner.is_none();
+            if started {
+                s.local_running = true;
+            }
+            started
+        });
+        started
+    }
+
+    /// Local: the command finished on its own; claims its result. False if
+    /// the remote branch claimed meanwhile (and waits for `local_stopped`).
+    pub fn claim_local(&self) -> bool {
+        let mut won = false;
+        self.state.send_if_modified(|s| {
+            won = s.winner != Some(Side::Remote);
+            let changed = s.winner.is_none();
+            if changed {
+                s.winner = Some(Side::Local);
+            }
+            changed
+        });
+        won
+    }
+
+    /// Local: the command ended or was stopped.
+    pub fn local_stopped(&self) {
+        self.state.send_modify(|s| s.local_running = false);
+    }
+
+    /// Remote: it gave up, the local branch must run (not only when a local
+    /// slot is free).
+    pub fn need_local(&self) {
+        self.state.send_modify(|s| s.local_needed = true);
+    }
 }
 
 /// Receives the result of a task a backend had run locally.
@@ -157,6 +301,12 @@ pub trait RemoteBackend: Send + Sync {
     fn materialize(&self, _task: &Task) -> MaterializeFuture {
         Box::pin(async { Ok(()) })
     }
+    /// `execute`, racing a local run of the task: the backend claims the
+    /// outputs through `race` before writing anything, and answers
+    /// `RemoteOutcome::Lost` when the local branch claimed them first.
+    fn execute_raced(&self, task: Task, _race: Arc<Race>) -> RemoteFuture {
+        self.execute(task)
+    }
 }
 
 pub trait CommandRunner: Send {
@@ -201,5 +351,36 @@ impl CommandRunner for DryRunRunner {
     }
     fn abort(&mut self) {
         self.finished.clear();
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_claim_waits_for_the_local_command() {
+        let race = Race::new();
+        assert!(race.start_local());
+        let r = race.clone();
+        let claim = tokio::spawn(async move { r.claim_remote().await });
+        // The local branch sees the remote claim, stops its command.
+        let _ = race.subscribe().wait_for(|s| s.winner == Some(Side::Remote)).await;
+        assert!(!claim.is_finished());
+        assert!(!race.claim_local());
+        race.local_stopped();
+        assert!(claim.await.unwrap());
+        // Too late for the local branch.
+        assert!(!race.start_local());
+    }
+
+    #[tokio::test]
+    async fn local_claim_wins() {
+        let race = Race::new();
+        assert!(race.start_local());
+        assert!(race.claim_local());
+        race.local_stopped();
+        assert!(!race.claim_remote().await);
+        assert_eq!(race.state().winner, Some(Side::Local));
     }
 }

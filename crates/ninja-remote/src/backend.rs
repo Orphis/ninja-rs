@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
 use ninja_core::depfile::parse_depfile;
-use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, LocalCapture, MaterializeError, MaterializeFuture, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
+use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, LocalCapture, LocalCommand, MapBack, MaterializeError, MaterializeFuture, Race, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
 use rbe_client::proto as re;
 use rbe_client::{ActionMeta, Client};
 
@@ -206,7 +206,12 @@ impl RemoteBackend for Backend {
 
     fn execute(&self, task: Task) -> RemoteFuture {
         let inner = self.inner.clone();
-        Box::pin(async move { inner.execute(task).await })
+        Box::pin(async move { inner.execute(task, None).await })
+    }
+
+    fn execute_raced(&self, task: Task, race: Arc<Race>) -> RemoteFuture {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.execute(task, Some(race)).await })
     }
 
     fn max_jobs(&self) -> usize {
@@ -257,10 +262,102 @@ enum Failure {
     /// A cache miss without remote execution (the disk cache alone, or a
     /// remote cache): run locally, then store the result.
     RunLocally(Box<Prepared>),
+    /// Racing: the local branch claimed the outputs first.
+    Lost,
+}
+
+/// The command a local run of the action uses (see `LocalCommand`): the
+/// remote action's. None for a command with steps on the host, which runs
+/// as the build file has it.
+fn local_command(p: &Prepared, build_dir: &std::path::Path) -> Option<LocalCommand> {
+    if !p.local_before.is_empty() || !p.local_after.is_empty() {
+        return None;
+    }
+    Some(LocalCommand {
+        argv: p.command.arguments.clone(),
+        dir: PathBuf::from(&p.mapper.build_dir),
+        env: p.command.environment_variables.iter().map(|e| (e.name.clone(), e.value.clone())).collect(),
+        files: p.rsp_files.clone(),
+        map_back: Some(Arc::new(LocalMapBack { mapper: p.mapper.clone(), tree_index: p.tree_index.clone(), build_dir: build_dir.to_path_buf() })),
+    })
+}
+
+/// Maps a local run of the remote command back, as a download does.
+struct LocalMapBack {
+    mapper: crate::paths::PathMapper,
+    tree_index: crate::paths::TreeIndex,
+    build_dir: PathBuf,
+}
+
+impl MapBack for LocalMapBack {
+    fn map_back(&self, task: &Task, result: &mut TaskResult) {
+        if let Some(depfile) = &task.depfile
+            && let Ok(data) = std::fs::read(depfile)
+        {
+            let _ = std::fs::write(depfile, map_depfile(&data, &self.mapper, &self.tree_index));
+        }
+        if task.deps.as_deref() == Some("msvc") {
+            result.output = map_show_includes(&result.output, task, &self.mapper, &self.tree_index, &self.build_dir);
+        }
+    }
+}
+
+/// A depfile in remote form (paths of the remote action) with local paths.
+fn map_depfile(data: &[u8], mapper: &crate::paths::PathMapper, tree_index: &crate::paths::TreeIndex) -> Vec<u8> {
+    let Ok(d) = parse_depfile(data) else { return data.to_vec() };
+    let map = |s: &str| mapper.map_back(s, tree_index);
+    let mut out = String::new();
+    let outs: Vec<String> = d.outs.iter().map(|o| map(o)).collect();
+    out.push_str(&outs.iter().map(|o| escape_make(o)).collect::<Vec<_>>().join(" "));
+    out.push(':');
+    for i in &d.ins {
+        out.push_str(" \\\n  ");
+        out.push_str(&escape_make(&map(i)));
+    }
+    out.push('\n');
+    out.into_bytes()
+}
+
+/// `/showIncludes` lines in remote form with local paths.
+fn map_show_includes(stdout: &[u8], task: &Task, mapper: &crate::paths::PathMapper, tree_index: &crate::paths::TreeIndex, build_dir: &std::path::Path) -> Vec<u8> {
+    let prefix = if task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { task.msvc_deps_prefix.as_str() };
+    let text = String::from_utf8_lossy(stdout);
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[body.len()..];
+        match filter_show_includes(body, prefix) {
+            Some(path) if !path.is_empty() => {
+                let mapped = mapper.map_back(path, tree_index);
+                let mapped = if !crate::paths::is_abs(&mapped, cfg!(windows)) {
+                    // Relative to the build dir: make it absolute so that
+                    // ninja's normalization sees what a local cl.exe prints.
+                    crate::scanner::normalize(&build_dir.join(&mapped)).to_string_lossy().into_owned()
+                } else {
+                    mapped
+                };
+                out.push_str(prefix);
+                out.push(' ');
+                out.push_str(&mapped);
+                out.push_str(ending);
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out.into_bytes()
+}
+
+/// Racing: claims the task's outputs for the remote branch, before it
+/// writes anything on the host.
+async fn claim(race: Option<&Arc<Race>>) -> Result<(), Failure> {
+    match race {
+        Some(r) if !r.claim_remote().await => Err(Failure::Lost),
+        _ => Ok(()),
+    }
 }
 
 impl Inner {
-    async fn execute(self: Arc<Self>, task: Task) -> RemoteOutcome {
+    async fn execute(self: Arc<Self>, task: Task, race: Option<Arc<Race>>) -> RemoteOutcome {
         self.fallbacks.started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let failed = |output: String| {
             RemoteOutcome::Done(TaskResult {
@@ -272,8 +369,10 @@ impl Inner {
                 lost_inputs: Vec::new(),
             })
         };
-        match self.clone().try_execute(&task).await {
+        let mut command = None;
+        match self.clone().try_execute(&task, race.as_ref(), &mut command).await {
             Ok(r) => RemoteOutcome::Done(r),
+            Err(Failure::Lost) => RemoteOutcome::Lost,
             Err(Failure::Prepare(reason)) => {
                 if self.config.strict {
                     return failed(format!("ninja-rs: the action can't run remotely (--remote_strict): {reason}\n"));
@@ -282,16 +381,19 @@ impl Inner {
                 unsent.0 += 1;
                 unsent.1.get_or_insert_with(|| first_line(&reason));
                 drop(unsent);
-                RemoteOutcome::Fallback(reason)
+                RemoteOutcome::Fallback(reason, None)
             }
-            Err(Failure::RunLocally(prepared)) => RemoteOutcome::RunLocally(Box::new(Capture { inner: self, prepared, task })),
+            Err(Failure::RunLocally(prepared)) => {
+                let command = local_command(&prepared, &self.shared.build_dir);
+                RemoteOutcome::RunLocally(Box::new(Capture { inner: self, prepared, task }), command)
+            }
             Err(Failure::Infra(e)) => {
                 let reason = format!("remote execution failed: {e:#}");
                 if !self.config.local_fallback || self.config.strict {
                     return failed(format!("ninja-rs: {reason}\n"));
                 }
                 match self.allow_fallback(&reason) {
-                    Ok(()) => RemoteOutcome::Fallback(reason),
+                    Ok(()) => RemoteOutcome::Fallback(reason, command),
                     Err(why) => failed(format!("ninja-rs: {reason}\nninja-rs: not running it locally: {why}\n")),
                 }
             }
@@ -316,7 +418,9 @@ impl Inner {
         Ok(())
     }
 
-    async fn try_execute(self: Arc<Self>, task: &Task) -> Result<TaskResult, Failure> {
+    /// Runs the task's action. `command` gets the command a local run would
+    /// use, once the action is prepared.
+    async fn try_execute(self: Arc<Self>, task: &Task, race: Option<&Arc<Race>>, command: &mut Option<LocalCommand>) -> Result<TaskResult, Failure> {
         let me = self.clone();
         let t = task.clone();
         let prepared = tokio::task::spawn_blocking(move || prepare(&t, &me.shared))
@@ -324,6 +428,12 @@ impl Inner {
             .map_err(|e| Failure::Prepare(format!("internal error: {e}")))?
             .map_err(Failure::Prepare)?;
         let meta = self.action_meta(task);
+        // A local run uses the remote action's command, for the same outputs.
+        // A command with steps on the host isn't raced (see below).
+        *command = local_command(&prepared, &self.shared.build_dir);
+        if let (Some(race), Some(c)) = (race, command.clone()) {
+            race.set_command(c);
+        }
         let digest = prepared.action_digest.clone();
         if let Some(log) = &self.config.execution_log {
             log_action(log, task, &meta, &prepared);
@@ -338,6 +448,7 @@ impl Inner {
             None => None,
         };
         if let Some(result) = disk_hit {
+            claim(race).await?;
             let mut output = Vec::new();
             if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
                 return Ok(failed);
@@ -375,7 +486,11 @@ impl Inner {
             return Err(Failure::RunLocally(Box::new(prepared)));
         }
 
-        // Local steps (e.g. deleting an archive before re-creating it).
+        // Local steps (e.g. deleting an archive before re-creating it). They
+        // write on the host: a command with some isn't raced.
+        if !prepared.local_before.is_empty() || !prepared.local_after.is_empty() {
+            claim(race).await?;
+        }
         let mut output = Vec::new();
         if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
             return Ok(failed);
@@ -440,6 +555,7 @@ impl Inner {
             }
         };
         let keep = self.disk.is_some() && result.exit_code == 0;
+        claim(race).await?;
         output.extend(self.download(Some(&client), task, &prepared, &result, keep).await.map_err(Failure::Infra)?);
         let kind = if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote };
         if result.exit_code == 0
@@ -759,47 +875,10 @@ impl Inner {
 
     /// Rewrites a depfile written by the remote compiler to local paths.
     fn map_depfile(&self, data: &[u8], p: &Prepared) -> Vec<u8> {
-        let Ok(d) = parse_depfile(data) else { return data.to_vec() };
-        let map = |s: &str| p.mapper.map_back(s, &p.tree_index);
-        let mut out = String::new();
-        let outs: Vec<String> = d.outs.iter().map(|o| map(o)).collect();
-        out.push_str(&outs.iter().map(|o| escape_make(o)).collect::<Vec<_>>().join(" "));
-        out.push(':');
-        for i in &d.ins {
-            out.push_str(" \\\n  ");
-            out.push_str(&escape_make(&map(i)));
-        }
-        out.push('\n');
-        out.into_bytes()
+        map_depfile(data, &p.mapper, &p.tree_index)
     }
-
     fn map_show_includes(&self, stdout: &[u8], task: &Task, p: &Prepared) -> Vec<u8> {
-        let prefix = if task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { task.msvc_deps_prefix.as_str() };
-        let text = String::from_utf8_lossy(stdout);
-        let mut out = String::new();
-        for line in text.split_inclusive('\n') {
-            let body = line.trim_end_matches(['\r', '\n']);
-            let ending = &line[body.len()..];
-            match filter_show_includes(body, prefix) {
-                Some(path) if !path.is_empty() => {
-                    let mapped = p.mapper.map_back(path, &p.tree_index);
-                    let mapped = if !crate::paths::is_abs(&mapped, cfg!(windows)) {
-                        // Relative to the build dir: make it absolute so that
-                        // ninja's normalization sees what a local cl.exe prints.
-                        let abs = self.shared.build_dir.join(&mapped);
-                        crate::scanner::normalize(&abs).to_string_lossy().into_owned()
-                    } else {
-                        mapped
-                    };
-                    out.push_str(prefix);
-                    out.push(' ');
-                    out.push_str(&mapped);
-                    out.push_str(ending);
-                }
-                _ => out.push_str(line),
-            }
-        }
-        out.into_bytes()
+        map_show_includes(stdout, task, &p.mapper, &p.tree_index, &self.shared.build_dir)
     }
 }
 

@@ -52,6 +52,8 @@ pub struct Service {
     disk_cache: Option<(String, Arc<ninja_remote::disk_cache::DiskCache>)>,
     digests_loaded: bool,
     remote_verbose: bool,
+    /// `--remote_racing` for the current invocation, with its counts.
+    racing: Option<exec_runner::Racing>,
     /// `-d stats` metrics of the current invocation: name, count, total time.
     metrics: Vec<(&'static str, u64, Duration)>,
     stat_counters: Option<Arc<StatCounters>>,
@@ -73,6 +75,7 @@ impl Service {
             disk_cache: None,
             digests_loaded: false,
             remote_verbose: false,
+            racing: None,
             metrics: Vec::new(),
             stat_counters: None,
             stat_cache: true,
@@ -130,6 +133,10 @@ impl Service {
 
     async fn run_invocation(&mut self, opts: &Options) -> i32 {
         self.remote_verbose = opts.remote.verbose;
+        self.racing = opts.remote.racing.then(|| exec_runner::Racing {
+            delay: Duration::from_millis(opts.remote.racing_delay_ms),
+            stats: Arc::default(),
+        });
         self.ids = InvocationIds::new(&opts.bes);
         // Build events cover builds, not tools.
         let bes = if opts.bes.enabled() && opts.tool.is_none() {
@@ -375,6 +382,14 @@ impl Service {
             if remote_n > 0 && opts.verbosity != Verbosity::Quiet {
                 status.info(&format!("{remote_n} remote actions ({hits} remote cache hits)."));
             }
+            if let Some(racing) = &self.racing
+                && opts.verbosity != Verbosity::Quiet
+            {
+                let (local, remote) = (racing.stats.local.load(std::sync::atomic::Ordering::Relaxed), racing.stats.remote.load(std::sync::atomic::Ordering::Relaxed));
+                if local + remote > 0 {
+                    status.info(&format!("racing: {local} actions finished first locally, {remote} remotely."));
+                }
+            }
             // Remote actions that ran locally, which is otherwise silent.
             if let Some(b) = &backend
                 && let Some((summary, after_failures)) = b.fallback_summary()
@@ -583,8 +598,10 @@ impl Service {
             Some(_) => jobserver.and_then(|j| j.jobs).unwrap_or(config.parallelism),
             None => config.parallelism,
         };
+        let racing = self.racing.clone().filter(|_| remote.is_some());
         let mut r = ExecRunner::new(parallelism, remote, self.interrupt.clone());
         r.verbose_remote = verbose_remote;
+        r.racing = racing;
         if let Some(c) = client {
             r.use_jobserver(c);
         }

@@ -158,7 +158,7 @@ pub fn relative(from: &str, to: &str, windows: bool) -> String {
 }
 
 /// Per-action mapping state.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PathMapper {
     pub windows: bool,
     pub exec_root: ExecRoot,
@@ -448,7 +448,7 @@ pub fn find_abs_paths(arg: &str, windows: bool) -> Vec<(usize, usize)> {
 
 /// Index of the files in an input tree, for mapping remote absolute paths
 /// back by suffix.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct TreeIndex {
     files: HashSet<String>,
 }

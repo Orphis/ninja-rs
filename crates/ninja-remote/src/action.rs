@@ -50,6 +50,9 @@ pub struct Prepared {
     /// Inputs that only exist remotely: (local path, task input, digest).
     pub remote_inputs: Vec<(PathBuf, String, re::Digest)>,
     pub command: re::Command,
+    /// Response files as the remote action reads them (paths rewritten):
+    /// (local path, contents).
+    pub rsp_files: Vec<(PathBuf, Vec<u8>)>,
     pub input_root_digest: re::Digest,
     /// Every input with its digest, when `Shared::log_inputs` (for the
     /// execution log).
@@ -302,10 +305,13 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         if windows && a.contains('\\') && input_keys.contains(&a.replace('\\', "/").to_ascii_lowercase()) { a.replace('\\', "/") } else { a }
     };
     // Rewrite response files now that the tree's top-level entries are known.
+    let mut rsp_files = Vec::new();
     for (path, content) in rsp_rewritten {
         let rel = mapper.tree_path(&to_s(&path)).ok_or_else(|| format!("{} is outside the exec root", path.display()))?;
         let args: Vec<String> = split_rsp(&content, windows).iter().map(|a| slashed(mapper.rewrite_arg(a))).collect();
-        tree.add_bytes(&rel, join_rsp(&args, windows).into_bytes(), false).map_err(|e| format!("{e:#}"))?;
+        let bytes = join_rsp(&args, windows).into_bytes();
+        tree.add_bytes(&rel, bytes.clone(), false).map_err(|e| format!("{e:#}"))?;
+        rsp_files.push((path, bytes));
         tree_files.push(rel);
     }
     let work_dir = mapper.work_dir.clone();
@@ -411,6 +417,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         side_outputs,
         remote_inputs: remote_inputs.into_iter().map(|(p, e, i)| (p, i, e.digest)).collect(),
         command,
+        rsp_files,
         input_root_digest,
         input_digests,
     })
