@@ -1,7 +1,8 @@
 //! Local command execution (ninja's `Subprocess`/`SubprocessSet`).
 //!
 //! As in ninja, commands run through `/bin/sh -c` on POSIX and are passed
-//! to `CreateProcess` verbatim on Windows. stdout and stderr share one pipe
+//! to `CreateProcess` verbatim on Windows. On POSIX, a command without
+//! shell syntax runs directly instead (see `simple_argv`). stdout and stderr share one pipe
 //! so their interleaving is preserved; `console` pool commands inherit the
 //! terminal instead.
 
@@ -72,9 +73,39 @@ pub fn split_windows_program(command: &str) -> (String, &str) {
     }
 }
 
-fn build_command(command: &str) -> tokio::process::Command {
+/// Shell builtins and keywords: a command starting with one needs the
+/// shell, even when a program of that name exists (`pwd`, `time`).
+const SHELL_WORDS: &[&str] = &[
+    ".", ":", "alias", "bg", "bind", "break", "builtin", "caller", "case", "cd", "command", "compgen", "complete", "continue",
+    "declare", "dirs", "disown", "do", "done", "elif", "else", "enable", "esac", "eval", "exec", "exit", "export", "fc", "fg",
+    "fi", "for", "function", "getopts", "hash", "help", "history", "if", "in", "jobs", "let", "local", "logout", "mapfile",
+    "popd", "pushd", "pwd", "read", "readarray", "readonly", "return", "select", "set", "shift", "shopt", "source", "suspend",
+    "then", "time", "times", "trap", "type", "typeset", "ulimit", "umask", "unalias", "unset", "until", "wait", "while",
+];
+
+/// The words of `command`, when `/bin/sh -c` would just run a program with
+/// those arguments: no quoting, expansion, redirection, globbing or other
+/// shell syntax, no variable assignment, and not a shell builtin or
+/// keyword. Such commands run directly on POSIX, saving a shell per
+/// command (ninja issue 2665).
+pub fn simple_argv(command: &str) -> Option<Vec<&str>> {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_-+=/.,:@%".contains(c) || c == ' ' || c == '\t';
+    if !command.chars().all(plain) {
+        return None;
+    }
+    let words: Vec<&str> = command.split([' ', '\t']).filter(|w| !w.is_empty()).collect();
+    let first = *words.first()?;
+    // `NAME=value cmd` assigns a variable.
+    if first.contains('=') || SHELL_WORDS.contains(&first) {
+        return None;
+    }
+    Some(words)
+}
+
+fn build_command(command: &str, direct: bool) -> tokio::process::Command {
     #[cfg(windows)]
     {
+        let _ = direct;
         let (program, rest) = split_windows_program(command);
         // CreateProcess also searches the current directory; std does not.
         let program = if !program.contains(['/', '\\']) && std::path::Path::new(&program).is_file() {
@@ -90,6 +121,11 @@ fn build_command(command: &str) -> tokio::process::Command {
     }
     #[cfg(not(windows))]
     {
+        if direct && let Some(argv) = simple_argv(command) {
+            let mut c = tokio::process::Command::new(argv[0]);
+            c.args(&argv[1..]);
+            return c;
+        }
         let mut c = tokio::process::Command::new("/bin/sh");
         c.arg("-c").arg(command);
         c
@@ -103,12 +139,22 @@ pub async fn run_local_command(command: &str, use_console: bool) -> (ExitStatus,
 
 /// [`run_local_command`] with extra environment variables.
 pub async fn run_local_command_env(command: &str, use_console: bool, env: &[(String, String)]) -> (ExitStatus, Vec<u8>) {
-    let mut cmd = build_command(command);
-    cmd.envs(env.iter().map(|(k, v)| (k, v)));
-    cmd.kill_on_drop(true);
+    let direct = cfg!(not(windows)) && simple_argv(command).is_some();
+    let make = |direct: bool| {
+        let mut cmd = build_command(command, direct);
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
+        cmd.kill_on_drop(true);
+        cmd
+    };
+    // A program run directly that can't start (missing, not executable)
+    // runs through the shell instead, for the shell's message and status.
     if use_console {
-        cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        return match cmd.spawn() {
+        let spawn = |direct: bool| make(direct).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn();
+        let spawned = match spawn(direct) {
+            Err(_) if direct => spawn(false),
+            r => r,
+        };
+        return match spawned {
             Ok(mut child) => match child.wait().await {
                 Ok(st) => (exit_status(st), Vec::new()),
                 Err(e) => (ExitStatus::Failure(1), format!("waiting for command: {e}\n").into_bytes()),
@@ -120,14 +166,16 @@ pub async fn run_local_command_env(command: &str, use_console: bool, env: &[(Str
         Ok(p) => p,
         Err(e) => return (ExitStatus::Failure(1), format!("pipe: {e}\n").into_bytes()),
     };
-    let writer2 = match writer.try_clone() {
-        Ok(w) => w,
-        Err(e) => return (ExitStatus::Failure(1), format!("pipe: {e}\n").into_bytes()),
+    // The command's copies of the write end close when it is dropped, at the
+    // end of `spawn`, so the reader sees EOF.
+    let spawn = |direct: bool| -> std::io::Result<tokio::process::Child> {
+        make(direct).stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer.try_clone()?).spawn()
     };
-    cmd.stdin(Stdio::null()).stdout(writer).stderr(writer2);
-    let spawned = cmd.spawn();
-    // Close our copies of the write end so the reader sees EOF.
-    drop(cmd);
+    let spawned = match spawn(direct) {
+        Err(_) if direct => spawn(false),
+        r => r,
+    };
+    drop(writer);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
@@ -264,6 +312,34 @@ mod tests {
         let cmd = if cfg!(windows) { "cmd /c exit 3" } else { "exit 3" };
         let (st, _) = run_local_command(cmd, false).await;
         assert_eq!(st, ExitStatus::Failure(3));
+    }
+
+    #[test]
+    fn simple_commands() {
+        assert_eq!(simple_argv("clang++ -c a.cpp -o obj/a.o -DX=1 -I../inc"), Some(vec!["clang++", "-c", "a.cpp", "-o", "obj/a.o", "-DX=1", "-I../inc"]));
+        assert_eq!(simple_argv("  ./tool\targ  "), Some(vec!["./tool", "arg"]));
+        // Shell syntax.
+        for c in ["a && b", "a | b", "a > out", "a $X", "a 'q'", "a \"q\"", "a *.o", "a ~/x", "a # c", "a\nb", "a;b", "a `b`", "a {x,y}", "a\\ b"] {
+            assert_eq!(simple_argv(c), None, "{c}");
+        }
+        // Assignments, builtins, keywords, nothing.
+        for c in ["X=1 a", "cd dir", "exit 3", "pwd", "time a", "if", ":", ". env", "", "  "] {
+            assert_eq!(simple_argv(c), None, "{c}");
+        }
+        // Not ASCII: left to the shell.
+        assert_eq!(simple_argv("cc é.c"), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_commands_fall_back_to_the_shell() {
+        // Runs directly.
+        let (st, out) = run_local_command("printf %s,%s a b", false).await;
+        assert_eq!((st, String::from_utf8_lossy(&out).into_owned()), (ExitStatus::Success, "a,b".to_string()));
+        // A missing program: the shell's status and message.
+        let (st, out) = run_local_command("ninja-rs-no-such-program x", false).await;
+        assert_eq!(st, ExitStatus::Failure(127));
+        assert!(String::from_utf8_lossy(&out).contains("not found"), "{}", String::from_utf8_lossy(&out));
     }
 
     #[tokio::test]

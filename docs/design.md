@@ -63,6 +63,13 @@ deps), 26 depfile parser tests, plus dyndep, lexer, canonicalization and
   Before "build stopped", the failed commands are shown again (at most 10,
   each with the first 20 lines of its output), unless the only one is
   still the last thing printed.
+- Direct exec on POSIX (ninja issue 2665): a command without shell syntax
+  (only letters, digits, spaces and `_-+=/.,:@%`), not starting with a
+  variable assignment or a shell builtin or keyword, runs without
+  `/bin/sh -c`, saving a shell per command (about 0.1 ms each: 5000
+  `touch` commands take 0.99 s instead of 1.57 s). CMake's compile
+  commands qualify. A program that can't start runs through the shell
+  instead, for the shell's message and status (127).
 - Dyndep outputs met as sources (ninja issues 2653 and 2743, open). When
   the dirty scan loads a dyndep file, its implicit outputs gain a producer,
   but edges already scanned may read them and took them for sources. ninja
