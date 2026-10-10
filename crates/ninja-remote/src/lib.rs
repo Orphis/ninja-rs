@@ -16,6 +16,8 @@ pub mod action;
 pub mod backend;
 pub mod cmdline;
 pub mod disk_cache;
+pub mod link;
+pub mod remote_outputs;
 pub mod paths;
 pub mod scanner;
 pub mod store;

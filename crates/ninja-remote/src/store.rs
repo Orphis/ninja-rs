@@ -90,6 +90,14 @@ impl Store {
         }
     }
 
+    /// Forgets that these blobs are in the CAS (it evicted some).
+    pub fn forget_uploaded<'a>(&self, hashes: impl IntoIterator<Item = &'a String>) {
+        let mut known = self.uploaded.lock().unwrap();
+        for h in hashes {
+            known.remove(h);
+        }
+    }
+
     /// Loads persisted file digests (`path\tsize\tmtime_ns\thash`). Entries
     /// are only used when size and mtime still match.
     pub fn load_digests(&self, file: &Path) {

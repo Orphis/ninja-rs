@@ -249,6 +249,17 @@ impl Client {
     pub async fn upload_blobs(&self, blobs: &BlobSet) -> Result<(usize, u64)> {
         let digests = blobs.0.values().map(|(d, _)| d.clone()).collect();
         let missing = self.find_missing(digests).await?;
+        // Blobs that only existed in the CAS can't be uploaded again.
+        let lost: Vec<std::path::PathBuf> = missing
+            .iter()
+            .filter_map(|d| match &blobs.0[&d.hash].1 {
+                BlobSource::Remote(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        if !lost.is_empty() {
+            return Err(MissingRemoteBlobs(lost).into());
+        }
         let mut up = Uploader::new(self);
         let mut spliced = Vec::new();
         for d in &missing {
@@ -645,6 +656,21 @@ fn upload_id() -> String {
 }
 
 /// Helpers to build `Platform` and `Command` with the canonical ordering REAPI requires.
+/// The error of [`Client::upload_blobs`] when blobs that only existed in the
+/// CAS (`BlobSource::Remote`: outputs of earlier actions never downloaded)
+/// are gone from it: the local paths they stand for.
+#[derive(Debug)]
+pub struct MissingRemoteBlobs(pub Vec<std::path::PathBuf>);
+
+impl std::fmt::Display for MissingRemoteBlobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let paths: Vec<String> = self.0.iter().map(|p| p.display().to_string()).collect();
+        write!(f, "no longer in the remote CAS: {}", paths.join(", "))
+    }
+}
+
+impl std::error::Error for MissingRemoteBlobs {}
+
 /// Uploads blobs: small ones batched, large ones through ByteStream.
 struct Uploader<'a> {
     client: &'a Client,

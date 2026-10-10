@@ -8,7 +8,7 @@
 //! rewritten relative to it, so actions contain no machine-specific paths.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ninja_core::canon::canonicalize_path_with;
 
@@ -317,11 +317,47 @@ impl PathMapper {
     }
 }
 
+/// clang-cl options glued to a path, longest first (a prefix of another
+/// comes after it).
+const CL_JOINED_OPTIONS: &[&str] = &[
+    "sourceDependencies",
+    "vctoolsdir",
+    "winsysroot",
+    "external:I",
+    "winsdkdir",
+    "imsvc",
+    "FI",
+    "Fo",
+    "Fe",
+    "Fd",
+    "Fp",
+    "Fa",
+    "Fi",
+    "Fm",
+    "Fr",
+    "FR",
+    "Yu",
+    "Yc",
+    "Tc",
+    "Tp",
+    "I",
+];
+
 /// Finds absolute paths embedded in a command line argument, e.g. in
-/// `-I/x`, `/FoC:\x\y.obj`, `--sysroot=/x`, `-Wl,-rpath,/x`.
+/// `-I/x`, `/FoC:\x\y.obj`, `--sysroot=/x`, `-Wl,-rpath,/x`, and clang-cl's
+/// `/vctoolsdir/x` on POSIX hosts.
 pub fn find_abs_paths(arg: &str, windows: bool) -> Vec<(usize, usize)> {
     let b = arg.as_bytes();
     let mut spans = Vec::new();
+    // clang-cl on a POSIX host: an option glued to its path ("/I/x",
+    // "/vctoolsdir/x"), unless the whole argument is a file. The path
+    // starts after the option.
+    let cl_path = if !windows && arg.starts_with('/') && !Path::new(arg).exists() {
+        CL_JOINED_OPTIONS.iter().find(|o| arg[1..].starts_with(*o) && arg[1 + o.len()..].starts_with('/')).map(|o| 1 + o.len())
+    } else {
+        None
+    };
+    let begin = cl_path.unwrap_or(0);
     let flag_prefix_ok = |i: usize| -> bool {
         if i == 0 {
             return true;
@@ -334,20 +370,22 @@ pub fn find_abs_paths(arg: &str, windows: bool) -> Vec<(usize, usize)> {
         (b[0] == b'-' || (windows && b[0] == b'/'))
             && b[1..i].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b':'))
     };
-    let mut i = 0;
+    let mut i = begin;
     while i < b.len() {
         let start = if windows {
             i + 2 < b.len() && b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'/' || b[i + 2] == b'\\')
         } else {
             b[i] == b'/'
-                && (i == 0 || matches!(b[i - 1], b'=' | b',' | b':' | b';' | b'@' | b'\'' | b'"') || {
+                && (i == begin || matches!(b[i - 1], b'=' | b',' | b':' | b';' | b'@' | b'\'' | b'"') || {
                     // "-I/x", "-isystem/x": flag letters before the path.
                     b[0] == b'-' && b[1..i].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
                 })
         };
         if start && (!windows || flag_prefix_ok(i)) {
             let mut e = i;
-            while e < b.len() && !matches!(b[e], b';' | b',' | b'"' | b'\'') && !(!windows && b[e] == b':') {
+            // '=' ends a path too: prefix maps are OLD=NEW
+            // (-ffile-prefix-map, -fdebug-prefix-map, /pathmap:).
+            while e < b.len() && !matches!(b[e], b';' | b',' | b'"' | b'\'' | b'=') && !(!windows && b[e] == b':') {
                 e += 1;
             }
             spans.push((i, e));
@@ -435,6 +473,14 @@ mod tests {
         assert_eq!(find_abs_paths("-IC:/x", true), vec![(2, 6)]);
         assert_eq!(find_abs_paths("/external:IC:\\x", true), vec![(11, 15)]);
         assert_eq!(find_abs_paths("-DX=C:/a;D:/b", true), vec![(4, 8), (9, 13)]);
+        // clang-cl options glued to POSIX paths.
+        assert_eq!(find_abs_paths("/vctoolsdir/tc/msvc", false), vec![(11, 19)]);
+        assert_eq!(find_abs_paths("/imsvc/sdk/include", false), vec![(6, 18)]);
+        assert_eq!(find_abs_paths("/I/src/include", false), vec![(2, 14)]);
+        assert_eq!(find_abs_paths("/usr/include", false), vec![(0, 12)]);
+        // Prefix maps: both sides, each up to the '='.
+        assert_eq!(find_abs_paths("-ffile-prefix-map=/src/x=/x", false), vec![(18, 24), (25, 27)]);
+        assert_eq!(find_abs_paths("/clang:-ffile-prefix-map=C:/co/.c=/c", true), vec![(25, 33)]);
         assert_eq!(find_abs_paths("abcC:/x", true), vec![]);
     }
 

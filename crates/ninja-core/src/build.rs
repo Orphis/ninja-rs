@@ -552,7 +552,12 @@ pub struct Builder<'a> {
     start: Instant,
     lock_file_path: String,
     deps_node_cache: Vec<Option<NodeId>>,
+    /// How many times each edge was rewound (see `rewind`).
+    rewinds: HashMap<EdgeId, u32>,
 }
+
+/// How many times an edge may wait again for lost inputs before it fails.
+const MAX_REWINDS: u32 = 3;
 
 impl<'a> Builder<'a> {
     pub fn new(
@@ -577,6 +582,7 @@ impl<'a> Builder<'a> {
             start: Instant::now(),
             lock_file_path,
             deps_node_cache: Vec::new(),
+            rewinds: HashMap::default(),
         }
     }
 
@@ -1265,9 +1271,59 @@ impl<'a> Builder<'a> {
             .map_err(|e| format!("command '{}' failed: {e}", info.command))
     }
 
+    /// Action rewinding: `edge` couldn't read `lost` inputs, outputs of
+    /// earlier edges that only existed in a remote store and are gone. Those
+    /// edges run again, and `edge` waits for them like any edge for its
+    /// inputs. Returns false (the edge fails) when an input has no edge to
+    /// make it, or after `MAX_REWINDS` attempts.
+    fn rewind(&mut self, edge: EdgeId, lost: &[String]) -> Result<bool, String> {
+        let attempts = self.rewinds.entry(edge).or_default();
+        if *attempts >= MAX_REWINDS {
+            return Ok(false);
+        }
+        *attempts += 1;
+        let mut producers = Vec::new();
+        for path in lost {
+            let (canonical, _) = canonicalize_path(path);
+            let Some(node) = self.state.lookup_node(&canonical) else { return Ok(false) };
+            let Some(producer) = self.state.node(node).in_edge else { return Ok(false) };
+            producers.push((node, producer));
+        }
+        // The edge was started: it frees its pool slot and waits again.
+        self.running.remove(&edge);
+        let pool = self.state.edge(edge).pool;
+        self.pool_edge_finished(edge);
+        self.pool_retrieve_ready_edges(pool);
+        self.plan.want.insert(edge, Want::ToStart);
+        let info = self.edge_info(edge);
+        self.status.build_edge_rewound(&info, lost);
+        for (node, producer) in producers {
+            let n = self.state.node_mut(node);
+            n.dirty = true;
+            n.mtime = 0;
+            n.exists = Existence::Missing;
+            self.state.edge_mut(producer).outputs_ready = false;
+            // Already planned to run (another consumer rewound it): wait.
+            if matches!(self.plan.want.get(&producer), Some(Want::ToStart | Want::ToFinish)) {
+                continue;
+            }
+            self.plan.want.insert(producer, Want::ToStart);
+            self.edge_wanted(producer);
+            if self.state.all_inputs_ready(producer) {
+                self.schedule_work(producer);
+            }
+        }
+        Ok(true)
+    }
+
     /// Returns whether the command (including deps extraction) succeeded.
     fn finish_command(&mut self, mut result: TaskResult) -> Result<bool, String> {
         let edge = result.edge;
+        // Inputs lost from the remote store: their edges run again, then
+        // this one.
+        if !result.lost_inputs.is_empty() && self.rewind(edge, &result.lost_inputs)? {
+            return Ok(true);
+        }
         // First try to extract dependencies from the result, if any. This must
         // happen first as it filters the command output (we want to filter
         // /showIncludes output, even on compile failure) and extraction itself

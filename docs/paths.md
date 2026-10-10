@@ -40,12 +40,23 @@ cl-style compilers) is scanned for embedded absolute paths:
   non-alphanumeric character, or after flag letters (`/FoC:\x`, `-IC:/x`,
   `/external:IC:\x`).
 
+A path ends at `;`, `,`, a quote or `=` (and `:` on POSIX): both sides of a
+prefix map (`-ffile-prefix-map=OLD=NEW`, `/pathmap:`) are rewritten.
+
 A path is rewritten to a path **relative to the working directory** when it
 lies under the exec root and its first tree component exists in the input
 tree (so `/dev/null` or unrelated system paths are left alone). Backslashes
 are kept on Windows if the original used them. argv[0] is always replaced by
 the relative path of the resolved executable (with `./` if it has no
 separator, so the worker doesn't search `PATH`).
+
+Paths keep the spelling the build uses: links and junctions are not
+resolved (on Windows, only 8.3 short names are expanded). A toolchain
+reached through a link inside the checkout, such as a cache linked as
+`<checkout>/.hermetic-cpp`, stays inside the exec root, so two checkouts
+at different paths run the same actions. `--execution_log_file` records
+each action's key, command and inputs, to find what differs when they
+don't.
 
 On Windows, tree paths are case-folded: the first spelling seen of each
 directory wins, so `C:\Proj\Src` and `c:\proj\src` don't become two

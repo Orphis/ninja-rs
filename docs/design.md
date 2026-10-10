@@ -147,11 +147,27 @@ persisted wholesale later, which the daemon needs.
    of local steps, fall back to local. Several remote steps run through
    `/bin/sh -c`, on POSIX hosts only.
 3. **Toolchain**: argv[0] is resolved (relative to the build dir or via
-   `PATH`, 8.3 short names expanded on Windows) and looked up in
+   `PATH`, 8.3 short names expanded on Windows, a symlink keeping its name:
+   LLVM's tools all link to one multi-call `llvm` binary) and looked up in
    the `rbe_toolchains` file by `tool` (case-insensitive on Windows). Its
    `inputs` are sent whole as grafted Merkle subtrees, its `platform` becomes
    the REAPI platform. Without a declaration only the executable is sent.
-4. **Include scanning** (`scanner`), see below.
+4. **Include scanning** (`scanner`), see below; a VFS overlay
+   (`-ivfsoverlay`, `-vfsoverlay`) is an input. **Links** (`link`): a
+   compiler driver that compiles nothing links. Its dry run (`-###`, first
+   on the command line: arguments after clang-cl's `/link` go to the linker)
+   gives the linker's command line; a linker's own arguments are read
+   directly. From it come the linker binary (as the driver names it), files
+   named by flags (`/vfsoverlay:`, `/def:`, `-T`, version scripts...), side
+   outputs (`/pdb:`, `/implib:`, `-Map`), requested as optional outputs, and
+   the library directories. Which libraries a link pulls in depends on
+   directives inside objects and libraries, so library directories outside
+   the build directory (once symlinks and junctions are resolved: the
+   toolchain's) are sent whole, as grafted trees like toolchain inputs; the
+   build's own libraries are declared inputs. A driver without a dry run
+   sends its declared inputs only. On Windows hosts, arguments naming an
+   input by a relative path are sent with forward slashes, so that an
+   archive's member names don't depend on the host.
 5. **Exec root and path rewriting** (`paths`), see [paths.md](paths.md).
 6. **Action**: `Command` (rewritten argv, `output_paths` and legacy
    `output_files` relative to the working directory, working directory,
@@ -305,15 +321,66 @@ before by a few edits only sends the chunks around them:
   edit in the middle of a 10 MB source, about 6% of it is uploaded and of
   its object downloaded.
 
+## Minimal downloads
+
+`--remote_download_outputs=minimal` (or `--remote_download_minimal`) leaves
+the outputs of remote actions in the remote CAS, except:
+
+- the outputs of `rbe_deliverable = 1` edges (executables and shared
+  libraries by default), with their side outputs (the PDB);
+- what the command line names, through phony targets, even when it is up
+  to date;
+- depfiles, which the build reads;
+- what a local command reads: before a task runs on the host (a local edge,
+  a fallback, `rbe_local`), `RemoteBackend::materialize` downloads its
+  inputs that only exist remotely.
+
+`remote_outputs::RemoteOutputs` records the others in `.ninja_remote` in the
+build directory: path, digest, executable bit and a time. The build's
+`Disk` is wrapped (`RemoteDisk`) so that a recorded output missing locally
+stats with its recorded time: ninja's up-to-date checks, build log and deps
+log work unchanged, and a recorded output is as present as a local one. A
+downloaded file gets its recorded time, so downloading it later doesn't make
+what depends on it stale. Remote actions read recorded inputs by digest
+(`InputTree::add_remote_file`). A local write of a recorded path, or a
+remote action producing it again, drops the record; a stale local copy of a
+remote-only output is deleted so local commands can't read it; `-t clean`
+deletes the file. A file the build itself reads (a dyndep file) is
+downloaded when it is read.
+
+Eviction: at the start of a build, one `FindMissingBlobs` over the recorded
+digests drops the records the remote CAS lost, so the build runs the
+actions producing them again. The disk cache only keeps results whose
+outputs were all downloaded.
+
+**Action rewinding**, for blobs lost during the build. The backend notices
+when an upload's `FindMissingBlobs` misses a remote-only input
+(`rbe_client::MissingRemoteBlobs`), when Execute fails with
+`FAILED_PRECONDITION` and a remote-only input is missing, or when a
+download for a local command fails and the blob is missing. It drops those
+records and returns the task's result with `lost_inputs`. The engine
+(`Builder::rewind`) then puts the edge back to waiting, marks the lost
+nodes dirty, and plans their producing edges again (whether they ran in this
+build or an earlier one). The edge runs once they finish, like any edge
+waiting for its inputs. The status line counts it as not started
+(`Status::build_edge_rewound`). A lost input with no edge to make it (a
+source), or a third rewind of the same edge, fails it.
+
+Two checks keep rewinding from finding the same stale data again. A cache
+hit whose outputs left the CAS is a miss in minimal mode, and Execute then
+skips the cache. On `FAILED_PRECONDITION` without lost remote-only inputs,
+blobs believed uploaded were evicted: they are uploaded again and Execute
+retried once.
+
+The default stays `all` for now. The design doc's default is `minimal`.
+
 ## Later phases (designed for, not built)
 
-- **Minimal download**: the builder's state is already behind
-  `CommandRunner` results; a digest-based output state (path → digest,
-  in `Store`) can replace mtimes for remote outputs. `rbe_deliverable = 1` is
-  passed through in `Task::bindings`, so only those outputs, and what the
-  command line names, would be fetched; local edges would request their
-  inputs on demand (the runner sees every input path). Lease extension / action rewinding would hang off
-  `Store::uploaded` (already the set of blobs we believe the CAS has).
+- **Minimal downloads, further**: lease extension (keeping remote-only
+  blobs alive rather than rebuilding them once evicted); a digest-based
+  state (an output whose digest didn't change doesn't dirty
+  what depends on it, ninja's `restat` for every remote edge); a regex mode
+  (download generated headers for IDEs).
 - **Daemon with file watching**: `Service` is already reusable across
   builds; the remaining work is keeping `State` between builds (it has
   `reset()`), invalidating `Store` entries from file watcher events, and

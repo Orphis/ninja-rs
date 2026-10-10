@@ -61,6 +61,10 @@ remote execution (only for manifests with rbe_version = 1):
   --remote_mnemonics=Compile     (comma-separated mnemonic suffixes)
   --[no]remote_local_fallback    (default on)
   --remote_verbose               (log cache hits and local fallbacks)
+  --remote_mnemonics=Compile,Link,Archive  (also links and archives)
+  --remote_download_outputs=all|minimal    (minimal: deliverables, named targets,
+                                            local inputs; alias --remote_download_minimal)
+  --execution_log_file=FILE      (JSON line per remote action: key, command, inputs)
   --disk_cache=DIR               (local action cache + CAS, with or without a remote)
   --disk_cache_max_size=SIZE     (LRU eviction above SIZE, default 10G)
 
@@ -109,13 +113,23 @@ left alone) and `.ninja_rs_digests` (file digest cache for remote builds).
 Build events (BES/BEP) are reported with targets, configurations and
 outputs from the RBE interface (see docs/design.md, "Build events").
 
+Compiles, archives and links run remotely (`--remote_mnemonics`); a link's
+linker, library directories and side outputs are found from the compiler
+driver's dry run. With `--remote_download_minimal`, only deliverables, named
+targets and the inputs of local commands are downloaded (see
+docs/design.md, "Minimal downloads").
+
 A local disk cache (`--disk_cache`) caches the actions remote execution
 would run, with or without a remote service; large blobs are stored as
 content-defined chunks, which similar outputs share, and travel as the
 chunks the other side lacks with a remote that splits and splices blobs
 (see docs/design.md, "Disk cache").
 
-Not done yet (later phases): minimal-download mode, daemon mode; jobserver.
+Outputs evicted from the remote cache during a build are rebuilt by their
+own actions in the same build (action rewinding).
+
+Not done yet (later phases): lease extension in minimal-download mode,
+daemon mode; jobserver.
 
 ## Layout
 

@@ -46,10 +46,18 @@ impl ExecRunner {
     }
 }
 
-async fn run_local(task: &Task, slots: &Semaphore) -> TaskResult {
+/// Runs a task on the host, once its inputs that only exist remotely are
+/// downloaded.
+async fn run_local(task: &Task, slots: &Semaphore, remote: Option<&Arc<dyn RemoteBackend>>) -> TaskResult {
+    if let Some(backend) = remote
+        && let Err(e) = backend.materialize(task).await
+    {
+        let output = format!("ninja-rs: fetching inputs: {}\n", e.message).into_bytes();
+        return TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: e.lost };
+    }
     let _permit = slots.acquire().await;
     let (status, output) = run_local_command(&task.command, task.use_console).await;
-    TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new() }
+    TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() }
 }
 
 impl CommandRunner for ExecRunner {
@@ -61,11 +69,12 @@ impl CommandRunner for ExecRunner {
         let edge = task.edge;
         self.active.insert(edge);
         let local_slots = self.local_slots.clone();
+        let inputs_from = self.remote.clone();
         let remote = self.remote.clone().filter(|r| !task.use_console && r.wants(&task));
         let verbose = self.verbose_remote;
         match remote {
             None => {
-                let h = self.tasks.spawn(async move { run_local(&task, &local_slots).await });
+                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, inputs_from.as_ref()).await });
                 self.ids.insert(h.id(), edge);
             }
             Some(backend) => {
@@ -78,7 +87,7 @@ impl CommandRunner for ExecRunner {
                     match outcome {
                         RemoteOutcome::Done(r) => r,
                         RemoteOutcome::Fallback(reason) => {
-                            let mut r = run_local(&task, &local_slots).await;
+                            let mut r = run_local(&task, &local_slots, Some(&backend)).await;
                             if verbose {
                                 let mut msg = format!("ninja-rs: running locally ({reason})\n").into_bytes();
                                 msg.extend_from_slice(&r.output);
@@ -87,7 +96,7 @@ impl CommandRunner for ExecRunner {
                             r
                         }
                         RemoteOutcome::RunLocally(capture) => {
-                            let r = run_local(&task, &local_slots).await;
+                            let r = run_local(&task, &local_slots, Some(&backend)).await;
                             // Storing outputs reads files: off the async threads.
                             let result = r.clone();
                             let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;
@@ -108,7 +117,7 @@ impl CommandRunner for ExecRunner {
                 r = self.tasks.join_next_with_id() => r,
                 _ = interrupt.wait() => {
                     let edge = self.active.iter().next().copied().unwrap_or_default();
-                    return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new() });
+                    return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
                 }
             };
             match joined? {
@@ -126,6 +135,7 @@ impl CommandRunner for ExecRunner {
                         output: format!("ninja-rs: internal error: {e}\n").into_bytes(),
                         kind: ExecKind::Local,
                         cas_outputs: Vec::new(),
+                        lost_inputs: Vec::new(),
                     })
                 }
             }

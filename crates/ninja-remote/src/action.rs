@@ -22,6 +22,10 @@ pub struct Shared {
     pub exec_root: Option<String>,
     pub store: Arc<Store>,
     pub windows: bool,
+    /// Outputs of earlier remote actions that only exist remotely.
+    pub remote_outputs: Option<Arc<crate::remote_outputs::RemoteOutputs>>,
+    /// List every input's digest in `Prepared::input_digests`.
+    pub log_inputs: bool,
 }
 
 /// An action ready to be looked up or executed.
@@ -39,6 +43,17 @@ pub struct Prepared {
     /// after the remote action, as argv.
     pub local_before: Vec<Vec<String>>,
     pub local_after: Vec<Vec<String>>,
+    /// Outputs the command may write besides the declared ones (a link's
+    /// PDB or import library): (path relative to the working directory,
+    /// local path).
+    pub side_outputs: Vec<(String, PathBuf)>,
+    /// Inputs that only exist remotely: (local path, task input, digest).
+    pub remote_inputs: Vec<(PathBuf, String, re::Digest)>,
+    pub command: re::Command,
+    pub input_root_digest: re::Digest,
+    /// Every input with its digest, when `Shared::log_inputs` (for the
+    /// execution log).
+    pub input_digests: Vec<(String, String)>,
 }
 
 fn to_s(p: &Path) -> String {
@@ -93,7 +108,22 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     for later in &steps[1..] {
         rsp_files.extend(expand_response_files(later, build_dir, windows).1);
     }
-    if style.is_some() {
+    // A driver that compiles nothing links: its linker's inputs are found
+    // from its dry run, like a linker's from its arguments.
+    let driver_link = style.is_some() && !crate::link::driver_compiles(&expanded);
+    // A driver without a dry run sends its declared inputs only.
+    let link = if steps.len() == 1 && (driver_link || crate::link::linker_flavor(&exe.to_string_lossy()).is_some()) {
+        match crate::link::analyze(exe, argv, build_dir, driver_link) {
+            Ok(info) => Some(info),
+            Err(e) => {
+                warnings.push(format!("link inputs: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if style.is_some() && !driver_link {
         let info = parse_compile(&expanded, build_dir);
         let scanner = Scanner { cache: &shared.store.scan, windows, volatile_roots: vec![build_dir.clone()] };
         let builtin = match scanner.builtin_dirs(exe, &info) {
@@ -124,10 +154,14 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         files.extend(info.extra_files);
     }
     // Declared inputs (explicit, implicit, and deps found by earlier builds).
+    // Outputs of remote actions that weren't downloaded go in by digest.
+    let mut remote_inputs: Vec<(PathBuf, crate::remote_outputs::Entry, String)> = Vec::new();
     for i in &task.inputs {
         let p = scanner::normalize(&build_dir.join(i));
         if p.is_file() {
             files.push(p);
+        } else if let Some(e) = shared.remote_outputs.as_ref().and_then(|r| r.get(i)) {
+            remote_inputs.push((p, e, i.clone()));
         }
     }
 
@@ -147,13 +181,30 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         }
     }
     files.extend(exes.iter().map(|e| scanner::normalize(e)));
+    // The link's: its linker and files, and the toolchain's library
+    // directories, whole (outside the build directory once links are
+    // resolved: the build's own libraries are declared inputs).
+    if let Some(link) = &link {
+        files.extend(link.linker.iter().cloned());
+        files.extend(link.files.iter().cloned());
+        let build_canonical = std::fs::canonicalize(build_dir).ok();
+        for d in &link.lib_dirs {
+            let fixed = match (std::fs::canonicalize(d), &build_canonical) {
+                (Ok(c), Some(b)) => !c.starts_with(b),
+                _ => false,
+            };
+            if fixed {
+                toolchain_dirs.push(d.clone());
+            }
+        }
+    }
 
     // Exec root.
     let exec_root = match &shared.exec_root {
         Some(r) => ExecRoot::fixed(r, windows),
         None => {
             let mut all: Vec<String> = vec![normalize_abs(&build_dir_s, windows)];
-            for f in files.iter().chain(&toolchain_dirs).chain(&whole_dirs).chain(&rsp_files) {
+            for f in files.iter().chain(&toolchain_dirs).chain(&whole_dirs).chain(&rsp_files).chain(remote_inputs.iter().map(|(p, _, _)| p)) {
                 all.push(normalize_abs(&to_s(f), windows));
             }
             ExecRoot::common(&all, windows)
@@ -236,10 +287,24 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         tree_files.push(rel);
         input_files += 1;
     }
+    for (p, e, _) in &remote_inputs {
+        let rel = mapper.tree_path(&to_s(p)).ok_or_else(|| format!("{} is outside the exec root", p.display()))?;
+        tree.add_remote_file(&rel, e.digest.clone(), e.executable, p).map_err(|e| format!("{e:#}"))?;
+        tree_files.push(rel);
+        input_files += 1;
+    }
+    // On Windows hosts, relative paths naming inputs are sent with forward
+    // slashes, which Windows tools accept: an archive's member names (the
+    // paths it was given) then don't depend on the host.
+    let input_keys: std::collections::HashSet<String> =
+        if windows { task.inputs.iter().map(|i| i.replace('\\', "/").to_ascii_lowercase()).collect() } else { Default::default() };
+    let slashed = |a: String| -> String {
+        if windows && a.contains('\\') && input_keys.contains(&a.replace('\\', "/").to_ascii_lowercase()) { a.replace('\\', "/") } else { a }
+    };
     // Rewrite response files now that the tree's top-level entries are known.
     for (path, content) in rsp_rewritten {
         let rel = mapper.tree_path(&to_s(&path)).ok_or_else(|| format!("{} is outside the exec root", path.display()))?;
-        let args: Vec<String> = split_rsp(&content, windows).iter().map(|a| mapper.rewrite_arg(a)).collect();
+        let args: Vec<String> = split_rsp(&content, windows).iter().map(|a| slashed(mapper.rewrite_arg(a))).collect();
         tree.add_bytes(&rel, join_rsp(&args, windows).into_bytes(), false).map_err(|e| format!("{e:#}"))?;
         tree_files.push(rel);
     }
@@ -249,7 +314,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     // Command line: one command, or a chain run by the shell.
     let mut remote_steps: Vec<Vec<String>> = Vec::new();
     for (argv, exe) in steps.iter().zip(&exes) {
-        let mut arguments: Vec<String> = argv.iter().map(|a| mapper.rewrite_arg(a)).collect();
+        let mut arguments: Vec<String> = argv.iter().map(|a| slashed(mapper.rewrite_arg(a))).collect();
         if let Some(rel) = mapper.tree_path(&to_s(exe)) {
             let mut p = mapper.rel_from_work_dir(&rel);
             if !p.contains('/') {
@@ -285,7 +350,16 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         Some(d) => Some((output_rel(&mut mapper, d)?, scanner::normalize(&build_dir.join(d)))),
         None => None,
     };
-    let mut output_paths: Vec<String> = outputs.iter().map(|(r, _)| r.clone()).collect();
+    let mut side_outputs = Vec::new();
+    for o in link.iter().flat_map(|l| &l.outputs) {
+        // Outside the build directory: not returned.
+        if let Ok(rel) = output_rel(&mut mapper, o)
+            && !outputs.iter().any(|(r, _)| *r == rel)
+        {
+            side_outputs.push((rel, scanner::normalize(&build_dir.join(o))));
+        }
+    }
+    let mut output_paths: Vec<String> = outputs.iter().chain(&side_outputs).map(|(r, _)| r.clone()).collect();
     if let Some((r, _)) = &depfile {
         output_paths.push(r.clone());
     }
@@ -312,9 +386,10 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     };
     let command_digest = blobs.insert_message(&command);
     let input_root_digest = tree.build(&mut blobs);
+    let input_digests = if shared.log_inputs { tree.digests() } else { Vec::new() };
     let action = re::Action {
         command_digest: Some(command_digest),
-        input_root_digest: Some(input_root_digest),
+        input_root_digest: Some(input_root_digest.clone()),
         timeout: None,
         do_not_cache: false,
         salt: vec![],
@@ -322,7 +397,23 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     };
     let action_digest = blobs.insert_message(&action);
     let tree_index = TreeIndex::new(tree_files, windows);
-    Ok(Prepared { action_digest, blobs, mapper, tree_index, outputs, depfile, warnings, input_files, local_before, local_after })
+    Ok(Prepared {
+        action_digest,
+        blobs,
+        mapper,
+        tree_index,
+        outputs,
+        depfile,
+        warnings,
+        input_files,
+        local_before,
+        local_after,
+        side_outputs,
+        remote_inputs: remote_inputs.into_iter().map(|(p, e, i)| (p, i, e.digest)).collect(),
+        command,
+        input_root_digest,
+        input_digests,
+    })
 }
 
 fn output_rel(mapper: &mut PathMapper, o: &str) -> Result<String, String> {

@@ -9,12 +9,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
 use ninja_core::depfile::parse_depfile;
-use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, LocalCapture, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
+use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, LocalCapture, MaterializeError, MaterializeFuture, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
 use rbe_client::proto as re;
 use rbe_client::{ActionMeta, Client};
 
 use crate::action::{Prepared, Shared, prepare};
 use crate::disk_cache::DiskCache;
+use crate::remote_outputs::{Entry, RemoteOutputs};
 use crate::store::Store;
 use crate::targets::Targets;
 use crate::toolchains::Toolchains;
@@ -33,6 +34,18 @@ pub struct BackendConfig {
     pub mnemonic_suffixes: Vec<String>,
     pub local_fallback: bool,
     pub verbose: bool,
+    /// Outputs of remote actions that weren't downloaded: remote actions
+    /// read them by digest, local commands get them downloaded first.
+    pub remote_outputs: Option<Arc<RemoteOutputs>>,
+    /// `--remote_download_outputs=minimal`: outputs of remote actions are
+    /// recorded in `remote_outputs` instead of downloaded, but for
+    /// deliverables (`rbe_deliverable`), depfiles and `requested`.
+    pub download_minimal: bool,
+    /// Paths the command line names, as `remote_outputs::key`s.
+    pub requested: Arc<std::collections::HashSet<String>>,
+    /// `--execution_log_file`: one JSON line per remote action (key,
+    /// command, inputs), to compare the actions of two builds.
+    pub execution_log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
 pub struct Backend {
@@ -45,6 +58,9 @@ struct Inner {
     disk: Option<Arc<DiskCache>>,
     shared: Shared,
     config: BackendConfig,
+    /// Held while downloading remote-only inputs, so that two tasks
+    /// reading the same file don't both write it.
+    materializing: tokio::sync::Mutex<()>,
 }
 
 impl Backend {
@@ -76,8 +92,10 @@ impl Backend {
             exec_root: config.exec_root.as_ref().map(|p| p.to_string_lossy().into_owned()),
             store,
             windows,
+            remote_outputs: config.remote_outputs.clone(),
+            log_inputs: config.execution_log.is_some(),
         };
-        Ok(Self { inner: Arc::new(Inner { client, disk, shared, config }) })
+        Ok(Self { inner: Arc::new(Inner { client, disk, shared, config, materializing: Default::default() }) })
     }
 }
 
@@ -107,6 +125,41 @@ impl RemoteBackend for Backend {
     fn max_jobs(&self) -> usize {
         self.inner.config.jobs
     }
+
+    fn materialize(&self, task: &Task) -> MaterializeFuture {
+        let inner = self.inner.clone();
+        let paths = task.inputs.clone();
+        Box::pin(async move { inner.materialize_paths(&paths).await })
+    }
+}
+
+impl Backend {
+    /// Downloads those of `paths` (relative to the build directory) that
+    /// only exist remotely, giving them their recorded time.
+    pub async fn materialize_paths(&self, paths: &[String]) -> Result<(), MaterializeError> {
+        self.inner.materialize_paths(paths).await
+    }
+
+    /// Drops the records of remote-only outputs the remote CAS no longer
+    /// has, so that the build re-runs the actions producing them. Returns
+    /// how many were dropped.
+    pub async fn forget_evicted_outputs(&self) -> Result<usize> {
+        let (Some(client), Some(outputs)) = (&self.inner.client, &self.inner.config.remote_outputs) else { return Ok(0) };
+        let entries = outputs.entries();
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let missing: std::collections::HashSet<String> =
+            client.find_missing(entries.iter().map(|e| e.digest.clone()).collect()).await?.into_iter().map(|d| d.hash).collect();
+        let mut dropped = 0;
+        for e in entries {
+            if missing.contains(&e.digest.hash) {
+                outputs.forget(&e.path);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
 }
 
 enum Failure {
@@ -135,6 +188,7 @@ impl Inner {
                         output: format!("ninja-rs: remote execution failed: {e:#}\n").into_bytes(),
                         kind: ExecKind::Remote,
                         cas_outputs: Vec::new(),
+                        lost_inputs: Vec::new(),
                     })
                 }
             }
@@ -154,6 +208,9 @@ impl Inner {
             configuration_id: self.config.targets.configuration(task.binding("rbe_config")).map(|c| c.id()).unwrap_or_default(),
         };
         let digest = prepared.action_digest.clone();
+        if let Some(log) = &self.config.execution_log {
+            log_action(log, task, &meta, &prepared);
+        }
 
         // The disk cache first.
         let disk_hit = match &self.disk {
@@ -178,7 +235,7 @@ impl Inner {
                 msg.extend_from_slice(&output);
                 output = msg;
             }
-            return Ok(TaskResult { edge: task.edge, status: ExitStatus::Success, output, kind: ExecKind::DiskCacheHit, cas_outputs: Vec::new() });
+            return Ok(TaskResult { edge: task.edge, status: ExitStatus::Success, output, kind: ExecKind::DiskCacheHit, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
         }
         let Some(client) = &self.client else { return Err(Failure::RunLocally(Box::new(prepared))) };
         let client = client.for_action(&meta, &prepared.action_digest.hash);
@@ -189,19 +246,73 @@ impl Inner {
             return Ok(failed);
         }
 
-        // Then the remote action cache.
-        let cached = client.get_action_result(&digest).await.map_err(Failure::Infra)?;
+        // Then the remote action cache. With minimal downloads, a hit whose
+        // outputs left the CAS is a miss: they wouldn't be downloaded now,
+        // and rewinding would only find the same result again.
+        let minimal = self.config.download_minimal;
+        let mut cached = client.get_action_result(&digest).await.map_err(Failure::Infra)?.filter(|r| r.exit_code == 0);
+        let mut stale = false;
+        if minimal
+            && let Some(r) = &cached
+            && !outputs_in_cas(&client, r).await.map_err(Failure::Infra)?
+        {
+            cached = None;
+            stale = true;
+        }
         let (result, hit) = match cached {
-            Some(r) if r.exit_code == 0 => (r, true),
-            _ => {
+            Some(r) => (r, true),
+            None => {
                 let to_upload = self.shared.store.filter_unknown(prepared_blobs(&prepared));
-                client.upload_blobs(&to_upload).await.map_err(Failure::Infra)?;
+                if let Err(e) = client.upload_blobs(&to_upload).await {
+                    // Inputs that only existed remotely are gone: rewind.
+                    if let Some(missing) = e.downcast_ref::<rbe_client::MissingRemoteBlobs>() {
+                        let lost: Vec<String> =
+                            prepared.remote_inputs.iter().filter(|(p, _, _)| missing.0.contains(p)).map(|(_, i, _)| i.clone()).collect();
+                        if let Some(outputs) = &self.config.remote_outputs {
+                            for i in &lost {
+                                outputs.forget(i);
+                            }
+                        }
+                        return Ok(lost_inputs_result(task, lost, output));
+                    }
+                    return Err(Failure::Infra(e));
+                }
                 self.shared.store.mark_uploaded(to_upload.0.keys());
-                let resp = client.execute(&digest, false).await.map_err(Failure::Infra)?;
+                let mut resp = client.execute(&digest, stale).await.map_err(Failure::Infra)?;
+                // FAILED_PRECONDITION: inputs missing from the CAS, which may
+                // be remote-only ones believed uploaded.
+                if resp.status.as_ref().is_some_and(|st| st.code == tonic_code::FAILED_PRECONDITION) {
+                    if !prepared.remote_inputs.is_empty() {
+                        let inputs = prepared.remote_inputs.iter().map(|(_, i, d)| (i.clone(), d.clone())).collect();
+                        let lost = self.lost_inputs(inputs).await;
+                        if !lost.is_empty() {
+                            return Ok(lost_inputs_result(task, lost, output));
+                        }
+                    }
+                    // Blobs believed uploaded were evicted: upload again, once.
+                    let all = prepared_blobs(&prepared);
+                    self.shared.store.forget_uploaded(all.0.keys());
+                    client.upload_blobs(&all).await.map_err(Failure::Infra)?;
+                    self.shared.store.mark_uploaded(all.0.keys());
+                    resp = client.execute(&digest, stale).await.map_err(Failure::Infra)?;
+                }
                 if let Some(st) = &resp.status
                     && st.code != 0
                 {
                     return Err(Failure::Infra(anyhow::anyhow!("Execute returned status {}: {}", st.code, st.message)));
+                }
+                // A cached result from Execute gets the same check.
+                if minimal
+                    && resp.cached_result
+                    && let Some(r) = &resp.result
+                    && !outputs_in_cas(&client, r).await.map_err(Failure::Infra)?
+                {
+                    resp = client.execute(&digest, true).await.map_err(Failure::Infra)?;
+                    if let Some(st) = &resp.status
+                        && st.code != 0
+                    {
+                        return Err(Failure::Infra(anyhow::anyhow!("Execute returned status {}: {}", st.code, st.message)));
+                    }
                 }
                 let hit = resp.cached_result;
                 (resp.result.ok_or_else(|| Failure::Infra(anyhow::anyhow!("Execute returned no result")))?, hit)
@@ -248,7 +359,7 @@ impl Inner {
                 Some(CasOutput { path: task.outputs.get(i)?.clone(), hash: d.hash.clone(), size: d.size_bytes })
             })
             .collect();
-        Ok(TaskResult { edge: task.edge, status, output, kind, cas_outputs })
+        Ok(TaskResult { edge: task.edge, status, output, kind, cas_outputs, lost_inputs: Vec::new() })
     }
 
     /// Runs steps on the host, in the build directory, appending their
@@ -277,7 +388,7 @@ impl Inner {
                     1
                 }
             };
-            return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(code), output: std::mem::take(output), kind: ExecKind::Remote, cas_outputs: Vec::new() });
+            return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(code), output: std::mem::take(output), kind: ExecKind::Remote, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
         }
         None
     }
@@ -311,10 +422,24 @@ impl Inner {
             }
         }
         let depfile_local = p.depfile.as_ref().map(|(_, l)| l.clone());
+        // In minimal mode a remote action's outputs stay in the remote CAS,
+        // recorded, unless they are deliverables, named on the command line,
+        // or the depfile (which the build reads).
+        let minimal = self.config.download_minimal && client.is_some() && result.output_directories.is_empty();
+        let deliverable = task.binding("rbe_deliverable") == Some("1");
+        let stays_remote = |local: &PathBuf, f: &re::OutputFile| {
+            minimal
+                && !deliverable
+                && Some(local) != depfile_local.as_ref()
+                && !self.config.requested.contains(&crate::remote_outputs::key(&f.path))
+        };
         let mut needed = Vec::new();
         for (local, f) in &files {
             let d = f.digest.clone().unwrap_or_default();
             if Some(local) != depfile_local.as_ref() && same_content(local, &d, &self.shared.store) {
+                continue;
+            }
+            if stays_remote(local, f) {
                 continue;
             }
             if f.contents.is_empty() || d.size_bytes == 0 {
@@ -322,11 +447,29 @@ impl Inner {
             }
         }
         let blobs = self.fetch_blobs(client, &needed).await?;
+        let mut left_remote = false;
         for (local, f) in &files {
             let d = f.digest.clone().unwrap_or_default();
             let is_depfile = Some(local) == depfile_local.as_ref();
             if !is_depfile && same_content(local, &d, &self.shared.store) {
+                if let Some(outputs) = &self.config.remote_outputs {
+                    outputs.forget(&f.path);
+                }
                 continue;
+            }
+            if stays_remote(local, f) {
+                // A stale local copy must not be what local commands read.
+                if local.exists() {
+                    std::fs::remove_file(local).with_context(|| format!("removing stale {}", local.display()))?;
+                }
+                if let Some(outputs) = &self.config.remote_outputs {
+                    outputs.record(Entry { path: f.path.clone(), digest: d, executable: f.is_executable, mtime: ninja_core::disk::now_ns() });
+                }
+                left_remote = true;
+                continue;
+            }
+            if let Some(outputs) = &self.config.remote_outputs {
+                outputs.forget(&f.path);
             }
             let data: Vec<u8> = if !f.contents.is_empty() {
                 f.contents.clone()
@@ -338,7 +481,9 @@ impl Inner {
             let data = if is_depfile { self.map_depfile(&data, p) } else { data };
             write_output(local, &data, f.is_executable)?;
         }
+        // The disk cache only keeps results whose outputs it can hold.
         if keep
+            && !left_remote
             && result.output_directories.is_empty()
             && let Some(disk) = &self.disk
         {
@@ -365,6 +510,69 @@ impl Inner {
         }
         out.extend_from_slice(&stderr);
         Ok(out)
+    }
+
+    async fn materialize_paths(&self, paths: &[String]) -> Result<(), MaterializeError> {
+        let Some(outputs) = &self.config.remote_outputs else { return Ok(()) };
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.materializing.lock().await;
+        let mut wanted: Vec<(PathBuf, Entry, &String)> = Vec::new();
+        for p in paths {
+            let local = self.shared.build_dir.join(p);
+            if local.exists() {
+                continue;
+            }
+            if let Some(e) = outputs.get(p) {
+                wanted.push((local, e, p));
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let digests: Vec<re::Digest> = wanted.iter().map(|(_, e, _)| e.digest.clone()).collect();
+        let blobs = match self.fetch_blobs(self.client.as_ref(), &digests).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Those gone from the remote CAS are rebuilt (rewinding).
+                let lost = self.lost_inputs(wanted.iter().map(|(_, e, p)| (p.to_string(), e.digest.clone())).collect()).await;
+                return Err(MaterializeError { message: format!("downloading outputs of remote actions: {e:#}"), lost });
+            }
+        };
+        let write = |local: &PathBuf, e: &Entry| -> Result<()> {
+            let data = if e.digest.size_bytes == 0 {
+                Vec::new()
+            } else {
+                blobs.get(&e.digest.hash).cloned().with_context(|| format!("missing blob for {}", local.display()))?
+            };
+            write_output(local, &data, e.executable)?;
+            crate::remote_outputs::set_mtime(local, e.mtime).with_context(|| format!("setting the time of {}", local.display()))
+        };
+        for (local, e, _) in &wanted {
+            write(local, e).map_err(|err| MaterializeError::from(format!("{err:#}")))?;
+            outputs.forget(&e.path);
+        }
+        Ok(())
+    }
+
+    /// Which of these remote-only inputs (task input, digest) the remote CAS
+    /// lost. Their records are dropped, so that rebuilding them records them
+    /// again.
+    async fn lost_inputs(&self, inputs: Vec<(String, re::Digest)>) -> Vec<String> {
+        let Some(client) = &self.client else { return Vec::new() };
+        let Ok(missing) = client.find_missing(inputs.iter().map(|(_, d)| d.clone()).collect()).await else { return Vec::new() };
+        let missing: std::collections::HashSet<String> = missing.into_iter().map(|d| d.hash).collect();
+        let mut lost = Vec::new();
+        for (path, d) in inputs {
+            if missing.contains(&d.hash) {
+                if let Some(outputs) = &self.config.remote_outputs {
+                    outputs.forget(&path);
+                }
+                lost.push(path);
+            }
+        }
+        lost
     }
 
     /// Blobs from the disk cache, else from the remote CAS (stored on disk
@@ -499,6 +707,13 @@ impl Capture {
             let digest = disk.put_file(local, digests)?;
             files.push(re::OutputFile { path: rel.clone(), digest: Some(digest), is_executable: is_executable(local), ..Default::default() });
         }
+        // Side outputs (a link's PDB) when the command wrote them.
+        for (rel, local) in &self.prepared.side_outputs {
+            if local.is_file() {
+                let digest = disk.put_file(local, digests)?;
+                files.push(re::OutputFile { path: rel.clone(), digest: Some(digest), is_executable: false, ..Default::default() });
+            }
+        }
         if let Some((rel, local)) = self.prepared.depfile.clone()
             && let Ok(data) = std::fs::read(&local)
         {
@@ -566,6 +781,56 @@ fn is_executable(p: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_: &std::path::Path) -> bool {
     false
+}
+
+/// Appends an action to the execution log: what makes its key.
+fn log_action(log: &std::sync::Mutex<std::fs::File>, task: &Task, meta: &ActionMeta, p: &Prepared) {
+    use std::io::Write;
+    #[allow(deprecated)] // The Action carries it too.
+    let platform: serde_json::Map<String, serde_json::Value> = p
+        .command
+        .platform
+        .iter()
+        .flat_map(|pl| &pl.properties)
+        .map(|prop| (prop.name.clone(), prop.value.clone().into()))
+        .collect();
+    let environment: serde_json::Map<String, serde_json::Value> =
+        p.command.environment_variables.iter().map(|e| (e.name.clone(), e.value.clone().into())).collect();
+    let inputs: serde_json::Map<String, serde_json::Value> = p.input_digests.iter().map(|(path, d)| (path.clone(), d.clone().into())).collect();
+    let entry = serde_json::json!({
+        "outputs": task.outputs,
+        "mnemonic": meta.mnemonic,
+        "target": meta.target_id,
+        "action": rbe_client::digest_str(&p.action_digest),
+        "arguments": p.command.arguments,
+        "working_directory": p.command.working_directory,
+        "environment": environment,
+        "platform": platform,
+        "input_root": rbe_client::digest_str(&p.input_root_digest),
+        "inputs": inputs,
+    });
+    let _ = writeln!(log.lock().unwrap(), "{entry}");
+}
+
+/// gRPC status codes in `google.rpc.Status`.
+mod tonic_code {
+    pub const FAILED_PRECONDITION: i32 = 9;
+}
+
+/// Whether the CAS still holds all of an action result's outputs.
+async fn outputs_in_cas(client: &Client, result: &re::ActionResult) -> Result<bool> {
+    let digests: Vec<re::Digest> = result.output_files.iter().filter_map(|f| f.digest.clone()).filter(|d| d.size_bytes > 0).collect();
+    if digests.is_empty() {
+        return Ok(true);
+    }
+    Ok(client.find_missing(digests).await?.is_empty())
+}
+
+/// The result of a task whose inputs were lost from the remote CAS: the
+/// engine rebuilds them and runs the task again.
+fn lost_inputs_result(task: &Task, lost: Vec<String>, mut output: Vec<u8>) -> TaskResult {
+    output.extend_from_slice(format!("ninja-rs: gone from the remote cache: {}\n", lost.join(", ")).as_bytes());
+    TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Remote, cas_outputs: Vec::new(), lost_inputs: lost }
 }
 
 /// Fetches a large blob as the chunks the remote splits it into, downloading

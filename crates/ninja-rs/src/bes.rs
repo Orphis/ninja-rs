@@ -677,6 +677,9 @@ impl Status for ReportingStatus<'_> {
             b.edge_finished(info, exit_code, kind, output, &progress);
         }
     }
+    fn build_edge_rewound(&mut self, info: &EdgeInfo, lost: &[String]) {
+        self.printer.build_edge_rewound(info, lost);
+    }
     fn build_started(&mut self) {
         self.printer.build_started();
     }

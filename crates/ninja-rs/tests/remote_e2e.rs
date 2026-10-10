@@ -117,6 +117,13 @@ fn fake_cmake(args: &[String]) -> i32 {
             }
             0
         }
+        [e, copy, from, to] if e == "-E" && copy == "copy" => match std::fs::copy(from, to) {
+            Ok(_) => 0,
+            Err(err) => {
+                eprintln!("fake-cmake: copying {from}: {err}");
+                1
+            }
+        },
         [e, touch, files @ ..] if e == "-E" && touch == "touch" => {
             for p in files {
                 std::fs::write(p, "").unwrap();
@@ -197,6 +204,7 @@ rule CC\n  command = {cc} -I{inc} -MD -MF $DEP_FILE $FLAGS -c $in -o $out\n  dep
 rule LINK\n  command = {cc} --link $in -o $out\n  description = LINK $out\n\
 rule AR\n  command = {ar}\n  description = AR $out\n\
 rule TOUCH\n  command = {cm} -E touch $out\n\
+rule COPY\n  command = {cm} -E copy $in $out\n\
 rule AR2\n  command = {ar2}\n\
 build obj/main.o: CC {main}\n  DEP_FILE = obj/main.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
 build obj/lib.o: CC {lib}\n  DEP_FILE = obj/lib.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
@@ -206,6 +214,7 @@ build obj/bad.o: CC {lib}\n  DEP_FILE = obj/bad.o.d\n  FLAGS = -DFAIL\n  rbe_mne
 build bad: phony obj/bad.o\n\
 build lib.a: AR obj/main.o obj/lib.o\n  rbe_target = lib\n  rbe_mnemonic = CArchive\n  rbe_artifact = 1\n\
 build helper.stamp: TOUCH\n  rbe_mnemonic = CArchive\n\
+build copy.o: COPY obj/lib.o\n\
 build lib2.a lib2.copy: AR2 obj/main.o\n  rbe_mnemonic = CArchive\n\
 build obj/broken.o: CC {lib}\n  DEP_FILE = obj/broken.o.d\n  FLAGS = -DFAIL\n  rbe_target = broken\n  rbe_mnemonic = CCompile\n\
 build user.bin: LINK obj/broken.o\n  rbe_target = user\n  rbe_mnemonic = CLink\n  rbe_deliverable = 1\n\
@@ -622,6 +631,94 @@ fn test_split_and_splice(minor: u32) -> Result<(), String> {
     })
 }
 
+/// The outputs recorded as remote-only.
+fn remote_only(f: &Fixture) -> Vec<String> {
+    let text = std::fs::read_to_string(f.build.join(".ninja_remote")).unwrap_or_default();
+    text.lines().skip(1).filter_map(|l| l.splitn(5, ' ').nth(4)).map(str::to_string).collect()
+}
+
+/// `--remote_download_minimal`: objects stay remote, deliverables come down,
+/// local commands and named targets get their files, and outputs gone
+/// from the remote cache are built again.
+fn test_minimal_downloads() -> Result<(), String> {
+    let f = fixture("minimal", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let flags = ["--remote_download_minimal", "--remote_mnemonics=Compile,Link"];
+        // 1. The compiles and the link run remotely; only the executable
+        //    (a deliverable) and the rbe_local object are on disk.
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "first build failed")?;
+        check(server.stats().executions == 3, &format!("expected 3 remote executions, got {:?}", server.stats()))?;
+        check(!f.build.join("obj/main.o").exists() && !f.build.join("obj/lib.o").exists(), "objects were downloaded")?;
+        check(remote_only(&f) == ["obj/lib.o", "obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        let app = std::fs::read_to_string(f.build.join("app.bin")).map_err(|e| e.to_string())?;
+        check(app.starts_with("LINKED") && app.contains("int main()"), "app.bin content")?;
+        // The deps of a remote-only object were still recorded.
+        check(!deps_of(&f, "obj/main.o").is_empty(), "no deps for obj/main.o")?;
+
+        // 2. Nothing to do: recorded outputs count as present.
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "no-op build failed")?;
+        check(server.stats().executions == 3, "the no-op build executed something")?;
+
+        // 3. Outputs gone from the remote cache are built again.
+        server.state.clear_cas();
+        server.state.clear_action_cache();
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "build after eviction failed")?;
+        check(server.stats().executions == 6, &format!("expected the 3 actions again, got {:?}", server.stats()))?;
+        check(remote_only(&f) == ["obj/lib.o", "obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+
+        // 4. A local command gets its remote-only input downloaded first.
+        check(run_ninja(&f, Some(&ep), &[flags[0], flags[1], "copy.o"]) == 0, "local copy failed")?;
+        let lib_o = std::fs::read(f.build.join("obj/lib.o")).map_err(|e| format!("obj/lib.o: {e}"))?;
+        check(std::fs::read(f.build.join("copy.o")).ok() == Some(lib_o), "copy.o content")?;
+        check(remote_only(&f) == ["obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+
+        // 5. A target named on the command line is downloaded, even up to
+        //    date, without making what depends on it stale.
+        check(run_ninja(&f, Some(&ep), &[flags[0], flags[1], "obj/main.o"]) == 0, "named target failed")?;
+        check(f.build.join("obj/main.o").exists(), "obj/main.o was not downloaded")?;
+        check(remote_only(&f).is_empty(), &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "final no-op failed")?;
+        check(server.stats().executions == 6, &format!("downloading made something stale: {:?}", server.stats()))?;
+
+        // 6. Cleaning forgets the records.
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        check(!f.build.join(".ninja_remote").exists(), ".ninja_remote survived the clean")?;
+        Ok(())
+    })
+}
+
+/// Action rewinding: remote-only inputs evicted during the build are built
+/// again by their own actions, then the action needing them runs, in the
+/// same build.
+fn test_action_rewinding() -> Result<(), String> {
+    let f = fixture("rewind", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let flags = ["--remote_download_minimal", "--remote_mnemonics=Compile,Link"];
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "first build failed")?;
+        check(server.stats().executions == 3, &format!("expected 3 remote executions, got {:?}", server.stats()))?;
+        check(remote_only(&f) == ["obj/lib.o", "obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+
+        // The link runs again; the CAS loses everything when it's sent, after
+        // the build checked the objects were there.
+        std::fs::remove_file(f.build.join("app.bin")).map_err(|e| e.to_string())?;
+        server.state.clear_action_cache();
+        server.state.evict_on_next_execute();
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "build with an eviction failed")?;
+        // Both compiles and the link ran (the link's first attempt never ran:
+        // its inputs were missing).
+        check(server.stats().executions == 6, &format!("expected 3 more executions, got {:?}", server.stats()))?;
+        let app = std::fs::read_to_string(f.build.join("app.bin")).map_err(|e| e.to_string())?;
+        check(app.starts_with("LINKED") && app.contains("int main()"), "app.bin content")?;
+        check(remote_only(&f) == ["obj/lib.o", "obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        // And it's all consistent: nothing left to do.
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "no-op build failed")?;
+        check(server.stats().executions == 6, &format!("the no-op build executed something: {:?}", server.stats()))?;
+        Ok(())
+    })
+}
+
 fn test_without_executor_runs_locally() -> Result<(), String> {
     let f = fixture("noexec", true);
     check(run_ninja(&f, None, &[]) == 0, "local build failed")?;
@@ -649,6 +746,8 @@ fn main() -> ExitCode {
         ("disk_cache_alone", test_disk_cache_alone),
         ("disk_cache_with_remote", test_disk_cache_with_remote),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
+        ("minimal_downloads", test_minimal_downloads),
+        ("action_rewinding", test_action_rewinding),
         ("split_and_splice_v2_12", || test_split_and_splice(12)),
         ("split_and_splice_v2_13", || test_split_and_splice(13)),
     ];

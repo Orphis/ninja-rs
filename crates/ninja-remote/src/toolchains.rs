@@ -69,9 +69,24 @@ impl Toolchains {
 /// to the long path; elsewhere returns the path unchanged (resolving
 /// symlinks there would break multi-call binaries like LLVM's).
 pub fn long_path(p: &Path) -> PathBuf {
-    if cfg!(windows)
-        && let Ok(c) = std::fs::canonicalize(p)
-    {
+    if !cfg!(windows) {
+        return p.to_path_buf();
+    }
+    // Only a path with a short name is expanded: expanding resolves links
+    // and junctions too, and a toolchain reached through a link inside the
+    // checkout must keep that spelling, or the exec root (and so the action
+    // keys) would depend on where the link points.
+    if !p.components().any(|c| c.as_os_str().to_string_lossy().contains('~')) {
+        return p.to_path_buf();
+    }
+    // A symlink keeps its name: LLVM's tools all link to llvm.exe, which
+    // acts by the name it's run under. Only its directory is expanded then.
+    let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    let canonical = match (is_link, p.parent(), p.file_name()) {
+        (true, Some(dir), Some(name)) => std::fs::canonicalize(dir).map(|d| d.join(name)),
+        _ => std::fs::canonicalize(p),
+    };
+    if let Ok(c) = canonical {
         let s = c.to_string_lossy().into_owned();
         if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
             return PathBuf::from(format!(r"\\{rest}"));

@@ -17,6 +17,8 @@ struct FakeRunner<'a> {
     commands_ran: Arc<Mutex<Vec<String>>>,
     active: Vec<Task>,
     max_active: usize,
+    /// Edges of the "lose-once" rule that already lost their inputs.
+    lost: Vec<EdgeId>,
 }
 
 impl CommandRunner for FakeRunner<'_> {
@@ -28,7 +30,7 @@ impl CommandRunner for FakeRunner<'_> {
         self.commands_ran.lock().unwrap().push(task.command.clone());
         let fs = self.fs;
         match task.rule.as_str() {
-            "cat" | "cat_rsp" | "cc" | "touch" | "touch-interrupt" | "touch-fail-tick2" | "cp_multi_msvc" | "cp_multi_gcc" => {
+            "cat" | "cat_rsp" | "cc" | "touch" | "lose-once" | "lose-always" | "touch-interrupt" | "touch-fail-tick2" | "cp_multi_msvc" | "cp_multi_gcc" => {
                 for o in &task.outputs {
                     fs.create(o, "");
                 }
@@ -72,9 +74,26 @@ impl CommandRunner for FakeRunner<'_> {
             && (last.rule == "interrupt" || last.rule == "touch-interrupt")
         {
             let edge = last.edge;
-            return Box::pin(async move { Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new() }) });
+            return Box::pin(async move { Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() }) });
         }
         let now = self.fs.now();
+        // "lose-once" reports its inputs lost the first time it runs,
+        // "lose-always" every time (action rewinding).
+        if let Some(task) = self.active.last()
+            && (task.rule == "lose-always" || (task.rule == "lose-once" && !self.lost.contains(&task.edge)))
+        {
+            let task = self.active.pop().unwrap();
+            self.lost.push(task.edge);
+            let r = TaskResult {
+                edge: task.edge,
+                status: ExitStatus::Failure(1),
+                output: Vec::new(),
+                kind: ExecKind::Remote,
+                cas_outputs: Vec::new(),
+                lost_inputs: task.inputs.clone(),
+            };
+            return Box::pin(async move { Some(r) });
+        }
         let r = self.active.pop().map(|task| {
             let mut output = Vec::new();
             let status = match task.rule.as_str() {
@@ -95,7 +114,7 @@ impl CommandRunner for FakeRunner<'_> {
                 }
                 _ => ExitStatus::Success,
             };
-            TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new() }
+            TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() }
         });
         Box::pin(async move { r })
     }
@@ -202,7 +221,7 @@ impl BuildTest {
         if b.already_up_to_date() {
             return Ok(());
         }
-        let mut runner = FakeRunner { fs: &self.fs, commands_ran: self.commands_ran.clone(), active: Vec::new(), max_active: 1 };
+        let mut runner = FakeRunner { fs: &self.fs, commands_ran: self.commands_ran.clone(), active: Vec::new(), max_active: 1, lost: Vec::new() };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(b.build(&mut runner)).map_err(|e| e.message)
     }
@@ -535,7 +554,7 @@ fn pool_with_depth_one_serializes() {
     let mut status = NullStatus::default();
     let mut b = Builder::new(&mut t.state, &t.fs, None, None, &t.config, &mut status);
     b.add_target_by_name("all").unwrap();
-    let mut runner = FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 10 };
+    let mut runner = FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 10, lost: Vec::new() };
     struct Check<'a> {
         inner: FakeRunner<'a>,
         max_seen: usize,
@@ -1045,7 +1064,7 @@ fn dyndep_build_discover_scheduled_edge() {
     let mut status = NullStatus::default();
     let mut b = Builder::new(&mut t.state, &t.fs, None, None, &t.config, &mut status);
     b.add_target_by_name("out2").unwrap();
-    let mut runner = FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 2 };
+    let mut runner = FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 2, lost: Vec::new() };
     let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     rt.block_on(b.build(&mut runner)).unwrap();
     assert_eq!(t.commands(), vec!["touch out1 out1.imp", "cp zdd-in zdd", "cp out1 out2"]);
@@ -1186,4 +1205,35 @@ fn critical_path_prefers_long_chains() {
     t.parse("rule touch\n  command = touch $out\nbuild a1: touch\nbuild a2: touch a1\nbuild a3: touch a2\nbuild b1: touch\nbuild all: phony a3 b1\n");
     t.build(&["all"]).unwrap();
     assert_eq!(t.commands()[0], "touch a1");
+}
+
+#[test]
+fn rewinds_lost_inputs() {
+    let mut t = BuildTest::empty();
+    t.parse("rule lose-once\n  command = lose $in > $out\nbuild a: cat in1\nbuild b: lose-once a\n");
+    t.fs.create("in1", "");
+    t.fs.tick();
+    t.fs.create("a", "");
+    t.build(&["b"]).unwrap();
+    // b lost a: a's edge ran again, then b.
+    assert_eq!(t.commands(), ["lose a > b", "cat in1 > a", "lose a > b"]);
+}
+
+#[test]
+fn rewinding_needs_a_producer_and_stops() {
+    // A lost source file can't be rebuilt.
+    let mut t = BuildTest::empty();
+    t.parse("rule lose-once\n  command = lose $in > $out\nbuild b: lose-once in1\n");
+    t.fs.create("in1", "");
+    assert!(t.build(&["b"]).is_err());
+    assert_eq!(t.commands(), ["lose in1 > b"]);
+
+    // Inputs lost again and again: the edge gives up.
+    let mut t = BuildTest::empty();
+    t.parse("rule lose-always\n  command = lose $in > $out\nbuild a: cat in1\nbuild b: lose-always a\n");
+    t.fs.create("in1", "");
+    t.fs.tick();
+    t.fs.create("a", "");
+    assert!(t.build(&["b"]).is_err());
+    assert_eq!(t.commands().iter().filter(|c| c.starts_with("lose")).count(), 4);
 }

@@ -23,6 +23,10 @@ Local changes:
   `add_file_with_digest` / `contains` were added.
 - `Cargo.toml` uses the ninja-rs workspace dependencies; a Bazel
   `BUILD.bazel` was added; an unused-variable warning on Windows was fixed.
+- `upload_blobs` fails with `MissingRemoteBlobs` (the local paths) when
+  blobs that only existed in the CAS (`BlobSource::Remote`) are gone, for
+  action rewinding; `InputTree::digests` lists every input with its
+  digest (for the execution log).
 - Content-defined chunking (`chunking.rs`: FastCDC 2020 through the
   `fastcdc` crate, and the server's split/splice support from its
   capabilities); `Client::split_blob` / `splice_blob` (`GetChunkMapping` /

@@ -91,6 +91,11 @@ pub struct RemoteFlags {
     pub disk_cache: Option<String>,
     /// Bytes the disk cache may take before old entries are evicted.
     pub disk_cache_max_size: u64,
+    /// `--remote_download_outputs=minimal`: download only deliverables,
+    /// what the command line names and what local commands read.
+    pub download_minimal: bool,
+    /// `--execution_log_file`: where to log every remote action (absolute).
+    pub execution_log: Option<String>,
 }
 
 /// `--disk_cache_max_size` default: 10 GiB.
@@ -143,6 +148,11 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --[no]remote_local_fallback  run locally when remote execution fails [default=on]
   --remote_verbose           log remote decisions and cache hits
   --disk_cache=DIR           local action cache and CAS (also without --remote_executor)
+  --remote_download_outputs=all|minimal
+                             outputs of remote actions to download: all, or only
+                             deliverables, named targets and local inputs [default=all]
+  --remote_download_minimal  same as --remote_download_outputs=minimal
+  --execution_log_file=FILE  log every remote action (key, command, inputs) as JSON lines
   --disk_cache_max_size=SIZE evict least recently used entries above SIZE [default=10G]
 
 build events (Bazel's Build Event Protocol):
@@ -250,6 +260,20 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_local_fallback" => o.remote.local_fallback = true,
                 "noremote_local_fallback" => o.remote.local_fallback = false,
                 "remote_verbose" => o.remote.verbose = true,
+                "remote_download_outputs" => {
+                    o.remote.download_minimal = match value(&mut i)?.as_str() {
+                        "all" => false,
+                        "minimal" => true,
+                        v => return Err(format!("invalid --remote_download_outputs '{v}' (all or minimal)")),
+                    }
+                }
+                "remote_download_minimal" => o.remote.download_minimal = true,
+                "remote_download_all" => o.remote.download_minimal = false,
+                "execution_log_file" => {
+                    let v = value(&mut i)?;
+                    let abs = std::path::absolute(&v).map_err(|e| format!("--execution_log_file={v}: {e}"))?;
+                    o.remote.execution_log = Some(abs.to_string_lossy().into_owned());
+                }
                 "disk_cache" => {
                     // Relative to where ninja-rs was started, not to -C.
                     let v = value(&mut i)?;

@@ -67,6 +67,9 @@ pub struct State {
     pub bes_streams_finished: Mutex<u32>,
     /// The RE API minor version whose split/splice RPCs are served, if any.
     chunking: Mutex<Option<u32>>,
+    /// Empties the CAS when the next Execute arrives (an eviction during a
+    /// build).
+    evict_on_execute: std::sync::atomic::AtomicBool,
     base: PathBuf,
     counter: AtomicU64,
 }
@@ -85,6 +88,11 @@ impl State {
     }
     pub fn clear_action_cache(&self) {
         self.ac.lock().unwrap().clear();
+    }
+    /// Evicts every blob when the next Execute request arrives, after the
+    /// client's checks of what the CAS holds.
+    pub fn evict_on_next_execute(&self) {
+        self.evict_on_execute.store(true, Ordering::SeqCst);
     }
     pub fn clear_cas(&self) {
         self.cas.lock().unwrap().clear();
@@ -410,6 +418,9 @@ impl re::execution_server::Execution for Svc {
             && let Ok(meta) = re::RequestMetadata::decode(bytes)
         {
             self.0.request_metadata.lock().unwrap().push(meta);
+        }
+        if self.0.evict_on_execute.swap(false, Ordering::SeqCst) {
+            self.0.clear_cas();
         }
         let r = r.into_inner();
         let d = r.action_digest.unwrap_or_default();

@@ -326,6 +326,22 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             }
             continue;
         }
+        // Virtual file system overlays: the overlay file is an input (its
+        // entries name files the include scan finds where they really are).
+        // "-ivfsoverlay F", "-vfsoverlay F", or cc1's through "-Xclang".
+        if a == "-Xclang" && argv.get(i).is_some_and(|n| n == "-ivfsoverlay") && argv.get(i + 1).is_some_and(|n| n == "-Xclang") {
+            if let Some(v) = argv.get(i + 2) {
+                info.extra_files.push(abs(v, cwd));
+            }
+            i += 3;
+            continue;
+        }
+        if let Some(v) = opt(&["-ivfsoverlay", "-vfsoverlay", "--vfsoverlay"], &mut i) {
+            if let Some(v) = v {
+                info.extra_files.push(abs(&v, cwd));
+            }
+            continue;
+        }
         if SKIP_NEXT.contains(&a.as_str()) {
             i += 1;
             continue;

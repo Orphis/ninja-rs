@@ -79,6 +79,10 @@ pub struct TaskResult {
     pub kind: ExecKind,
     /// Outputs a remote execution left in the CAS (for build events).
     pub cas_outputs: Vec<CasOutput>,
+    /// Inputs (as in `Task::inputs`) the task couldn't read because they
+    /// only existed remotely and are gone: the engine runs the edges
+    /// producing them again, then the task (action rewinding).
+    pub lost_inputs: Vec<String>,
 }
 
 /// An output file stored in a content-addressable store.
@@ -113,6 +117,29 @@ pub trait LocalCapture: Send {
 
 pub type RemoteFuture = Pin<Box<dyn Future<Output = RemoteOutcome> + Send>>;
 
+/// Why a task's inputs couldn't be put on disk.
+#[derive(Clone, Debug, Default)]
+pub struct MaterializeError {
+    pub message: String,
+    /// Inputs gone from the remote store (see `TaskResult::lost_inputs`).
+    pub lost: Vec<String>,
+}
+
+impl std::fmt::Display for MaterializeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for MaterializeError {
+    fn from(message: String) -> Self {
+        Self { message, lost: Vec::new() }
+    }
+}
+
+/// Completes once a task's inputs are on disk; an error fails the task.
+pub type MaterializeFuture = Pin<Box<dyn Future<Output = Result<(), MaterializeError>> + Send>>;
+
 /// A remote execution backend (REAPI). Lives in its own crate; the engine
 /// only knows this interface.
 pub trait RemoteBackend: Send + Sync {
@@ -122,6 +149,11 @@ pub trait RemoteBackend: Send + Sync {
     fn execute(&self, task: Task) -> RemoteFuture;
     /// How many remote actions may be in flight.
     fn max_jobs(&self) -> usize;
+    /// Before a task runs on the host: downloads its inputs that only exist
+    /// remotely (outputs of remote actions that weren't downloaded).
+    fn materialize(&self, _task: &Task) -> MaterializeFuture {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub trait CommandRunner: Send {
@@ -157,6 +189,7 @@ impl CommandRunner for DryRunRunner {
             output: Vec::new(),
             kind: ExecKind::DryRun,
             cas_outputs: Vec::new(),
+            lost_inputs: Vec::new(),
         });
         Box::pin(async move { r })
     }

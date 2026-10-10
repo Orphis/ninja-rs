@@ -43,6 +43,9 @@ pub trait Status {
     fn edge_removed_from_plan(&mut self);
     fn build_edge_started(&mut self, info: &EdgeInfo, start_ms: i64);
     fn build_edge_finished(&mut self, info: &EdgeInfo, end_ms: i64, exit_code: Option<i32>, kind: &ExecKind, output: &[u8]);
+    /// A started edge goes back to waiting: inputs it needed were lost from
+    /// the remote store, and their edges run again first.
+    fn build_edge_rewound(&mut self, _info: &EdgeInfo, _lost: &[String]) {}
     fn build_started(&mut self);
     fn build_finished(&mut self);
     fn info(&mut self, msg: &str);
@@ -366,6 +369,18 @@ impl Status for StatusPrinter {
     }
     fn edge_removed_from_plan(&mut self) {
         self.total_edges = self.total_edges.saturating_sub(1);
+    }
+    fn build_edge_rewound(&mut self, info: &EdgeInfo, lost: &[String]) {
+        // Not started after all: it starts again.
+        self.started_edges = self.started_edges.saturating_sub(1);
+        self.running_edges = self.running_edges.saturating_sub(1);
+        if info.use_console {
+            self.printer.set_console_locked(false);
+        }
+        if self.verbosity != Verbosity::Quiet {
+            let msg = format!("ninja: rewinding {}: {} gone from the remote cache, building again\n", info.outputs.join(" "), lost.join(" "));
+            self.printer.print_on_new_line(msg.as_bytes());
+        }
     }
     fn build_edge_started(&mut self, info: &EdgeInfo, start_ms: i64) {
         self.started_edges += 1;

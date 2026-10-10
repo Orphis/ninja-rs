@@ -324,6 +324,27 @@ impl InputTree {
         out
     }
 
+    /// Every file and grafted subtree with its digest (`hash/size`, a
+    /// subtree's prefixed with `tree:`), sorted by path: what makes the
+    /// input root's digest.
+    pub fn digests(&self) -> Vec<(String, String)> {
+        fn walk(dir: &DirNode, prefix: &str, out: &mut Vec<(String, String)>) {
+            for (name, node) in &dir.children {
+                let path = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+                match node {
+                    Node::File { digest, executable, .. } => {
+                        out.push((path, format!("{}/{}{}", digest.hash, digest.size_bytes, if *executable { " x" } else { "" })))
+                    }
+                    Node::Subtree(d) => out.push((path, format!("tree:{}/{}", d.hash, d.size_bytes))),
+                    Node::Dir(d) => walk(d, &path, out),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, "", &mut out);
+        out
+    }
+
     /// Serializes the tree, adding every blob (Directory protos and files) to
     /// `blobs`, and returns the root digest.
     pub fn build(&self, blobs: &mut BlobSet) -> re::Digest {

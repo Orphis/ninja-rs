@@ -20,6 +20,7 @@ use ninja_core::canon::canonicalize_path;
 use ninja_core::deps_log::{DEPS_LOG_FILE, DepsLog};
 use ninja_core::disk::{Disk, RealDisk, StatCounters};
 use ninja_core::graph::{ROOT_SCOPE, State};
+use ninja_remote::remote_outputs::{REMOTE_OUTPUTS_FILE, RemoteDisk, RemoteOutputs};
 use ninja_core::parser::{ManifestParser, ParserOptions, PhonyCycleAction, RealFileReader};
 use ninja_core::runner::{CommandRunner, DryRunRunner, RemoteBackend};
 use ninja_core::status::{Status, StatusPrinter, Verbosity};
@@ -193,6 +194,10 @@ impl Service {
             if let Some(t) = tool
                 && t.when == When::AfterLoad
             {
+                if t.name == "clean" && !opts.dry_run {
+                    // Cleaned outputs must not stay recorded as remote ones.
+                    let _ = std::fs::remove_file(in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE));
+                }
                 let mut ctx = ToolCtx {
                     state: &mut state,
                     build_log: &mut build_log,
@@ -251,13 +256,31 @@ impl Service {
             }
 
             let targets = Arc::new(self.load_targets(&state, status));
-            let remote = match self.remote_backend(&state, opts, targets.clone(), status).await {
+            // Outputs of remote actions that weren't downloaded, from earlier
+            // builds (whatever the download mode).
+            let remote_outputs = (opts.remote.executor.is_some() && !opts.dry_run)
+                .then(|| Arc::new(RemoteOutputs::load(std::path::Path::new(&in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE)))));
+            let requested = requested_paths(&state, &deps_log, &opts.targets);
+            let backend = match self.remote_backend(&state, opts, targets.clone(), remote_outputs.clone(), &requested, status).await {
                 Ok(r) => r,
                 Err(e) => {
                     status.error(&e);
                     return EXIT_FAILURE;
                 }
             };
+            // Without a backend (the manifest left RBE), records are moot:
+            // the outputs are built again.
+            let remote_outputs = remote_outputs.filter(|_| backend.is_some());
+            if let (Some(b), Some(outputs)) = (&backend, &remote_outputs)
+                && !outputs.is_empty()
+            {
+                match b.forget_evicted_outputs().await {
+                    Ok(0) => {}
+                    Ok(n) => status.info(&format!("{n} outputs of remote actions are gone from the remote cache: building them again.")),
+                    Err(e) => status.warning(&format!("checking outputs of remote actions: {e:#}")),
+                }
+            }
+            let remote: Option<Arc<dyn RemoteBackend>> = backend.clone().map(|b| b as Arc<dyn RemoteBackend>);
             if remote.is_some() && !self.digests_loaded {
                 // File digests persist across invocations (keyed by path,
                 // size and mtime) so that toolchains are hashed once.
@@ -310,8 +333,13 @@ impl Service {
             };
             let use_remote = remote.is_some();
             let code = self
-                .run_build(&opts.targets, &mut state, &mut build_log, &mut deps_log, &config, status, remote, targets)
+                .run_build(&opts.targets, &mut state, &mut build_log, &mut deps_log, &config, status, remote, targets, backend, remote_outputs.clone(), &requested)
                 .await;
+            if let Some(outputs) = &remote_outputs
+                && let Err(e) = outputs.save()
+            {
+                status.warning(&format!("saving {REMOTE_OUTPUTS_FILE}: {e}"));
+            }
             if use_remote && let Err(e) = self.store.save_digests(std::path::Path::new(&digests_file)) {
                 status.warning(&format!("saving {digests_file}: {e}"));
             }
@@ -349,8 +377,10 @@ impl Service {
         state: &State,
         opts: &Options,
         targets: Arc<ninja_remote::targets::Targets>,
+        remote_outputs: Option<Arc<RemoteOutputs>>,
+        requested: &[String],
         status: &mut dyn Status,
-    ) -> Result<Option<Arc<dyn RemoteBackend>>, String> {
+    ) -> Result<Option<Arc<ninja_remote::Backend>>, String> {
         if opts.remote.executor.is_none() && opts.remote.disk_cache.is_none() {
             return Ok(None);
         }
@@ -407,6 +437,10 @@ impl Service {
         }
         let build_dir = std::env::current_dir().map_err(|e| e.to_string())?;
         let file_var = |name: &str| Some(state.lookup_variable(ROOT_SCOPE, name)).filter(|v| !v.is_empty());
+        let execution_log = match &opts.remote.execution_log {
+            Some(f) => Some(Arc::new(std::sync::Mutex::new(std::fs::File::create(f).map_err(|e| format!("creating {f}: {e}"))?))),
+            None => None,
+        };
         let backend = ninja_remote::Backend::new(
             ninja_remote::BackendConfig {
                 build_dir,
@@ -417,6 +451,10 @@ impl Service {
                 mnemonic_suffixes: opts.remote.mnemonic_suffixes.clone(),
                 local_fallback: opts.remote.local_fallback,
                 verbose: opts.remote.verbose,
+                remote_outputs,
+                download_minimal: opts.remote.download_minimal,
+                requested: Arc::new(requested.iter().map(|p| ninja_remote::remote_outputs::key(p)).collect()),
+                execution_log,
             },
             client,
             disk,
@@ -540,6 +578,9 @@ impl Service {
         status: &mut ReportingStatus<'_>,
         remote: Option<Arc<dyn RemoteBackend>>,
         targets_file: Arc<ninja_remote::targets::Targets>,
+        backend: Option<Arc<ninja_remote::Backend>>,
+        remote_outputs: Option<Arc<RemoteOutputs>>,
+        requested: &[String],
     ) -> i32 {
         let bes = status.bes.clone();
         let nodes = match tools::collect_targets(state, Some(deps_log), targets) {
@@ -549,10 +590,25 @@ impl Service {
                 return EXIT_FAILURE;
             }
         };
-        let disk = self.real_disk();
+        let real = self.real_disk();
+        // Outputs of remote actions that weren't downloaded count as
+        // present; a file the build itself reads (a dyndep file) is
+        // downloaded then.
+        let handle = tokio::runtime::Handle::current();
+        let fetch_backend = backend.clone();
+        let fetch = move |path: &str| -> Result<(), String> {
+            let Some(b) = &fetch_backend else { return Ok(()) };
+            let paths = vec![path.to_string()];
+            tokio::task::block_in_place(|| handle.block_on(b.materialize_paths(&paths))).map_err(|e| format!("{e:#}"))
+        };
+        let remote_disk = remote_outputs.as_deref().map(|outputs| RemoteDisk { inner: &real, outputs, fetch: Some(&fetch) });
+        let disk: &dyn Disk = match &remote_disk {
+            Some(d) => d,
+            None => &real,
+        };
         let verbose_remote = remote.is_some() && (self.remote_verbose || config.verbosity == Verbosity::Verbose);
         let mut runner = self.make_runner(config, remote, verbose_remote);
-        let mut builder = Builder::new(state, &disk, Some(build_log), Some(deps_log), config, status);
+        let mut builder = Builder::new(state, disk, Some(build_log), Some(deps_log), config, status);
         // Like ninja: cache stats while scanning, but not while building, so
         // restat and later edges see the outputs' new timestamps.
         disk.allow_stat_cache(self.stat_cache);
@@ -567,18 +623,55 @@ impl Service {
         if let Some(b) = &bes {
             b.plan(builder.state, &builder.plan, targets_file, targets);
         }
-        if builder.already_up_to_date() {
+        let code = if builder.already_up_to_date() {
             if config.verbosity != Verbosity::NoStatusUpdate {
                 builder.status.info("no work to do.");
             }
-            return EXIT_SUCCESS;
-        }
-        match builder.build(runner.as_mut()).await {
-            Ok(()) => EXIT_SUCCESS,
-            Err(e) => {
-                builder.status.info(&format!("build stopped: {}.", e.message));
-                if e.interrupted { EXIT_INTERRUPTED } else { EXIT_FAILURE }
+            EXIT_SUCCESS
+        } else {
+            match builder.build(runner.as_mut()).await {
+                Ok(()) => EXIT_SUCCESS,
+                Err(e) => {
+                    builder.status.info(&format!("build stopped: {}.", e.message));
+                    if e.interrupted { EXIT_INTERRUPTED } else { EXIT_FAILURE }
+                }
             }
+        };
+        // What the command line names is downloaded, even when it was up
+        // to date.
+        if code == EXIT_SUCCESS
+            && let Some(b) = &backend
+            && let Err(e) = b.materialize_paths(requested).await
+        {
+            builder.status.error(&format!("{e:#}"));
+            return EXIT_FAILURE;
+        }
+        code
+    }
+}
+
+/// `file` in the manifest's `builddir` (the current directory if unset).
+fn in_build_dir(build_dir: &str, file: &str) -> String {
+    if build_dir.is_empty() { file.to_string() } else { format!("{build_dir}/{file}") }
+}
+
+/// The files the command line names, through phony targets: they are always
+/// downloaded. None for the default targets.
+fn requested_paths(state: &State, deps_log: &DepsLog, targets: &[String]) -> Vec<String> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let Ok(mut stack) = tools::collect_targets(state, Some(deps_log), targets) else { return Vec::new() };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    while let Some(n) = stack.pop() {
+        if !seen.insert(n) {
+            continue;
+        }
+        match state.node(n).in_edge {
+            Some(e) if state.is_phony(e) => stack.extend(state.edge(e).inputs.iter().copied()),
+            _ => out.push(state.path(n).to_string()),
         }
     }
+    out
 }
