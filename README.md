@@ -135,6 +135,10 @@ driver's dry run. With `--remote_download_minimal`, only deliverables, named
 targets and the inputs of local commands are downloaded (see
 docs/design.md, "Minimal downloads").
 
+Thin archives work too: an action reading one gets its members, and with
+minimal downloads a thin archive stays remote, its member list read with
+ranged reads past its symbol table (see docs/design.md, "Thin archives").
+
 Without remote execution, a remote cache (`--remote_cache`) shares the
 results of actions run locally, across machines and checkouts (see
 docs/design.md, "Remote cache only").

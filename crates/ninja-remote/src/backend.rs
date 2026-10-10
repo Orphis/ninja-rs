@@ -673,12 +673,41 @@ impl Inner {
         // or the depfile (which the build reads).
         let minimal = self.config.download_minimal && client.is_some() && result.output_directories.is_empty();
         let deliverable = task.binding("rbe_deliverable") == Some("1");
-        let stays_remote = |local: &PathBuf, f: &re::OutputFile| {
+        let may_stay_remote = |local: &PathBuf, f: &re::OutputFile| {
             minimal
                 && !deliverable
                 && Some(local) != depfile_local.as_ref()
                 && !self.config.requested.contains(&crate::remote_outputs::key(&f.path))
         };
+        // A thin archive left remote is recorded with its members, read with
+        // ranged reads, so that the actions reading it get them without
+        // downloading it. When that fails, it's downloaded. Archives are
+        // recognized by their archiver's flags, or else by their name.
+        let thin_command = crate::archive::creates_thin(&p.command.arguments);
+        let mut thin: std::collections::HashMap<String, Arc<Vec<String>>> = Default::default();
+        let mut download_anyway: std::collections::HashSet<String> = Default::default();
+        if let Some(c) = client {
+            for (local, f) in &files {
+                let d = f.digest.clone().unwrap_or_default();
+                let named_like_archive = [".a", ".lib"].iter().any(|ext| f.path.to_ascii_lowercase().ends_with(ext));
+                if !may_stay_remote(local, f) || !(thin_command || named_like_archive) || same_content(local, &d, &self.shared.store) {
+                    continue;
+                }
+                match self.remote_thin_members(c, &d).await {
+                    Ok(Some(members)) => {
+                        thin.insert(f.path.clone(), Arc::new(members));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if self.config.verbose {
+                            eprintln!("ninja-rs: reading the members of {}: {e:#}; downloading it", f.path);
+                        }
+                        download_anyway.insert(f.path.clone());
+                    }
+                }
+            }
+        }
+        let stays_remote = |local: &PathBuf, f: &re::OutputFile| may_stay_remote(local, f) && !download_anyway.contains(&f.path);
         let mut needed = Vec::new();
         for (local, f) in &files {
             let d = f.digest.clone().unwrap_or_default();
@@ -709,7 +738,13 @@ impl Inner {
                     std::fs::remove_file(local).with_context(|| format!("removing stale {}", local.display()))?;
                 }
                 if let Some(outputs) = &self.config.remote_outputs {
-                    outputs.record(Entry { path: f.path.clone(), digest: d, executable: f.is_executable, mtime: ninja_core::disk::now_ns() });
+                    outputs.record(Entry {
+                        path: f.path.clone(),
+                        digest: d,
+                        executable: f.is_executable,
+                        mtime: ninja_core::disk::now_ns(),
+                        members: thin.get(&f.path).cloned(),
+                    });
                 }
                 left_remote = true;
                 continue;
@@ -764,8 +799,10 @@ impl Inner {
             return Ok(());
         }
         let _guard = self.materializing.lock().await;
+        // A local command reading a thin archive reads its members too.
+        let members = crate::archive::expand(paths, &self.shared.build_dir, Some(outputs), &self.shared.store).map_err(MaterializeError::from)?;
         let mut wanted: Vec<(PathBuf, Entry, &String)> = Vec::new();
-        for p in paths {
+        for p in paths.iter().chain(&members) {
             let local = self.shared.build_dir.join(p);
             if local.exists() {
                 continue;
@@ -800,6 +837,29 @@ impl Inner {
             outputs.forget(&e.path);
         }
         Ok(())
+    }
+
+    /// The members of a blob if it's a thin archive: from the disk cache
+    /// when it has it, else with ranged reads that skip the symbol table
+    /// (small archives are read whole).
+    async fn remote_thin_members(&self, client: &Client, d: &re::Digest) -> Result<Option<Vec<String>>> {
+        const READ_WHOLE: i64 = 64 * 1024;
+        if let Some(data) = self.disk.as_ref().and_then(|disk| disk.read_blob(d)) {
+            return crate::archive::members(&data).map_err(anyhow::Error::msg);
+        }
+        if d.size_bytes <= READ_WHOLE {
+            return crate::archive::members(&client.read_blob(d).await?).map_err(anyhow::Error::msg);
+        }
+        let head = client.read_range(d, 0, crate::archive::HEAD as i64).await?;
+        if !crate::archive::is_thin(&head) {
+            return Ok(None);
+        }
+        let start = crate::archive::symbols_end(&head).map_err(anyhow::Error::msg)? as i64;
+        if start > d.size_bytes {
+            bail!("truncated thin archive");
+        }
+        let rest = if start == d.size_bytes { Vec::new() } else { client.read_range(d, start, d.size_bytes - start).await? };
+        crate::archive::members_from(&rest).map(Some).map_err(anyhow::Error::msg)
     }
 
     /// Which of these remote-only inputs (task input, digest) the remote CAS

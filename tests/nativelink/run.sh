@@ -13,7 +13,11 @@
 #   5. checkout 1 again, racing local runs that start at once: whichever
 #      wins, the outputs stay identical;
 #   6. a change raced in checkout 1, executed remotely in checkout 2: local
-#      runs of the remote command write the same bytes.
+#      runs of the remote command write the same bytes;
+#   7. the static library as a thin archive (llvm-ar qcT), with a symbol
+#      table too large to be read whole: checkout 1 with minimal downloads
+#      keeps it remote, reading its members with ranged reads, and links
+#      with them remotely; checkout 2 downloads everything.
 #
 # Each step's outputs (objects included) must be byte-identical between the
 # checkouts. Linux only.
@@ -184,4 +188,28 @@ no_checkout_paths "$A"
 cp "$A/hello.c" "$B/hello.c"
 build "$B" exec3 "${EXEC[@]}"
 same_outputs
+
+echo "=== 7. a thin static library: kept remote with minimal downloads, its members read with ranged reads"
+archive=libgreeter_static.a
+for co in "$A" "$B"; do
+  # Enough symbols for a symbol table larger than what's read whole (64 KiB).
+  for i in $(seq 3000); do
+    printf 'int ninja_rs_thin_archive_test_symbol_%04d_with_a_long_name() { return %d; }\n' "$i" "$i"
+  done > "$co/many_symbols.cpp"
+  echo 'target_sources(greeter_static PRIVATE many_symbols.cpp)' >> "$co/hello_native.cmake"
+  "$CMAKE" -S "$co" -B "$co/build" -DCMAKE_CXX_ARCHIVE_CREATE="<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>" \
+    > "$co/configure-thin.log" 2>&1 || { tail -30 "$co/configure-thin.log"; exit 1; }
+done
+"$NINJA_RS" -C "$A/build" -t clean > /dev/null
+build "$A" thin1 "${EXEC[@]}" --remote_download_minimal
+[[ ! -e $A/build/$archive ]] || { echo "  $archive was downloaded"; exit 1; }
+grep -qx "+ CMakeFiles/greeter_static.dir/greeter.cpp.o" "$A/build/.ninja_remote" || { echo "  no members recorded for $archive"; exit 1; }
+echo "  $archive stays remote, $(grep -c '^+ ' "$A/build/.ninja_remote") members recorded"
+"$A/build/hello_cxx" > /dev/null
+build "$B" thin2 "${EXEC[@]}"
+[[ $(head -c 8 "$B/build/$archive") == '!<thin>' ]]
+# Named on the command line, the archive comes down: the same bytes.
+build "$A" thin3 "${EXEC[@]}" --remote_download_minimal "$archive"
+same_outputs
+no_checkout_paths "$A"
 echo "PASS"

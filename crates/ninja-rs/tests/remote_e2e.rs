@@ -5,7 +5,9 @@
 //! `fake-clang` it behaves like a tiny C compiler (follows `#include "..."`,
 //! writes a depfile, answers `-E -v` with an include search list). Under the
 //! name `fake-cmake` it deletes and touches files (`-E rm -f`, `-E touch`),
-//! a tool declared local. This keeps the test hermetic on every host.
+//! a tool declared local. Under the name `fake-ar` it writes thin archives
+//! (`qcT`), which `fake-clang --link` reads. This keeps the test hermetic on
+//! every host.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -68,7 +70,23 @@ fn fake_clang(args: &[String]) -> i32 {
     if link {
         let mut data = String::from("LINKED\n");
         for i in &inputs {
-            data.push_str(&std::fs::read_to_string(i).unwrap_or_default());
+            let bytes = std::fs::read(i).unwrap_or_default();
+            match ninja_remote::archive::members(&bytes) {
+                // A thin archive: its members, next to it.
+                Ok(Some(members)) => {
+                    for m in members {
+                        let p = Path::new(i).parent().unwrap().join(&m);
+                        match std::fs::read_to_string(&p) {
+                            Ok(s) => data.push_str(&s),
+                            Err(e) => {
+                                eprintln!("fake-clang: thin archive {i}: member {m}: {e}");
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                _ => data.push_str(&String::from_utf8_lossy(&bytes)),
+            }
         }
         std::fs::write(&out, data).unwrap();
         return 0;
@@ -114,6 +132,49 @@ fn fake_clang(args: &[String]) -> i32 {
     }
     std::fs::write(&out, text).unwrap();
     println!("fake-clang: compiled {src}");
+    0
+}
+
+/// `fake-ar qcT <archive> <members...>`: a GNU thin archive, with member
+/// paths relative to the archive's directory and a large symbol table (so
+/// that reading the members skips most of the archive).
+fn fake_ar(args: &[String]) -> i32 {
+    let [op, out, members @ ..] = args else {
+        eprintln!("fake-ar: usage: qcT <archive> <members...>");
+        return 2;
+    };
+    if op != "qcT" {
+        eprintln!("fake-ar: unsupported operation {op}");
+        return 2;
+    }
+    let comps = |p: &str| -> Vec<String> { p.replace('\\', "/").split('/').filter(|c| !c.is_empty() && *c != ".").map(str::to_string).collect() };
+    let mut dir = comps(out);
+    dir.pop();
+    let header = |name: &str, size: usize| format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).into_bytes();
+    let mut names = String::new();
+    let mut refs = Vec::new();
+    for m in members {
+        let size = std::fs::metadata(m).map(|md| md.len() as usize).unwrap_or(0);
+        let m = comps(m);
+        let common = dir.iter().zip(&m).take_while(|(a, b)| a == b).count();
+        let mut rel: Vec<String> = vec!["..".to_string(); dir.len() - common];
+        rel.extend(m[common..].iter().cloned());
+        refs.push((format!("/{}", names.len()), size));
+        names.push_str(&format!("{}/\n", rel.join("/")));
+    }
+    let symbols: Vec<u8> = b"SYMBOLS!".iter().copied().cycle().take(100_000).collect();
+    let mut data = b"!<thin>\n".to_vec();
+    data.extend(header("/", symbols.len()));
+    data.extend(&symbols);
+    data.extend(header("//", names.len()));
+    data.extend(names.as_bytes());
+    if names.len() % 2 == 1 {
+        data.push(b'\n');
+    }
+    for (name, size) in refs {
+        data.extend(header(&name, size));
+    }
+    std::fs::write(out, data).unwrap();
     0
 }
 
@@ -169,6 +230,8 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     let compiler = root.join("tc/bin").join(if cfg!(windows) { "fake-clang.exe" } else { "fake-clang" });
     std::fs::create_dir_all(compiler.parent().unwrap()).unwrap();
     std::fs::copy(&exe, &compiler).unwrap();
+    let ar = root.join("tc/bin").join(if cfg!(windows) { "fake-ar.exe" } else { "fake-ar" });
+    std::fs::copy(&exe, &ar).unwrap();
     let cmake = root.join("cmake/bin").join(if cfg!(windows) { "fake-cmake.exe" } else { "fake-cmake" });
     std::fs::create_dir_all(cmake.parent().unwrap()).unwrap();
     std::fs::copy(&exe, &cmake).unwrap();
@@ -179,11 +242,14 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     write(&root.join("src/big.c"), "int big;\n");
     let fwd = |p: &Path| p.to_string_lossy().replace('\\', "/");
     let tc_json = format!(
-        "{{\"version\": 1, \"toolchains\": [{{\"language\": \"C\", \"tool\": \"{}\", \"inputs\": [\"{}\"], \"platform\": {{\"OSFamily\": \"{}\"}}}}, {{\"tool\": \"{}\", \"local\": true}}]}}",
+        "{{\"version\": 1, \"toolchains\": [{{\"language\": \"C\", \"tool\": \"{}\", \"inputs\": [\"{}\"], \"platform\": {{\"OSFamily\": \"{os}\"}}}}, \
+          {{\"tool\": \"{}\", \"inputs\": [\"{}\"], \"platform\": {{\"OSFamily\": \"{os}\"}}}}, {{\"tool\": \"{}\", \"local\": true}}]}}",
         fwd(&compiler),
         fwd(&root.join("tc")),
-        if cfg!(windows) { "Windows" } else { "Linux" },
+        fwd(&ar),
+        fwd(&root.join("tc")),
         fwd(&cmake),
+        os = if cfg!(windows) { "Windows" } else { "Linux" },
     );
     write(&build.join("CMakeFiles/rbe_toolchains.json"), &tc_json);
     write(
@@ -193,6 +259,7 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     );
     let cc = compiler.to_string_lossy().to_string();
     let cm = cmake.to_string_lossy().to_string();
+    let thin_ar = ar.to_string_lossy().to_string();
     let inc = root.join("include").to_string_lossy().to_string();
     let header = if rbe {
         "rbe_version = 1\nrbe_toolchains = CMakeFiles/rbe_toolchains.json\nrbe_targets = CMakeFiles/rbe_targets.json\n"
@@ -217,6 +284,7 @@ rule TOUCH\n  command = {cm} -E touch $out\n\
 rule COPY\n  command = {cm} -E copy $in $out\n\
 rule AR2\n  command = {ar2}\n\
 rule SANDWICH\n  command = {sandwich}\n\
+rule THINAR\n  command = {thin_ar} qcT $out $in\n\
 build sandwich.o: SANDWICH {lib}\n  rbe_mnemonic = CCompile\n\
 build obj/main.o: CC {main}\n  DEP_FILE = obj/main.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
 build obj/lib.o: CC {lib}\n  DEP_FILE = obj/lib.o.d\n  rbe_target = app\n  rbe_mnemonic = CCompile\n\
@@ -231,6 +299,8 @@ build lib2.a lib2.copy: AR2 obj/main.o\n  rbe_mnemonic = CArchive\n\
 build obj/broken.o: CC {lib}\n  DEP_FILE = obj/broken.o.d\n  FLAGS = -DFAIL\n  rbe_target = broken\n  rbe_mnemonic = CCompile\n\
 build user.bin: LINK obj/broken.o\n  rbe_target = user\n  rbe_mnemonic = CLink\n  rbe_deliverable = 1\n\
 build obj/big.o: CC {big}\n  DEP_FILE = obj/big.o.d\n  rbe_mnemonic = CCompile\n\
+build lib/libthin.a: THINAR obj/main.o obj/lib.o\n  rbe_mnemonic = CArchive\n\
+build thin.bin: LINK lib/libthin.a\n  rbe_mnemonic = CLink\n  rbe_deliverable = 1\n\
 default app.bin\n",
         main = ninja_escape_path(&root.join("src/main.c").to_string_lossy()),
         lib = ninja_escape_path(&root.join("src/lib.c").to_string_lossy()),
@@ -836,6 +906,63 @@ fn test_action_rewinding() -> Result<(), String> {
     })
 }
 
+/// The members of a thin archive recorded as remote-only.
+fn recorded_members(f: &Fixture, archive: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(f.build.join(".ninja_remote")).unwrap_or_default();
+    let mut lines = text.lines().skip_while(|l| l.splitn(5, ' ').nth(4) != Some(archive));
+    lines.next();
+    lines.map_while(|l| l.strip_prefix("+ ")).map(str::to_string).collect()
+}
+
+/// Thin archives: a remote link gets the members of the archives it reads.
+/// Downloaded, the archive is read from disk; left remote, its members are
+/// read with ranged reads past its symbol table, and recorded; a local link
+/// gets the archive and its members downloaded.
+fn test_thin_archives() -> Result<(), String> {
+    let mnemonics = "--remote_mnemonics=Compile,Link,Archive";
+    let linked = |f: &Fixture| std::fs::read_to_string(f.build.join("thin.bin")).unwrap_or_default();
+    // All outputs downloaded.
+    let f = fixture("thin", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &[mnemonics, "thin.bin"]) == 0, "build failed")?;
+        check(server.stats().executions == 4, &format!("expected 4 remote executions, got {:?}", server.stats()))?;
+        check(f.build.join("lib/libthin.a").exists(), "the archive wasn't downloaded")?;
+        check(linked(&f).contains("int main()") && linked(&f).contains("int lib()"), &format!("thin.bin: {}", linked(&f)))?;
+        Ok::<(), String>(())
+    })?;
+
+    // Minimal downloads.
+    let f = fixture("thin-minimal", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let flags = ["--remote_download_minimal", mnemonics, "thin.bin"];
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "build failed")?;
+        let stats = server.stats();
+        check(stats.executions == 4, &format!("expected 4 remote executions, got {stats:?}"))?;
+        check(!f.build.join("lib/libthin.a").exists() && !f.build.join("obj/main.o").exists(), "the archive or an object was downloaded")?;
+        check(recorded_members(&f, "lib/libthin.a") == ["../obj/main.o", "../obj/lib.o"], &format!("members: {:?}", recorded_members(&f, "lib/libthin.a")))?;
+        // The members were read past the symbol table (100 kB).
+        check(stats.ranged_reads == 2 && stats.bytes_read < 10_000, &format!("reads: {stats:?}"))?;
+        check(linked(&f).contains("int main()") && linked(&f).contains("int lib()"), &format!("thin.bin: {}", linked(&f)))?;
+
+        // A member changes: the link gets the new one.
+        write(&f.root.join("src/lib.c"), "#include \"lib.h\"\nint lib() { return DEEP + 1; }\n");
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "rebuild failed")?;
+        check(server.stats().executions == 7, &format!("expected the compile, archive and link again, got {:?}", server.stats()))?;
+        check(linked(&f).contains("DEEP + 1"), &format!("thin.bin is stale: {}", linked(&f)))?;
+
+        // A local link downloads the archive and its members.
+        let remote_link = linked(&f);
+        std::fs::remove_file(f.build.join("thin.bin")).map_err(|e| e.to_string())?;
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Compile,Archive", "thin.bin"]) == 0, "local link failed")?;
+        check(server.stats().executions == 7, &format!("something ran remotely: {:?}", server.stats()))?;
+        check(linked(&f) == remote_link, &format!("local link: {}", linked(&f)))?;
+        check(f.build.join("lib/libthin.a").exists() && f.build.join("obj/lib.o").exists(), "the archive and its members weren't downloaded")?;
+        Ok(())
+    })
+}
+
 fn test_without_executor_runs_locally() -> Result<(), String> {
     let f = fixture("noexec", true);
     check(run_ninja(&f, None, &[]) == 0, "local build failed")?;
@@ -850,6 +977,10 @@ fn main() -> ExitCode {
     if stem.starts_with("fake-clang") {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ExitCode::from(fake_clang(&args) as u8);
+    }
+    if stem.starts_with("fake-ar") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ExitCode::from(fake_ar(&args) as u8);
     }
     if stem.starts_with("fake-cmake") {
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -868,6 +999,7 @@ fn main() -> ExitCode {
         ("without_executor_runs_locally", test_without_executor_runs_locally),
         ("minimal_downloads", test_minimal_downloads),
         ("action_rewinding", test_action_rewinding),
+        ("thin_archives", test_thin_archives),
         ("split_and_splice_v2_12", || test_split_and_splice(12)),
         ("split_and_splice_v2_13", || test_split_and_splice(13)),
     ];

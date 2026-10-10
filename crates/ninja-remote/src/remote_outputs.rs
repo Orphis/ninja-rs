@@ -12,12 +12,14 @@
 //! record, as does a remote action producing it again.
 //!
 //! File format (`.ninja_remote`): a version line, then one line per output:
-//! `<mtime ns> <hash> <size> <x|-> <path>`.
+//! `<mtime ns> <hash> <size> <x|-> <path>`, followed for a thin archive by
+//! one `+ <name>` line per member, as the archive stores it (see
+//! `archive`). Version 1 files, without member lines, are read too.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninja_core::disk::Disk;
@@ -25,7 +27,8 @@ use ninja_core::graph::TimeStamp;
 use rbe_client::proto as re;
 
 pub const REMOTE_OUTPUTS_FILE: &str = ".ninja_remote";
-const HEADER: &str = "# ninja-rs remote outputs v1";
+const HEADER: &str = "# ninja-rs remote outputs v2";
+const HEADER_V1: &str = "# ninja-rs remote outputs v1";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -35,6 +38,10 @@ pub struct Entry {
     pub executable: bool,
     /// What `stat` reports, in ns (ninja's `TimeStamp`).
     pub mtime: TimeStamp,
+    /// For a thin archive, its members as stored (read with ranged reads
+    /// when the action produced it), so that actions reading it get them
+    /// without downloading it.
+    pub members: Option<Arc<Vec<String>>>,
 }
 
 pub struct RemoteOutputs {
@@ -62,9 +69,18 @@ impl RemoteOutputs {
     pub fn load(file: &Path) -> Self {
         let mut entries = HashMap::new();
         if let Ok(text) = std::fs::read_to_string(file)
-            && text.lines().next() == Some(HEADER)
+            && matches!(text.lines().next(), Some(HEADER | HEADER_V1))
         {
+            let mut last: Option<String> = None;
             for line in text.lines().skip(1) {
+                if let Some(name) = line.strip_prefix("+ ") {
+                    if let Some(e) = last.as_ref().and_then(|k| entries.get_mut(k)) {
+                        let e: &mut Entry = e;
+                        Arc::make_mut(e.members.get_or_insert_with(Default::default)).push(name.to_string());
+                    }
+                    continue;
+                }
+                last = None;
                 let mut parts = line.splitn(5, ' ');
                 let (Some(mtime), Some(hash), Some(size), Some(x), Some(path)) =
                     (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
@@ -72,8 +88,9 @@ impl RemoteOutputs {
                     continue;
                 };
                 let (Ok(mtime), Ok(size)) = (mtime.parse(), size.parse()) else { continue };
-                let e = Entry { path: path.to_string(), digest: re::Digest { hash: hash.to_string(), size_bytes: size }, executable: x == "x", mtime };
+                let e = Entry { path: path.to_string(), digest: re::Digest { hash: hash.to_string(), size_bytes: size }, executable: x == "x", mtime, members: None };
                 entries.insert(key(path), e);
+                last = Some(key(path));
             }
         }
         Self { file: file.to_path_buf(), entries: Mutex::new(entries), changed: AtomicBool::new(false) }
@@ -99,6 +116,9 @@ impl RemoteOutputs {
             writeln!(f, "{HEADER}")?;
             for e in sorted {
                 writeln!(f, "{} {} {} {} {}", e.mtime, e.digest.hash, e.digest.size_bytes, if e.executable { "x" } else { "-" }, e.path)?;
+                for m in e.members.iter().flat_map(|m| m.iter()) {
+                    writeln!(f, "+ {m}")?;
+                }
             }
             f.flush()?;
         }
@@ -209,7 +229,7 @@ mod tests {
     use ninja_core::disk::VirtualDisk;
 
     fn entry(path: &str, mtime: TimeStamp) -> Entry {
-        Entry { path: path.into(), digest: rbe_client::digest_of(path.as_bytes()), executable: false, mtime }
+        Entry { path: path.into(), digest: rbe_client::digest_of(path.as_bytes()), executable: false, mtime, members: None }
     }
 
     #[test]
@@ -220,16 +240,36 @@ mod tests {
         assert!(s.is_empty());
         s.record(entry("obj/a.o", 5));
         s.record(Entry { executable: true, ..entry("bin dir/app", 7) });
+        let thin = Entry { members: Some(Arc::new(vec!["../obj/a.o".into(), "../obj/b c.o".into()])), ..entry("lib/libt.a", 8) };
+        s.record(thin.clone());
+        s.record(Entry { members: Some(Arc::new(vec![])), ..entry("lib/empty.a", 8) });
         s.save().unwrap();
         let t = RemoteOutputs::load(&file);
         assert_eq!(t.get("obj/a.o"), Some(entry("obj/a.o", 5)));
         assert!(t.get("bin dir/app").unwrap().executable);
+        assert_eq!(t.get("lib/libt.a"), Some(thin));
+        // An empty thin archive has no member lines: indistinguishable from
+        // any other output, which is harmless.
+        assert_eq!(t.get("lib/empty.a").unwrap().members, None);
+        t.forget("lib/libt.a");
+        t.forget("lib/empty.a");
         // Keys ignore separators (and case on Windows).
         assert!(t.get("obj\\a.o").is_some());
         t.forget("obj/a.o");
         t.forget("bin dir/app");
         t.save().unwrap();
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn reads_version_1() {
+        let file = std::env::temp_dir().join(format!("ninja-rs-remote-outputs-v1-{}", std::process::id()));
+        std::fs::write(&file, format!("{HEADER_V1}
+5 {} 3 - obj/a.o
+", "ab".repeat(32))).unwrap();
+        let t = RemoteOutputs::load(&file);
+        assert_eq!(t.get("obj/a.o").unwrap().mtime, 5);
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

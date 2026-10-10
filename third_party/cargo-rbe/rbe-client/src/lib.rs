@@ -546,6 +546,30 @@ impl Client {
         self.decode(compressor, wire, d.size_bytes)
     }
 
+    /// Reads `limit` bytes of a blob from `offset` (ByteStream's
+    /// `read_offset` and `read_limit`), uncompressed: a part of a large blob
+    /// without fetching all of it.
+    pub async fn read_range(&self, d: &re::Digest, offset: i64, limit: i64) -> Result<Vec<u8>> {
+        let mut stream = ByteStreamClient::new(self.channel.clone())
+            .read(self.req(ReadRequest {
+                resource_name: format!("{}blobs/{}/{}", self.prefix(), d.hash, d.size_bytes),
+                read_offset: offset,
+                read_limit: limit,
+            }))
+            .await
+            .with_context(|| format!("ByteStream read {} at {offset}", digest_str(d)))?
+            .into_inner();
+        let mut data = Vec::new();
+        while let Some(chunk) = stream.message().await? {
+            data.extend_from_slice(&chunk.data);
+        }
+        self.wire_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+        if limit > 0 && data.len() as i64 > limit {
+            data.truncate(limit as usize);
+        }
+        Ok(data)
+    }
+
     /// Bytes received for blob reads (after compression), since connect.
     pub fn wire_bytes_read(&self) -> u64 {
         self.wire_read.load(Ordering::Relaxed)

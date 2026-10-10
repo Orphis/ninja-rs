@@ -22,5 +22,6 @@ rust_library(
 
 rust_test(
     name = "ninja-remote_test",
+    compile_data = glob(["testdata/**"]),
     crate = ":ninja-remote",
 )

@@ -276,7 +276,9 @@ persisted wholesale later, which the daemon needs.
    build's own libraries are declared inputs. A driver without a dry run
    sends its declared inputs only. On Windows hosts, arguments naming an
    input by a relative path are sent with forward slashes, so that an
-   archive's member names don't depend on the host.
+   archive's member names don't depend on the host. **Thin archives**
+   among the inputs of any action but a compile bring their members, see
+   below.
 5. **Exec root and path rewriting** (`paths`), see [paths.md](paths.md).
 6. **Action**: `Command` (rewritten argv, `output_paths` and legacy
    `output_files` relative to the working directory, working directory,
@@ -294,6 +296,41 @@ persisted wholesale later, which the daemon needs.
    (`deps = gcc`); `/showIncludes` lines in stdout are rewritten for
    `deps = msvc`. stdout and stderr are concatenated like a local run, with
    the output of the local steps run before and after.
+
+## Thin archives
+
+A thin archive (`llvm-ar --thin` or `qcT`, `ar T`, `llvm-lib
+/llvmlibthin`; always the GNU format) holds the symbol table and, for each
+member, a header naming the file, relative to the archive's directory: an
+action reading it reads its members too. They aren't declared inputs, so
+`archive::expand` adds them: for each input that is a thin archive (on disk,
+read once per version of the file by `Store::thin_members`, or recorded as
+remote-only with its members), its members, resolved against its directory,
+and theirs if they are thin archives too. A remote action gets them like
+other inputs, by digest when they only exist remotely; `materialize`
+downloads them with the archive for a local command. Compiles read no
+archives and skip this. Member paths survive the input root's layout (tree
+paths are relative to the exec root); a member named by an absolute path
+wouldn't, and makes the action run locally. The action's key includes the
+members' digests: a thin archive's bytes only depend on its members'
+names, sizes and symbols.
+
+With minimal downloads an archive often stays remote, so its members are
+recorded with it in `.ninja_remote` (`+ <name>` lines after its entry),
+read when the action producing it finishes. The member list follows the
+symbol table, which is most of a thin archive: the first ranged ByteStream
+read (`read_offset`, `read_limit`, through `Client::read_range`) gets the
+magic and the first header, the second everything past the symbol table
+(`archive::symbols_end`, `archive::members_from`). Archives up to 64 KiB
+are read whole, and one in the disk cache is read there. An output is read
+this way when its command creates a thin archive (`archive::creates_thin`:
+the `T` modifier, `--thin`, `/llvmlibthin`) or its name ends with `.a` or
+`.lib`; if the reads fail, it is downloaded.
+
+`restat` and thin archives don't mix: when a member changes but not its
+size or symbols, the archive's bytes stay the same, the download leaves it
+untouched, and with `restat = 1` on the archiving edge the link would be
+skipped. CMake doesn't set `restat` on archives.
 
 ## Include scanner
 
@@ -476,7 +513,8 @@ the outputs of remote actions in the remote CAS, except:
   inputs that only exist remotely.
 
 `remote_outputs::RemoteOutputs` records the others in `.ninja_remote` in the
-build directory: path, digest, executable bit and a time. The build's
+build directory: path, digest, executable bit, a time, and the members of a
+thin archive (see "Thin archives"). The build's
 `Disk` is wrapped (`RemoteDisk`) so that a recorded output missing locally
 stats with its recorded time: ninja's up-to-date checks, build log and deps
 log work unchanged, and a recorded output is as present as a local one. A

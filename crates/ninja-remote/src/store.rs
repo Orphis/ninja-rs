@@ -1,6 +1,7 @@
 //! Caches that outlive a single action (and, in a future daemon, a single
-//! build): file digests, include scanning results, toolchain input trees and
-//! the set of blobs known to be in the remote CAS.
+//! build): file digests, include scanning results, toolchain input trees,
+//! the members of thin archives and the set of blobs known to be in the
+//! remote CAS.
 //!
 //! Everything lives behind this one `Store`, owned by the service; nothing
 //! is global. The file digest cache can be saved to and loaded from disk
@@ -11,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rbe_client::proto as re;
 use rbe_client::tree::MemDigestCache;
@@ -46,12 +47,16 @@ pub fn walk_files(dir: &Path, rel: &str, out: &mut Vec<String>) {
 
 type TreeCell = Arc<OnceLock<Result<Arc<ToolchainTree>, String>>>;
 
+/// The members of a file if it's a thin archive, for its size and mtime.
+type ThinEntry = (u64, SystemTime, Option<Arc<Vec<String>>>);
+
 #[derive(Default)]
 pub struct Store {
     pub digests: MemDigestCache,
     pub scan: ScanCache,
     /// One cell per directory, so concurrent actions build each tree once.
     toolchain_trees: Mutex<HashMap<PathBuf, TreeCell>>,
+    thin_archives: Mutex<HashMap<PathBuf, ThinEntry>>,
     /// Hashes of blobs uploaded to (or found in) the CAS during this session.
     uploaded: Mutex<HashSet<String>>,
 }
@@ -75,6 +80,21 @@ impl Store {
             Ok(Arc::new(ToolchainTree { digest, blobs: Arc::new(blobs), files: Arc::new(files) }))
         })
         .clone()
+    }
+
+    /// The members of `path` if it's a thin archive (see `archive`), read
+    /// once per version of the file.
+    pub fn thin_members(&self, path: &Path) -> Result<Option<Arc<Vec<String>>>, String> {
+        let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let (len, mtime) = (meta.len(), meta.modified().unwrap_or(UNIX_EPOCH));
+        if let Some((l, m, members)) = self.thin_archives.lock().unwrap().get(path)
+            && (*l, *m) == (len, mtime)
+        {
+            return Ok(members.clone());
+        }
+        let members = crate::archive::read_members(path).map_err(|e| format!("{}: {e}", path.display()))?.map(Arc::new);
+        self.thin_archives.lock().unwrap().insert(path.to_path_buf(), (len, mtime, members.clone()));
+        Ok(members)
     }
 
     /// Keeps only the blobs not yet known to be in the CAS.

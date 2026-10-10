@@ -167,6 +167,22 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
             remote_inputs.push((p, e, i.clone()));
         }
     }
+    // Thin archives bring their members, which aren't declared inputs (a
+    // compile reads none).
+    if style.is_none() || driver_link {
+        let members = crate::archive::expand(&task.inputs, build_dir, shared.remote_outputs.as_deref(), &shared.store)?;
+        for m in members {
+            let p = scanner::normalize(&build_dir.join(&m));
+            if p.is_file() {
+                files.push(p);
+            } else if let Some(e) = shared.remote_outputs.as_ref().and_then(|r| r.get(&m)) {
+                let i = e.path.clone();
+                remote_inputs.push((p, e, i));
+            } else {
+                return Err(format!("thin archive member {m} is missing"));
+            }
+        }
+    }
 
     // Toolchain inputs are sent whole; without a declaration, just the
     // executables.

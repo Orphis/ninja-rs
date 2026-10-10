@@ -6,6 +6,8 @@
 //! - [`action`] turns a ninja task into a REAPI action.
 //! - [`cmdline`] splits command lines into the commands they run.
 //! - [`scanner`] finds the headers a C/C++ compile reads.
+//! - [`link`] finds what a link reads, and [`archive`] the members of thin
+//!   archives.
 //! - [`paths`] maps local paths into the remote input root and back.
 //! - [`toolchains`] reads the `rbe_toolchains` file.
 //! - [`targets`] reads the `rbe_targets` file.
@@ -13,6 +15,7 @@
 //! - [`disk_cache::DiskCache`] is the local action cache and CAS.
 
 pub mod action;
+pub mod archive;
 pub mod backend;
 pub mod cmdline;
 pub mod disk_cache;

@@ -48,6 +48,8 @@ pub struct Stats {
     pub bytes_uploaded: u64,
     /// Blob bytes sent (batches and ByteStream).
     pub bytes_read: u64,
+    /// ByteStream reads of part of a blob (`read_offset`, `read_limit`).
+    pub ranged_reads: u64,
     /// Blobs split, and blobs spliced.
     pub splits: u64,
     pub splices: u64,
@@ -312,10 +314,20 @@ impl bs::byte_stream_server::ByteStream for Svc {
         let r = r.into_inner();
         let d = parse_resource(&r.resource_name).ok_or_else(|| Status::invalid_argument("bad resource name"))?;
         let data = self.0.get(&d).ok_or_else(|| Status::not_found("blob not found"))?;
-        let start = (r.read_offset as usize).min(data.len());
-        self.0.stats.lock().unwrap().bytes_read += (data.len() - start) as u64;
+        if r.read_offset < 0 || r.read_limit < 0 || r.read_offset as usize > data.len() {
+            return Err(Status::out_of_range("bad read_offset or read_limit"));
+        }
+        let start = r.read_offset as usize;
+        let end = if r.read_limit > 0 { (start + r.read_limit as usize).min(data.len()) } else { data.len() };
+        {
+            let mut stats = self.0.stats.lock().unwrap();
+            stats.bytes_read += (end - start) as u64;
+            if r.read_offset > 0 || r.read_limit > 0 {
+                stats.ranged_reads += 1;
+            }
+        }
         let chunks: Vec<Result<bs::ReadResponse, Status>> =
-            data[start..].chunks(64 * 1024).map(|c| Ok(bs::ReadResponse { data: c.to_vec() })).collect();
+            data[start..end].chunks(64 * 1024).map(|c| Ok(bs::ReadResponse { data: c.to_vec() })).collect();
         Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
     }
 
