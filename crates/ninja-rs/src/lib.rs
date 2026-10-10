@@ -680,6 +680,9 @@ impl Service {
             match builder.build(runner.as_mut()).await {
                 Ok(()) => EXIT_SUCCESS,
                 Err(e) => {
+                    if !e.interrupted {
+                        builder.status.failure_summary();
+                    }
                     builder.status.info(&format!("build stopped: {}.", e.message));
                     if e.interrupted { EXIT_INTERRUPTED } else { EXIT_FAILURE }
                 }

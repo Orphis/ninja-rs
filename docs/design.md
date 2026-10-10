@@ -58,6 +58,11 @@ deps), 26 depfile parser tests, plus dyndep, lexer, canonicalization and
 - Not implemented: `-l` (accepted, ignored),
   `-t browse/graph/msvc/wincodepage/multi-inputs/urtle`.
 - Tools write `\n` line endings on Windows too (ninja writes `\r\n`).
+- Failed commands summary (ninja issue 2378): with many jobs, a `FAILED:`
+  block scrolls away behind the output of the commands still running.
+  Before "build stopped", the failed commands are shown again (at most 10,
+  each with the first 20 lines of its output), unless the only one is
+  still the last thing printed.
 - Dyndep outputs met as sources (ninja issues 2653 and 2743, open). When
   the dirty scan loads a dyndep file, its implicit outputs gain a producer,
   but edges already scanned may read them and took them for sources. ninja

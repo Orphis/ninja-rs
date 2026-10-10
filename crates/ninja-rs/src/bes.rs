@@ -704,6 +704,9 @@ impl Status for ReportingStatus<'_> {
             b.message(&format!("ninja: error: {msg}\n"));
         }
     }
+    fn failure_summary(&mut self) {
+        self.printer.failure_summary();
+    }
     fn explain(&mut self, msg: &str) {
         self.printer.explain(msg);
     }

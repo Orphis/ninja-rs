@@ -196,6 +196,45 @@ fn test_status_format() -> Result<(), String> {
     )
 }
 
+/// Failed commands are shown again before "build stopped" when other output
+/// followed them (ninja issue 2378), not when the only one is still last.
+fn test_failure_summary() -> Result<(), String> {
+    let dir = test_dir("summary");
+    let (fail, noisy) = if cfg!(windows) {
+        ("cmd /c \"echo $out: error& exit 1\"", "cmd /c \"echo $out: output\"")
+    } else {
+        ("echo $out: error; exit 1", "echo $out: output")
+    };
+    let manifest = format!(
+        "rule fail
+  command = {fail}
+rule noisy
+  command = {noisy}
+build a.o: fail
+build b.o: noisy
+build c.o: fail
+build d.o: noisy
+build all: phony a.o b.o c.o d.o
+default all
+"
+    );
+    std::fs::write(dir.join("build.ninja"), manifest).unwrap();
+    let r = ninja(&dir, &["-k", "0", "-j1"], &[]);
+    let summary = format!("ninja: 2 commands failed:
+FAILED: a.o
+{}
+a.o: error
+FAILED: c.o
+", fail.replace("$out", "a.o"));
+    let at = r.stdout.find(&summary).ok_or_else(|| format!("no summary:
+{}", r.stdout))?;
+    check(r.code == 1 && r.stdout[at..].contains("ninja: build stopped"), &format!("summary not before build stopped:
+{}", r.stdout))?;
+    let r = ninja(&dir, &["-j1", "a.o"], &[]);
+    check(r.code == 1 && !r.stdout.contains("failed:"), &format!("summary of a failure still last:
+{}", r.stdout))
+}
+
 // ---------------------------------------------------------------------------
 // Jobserver
 // ---------------------------------------------------------------------------
@@ -294,6 +333,7 @@ fn main() -> ExitCode {
         ("compdb", test_compdb),
         ("missingdeps", test_missingdeps),
         ("status_format", test_status_format),
+        ("failure_summary", test_failure_summary),
         ("jobserver_pool", test_jobserver_pool),
         ("jobserver_pool_from_manifest", test_jobserver_pool_from_manifest),
         ("jobserver_client", test_jobserver_client),

@@ -54,6 +54,9 @@ pub trait Status {
     fn explain(&mut self, msg: &str) {
         eprintln!("ninja explain: {msg}");
     }
+    /// The build stopped on failed commands: before saying so, show them
+    /// again if other output followed them.
+    fn failure_summary(&mut self) {}
 }
 
 /// Prints lines, overwriting the previous status line on smart terminals.
@@ -268,7 +271,24 @@ pub struct StatusPrinter {
     status_eval: Option<crate::eval::EvalString>,
     start: Instant,
     time_millis: i64,
+    /// The commands that failed, for `failure_summary`.
+    failures: Vec<Failure>,
+    /// Something was printed after the last failure.
+    printed_since_failure: bool,
 }
+
+/// A failed command, as its `FAILED:` block showed it.
+struct Failure {
+    code: i32,
+    outputs: String,
+    command: String,
+    output: Vec<u8>,
+}
+
+/// How many failed commands `failure_summary` shows, and how many lines of
+/// each one's output.
+const SUMMARY_MAX_FAILURES: usize = 10;
+const SUMMARY_MAX_LINES: usize = 20;
 
 /// The variables of a `--status` format.
 const STATUS_VARIABLES: &[&str] = &[
@@ -314,7 +334,39 @@ impl StatusPrinter {
             status_eval: None,
             start: Instant::now(),
             time_millis: 0,
+            failures: Vec::new(),
+            printed_since_failure: false,
         }
+    }
+
+    /// Prints a failed command's `FAILED:` block: outputs, command line, and
+    /// its output.
+    fn print_failure(&mut self, f: &Failure, max_lines: Option<usize>) {
+        let failed = if self.printer.supports_color() { "\x1b[31mFAILED: \x1b[0m" } else { "FAILED: " };
+        let code_str = if f.code != 1 { format!("[code={}] ", f.code) } else { String::new() };
+        self.printer.print_on_new_line(format!("{failed}{code_str}{}\n", f.outputs).as_bytes());
+        self.printer.print_on_new_line(format!("{}\n", f.command).as_bytes());
+        if f.output.is_empty() {
+            return;
+        }
+        let mut out = if self.printer.supports_color() { f.output.clone() } else { strip_ansi_escape_codes(&f.output) };
+        #[cfg(windows)]
+        {
+            // Normalize CRLF to LF; stdout is in text mode in ninja.
+            out = String::from_utf8_lossy(&out).replace("\r\n", "\n").into_bytes();
+        }
+        if let Some(max) = max_lines {
+            let lines = out.split_inclusive(|&b| b == b'\n').count();
+            if lines > max {
+                let kept: usize = out.split_inclusive(|&b| b == b'\n').take(max).map(<[u8]>::len).sum();
+                out.truncate(kept);
+                if !out.ends_with(b"\n") {
+                    out.push(b'\n');
+                }
+                out.extend_from_slice(format!("[{} more lines]\n", lines - max).as_bytes());
+            }
+        }
+        self.printer.print_on_new_line(&out);
     }
 
     /// `--status FMT`: the status line is FMT with ninja-style variables
@@ -509,20 +561,18 @@ impl Status for StatusPrinter {
         // As ninja: the finished edge's line still counts it as running.
         if !info.use_console {
             self.print_status(info, end_ms);
+            // On a smart terminal, status lines replace each other.
+            if !self.printer.is_smart_terminal() {
+                self.printed_since_failure = true;
+            }
         }
         self.running_edges = self.running_edges.saturating_sub(1);
         if let Some(code) = exit_code {
-            let mut outputs = String::new();
-            for o in &info.outputs {
-                outputs.push_str(o);
-                outputs.push(' ');
-            }
-            let failed = if self.printer.supports_color() { "\x1b[31mFAILED: \x1b[0m" } else { "FAILED: " };
-            let code_str = if code != 1 { format!("[code={code}] ") } else { String::new() };
-            self.printer.print_on_new_line(format!("{failed}{code_str}{}\n", outputs.trim_end()).as_bytes());
-            self.printer.print_on_new_line(format!("{}\n", info.command).as_bytes());
-        }
-        if !output.is_empty() {
+            let failure = Failure { code, outputs: info.outputs.join(" "), command: info.command.clone(), output: output.to_vec() };
+            self.print_failure(&failure, None);
+            self.failures.push(failure);
+            self.printed_since_failure = false;
+        } else if !output.is_empty() {
             let out = if self.printer.supports_color() { output.to_vec() } else { strip_ansi_escape_codes(output) };
             #[cfg(windows)]
             let out = {
@@ -531,6 +581,7 @@ impl Status for StatusPrinter {
                 s.into_bytes()
             };
             self.printer.print_on_new_line(&out);
+            self.printed_since_failure = true;
         }
     }
     fn build_started(&mut self) {
@@ -546,14 +597,37 @@ impl Status for StatusPrinter {
     fn info(&mut self, msg: &str) {
         self.printer.print_on_new_line(b"");
         println!("ninja: {msg}");
+        self.printed_since_failure = true;
     }
     fn warning(&mut self, msg: &str) {
         self.printer.print_on_new_line(b"");
         eprintln!("ninja: warning: {msg}");
+        self.printed_since_failure = true;
     }
     fn error(&mut self, msg: &str) {
         self.printer.print_on_new_line(b"");
         eprintln!("ninja: error: {msg}");
+        self.printed_since_failure = true;
+    }
+    /// With many jobs, a failure scrolls away behind the output of the
+    /// commands still running (ninja issue 2378): the failed commands are
+    /// shown again, the first lines of their output too, unless the only
+    /// failure is still the last thing printed.
+    fn failure_summary(&mut self) {
+        if self.verbosity == Verbosity::Quiet || self.failures.is_empty() || (self.failures.len() == 1 && !self.printed_since_failure) {
+            return;
+        }
+        let failures = std::mem::take(&mut self.failures);
+        let n = failures.len();
+        self.printer.print_on_new_line(format!("ninja: {n} command{} failed:\n", if n == 1 { "" } else { "s" }).as_bytes());
+        for f in failures.iter().take(SUMMARY_MAX_FAILURES) {
+            self.print_failure(f, Some(SUMMARY_MAX_LINES));
+        }
+        if n > SUMMARY_MAX_FAILURES {
+            let more = n - SUMMARY_MAX_FAILURES;
+            self.printer.print_on_new_line(format!("ninja: and {more} more; search the output above for FAILED:\n").as_bytes());
+        }
+        self.failures = failures;
     }
 }
 
@@ -591,6 +665,32 @@ mod tests {
         s.running_edges = 1;
         assert_eq!(s.format_progress_status("[%f/%t] ", 0), "[2/10] ");
         assert_eq!(s.format_progress_status("%s %r %u %p %%", 0), "3 1 7  20% %");
+    }
+
+    #[test]
+    fn failure_summary_only_when_needed() {
+        let failed = |s: &mut StatusPrinter, out: &str| {
+            let info = EdgeInfo { outputs: vec![out.into()], command: format!("cc {out}"), ..Default::default() };
+            s.build_edge_finished(&info, 0, Some(1), &ExecKind::Local, b"error\n");
+        };
+        let ok = |s: &mut StatusPrinter, output: &[u8]| {
+            let info = EdgeInfo { outputs: vec!["ok.o".into()], command: "cc ok.o".into(), ..Default::default() };
+            s.build_edge_finished(&info, 0, None, &ExecKind::Local, output);
+        };
+        // One failure, still the last thing printed: nothing to repeat.
+        let mut s = StatusPrinter::new(Verbosity::Normal);
+        s.printer.set_smart_terminal(true);
+        failed(&mut s, "a.o");
+        ok(&mut s, b"");
+        assert!(s.failures.len() == 1 && !s.printed_since_failure);
+        // Output of another command followed it.
+        ok(&mut s, b"warning\n");
+        assert!(s.printed_since_failure);
+        // Several failures are always repeated.
+        let mut s = StatusPrinter::new(Verbosity::Normal);
+        failed(&mut s, "a.o");
+        failed(&mut s, "b.o");
+        assert_eq!(s.failures.len(), 2);
     }
 
     #[test]
