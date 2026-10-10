@@ -100,11 +100,15 @@ left alone) and `.ninja_rs_digests` (file digest cache for remote builds).
   the test binary itself acting as the compiler, and
   `//crates/ninja-rs:cli_e2e`: tools, `--status` and the jobserver (pools,
   external pools, GNU make 4.3 pipes) against ninja's outputs.
-- `tests/nativelink/run.sh` (Linux): builds a small C++ project through
-  ninja-rs against a local NativeLink (scheduler + local worker), with remote
-  compiles by the hermetic clang from the llvm module:
-  `NATIVELINK=/path/to/nativelink tests/nativelink/run.sh` after
-  `bazelisk build -c opt //crates/ninja-rs`.
+- `tests/nativelink/run.sh` (Linux): builds hermetic-llvm-cmake's sample
+  (`tests/hello`) with its toolchain set up for remote execution (the
+  toolchain cache inside each checkout, CMake's Ninja generator in RBE
+  mode) against a local NativeLink (scheduler + local worker), in two
+  checkouts at different paths: remote execution in one, the remote cache
+  alone in the other, local misses stored and reused, outputs identical:
+  `NATIVELINK=/path/to/nativelink HERMETIC=/path/to/hermetic-llvm-cmake
+  CMAKE=/path/to/cmake tests/nativelink/run.sh` after
+  `bazelisk build //crates/ninja-rs`.
 
 ## Status
 
