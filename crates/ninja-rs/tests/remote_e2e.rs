@@ -411,6 +411,42 @@ fn test_disk_cache_alone() -> Result<(), String> {
     Ok(())
 }
 
+/// `--remote_cache`: a remote cache without remote execution. Misses run
+/// locally and store their results; another checkout gets them as hits.
+fn test_remote_cache_only() -> Result<(), String> {
+    let f = fixture("cacheonly", true);
+    with_server(&f, |server| {
+        let flag = format!("--remote_cache={}", server.endpoint);
+        // 1. Misses run locally and store the two compiles (not the
+        //    rbe_local one, nor the link, which isn't a cached mnemonic).
+        check(run_ninja(&f, None, &[&flag]) == 0, "first build failed")?;
+        let st = server.stats();
+        check(st.executions == 0 && st.action_cache_updates == 2, &format!("expected 2 stored results and no executions, got {st:?}"))?;
+
+        // 2. Another checkout of the same sources: the compiles are hits, and
+        //    the depfiles map back to its paths.
+        let g = fixture("cacheonly-other", true);
+        check(run_ninja(&g, None, &[&flag]) == 0, "build in the other checkout failed")?;
+        let st = server.stats();
+        check(st.executions == 0 && st.action_cache_hits == 2 && st.action_cache_updates == 2, &format!("expected 2 remote cache hits, got {st:?}"))?;
+        check(std::fs::read(g.build.join("obj/main.o")).ok() == std::fs::read(f.build.join("obj/main.o")).ok(), "obj/main.o differs")?;
+        check(std::fs::read_to_string(g.build.join("app.bin")).is_ok_and(|s| s.starts_with("LINKED")), "app.bin")?;
+        let deep = g.root.join("include/nested/deep.h").to_string_lossy().replace('\\', "/");
+        let deps = deps_of(&g, "obj/main.o");
+        check(deps.iter().any(|d| d.replace('\\', "/").eq_ignore_ascii_case(&deep)), &format!("deps of obj/main.o: {deps:?}"))?;
+
+        // 3. Read only: a changed source misses, runs locally, and nothing
+        //    is stored.
+        write(&g.root.join("src/lib.c"), "#include \"lib.h\"
+int lib() { return DEEP + 1; }
+");
+        check(run_ninja(&g, None, &[&flag, "--noremote_upload_local_results"]) == 0, "read-only build failed")?;
+        let st = server.stats();
+        check(st.executions == 0 && st.action_cache_updates == 2, &format!("a read-only build stored results: {st:?}"))?;
+        Ok(())
+    })
+}
+
 fn test_disk_cache_with_remote() -> Result<(), String> {
     let f = fixture("diskremote", true);
     with_server(&f, |server| {
@@ -745,6 +781,7 @@ fn main() -> ExitCode {
         ("build_events", test_build_events),
         ("disk_cache_alone", test_disk_cache_alone),
         ("disk_cache_with_remote", test_disk_cache_with_remote),
+        ("remote_cache_only", test_remote_cache_only),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
         ("minimal_downloads", test_minimal_downloads),
         ("action_rewinding", test_action_rewinding),

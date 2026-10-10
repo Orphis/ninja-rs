@@ -86,6 +86,13 @@ impl BesFlags {
 #[derive(Clone, Debug, Default)]
 pub struct RemoteFlags {
     pub executor: Option<String>,
+    /// `--remote_cache`: a remote cache without remote execution. Actions
+    /// remote execution would run are looked up there, and run locally on
+    /// a miss.
+    pub cache: Option<String>,
+    /// `--[no]remote_upload_local_results`: with `cache`, store the results
+    /// of actions run locally.
+    pub upload_local_results: bool,
     pub instance_name: String,
     pub headers: Vec<(String, String)>,
     pub jobs: usize,
@@ -102,6 +109,18 @@ pub struct RemoteFlags {
     pub download_minimal: bool,
     /// `--execution_log_file`: where to log every remote action (absolute).
     pub execution_log: Option<String>,
+}
+
+impl RemoteFlags {
+    /// The remote service: the executor, or the cache alone.
+    pub fn endpoint(&self) -> Option<&String> {
+        self.executor.as_ref().or(self.cache.as_ref())
+    }
+
+    /// A remote cache without remote execution.
+    pub fn cache_only(&self) -> bool {
+        self.executor.is_none() && self.cache.is_some()
+    }
 }
 
 /// `--disk_cache_max_size` default: 10 GiB.
@@ -153,6 +172,10 @@ options:
 
 remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --remote_executor=URL      grpc://host:port or grpcs://host:port
+  --remote_cache=URL         remote cache alone: actions remote execution would run
+                             are looked up there, and run locally on a miss
+  --[no]remote_upload_local_results  with --remote_cache, store the results of
+                             actions run locally [default=on]
   --remote_instance_name=S   REAPI instance name
   --remote_header=K=V        extra gRPC header (repeatable)
   --remote_jobs=N            remote actions in flight [default=50]
@@ -217,6 +240,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
             jobs: 50,
             mnemonic_suffixes: vec!["Compile".into()],
             local_fallback: true,
+            upload_local_results: true,
             disk_cache_max_size: DEFAULT_DISK_CACHE_MAX_SIZE,
             ..Default::default()
         },
@@ -256,6 +280,9 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "jobserver-pool" => o.jobserver_pool = true,
                 "help" => return Ok(ParseOutcome::Exit(usage(), 1)),
                 "remote_executor" => o.remote.executor = Some(value(&mut i)?),
+                "remote_cache" => o.remote.cache = Some(value(&mut i)?),
+                "remote_upload_local_results" => o.remote.upload_local_results = true,
+                "noremote_upload_local_results" => o.remote.upload_local_results = false,
                 "remote_instance_name" => o.remote.instance_name = value(&mut i)?,
                 "remote_header" => {
                     let v = value(&mut i)?;
@@ -414,6 +441,11 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         positional.push(a.clone());
     }
     o.targets = positional;
+    if let (Some(e), Some(c)) = (&o.remote.executor, &o.remote.cache)
+        && e != c
+    {
+        return Err("--remote_cache and --remote_executor name different services: the executor's cache is used".into());
+    }
     Ok(ParseOutcome::Run(Box::new(o)))
 }
 
@@ -467,6 +499,20 @@ mod tests {
         assert_eq!(o.remote.jobs, 12);
         assert!(!o.remote.local_fallback);
         assert_eq!(o.remote.mnemonic_suffixes, vec!["Compile", "Archive"]);
+    }
+
+    #[test]
+    fn remote_cache_flags() {
+        let o = p(&["--remote_cache=grpcs://cache:443"]);
+        assert!(o.remote.cache_only() && o.remote.upload_local_results);
+        assert_eq!(o.remote.endpoint().map(String::as_str), Some("grpcs://cache:443"));
+        let o = p(&["--remote_cache=grpc://c:1", "--noremote_upload_local_results"]);
+        assert!(!o.remote.upload_local_results);
+        // The executor's own cache.
+        let o = p(&["--remote_executor=grpc://e:1", "--remote_cache=grpc://e:1"]);
+        assert!(!o.remote.cache_only());
+        let v: Vec<String> = ["--remote_executor=grpc://e:1", "--remote_cache=grpc://c:1"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(&v).is_err());
     }
 
     #[test]

@@ -33,6 +33,11 @@ pub struct BackendConfig {
     pub jobs: usize,
     pub mnemonic_suffixes: Vec<String>,
     pub local_fallback: bool,
+    /// The remote service is a cache without execution: a miss runs the
+    /// command locally.
+    pub cache_only: bool,
+    /// With `cache_only`, store the results of commands run locally there.
+    pub upload_local_results: bool,
     pub verbose: bool,
     /// Outputs of remote actions that weren't downloaded: remote actions
     /// read them by digest, local commands get them downloaded first.
@@ -55,6 +60,9 @@ pub struct Backend {
 struct Inner {
     /// The remote service; without it, the disk cache alone.
     client: Option<Client>,
+    /// Results of commands run locally on a cache miss go to the remote
+    /// cache (`cache_only`, when the server accepts them).
+    upload: bool,
     disk: Option<Arc<DiskCache>>,
     shared: Shared,
     config: BackendConfig,
@@ -74,6 +82,7 @@ impl Backend {
         // The capabilities also configure the client (batch sizes,
         // compression, split and spliced blobs): keep that one.
         let mut client = client;
+        let mut upload = false;
         if let Some(client) = &mut client {
             let caps = client.capabilities().await.context("GetCapabilities")?;
             if let Some(cc) = &caps.cache_capabilities
@@ -82,7 +91,10 @@ impl Backend {
             {
                 bail!("the remote cache does not support SHA-256");
             }
-            if caps.execution_capabilities.as_ref().is_some_and(|e| !e.exec_enabled) {
+            if config.cache_only {
+                let updates = caps.cache_capabilities.as_ref().and_then(|c| c.action_cache_update_capabilities.as_ref()).is_some_and(|u| u.update_enabled);
+                upload = config.upload_local_results && updates;
+            } else if caps.execution_capabilities.as_ref().is_some_and(|e| !e.exec_enabled) {
                 bail!("the remote instance does not support execution");
             }
         }
@@ -95,7 +107,12 @@ impl Backend {
             remote_outputs: config.remote_outputs.clone(),
             log_inputs: config.execution_log.is_some(),
         };
-        Ok(Self { inner: Arc::new(Inner { client, disk, shared, config, materializing: Default::default() }) })
+        Ok(Self { inner: Arc::new(Inner { client, upload, disk, shared, config, materializing: Default::default() }) })
+    }
+
+    /// Whether results of commands run locally go to the remote cache.
+    pub fn uploads_local_results(&self) -> bool {
+        self.inner.upload
     }
 }
 
@@ -167,8 +184,8 @@ enum Failure {
     Prepare(String),
     /// The remote service failed.
     Infra(anyhow::Error),
-    /// A disk cache miss without a remote service: run locally, then store
-    /// the result.
+    /// A cache miss without remote execution (the disk cache alone, or a
+    /// remote cache): run locally, then store the result.
     RunLocally(Box<Prepared>),
 }
 
@@ -202,11 +219,7 @@ impl Inner {
             .await
             .map_err(|e| Failure::Prepare(format!("internal error: {e}")))?
             .map_err(Failure::Prepare)?;
-        let meta = ActionMeta {
-            mnemonic: task.binding("rbe_mnemonic").unwrap_or_default().to_string(),
-            target_id: task.binding("rbe_target").map(|t| self.config.targets.label(t)).unwrap_or_default(),
-            configuration_id: self.config.targets.configuration(task.binding("rbe_config")).map(|c| c.id()).unwrap_or_default(),
-        };
+        let meta = self.action_meta(task);
         let digest = prepared.action_digest.clone();
         if let Some(log) = &self.config.execution_log {
             log_action(log, task, &meta, &prepared);
@@ -240,12 +253,6 @@ impl Inner {
         let Some(client) = &self.client else { return Err(Failure::RunLocally(Box::new(prepared))) };
         let client = client.for_action(&meta, &prepared.action_digest.hash);
 
-        // Local steps first (e.g. deleting an archive before re-creating it).
-        let mut output = Vec::new();
-        if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
-            return Ok(failed);
-        }
-
         // Then the remote action cache. With minimal downloads, a hit whose
         // outputs left the CAS is a miss: they wouldn't be downloaded now,
         // and rewinding would only find the same result again.
@@ -258,6 +265,16 @@ impl Inner {
         {
             cached = None;
             stale = true;
+        }
+        // Without remote execution, a miss runs locally.
+        if self.config.cache_only && cached.is_none() {
+            return Err(Failure::RunLocally(Box::new(prepared)));
+        }
+
+        // Local steps (e.g. deleting an archive before re-creating it).
+        let mut output = Vec::new();
+        if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
+            return Ok(failed);
         }
         let (result, hit) = match cached {
             Some(r) => (r, true),
@@ -360,6 +377,15 @@ impl Inner {
             })
             .collect();
         Ok(TaskResult { edge: task.edge, status, output, kind, cas_outputs, lost_inputs: Vec::new() })
+    }
+
+    /// The request metadata of `task`'s action.
+    fn action_meta(&self, task: &Task) -> ActionMeta {
+        ActionMeta {
+            mnemonic: task.binding("rbe_mnemonic").unwrap_or_default().to_string(),
+            target_id: task.binding("rbe_target").map(|t| self.config.targets.label(t)).unwrap_or_default(),
+            configuration_id: self.config.targets.configuration(task.binding("rbe_config")).map(|c| c.id()).unwrap_or_default(),
+        }
     }
 
     /// Runs steps on the host, in the build directory, appending their
@@ -695,22 +721,42 @@ impl LocalCapture for Capture {
     }
 }
 
+/// Above this size, the stdout of a local result goes to the remote CAS
+/// rather than inside its action cache entry.
+const INLINE_STDOUT_MAX: usize = 64 << 10;
+
 impl Capture {
+    /// Stores the result of the command, run locally on a cache miss, in the
+    /// disk cache and the remote cache (when the server accepts results).
+    /// Runs on a blocking thread.
     fn store(&mut self, output: &[u8]) -> Result<()> {
-        let Some(disk) = self.inner.disk.clone() else { return Ok(()) };
+        let disk = self.inner.disk.clone();
+        let client = self.inner.client.as_ref().filter(|_| self.inner.upload).map(|c| c.for_action(&self.inner.action_meta(&self.task), &self.prepared.action_digest.hash));
+        if disk.is_none() && client.is_none() {
+            return Ok(());
+        }
         let digests = Some(&self.inner.shared.store.digests as &dyn rbe_client::tree::DigestCache);
+        let mut blobs = rbe_client::BlobSet::default();
+        let mut put_file = |local: &PathBuf| -> Result<re::Digest> {
+            let digest = match &disk {
+                Some(disk) => disk.put_file(local, digests)?,
+                None => rbe_client::tree::file_digest(local, digests)?,
+            };
+            blobs.insert(digest.clone(), rbe_client::BlobSource::File(local.clone()));
+            Ok(digest)
+        };
         let mut files = Vec::new();
         for (rel, local) in &self.prepared.outputs {
             if !local.is_file() {
                 bail!("{} was not produced", local.display());
             }
-            let digest = disk.put_file(local, digests)?;
+            let digest = put_file(local)?;
             files.push(re::OutputFile { path: rel.clone(), digest: Some(digest), is_executable: is_executable(local), ..Default::default() });
         }
         // Side outputs (a link's PDB) when the command wrote them.
         for (rel, local) in &self.prepared.side_outputs {
             if local.is_file() {
-                let digest = disk.put_file(local, digests)?;
+                let digest = put_file(local)?;
                 files.push(re::OutputFile { path: rel.clone(), digest: Some(digest), is_executable: false, ..Default::default() });
             }
         }
@@ -719,18 +765,48 @@ impl Capture {
         {
             let data = self.depfile_to_remote(&data);
             let digest = rbe_client::digest_of(&data);
-            disk.put_bytes(&digest, &data)?;
+            if let Some(disk) = &disk {
+                disk.put_bytes(&digest, &data)?;
+            }
+            blobs.insert(digest.clone(), rbe_client::BlobSource::Bytes(data));
             files.push(re::OutputFile { path: rel, digest: Some(digest), ..Default::default() });
         }
         let stdout = if self.task.deps.as_deref() == Some("msvc") { self.show_includes_to_remote(output) } else { output.to_vec() };
-        let result = re::ActionResult {
+        // Paths in diagnostics as a remote execution prints them: another
+        // checkout replaying them gets them relative to its build directory.
+        let stdout = self.prepared.mapper.rewrite_text(&stdout);
+        let mut result = re::ActionResult {
             output_files: files,
             exit_code: 0,
             stdout_raw: stdout,
             execution_metadata: Some(re::ExecutedActionMetadata { worker: "local".into(), ..Default::default() }),
             ..Default::default()
         };
-        disk.put_action_result(&self.prepared.action_digest, &result)?;
+        if let Some(disk) = &disk {
+            disk.put_action_result(&self.prepared.action_digest, &result)?;
+        }
+        let Some(client) = client else { return Ok(()) };
+        if result.stdout_raw.len() > INLINE_STDOUT_MAX {
+            let digest = rbe_client::digest_of(&result.stdout_raw);
+            blobs.insert(digest.clone(), rbe_client::BlobSource::Bytes(result.stdout_raw.clone()));
+            result.stdout_digest = Some(digest);
+        }
+        // The action and its command too, as remote execution would have
+        // them: tools inspecting the cache can show what produced a result.
+        let command_digest = rbe_client::digest_of(&prost::Message::encode_to_vec(&self.prepared.command));
+        for d in [&self.prepared.action_digest, &command_digest] {
+            if let Some((digest, src)) = self.prepared.blobs.0.get(&d.hash) {
+                blobs.insert(digest.clone(), src.clone());
+            }
+        }
+        // The outputs first, then the entry pointing at them.
+        let store = &self.inner.shared.store;
+        let to_upload = store.filter_unknown(blobs);
+        tokio::runtime::Handle::current().block_on(async {
+            client.upload_blobs(&to_upload).await?;
+            client.update_action_result(&self.prepared.action_digest, result).await
+        })?;
+        store.mark_uploaded(to_upload.0.keys());
         Ok(())
     }
 

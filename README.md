@@ -56,6 +56,8 @@ ninja-rs [options] [targets...]
 
 remote execution (only for manifests with rbe_version = 1):
   --remote_executor=grpc://host:port | grpcs://host:port
+  --remote_cache=grpc://host:port  (remote cache alone: local execution on a miss)
+  --[no]remote_upload_local_results  (with --remote_cache, default on)
   --remote_instance_name=NAME
   --remote_header=K=V            (repeatable)
   --remote_jobs=N                (default 50)
@@ -122,6 +124,10 @@ linker, library directories and side outputs are found from the compiler
 driver's dry run. With `--remote_download_minimal`, only deliverables, named
 targets and the inputs of local commands are downloaded (see
 docs/design.md, "Minimal downloads").
+
+Without remote execution, a remote cache (`--remote_cache`) shares the
+results of actions run locally, across machines and checkouts (see
+docs/design.md, "Remote cache only").
 
 A local disk cache (`--disk_cache`) caches the actions remote execution
 would run, with or without a remote service; large blobs are stored as

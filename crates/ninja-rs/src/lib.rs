@@ -133,7 +133,7 @@ impl Service {
         self.ids = InvocationIds::new(&opts.bes);
         // Build events cover builds, not tools.
         let bes = if opts.bes.enabled() && opts.tool.is_none() {
-            let bytestream = opts.remote.executor.as_ref().map(|e| bes::bytestream_prefix(e, &opts.remote.instance_name));
+            let bytestream = opts.remote.endpoint().map(|e| bes::bytestream_prefix(e, &opts.remote.instance_name));
             Some(Bes::start(&opts.bes, &self.ids, &opts.argv, &opts.targets, bytestream, self.store.clone()).await)
         } else {
             None
@@ -265,7 +265,7 @@ impl Service {
             let targets = Arc::new(self.load_targets(&state, status));
             // Outputs of remote actions that weren't downloaded, from earlier
             // builds (whatever the download mode).
-            let remote_outputs = (opts.remote.executor.is_some() && !opts.dry_run)
+            let remote_outputs = (opts.remote.endpoint().is_some() && !opts.dry_run)
                 .then(|| Arc::new(RemoteOutputs::load(std::path::Path::new(&in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE)))));
             let requested = requested_paths(&state, &deps_log, &opts.targets);
             let backend = match self.remote_backend(&state, opts, targets.clone(), remote_outputs.clone(), &requested, status).await {
@@ -409,7 +409,7 @@ impl Service {
         requested: &[String],
         status: &mut dyn Status,
     ) -> Result<Option<Arc<ninja_remote::Backend>>, String> {
-        if opts.remote.executor.is_none() && opts.remote.disk_cache.is_none() {
+        if opts.remote.endpoint().is_none() && opts.remote.disk_cache.is_none() {
             return Ok(None);
         }
         if opts.dry_run {
@@ -431,7 +431,7 @@ impl Service {
             }
         }
         let disk = self.open_disk_cache(opts, status);
-        let client = match &opts.remote.executor {
+        let client = match opts.remote.endpoint() {
             Some(endpoint) => {
                 let key = format!("{endpoint}|{}|{:?}", opts.remote.instance_name, opts.remote.headers);
                 if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
@@ -478,6 +478,8 @@ impl Service {
                 jobs: opts.remote.jobs,
                 mnemonic_suffixes: opts.remote.mnemonic_suffixes.clone(),
                 local_fallback: opts.remote.local_fallback,
+                cache_only: opts.remote.cache_only(),
+                upload_local_results: opts.remote.upload_local_results,
                 verbose: opts.remote.verbose,
                 remote_outputs,
                 download_minimal: opts.remote.download_minimal,
@@ -490,6 +492,9 @@ impl Service {
         )
         .await
         .map_err(|e| format!("remote execution: {e:#}"))?;
+        if opts.remote.cache_only() && opts.remote.upload_local_results && !backend.uploads_local_results() {
+            status.warning("the remote cache doesn't accept results from clients: local results aren't stored");
+        }
         Ok(Some(Arc::new(backend)))
     }
 

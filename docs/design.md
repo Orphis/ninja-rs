@@ -375,6 +375,37 @@ before by a few edits only sends the chunks around them:
   edit in the middle of a 10 MB source, about 6% of it is uploaded and of
   its object downloaded.
 
+## Remote cache only
+
+`--remote_cache=URL` uses a remote cache without remote execution: builds
+without an executor still share results, across machines and checkouts.
+
+- Actions are prepared as for remote execution: the same policy decides
+  which edges qualify, the include scanner gives the inputs, and the key is
+  the action digest. It doesn't depend on deps an earlier build recorded,
+  so a fresh checkout's first build already hits.
+- **Lookup order:** the disk cache (with `--disk_cache`), then the remote
+  action cache. A hit runs the edge's local-tool steps and restores the
+  outputs as a remote execution's (`ExecKind::RemoteCacheHit`); with
+  `--remote_download_minimal`, they are recorded instead, as for remote
+  execution, and a hit whose outputs left the CAS is a miss.
+- **A miss** returns `RemoteOutcome::RunLocally`: the command runs locally
+  within `-j`, and the capture stores its outputs, depfile (remote form)
+  and output in the disk cache, then uploads them, with the action and its
+  command, before the action cache entry pointing at them. stdout larger
+  than 64 KiB goes to the CAS instead of inside the entry. Absolute paths
+  into the input tree in that output (diagnostics) are rewritten relative
+  to the working directory (`PathMapper::rewrite_text`), as a remote
+  execution prints them: another checkout replaying a warning gets its own
+  file. The disk cache stores local results the same way.
+- `--noremote_upload_local_results` reads only: developer machines can
+  use a cache only CI fills. Uploads also stop when the server reports
+  `update_enabled = false`, with a warning.
+- With `--remote_executor`, the executor's cache is used; both naming
+  different services is an error.
+- A cache outage follows `--remote_local_fallback`: the edge runs locally,
+  nothing is stored.
+
 ## Minimal downloads
 
 `--remote_download_outputs=minimal` (or `--remote_download_minimal`) leaves

@@ -285,6 +285,55 @@ impl PathMapper {
         out
     }
 
+    /// Rewrites absolute local paths into the tree inside a command's
+    /// output (diagnostics like `C:\src\a.c(3,13): warning` or
+    /// `/src/a.c:3:13: error`) to paths relative to the working directory, as
+    /// the command prints them when given relative paths, as remote execution
+    /// does. A path ends at whitespace or a character diagnostics put after
+    /// it; one with spaces keeps its tail, which stays correct relative to the
+    /// rewritten head. Bytes that aren't UTF-8 pass through.
+    pub fn rewrite_text(&mut self, text: &[u8]) -> Vec<u8> {
+        let Some(root) = self.exec_root.root().map(str::to_string) else { return text.to_vec() };
+        let root = root.trim_end_matches('/').to_string();
+        let windows = self.windows;
+        let spellings: Vec<Vec<u8>> = if windows {
+            vec![root.clone().into_bytes(), root.replace('/', "\\").into_bytes()]
+        } else {
+            vec![root.into_bytes()]
+        };
+        let matches_at = |i: usize, s: &[u8]| {
+            let Some(t) = text.get(i..i + s.len()) else { return false };
+            if windows { t.eq_ignore_ascii_case(s) } else { t == s }
+        };
+        let mut out = Vec::with_capacity(text.len());
+        let mut last = 0;
+        let mut i = 0;
+        while i < text.len() {
+            let starts_word = i == 0 || !(text[i - 1].is_ascii_alphanumeric() || matches!(text[i - 1], b'_' | b'.' | b'/' | b'\\'));
+            let hit = if starts_word { spellings.iter().find(|s| matches_at(i, s)).map(Vec::len) } else { None };
+            let Some(len) = hit.filter(|&len| matches!(text.get(i + len), None | Some(b'/' | b'\\'))) else {
+                i += 1;
+                continue;
+            };
+            let mut e = i + len;
+            while e < text.len()
+                && !matches!(text[e], b' ' | b'\t' | b'\r' | b'\n' | b'(' | b')' | b':' | b'"' | b'\'' | b',' | b';' | b'<' | b'>' | b'|' | b'[' | b']')
+            {
+                e += 1;
+            }
+            if let Ok(path) = std::str::from_utf8(&text[i..e])
+                && let Some(rel) = self.rewrite_one(path)
+            {
+                out.extend_from_slice(&text[last..i]);
+                out.extend_from_slice(rel.as_bytes());
+                last = e;
+            }
+            i = e;
+        }
+        out.extend_from_slice(&text[last..]);
+        out
+    }
+
     /// Maps a path reported by the remote action (in a depfile or
     /// /showIncludes output) back to a local path: relative paths are
     /// resolved against the working directory, absolute remote paths are
@@ -508,6 +557,30 @@ mod tests {
         assert_eq!(m.tree_path("C:/Users/x/proj/src/B.h").as_deref(), Some("SRC/B.h"));
         assert_eq!(m.rewrite_arg("/FoC:\\Users\\x\\proj\\build\\obj\\a.obj"), "/Foobj\\a.obj");
         assert_eq!(m.rewrite_arg("-IC:/users/x/proj/src"), "-I../SRC");
+    }
+
+    #[test]
+    fn rewrite_output_text() {
+        let root = ExecRoot::common(&["/home/u/proj/build".into(), "/home/u/proj/src/a.c".into(), "/home/u/tc/bin/clang".into()], false);
+        let mut m = PathMapper::new(root, "/home/u/proj/build", false).unwrap();
+        m.tree_path("/home/u/proj/src/a.c").unwrap();
+        m.tree_path("/home/u/tc/bin/clang").unwrap();
+        let out = m.rewrite_text(b"/home/u/proj/src/a.c:3:13: warning: x [-Wy]\nIn file included from /home/u/proj/src/my dir/b.h:1:\n/usr/include/z.h:1: note\n");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "../src/a.c:3:13: warning: x [-Wy]\nIn file included from ../src/my dir/b.h:1:\n/usr/include/z.h:1: note\n"
+        );
+        // Only whole paths: the root inside another path or word stays.
+        assert_eq!(m.rewrite_text(b"/x/home/u/proj/src/a.c"), b"/x/home/u/proj/src/a.c");
+        assert_eq!(m.rewrite_text(b"/home/u/projects/a.c"), b"/home/u/projects/a.c");
+        // Not UTF-8: unchanged around the paths.
+        assert_eq!(m.rewrite_text(b"\xe9 /home/u/proj/src/a.c(1)"), b"\xe9 ../src/a.c(1)");
+
+        let root = ExecRoot::common(&["C:/tmp/rc1/build".into(), "C:/tmp/rc1/gen.c".into()], true);
+        let mut m = PathMapper::new(root, "C:\\tmp\\rc1\\build", true).unwrap();
+        m.tree_path("C:/tmp/rc1/gen.c").unwrap();
+        let out = m.rewrite_text(b"c:\\tmp\\RC1\\gen.c(3,13): warning: 'fopen' is deprecated\r\nC:/tmp/rc1/gen.c:3\r\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "..\\gen.c(3,13): warning: 'fopen' is deprecated\r\n../gen.c:3\r\n");
     }
 
     #[test]

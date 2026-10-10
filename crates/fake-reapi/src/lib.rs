@@ -40,6 +40,8 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 pub struct Stats {
     pub executions: u64,
     pub action_cache_hits: u64,
+    /// Results stored by clients (UpdateActionResult).
+    pub action_cache_updates: u64,
     pub blobs_uploaded: u64,
     pub bytestream_writes: u64,
     /// Blob bytes received (batches and ByteStream).
@@ -250,6 +252,7 @@ impl re::action_cache_server::ActionCache for Svc {
         let r = r.into_inner();
         let ar = r.action_result.unwrap_or_default();
         self.0.ac.lock().unwrap().insert(r.action_digest.unwrap_or_default().hash, ar.clone());
+        self.0.stats.lock().unwrap().action_cache_updates += 1;
         Ok(Response::new(ar))
     }
 }
