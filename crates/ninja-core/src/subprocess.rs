@@ -98,7 +98,13 @@ fn build_command(command: &str) -> tokio::process::Command {
 
 /// Runs one command. Returns the exit status and combined stdout/stderr.
 pub async fn run_local_command(command: &str, use_console: bool) -> (ExitStatus, Vec<u8>) {
+    run_local_command_env(command, use_console, &[]).await
+}
+
+/// [`run_local_command`] with extra environment variables.
+pub async fn run_local_command_env(command: &str, use_console: bool, env: &[(String, String)]) -> (ExitStatus, Vec<u8>) {
     let mut cmd = build_command(command);
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
     cmd.kill_on_drop(true);
     if use_console {
         cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());

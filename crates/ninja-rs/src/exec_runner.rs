@@ -1,22 +1,48 @@
 //! The command runner used by the CLI: runs each task locally or through a
 //! remote backend, according to the backend's policy.
 //!
-//! Local tasks are limited by `-j`, remote ones by `--remote_jobs`. Tasks
-//! are started immediately and wait for a slot of their kind inside their
-//! own tokio task, so the engine may have up to `-j + --remote_jobs` tasks
-//! in flight.
+//! Local tasks are limited by `-j`, or by a jobserver's tokens, remote ones
+//! by `--remote_jobs`. Tasks are started immediately and wait for a slot of
+//! their kind inside their own tokio task, so the engine may have up to
+//! `-j + --remote_jobs` tasks in flight.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ninja_core::graph::EdgeId;
 use ninja_core::runner::{CommandRunner, ExecKind, ExitStatus, RemoteBackend, RemoteOutcome, Task, TaskResult, WaitFuture};
-use ninja_core::subprocess::{Interrupt, run_local_command};
-use tokio::sync::Semaphore;
+use ninja_core::subprocess::{Interrupt, run_local_command_env};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
+use crate::jobserver;
+
+/// Where local tasks get their slot.
+enum LocalSlots {
+    Count(Semaphore),
+    Jobserver(Arc<jobserver::Client>),
+}
+
+/// Held while the task runs; dropping it gives the slot back.
+#[allow(dead_code)]
+enum LocalSlot<'a> {
+    Count(SemaphorePermit<'a>),
+    Jobserver(jobserver::Slot),
+}
+
+impl LocalSlots {
+    async fn acquire(&self) -> Option<LocalSlot<'_>> {
+        match self {
+            LocalSlots::Count(s) => s.acquire().await.ok().map(LocalSlot::Count),
+            LocalSlots::Jobserver(c) => Some(LocalSlot::Jobserver(c.acquire().await)),
+        }
+    }
+}
+
 pub struct ExecRunner {
-    local_slots: Arc<Semaphore>,
+    local_slots: Arc<LocalSlots>,
+    /// Extra environment of local commands.
+    env: Arc<Vec<(String, String)>>,
     remote_slots: Arc<Semaphore>,
     capacity: usize,
     tasks: JoinSet<TaskResult>,
@@ -33,7 +59,8 @@ impl ExecRunner {
         let parallelism = parallelism.max(1);
         let remote_jobs = remote.as_ref().map(|r| r.max_jobs().max(1)).unwrap_or(0);
         Self {
-            local_slots: Arc::new(Semaphore::new(parallelism.min(Semaphore::MAX_PERMITS))),
+            local_slots: Arc::new(LocalSlots::Count(Semaphore::new(parallelism.min(Semaphore::MAX_PERMITS)))),
+            env: Arc::default(),
             remote_slots: Arc::new(Semaphore::new(remote_jobs.max(1))),
             capacity: parallelism.saturating_add(remote_jobs),
             tasks: JoinSet::new(),
@@ -44,11 +71,21 @@ impl ExecRunner {
             verbose_remote: false,
         }
     }
+
+    /// Local tasks take a jobserver token instead of a `-j` slot.
+    pub fn use_jobserver(&mut self, client: Arc<jobserver::Client>) {
+        self.local_slots = Arc::new(LocalSlots::Jobserver(client));
+    }
+
+    /// Sets environment variables for local commands.
+    pub fn set_env(&mut self, env: Vec<(String, String)>) {
+        self.env = Arc::new(env);
+    }
 }
 
 /// Runs a task on the host, once its inputs that only exist remotely are
 /// downloaded.
-async fn run_local(task: &Task, slots: &Semaphore, remote: Option<&Arc<dyn RemoteBackend>>) -> TaskResult {
+async fn run_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], remote: Option<&Arc<dyn RemoteBackend>>) -> TaskResult {
     if let Some(backend) = remote
         && let Err(e) = backend.materialize(task).await
     {
@@ -56,7 +93,7 @@ async fn run_local(task: &Task, slots: &Semaphore, remote: Option<&Arc<dyn Remot
         return TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: e.lost };
     }
     let _permit = slots.acquire().await;
-    let (status, output) = run_local_command(&task.command, task.use_console).await;
+    let (status, output) = run_local_command_env(&task.command, task.use_console, env).await;
     TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() }
 }
 
@@ -69,12 +106,13 @@ impl CommandRunner for ExecRunner {
         let edge = task.edge;
         self.active.insert(edge);
         let local_slots = self.local_slots.clone();
+        let env = self.env.clone();
         let inputs_from = self.remote.clone();
         let remote = self.remote.clone().filter(|r| !task.use_console && r.wants(&task));
         let verbose = self.verbose_remote;
         match remote {
             None => {
-                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, inputs_from.as_ref()).await });
+                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, &env, inputs_from.as_ref()).await });
                 self.ids.insert(h.id(), edge);
             }
             Some(backend) => {
@@ -87,7 +125,7 @@ impl CommandRunner for ExecRunner {
                     match outcome {
                         RemoteOutcome::Done(r) => r,
                         RemoteOutcome::Fallback(reason) => {
-                            let mut r = run_local(&task, &local_slots, Some(&backend)).await;
+                            let mut r = run_local(&task, &local_slots, &env, Some(&backend)).await;
                             if verbose {
                                 let mut msg = format!("ninja-rs: running locally ({reason})\n").into_bytes();
                                 msg.extend_from_slice(&r.output);
@@ -96,7 +134,7 @@ impl CommandRunner for ExecRunner {
                             r
                         }
                         RemoteOutcome::RunLocally(capture) => {
-                            let r = run_local(&task, &local_slots, Some(&backend)).await;
+                            let r = run_local(&task, &local_slots, &env, Some(&backend)).await;
                             // Storing outputs reads files: off the async threads.
                             let result = r.clone();
                             let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;

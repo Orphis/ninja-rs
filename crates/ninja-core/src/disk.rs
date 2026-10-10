@@ -116,8 +116,15 @@ fn stat_all_files_in_dir(dir: &str) -> Result<HashMap<String, TimeStamp>, String
     };
     for entry in entries {
         let entry = entry.map_err(|e| format!("FindNextFile({dir}): {e}"))?;
-        let modified = entry.metadata().and_then(|m| m.modified()).map_err(|e| format!("stat({dir}): {e}"))?;
-        stamps.insert(entry.file_name().to_string_lossy().to_ascii_lowercase(), system_time_to_ns(modified));
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // A symlink's listing has the link's times: stat its target.
+        let stamp = if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            stat_single(&format!("{}\\{name}", if dir.is_empty() { "." } else { dir }))?
+        } else {
+            let modified = entry.metadata().and_then(|m| m.modified()).map_err(|e| format!("stat({dir}): {e}"))?;
+            system_time_to_ns(modified)
+        };
+        stamps.insert(name.to_ascii_lowercase(), stamp);
     }
     Ok(stamps)
 }
@@ -303,6 +310,33 @@ mod tests {
         }
         disk.allow_stat_cache(false);
         assert!(disk.stat(&format!("{root}/new.txt")).unwrap() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_follows_symlinks() {
+        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-symlink", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "t").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::options().write(true).open(&target).unwrap().set_modified(old).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, dir.join("link.txt"));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, dir.join("link.txt"));
+        // Windows needs developer mode or a privilege for symlinks.
+        if linked.is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let link = format!("{}/link.txt", dir.to_string_lossy().replace('\\', "/"));
+        let disk = RealDisk::default();
+        let want = system_time_to_ns(old);
+        assert_eq!(disk.stat(&link).unwrap(), want);
+        disk.allow_stat_cache(true);
+        assert_eq!(disk.stat(&link).unwrap(), want);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

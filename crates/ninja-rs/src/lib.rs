@@ -7,6 +7,7 @@
 
 pub mod bes;
 pub mod exec_runner;
+pub mod jobserver;
 pub mod options;
 pub mod tools;
 
@@ -138,6 +139,12 @@ impl Service {
             None
         };
         let mut printer = StatusPrinter::new(opts.verbosity);
+        if let Some(fmt) = &opts.status_format
+            && let Err(e) = printer.set_status_format(fmt)
+        {
+            eprintln!("ninja: fatal: {e}");
+            return EXIT_FAILURE;
+        }
         let mut status = ReportingStatus { printer: &mut printer, bes: bes.clone() };
         let code = self.run_build_invocation(opts, &mut status).await;
         if let Some(b) = bes {
@@ -332,8 +339,29 @@ impl Service {
                 format!("{build_dir}/{}", ninja_remote::store::DIGESTS_FILE)
             };
             let use_remote = remote.is_some();
+            let jobserver_settings = jobserver::Settings {
+                parallelism: opts.parallelism,
+                explicit_parallelism: opts.explicit_parallelism,
+                // Like ninja: any other value doesn't turn the flag off.
+                pool: opts.jobserver_pool || state.lookup_variable(ROOT_SCOPE, "enable_jobserver_pool") == "1",
+                dry_run: opts.dry_run,
+                verbosity: opts.verbosity,
+            };
             let code = self
-                .run_build(&opts.targets, &mut state, &mut build_log, &mut deps_log, &config, status, remote, targets, backend, remote_outputs.clone(), &requested)
+                .run_build(
+                    &opts.targets,
+                    &mut state,
+                    &mut build_log,
+                    &mut deps_log,
+                    &config,
+                    status,
+                    remote,
+                    targets,
+                    backend,
+                    remote_outputs.clone(),
+                    &requested,
+                    &jobserver_settings,
+                )
                 .await;
             if let Some(outputs) = &remote_outputs
                 && let Err(e) = outputs.save()
@@ -519,14 +547,32 @@ impl Service {
         })
     }
 
-    fn make_runner(&self, config: &BuildConfig, remote: Option<Arc<dyn RemoteBackend>>, verbose_remote: bool) -> Box<dyn CommandRunner> {
+    fn make_runner(
+        &self,
+        config: &BuildConfig,
+        remote: Option<Arc<dyn RemoteBackend>>,
+        verbose_remote: bool,
+        jobserver: Option<&jobserver::Jobserver>,
+    ) -> Box<dyn CommandRunner> {
         if config.dry_run {
-            Box::new(DryRunRunner::default())
-        } else {
-            let mut r = ExecRunner::new(config.parallelism, remote, self.interrupt.clone());
-            r.verbose_remote = verbose_remote;
-            Box::new(r)
+            return Box::new(DryRunRunner::default());
         }
+        let client = jobserver.and_then(|j| j.client.clone());
+        // With a jobserver, the pool's size bounds how many local tasks
+        // wait for a token.
+        let parallelism = match &client {
+            Some(_) => jobserver.and_then(|j| j.jobs).unwrap_or(config.parallelism),
+            None => config.parallelism,
+        };
+        let mut r = ExecRunner::new(parallelism, remote, self.interrupt.clone());
+        r.verbose_remote = verbose_remote;
+        if let Some(c) = client {
+            r.use_jobserver(c);
+        }
+        if let Some(flags) = jobserver.and_then(|j| j.makeflags.clone()) {
+            r.set_env(vec![("MAKEFLAGS".into(), flags)]);
+        }
+        Box::new(r)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -546,7 +592,7 @@ impl Service {
         let (path, _) = canonicalize_path(input_file);
         let Some(node) = state.lookup_node(&path) else { return Ok(false) };
         let disk = self.real_disk();
-        let mut runner = self.make_runner(config, remote, false);
+        let mut runner = self.make_runner(config, remote, false, None);
         {
             let mut builder = Builder::new(state, &disk, Some(build_log), Some(deps_log), config, status);
             builder.add_target(node).map_err(|e| (e, EXIT_FAILURE))?;
@@ -581,6 +627,7 @@ impl Service {
         backend: Option<Arc<ninja_remote::Backend>>,
         remote_outputs: Option<Arc<RemoteOutputs>>,
         requested: &[String],
+        jobserver_settings: &jobserver::Settings,
     ) -> i32 {
         let bes = status.bes.clone();
         let nodes = match tools::collect_targets(state, Some(deps_log), targets) {
@@ -607,7 +654,8 @@ impl Service {
             None => &real,
         };
         let verbose_remote = remote.is_some() && (self.remote_verbose || config.verbosity == Verbosity::Verbose);
-        let mut runner = self.make_runner(config, remote, verbose_remote);
+        let jobserver = jobserver::setup(jobserver_settings, std::env::var("MAKEFLAGS").ok(), status);
+        let mut runner = self.make_runner(config, remote, verbose_remote, Some(&jobserver));
         let mut builder = Builder::new(state, disk, Some(build_log), Some(deps_log), config, status);
         // Like ninja: cache stats while scanning, but not while building, so
         // restat and later edges see the outputs' new timestamps.

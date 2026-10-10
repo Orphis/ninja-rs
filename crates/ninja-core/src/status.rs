@@ -99,10 +99,15 @@ impl LinePrinter {
         let tty = std::io::stdout().is_terminal();
         let term = std::env::var("TERM").unwrap_or_default();
         let smart = tty && term != "dumb";
-        let clicolor_force = std::env::var("CLICOLOR_FORCE").map(|v| v != "0").unwrap_or(false);
+        // As ninja: NO_COLOR turns colors off on a terminal; CLICOLOR_FORCE
+        // turns them on elsewhere unless NO_COLOR is set; FORCE_COLOR always
+        // does. "0" is the same as unset.
+        let set = |name: &str| std::env::var(name).is_ok_and(|v| v != "0");
+        let no_color = set("NO_COLOR");
+        let supports_color = (!no_color && (smart || set("CLICOLOR_FORCE"))) || set("FORCE_COLOR");
         Self {
             smart_terminal: smart,
-            supports_color: smart || clicolor_force,
+            supports_color,
             have_blank_line: true,
             last_len: 0,
             console_locked: false,
@@ -259,9 +264,33 @@ pub struct StatusPrinter {
     cache_hits: usize,
     disk_cache_hits: usize,
     progress_status_format: String,
+    /// `--status FMT`, parsed: replaces `NINJA_STATUS` and the description.
+    status_eval: Option<crate::eval::EvalString>,
     start: Instant,
     time_millis: i64,
 }
+
+/// The variables of a `--status` format.
+const STATUS_VARIABLES: &[&str] = &[
+    "description",
+    "started",
+    "total",
+    "running",
+    "remaining",
+    "finished",
+    "rate",
+    "current_rate",
+    "progress",
+    "predicted_progress",
+    "elapsed",
+    "elapsed_seconds",
+    "eta",
+    "eta_seconds",
+    // ninja-rs: remote actions, remote and disk cache hits.
+    "remote",
+    "remote_cache_hits",
+    "disk_cache_hits",
+];
 
 impl StatusPrinter {
     pub fn new(verbosity: Verbosity) -> Self {
@@ -282,8 +311,69 @@ impl StatusPrinter {
             cache_hits: 0,
             disk_cache_hits: 0,
             progress_status_format: fmt,
+            status_eval: None,
             start: Instant::now(),
             time_millis: 0,
+        }
+    }
+
+    /// `--status FMT`: the status line is FMT with ninja-style variables
+    /// (`$finished`, `${total}`, `$description`...) expanded, instead of
+    /// `NINJA_STATUS` followed by the description.
+    pub fn set_status_format(&mut self, fmt: &str) -> Result<(), String> {
+        // The lexer reads a value up to the end of its line.
+        let input = format!("{fmt}\n");
+        let mut lexer = crate::lexer::Lexer::new("--status", input.as_bytes());
+        let mut eval = crate::eval::EvalString::new();
+        lexer.read_var_value(&mut eval).map_err(|e| format!("invalid --status: {e}"))?;
+        for part in eval.parts() {
+            if let crate::eval::EvalPart::Var(name) = part
+                && !STATUS_VARIABLES.contains(&name.as_str())
+            {
+                return Err(format!("unknown variable '{name}' in --status format"));
+            }
+        }
+        self.status_eval = Some(eval);
+        Ok(())
+    }
+
+    /// The value of a `--status` variable.
+    fn status_variable(&self, name: &str, description: &str) -> String {
+        let secs = self.time_millis as f64 / 1e3;
+        let rate = if secs > 0.0 { self.finished_edges as f64 / secs } else { 0.0 };
+        // Remaining time, from the average time per finished edge.
+        let eta = (self.finished_edges > 0)
+            .then(|| secs * self.total_edges.saturating_sub(self.finished_edges) as f64 / self.finished_edges as f64);
+        let clock = |sec: f64| {
+            let s = sec as i64;
+            if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{:02}:{:02}", s / 60, s % 60) }
+        };
+        match name {
+            "description" => description.to_string(),
+            "started" => self.started_edges.to_string(),
+            "total" => self.total_edges.to_string(),
+            "running" => self.running_edges.to_string(),
+            "remaining" => self.total_edges.saturating_sub(self.started_edges).to_string(),
+            "finished" => self.finished_edges.to_string(),
+            "rate" | "current_rate" => {
+                if self.finished_edges == 0 || secs == 0.0 {
+                    "?".to_string()
+                } else {
+                    format!("{rate:.1}")
+                }
+            }
+            "progress" | "predicted_progress" => {
+                let pct = if self.total_edges > 0 { 100 * self.finished_edges / self.total_edges } else { 0 };
+                format!("{pct:3}%")
+            }
+            "elapsed" => clock(secs),
+            "elapsed_seconds" => format!("{secs:.3}"),
+            "eta" => eta.map_or("?".to_string(), clock),
+            "eta_seconds" => eta.map_or("?".to_string(), |s| format!("{s:.3}")),
+            "remote" => self.remote_edges.to_string(),
+            "remote_cache_hits" => self.cache_hits.to_string(),
+            "disk_cache_hits" => self.disk_cache_hits.to_string(),
+            _ => String::new(),
         }
     }
 
@@ -358,7 +448,11 @@ impl StatusPrinter {
         if to_print.is_empty() || force_full_command {
             to_print = info.command.clone();
         }
-        let line = format!("{}{}", self.format_progress_status(&self.progress_status_format.clone(), time_millis), to_print);
+        let line = match &self.status_eval {
+            // `--status`: the description only where the format says.
+            Some(eval) => eval.evaluate(&mut |name| self.status_variable(name, &to_print)),
+            None => format!("{}{}", self.format_progress_status(&self.progress_status_format.clone(), time_millis), to_print),
+        };
         self.printer.print(&line, !force_full_command);
     }
 }
@@ -396,7 +490,6 @@ impl Status for StatusPrinter {
     fn build_edge_finished(&mut self, info: &EdgeInfo, end_ms: i64, exit_code: Option<i32>, kind: &ExecKind, output: &[u8]) {
         self.time_millis = end_ms;
         self.finished_edges += 1;
-        self.running_edges = self.running_edges.saturating_sub(1);
         match kind {
             ExecKind::Remote => self.remote_edges += 1,
             ExecKind::RemoteCacheHit => {
@@ -410,11 +503,14 @@ impl Status for StatusPrinter {
             self.printer.set_console_locked(false);
         }
         if self.verbosity == Verbosity::Quiet {
+            self.running_edges = self.running_edges.saturating_sub(1);
             return;
         }
+        // As ninja: the finished edge's line still counts it as running.
         if !info.use_console {
             self.print_status(info, end_ms);
         }
+        self.running_edges = self.running_edges.saturating_sub(1);
         if let Some(code) = exit_code {
             let mut outputs = String::new();
             for o in &info.outputs {

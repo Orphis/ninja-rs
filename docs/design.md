@@ -49,8 +49,34 @@ deps), 26 depfile parser tests, plus dyndep, lexer, canonicalization and
 - `--version` prints `1.13.1` (the manifest language level implemented,
   including `$^`, validations and dyndep), which also satisfies CMake's
   feature checks.
-- Not implemented: jobserver, `-l` (accepted, ignored),
-  `-t browse/graph/compdb/missingdeps/msvc/wincodepage/multi-inputs/urtle`.
+- From ninja 1.14 (unreleased): `--status FMT` (the status line from
+  `$`-variables: `$started`, `$finished`, `$total`, `$running`, `$rate`,
+  `$progress`, `$elapsed`, `$eta`, ...; ninja-rs adds `$remote`,
+  `$remote_cache_hits` and `$disk_cache_hits`), `NO_COLOR`/`FORCE_COLOR`,
+  `-t inputs` flags and shell escaping, `-t rules -d`, `-t compdb` listing
+  every input, `-t compdb-targets` and the jobserver (below).
+- Not implemented: `-l` (accepted, ignored),
+  `-t browse/graph/msvc/wincodepage/multi-inputs/urtle`.
+- Tools write `\n` line endings on Windows too (ninja writes `\r\n`).
+- Not yet from ninja 1.14: an edge already dirty doesn't load its depfile
+  or deps log entry (ninja `0b115d8`), so stale discovered inputs can't
+  order the build or form cycles. `$^` doesn't require
+  `ninja_required_version = 1.14`, since `--version` is 1.13.1.
+
+### Jobserver
+
+As in ninja 1.13: without `-j`, a GNU make jobserver named by `MAKEFLAGS`
+limits local commands, each taking a token (the client's implicit slot
+first) and giving the same byte back when done. As in ninja 1.14
+(unreleased), `--jobserver-pool` (or `enable_jobserver_pool = 1` in the
+manifest) creates a pool of `-j` slots for the commands, through `MAKEFLAGS`
+in their environment, unless a pool already exists or with `-j1`. Pools are
+FIFOs on Unix, named semaphores on Windows. The client also speaks GNU make
+4.3's pipe protocol (`--jobserver-auth=R,W`), which upstream ninja dropped
+and Kitware's fork restores. Remote actions take no token; local fallbacks
+do. Tokens are taken inside the tasks in the order they started (by
+priority), polling every few milliseconds, since other processes' releases
+aren't signalled.
 
 ### Performance notes
 
@@ -103,9 +129,9 @@ and the loop awaits completions.
 
 `ExecRunner` (in `ninja-rs`) runs a task locally or through a
 `RemoteBackend` (trait in `ninja-core`, implemented in `ninja-remote`).
-Local work is limited by `-j`, remote work by `--remote_jobs`; tasks wait for
-a slot of their kind inside their own tokio task, so up to `-j +
---remote_jobs` tasks are in flight. Console-pool tasks always run locally.
+Local work is limited by `-j` (or a jobserver's tokens), remote work by
+`--remote_jobs`; tasks wait for a slot of their kind inside their own tokio
+task, so up to `-j + --remote_jobs` tasks are in flight. Console-pool tasks always run locally.
 A backend may answer `Fallback(reason)` to have the task run locally (command
 not unwrappable, unknown compiler, or a service failure with
 `--remote_local_fallback`).

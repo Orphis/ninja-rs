@@ -48,9 +48,11 @@ local Rust toolchain and linker, unlike the Bazel build).
 ```
 ninja-rs [options] [targets...]
 
-  -C DIR  -f FILE  -j N  -k N  -l N (ignored)  -n  -v/--verbose  --quiet
+  -C DIR  -f FILE  -j N  -k N  -l N (ignored)  -n  -v/--verbose  --quiet  --status FMT
   -d explain|keepdepfile|keeprsp|stats|nostatcache  -w phonycycle=err|warn  --version
   -t list|targets|commands|inputs|query|deps|rules|clean|cleandead|recompact|restat
+     |compdb|compdb-targets|missingdeps
+  --jobserver-pool               (GNU make jobserver pool for the commands)
 
 remote execution (only for manifests with rbe_version = 1):
   --remote_executor=grpc://host:port | grpcs://host:port
@@ -93,7 +95,9 @@ left alone) and `.ninja_rs_digests` (file digest cache for remote builds).
   scanner, policy, store), rbe-client tests, and
   `//crates/ninja-rs:remote_e2e`: a hand-written contract-style `build.ninja`
   built through an in-process fake REAPI server (`crates/fake-reapi`), with
-  the test binary itself acting as the compiler.
+  the test binary itself acting as the compiler, and
+  `//crates/ninja-rs:cli_e2e`: tools, `--status` and the jobserver (pools,
+  external pools, GNU make 4.3 pipes) against ninja's outputs.
 - `tests/nativelink/run.sh` (Linux): builds a small C++ project through
   ninja-rs against a local NativeLink (scheduler + local worker), with remote
   compiles by the hermetic clang from the llvm module:
@@ -128,8 +132,11 @@ chunks the other side lacks with a remote that splits and splices blobs
 Outputs evicted from the remote cache during a build are rebuilt by their
 own actions in the same build (action rewinding).
 
+GNU make's jobserver is supported as a client (FIFO, pipe and Windows
+semaphore) and as a pool (`--jobserver-pool`).
+
 Not done yet (later phases): lease extension in minimal-download mode,
-daemon mode; jobserver.
+daemon mode.
 
 ## Layout
 

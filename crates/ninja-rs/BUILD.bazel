@@ -21,7 +21,10 @@ rust_library(
         "@crates//:prost",
         "@crates//:prost-types",
         "@crates//:tokio",
-    ],
+    ] + select({
+        "@platforms//os:windows": [],
+        "//conditions:default": ["@crates//:libc"],
+    }),
 )
 
 # Embeds the Windows long path manifest (MSVC targets; see build.rs).
@@ -60,4 +63,17 @@ rust_test(
         "//third_party/cargo-rbe/rbe-client",
         "@crates//:tokio",
     ],
+)
+
+# Command line tests (tools, --status, the jobserver) running the binary.
+rust_test(
+    name = "cli_e2e",
+    srcs = ["tests/cli_e2e.rs"],
+    data = [":ninja-rs"],
+    rustc_env = {"CARGO_BIN_EXE_ninja-rs": "$(rootpath :ninja-rs)"},
+    use_libtest_harness = False,
+    deps = [":ninja_rs_lib"] + select({
+        "@platforms//os:windows": [],
+        "//conditions:default": ["@crates//:libc"],
+    }),
 )

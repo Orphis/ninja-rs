@@ -8,6 +8,10 @@ pub struct Options {
     pub working_dir: Option<String>,
     pub input_file: String,
     pub parallelism: usize,
+    /// `-j` was given.
+    pub explicit_parallelism: bool,
+    /// `--jobserver-pool`: hand a jobserver pool to the commands.
+    pub jobserver_pool: bool,
     /// `usize::MAX` for `-k 0`.
     pub failures_allowed: usize,
     pub dry_run: bool,
@@ -20,6 +24,8 @@ pub struct Options {
     /// `-d nostatcache`: don't batch stats per directory.
     pub no_stat_cache: bool,
     pub phonycycle_err: bool,
+    /// `--status FMT`: the status line with ninja-style variables.
+    pub status_format: Option<String>,
     pub tool: Option<String>,
     pub tool_args: Vec<String>,
     pub targets: Vec<String>,
@@ -124,6 +130,8 @@ options:
   --version      print ninja version (\"{version}\")
   -v, --verbose  show all command lines while building
   --quiet        don't show progress status, just command output
+  --status FMT   progress status format using Ninja-style $vars
+                 (e.g. --status '[$finished/$total] ')
 
   -C DIR   change to DIR before doing anything else
   -f FILE  specify input build file [default=build.ninja]
@@ -137,6 +145,11 @@ options:
   -t TOOL  run a subtool (use '-t list' to list subtools)
     terminates toplevel options; further flags are passed to the tool
   -w FLAG  adjust warnings (use '-w list' to list warnings)
+
+  --jobserver-pool
+           setup a GNU jobserver pool of job slots matching the
+           current parallel job configuration. Ignored if -j1 is
+           specified explicitly, or if an existing pool is detected
 
 remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --remote_executor=URL      grpc://host:port or grpcs://host:port
@@ -185,6 +198,8 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         working_dir: None,
         input_file: "build.ninja".into(),
         parallelism: guess_parallelism(),
+        explicit_parallelism: false,
+        jobserver_pool: false,
         failures_allowed: 1,
         dry_run: false,
         verbosity: Verbosity::Normal,
@@ -194,6 +209,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         stats: false,
         no_stat_cache: false,
         phonycycle_err: false,
+        status_format: None,
         tool: None,
         tool_args: Vec::new(),
         targets: Vec::new(),
@@ -236,6 +252,8 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "version" => return Ok(ParseOutcome::Exit(format!("{}\n", ninja_core::parser::NINJA_VERSION), 0)),
                 "verbose" => o.verbosity = Verbosity::Verbose,
                 "quiet" => o.verbosity = Verbosity::NoStatusUpdate,
+                "status" => o.status_format = Some(value(&mut i)?),
+                "jobserver-pool" => o.jobserver_pool = true,
                 "help" => return Ok(ParseOutcome::Exit(usage(), 1)),
                 "remote_executor" => o.remote.executor = Some(value(&mut i)?),
                 "remote_instance_name" => o.remote.instance_name = value(&mut i)?,
@@ -350,6 +368,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                         // We want to run N jobs in parallel. For N = 0, INT_MAX
                         // is close enough to infinite for most sane builds.
                         o.parallelism = if n > 0 { n as usize } else { i32::MAX as usize };
+                        o.explicit_parallelism = true;
                     }
                     'k' => {
                         let n = parse_int("-k", arg.as_deref().unwrap())?;

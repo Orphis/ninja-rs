@@ -23,9 +23,16 @@ rbe-bes = { path = "../../third_party/cargo-rbe/rbe-bes" }
 rbe-client = { path = "../../third_party/cargo-rbe/rbe-client" }
 tokio = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 fake-reapi = { path = "../fake-reapi" }
 
 [[test]]
 name = "remote_e2e"
+harness = false
+
+[[test]]
+name = "cli_e2e"
 harness = false
