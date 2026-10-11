@@ -6,9 +6,11 @@
 //! directive is followed, and every directory of the search path that
 //! contains a candidate contributes it (which also covers `#include_next`).
 //! Strings in `#define` lines that look like header names are also treated
-//! as candidates (they are often used as computed includes). For a computed
-//! include (`#include MACRO`) the directory containing the file is sent
-//! whole, with a warning.
+//! as candidates (they are often used as computed includes). A computed
+//! include (`#include MACRO`) is covered when the scanned files define the
+//! macro as a header name (directly or through other macros); otherwise the
+//! directory containing the file is sent whole, with a warning. Comments are
+//! skipped: a `#include` in a comment is not a directive.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -158,9 +160,35 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
     };
     // Flags taking a separate argument that we don't care about.
     const SKIP_NEXT: &[&str] = &[
-        "-o", "-MF", "-MT", "-MQ", "-MJ", "-Xclang", "-Xlinker", "-Xpreprocessor", "-Xassembler", "-mllvm", "-arch", "-D", "-U",
-        "-main-file-name", "-L", "-l", "-F", "-iframework", "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-dependency-file",
-        "-Xarch_host", "-Xarch_device", "-Xcuda-ptxas", "-z", "-u", "-e", "-T",
+        "-o",
+        "-MF",
+        "-MT",
+        "-MQ",
+        "-MJ",
+        "-Xclang",
+        "-Xlinker",
+        "-Xpreprocessor",
+        "-Xassembler",
+        "-mllvm",
+        "-arch",
+        "-D",
+        "-U",
+        "-main-file-name",
+        "-L",
+        "-l",
+        "-F",
+        "-iframework",
+        "-iprefix",
+        "-iwithprefix",
+        "-iwithprefixbefore",
+        "-dependency-file",
+        "-Xarch_host",
+        "-Xarch_device",
+        "-Xcuda-ptxas",
+        "-z",
+        "-u",
+        "-e",
+        "-T",
     ];
     while i < argv.len() {
         let a = argv[i].clone();
@@ -215,9 +243,7 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             }
             continue;
         }
-        if msvc
-            && let Some(v) = opt(&["/FI", "-FI"], &mut i)
-        {
+        if msvc && let Some(v) = opt(&["/FI", "-FI"], &mut i) {
             if let Some(v) = v {
                 info.forced_includes.push(abs(&v, cwd));
             }
@@ -308,7 +334,11 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             i += 1;
             continue;
         }
-        if a.starts_with("-fprofile-use=") || a.starts_with("-fprofile-instr-use=") || a.starts_with("-fsanitize-ignorelist=") || a.starts_with("-fsanitize-blacklist=") {
+        if a.starts_with("-fprofile-use=")
+            || a.starts_with("-fprofile-instr-use=")
+            || a.starts_with("-fsanitize-ignorelist=")
+            || a.starts_with("-fsanitize-blacklist=")
+        {
             if let Some((_, v)) = a.split_once('=') {
                 let p = abs(v, cwd);
                 if p.is_file() {
@@ -378,7 +408,84 @@ pub struct Directives {
     pub includes: Vec<Include>,
     /// Header-looking strings from `#define` lines (possible computed includes).
     pub define_candidates: Vec<Include>,
-    pub computed: bool,
+    /// The macros of computed includes (`#include MACRO`); empty for one
+    /// whose macro can't be named (`#include MACRO(x)`, other tokens).
+    pub computed: Vec<String>,
+    /// Macros defined as (or containing) a header name.
+    pub header_macros: Vec<String>,
+    /// `#define A B`: macros defined as another macro.
+    pub macro_aliases: Vec<(String, String)>,
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut c = s.chars();
+    c.next().is_some_and(|f| f.is_ascii_alphabetic() || f == '_') && c.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `line` without its comments (each replaced by a space). `in_comment`
+/// carries a block comment from one line to the next. String and character
+/// literals are kept whole, so that `"/*"` doesn't start a comment; an
+/// apostrophe inside a number (`1'000`) is a digit separator.
+fn strip_comments(line: &str, in_comment: &mut bool) -> String {
+    let b = line.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        if *in_comment {
+            if c == b'*' && next == Some(b'/') {
+                *in_comment = false;
+                out.push(b' ');
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            out.push(c);
+            if c == b'\\' {
+                if let Some(n) = next {
+                    out.push(n);
+                }
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match (c, next) {
+            (b'/', Some(b'*')) => {
+                *in_comment = true;
+                i += 2;
+            }
+            (b'/', Some(b'/')) => break,
+            (b'"', _) => {
+                quote = Some(c);
+                out.push(c);
+                i += 1;
+            }
+            (b'\'', _) => {
+                // A digit separator when the token before is a number.
+                let start = out.iter().rposition(|&x| !(x.is_ascii_alphanumeric() || x == b'_' || x == b'\'')).map_or(0, |p| p + 1);
+                if !out.get(start).is_some_and(u8::is_ascii_digit) {
+                    quote = Some(c);
+                }
+                out.push(c);
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn header_like(name: &str) -> bool {
@@ -386,9 +493,7 @@ fn header_like(name: &str) -> bool {
         return false;
     }
     let lower = name.to_ascii_lowercase();
-    [".h", ".hh", ".hpp", ".hxx", ".h++", ".inc", ".inl", ".ipp", ".def", ".tcc", ".ixx", ".tlh", ".tli"]
-        .iter()
-        .any(|e| lower.ends_with(e))
+    [".h", ".hh", ".hpp", ".hxx", ".h++", ".inc", ".inl", ".ipp", ".def", ".tcc", ".ixx", ".tlh", ".tli"].iter().any(|e| lower.ends_with(e))
 }
 
 fn parse_quoted(s: &str) -> Option<(Include, &str)> {
@@ -409,6 +514,7 @@ pub fn parse_directives(content: &[u8]) -> Directives {
     let text = String::from_utf8_lossy(content);
     let mut d = Directives::default();
     let mut lines = text.split('\n').peekable();
+    let mut in_comment = false;
     while let Some(raw) = lines.next() {
         let mut line = raw.trim_end_matches('\r').to_string();
         // Line continuations.
@@ -419,6 +525,7 @@ pub fn parse_directives(content: &[u8]) -> Directives {
                 None => break,
             }
         }
+        let line = strip_comments(&line, &mut in_comment);
         let t = line.trim_start();
         let Some(rest) = t.strip_prefix('#') else { continue };
         let rest = rest.trim_start();
@@ -432,8 +539,8 @@ pub fn parse_directives(content: &[u8]) -> Directives {
                 None => {
                     let a = args.trim();
                     // `#include MACRO`: a computed include.
-                    if !a.is_empty() && !a.starts_with("//") && !a.starts_with("/*") {
-                        d.computed = true;
+                    if !a.is_empty() {
+                        d.computed.push(if is_identifier(a) { a.to_string() } else { String::new() });
                     }
                 }
             },
@@ -453,17 +560,28 @@ pub fn parse_directives(content: &[u8]) -> Directives {
                 }
             }
             "define" => {
+                let a = args.trim_start();
+                let name_end = a.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(a.len());
+                let (name, value) = (&a[..name_end], a[name_end..].trim());
+                if is_identifier(value) && !name.is_empty() {
+                    d.macro_aliases.push((name.to_string(), value.to_string()));
+                }
                 let mut s = args;
+                let mut defines_header = false;
                 while let Some(p) = s.find(['"', '<']) {
                     match parse_quoted(&s[p..]) {
                         Some((inc, r)) => {
                             if header_like(&inc.name) {
                                 d.define_candidates.push(inc);
+                                defines_header = true;
                             }
                             s = r;
                         }
                         None => break,
                     }
+                }
+                if defines_header && !name.is_empty() {
+                    d.header_macros.push(name.to_string());
                 }
             }
             _ => {}
@@ -499,7 +617,8 @@ type FileKey = (PathBuf, u64, Option<SystemTime>);
 #[derive(Clone, Debug, Default)]
 pub struct Resolved {
     pub files: Vec<PathBuf>,
-    pub computed: bool,
+    /// The file's directives about macros (see `Directives`).
+    pub directives: Arc<Directives>,
 }
 
 /// Scanner caches, shared across actions (and builds, in a daemon).
@@ -647,7 +766,7 @@ impl Scanner<'_> {
         }
         files.sort();
         files.dedup();
-        let r = Arc::new(Resolved { files, computed: d.computed });
+        let r = Arc::new(Resolved { files, directives: d.clone() });
         // An include that is not found may be generated later in the build
         // directory: don't cache that.
         let volatile_search = sp.quote.iter().chain(&sp.angled).any(|d| self.is_volatile(d)) || self.is_volatile(from_dir);
@@ -664,25 +783,49 @@ impl Scanner<'_> {
         let mut dirs = BTreeSet::new();
         let mut warnings = Vec::new();
         let mut queue: VecDeque<PathBuf> = roots.iter().cloned().collect();
+        // Computed includes, and the macros the scanned files define.
+        let mut computed: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        let mut header_macros: HashSet<String> = HashSet::new();
+        let mut aliases: Vec<(String, String)> = Vec::new();
         while let Some(f) = queue.pop_front() {
             if !files.insert(f.clone()) {
                 continue;
             }
             let r = self.resolve_file(&f, sp, sp_id);
-            if r.computed
-                && let Some(parent) = f.parent()
-                && dirs.insert(parent.to_path_buf())
-            {
-                warnings.push(format!(
-                    "computed #include in {}: sending {} whole",
-                    f.display(),
-                    parent.display()
-                ));
+            if !r.directives.computed.is_empty() {
+                computed.push((f.clone(), r.directives.computed.clone()));
             }
+            header_macros.extend(r.directives.header_macros.iter().cloned());
+            aliases.extend(r.directives.macro_aliases.iter().cloned());
             for inc in r.files.iter() {
                 if !files.contains(inc) {
                     queue.push_back(inc.clone());
                 }
+            }
+        }
+        // `#define A B` with B a header macro makes A one.
+        loop {
+            let before = header_macros.len();
+            for (a, b) in &aliases {
+                if header_macros.contains(b) {
+                    header_macros.insert(a.clone());
+                }
+            }
+            if header_macros.len() == before {
+                break;
+            }
+        }
+        // A computed include whose macro names a header is covered: the
+        // header was followed as a candidate. Otherwise its directory goes
+        // whole.
+        for (f, macros) in computed {
+            if macros.iter().all(|m| header_macros.contains(m)) {
+                continue;
+            }
+            if let Some(parent) = f.parent()
+                && dirs.insert(parent.to_path_buf())
+            {
+                warnings.push(format!("computed #include in {}: sending {} whole", f.display(), parent.display()));
             }
         }
         ScanResult { files, dirs, warnings }
@@ -733,11 +876,7 @@ pub fn discover_builtin_dirs(compiler: &Path, info: &CompileInfo, lang: Lang) ->
     let text = String::from_utf8_lossy(&out.stderr);
     let dirs = parse_search_list(&text);
     if dirs.is_empty() {
-        return Err(format!(
-            "could not find the include search list in `{} -v` output (exit {:?})",
-            compiler.display(),
-            out.status.code()
-        ));
+        return Err(format!("could not find the include search list in `{} -v` output (exit {:?})", compiler.display(), out.status.code()));
     }
     Ok(dirs)
 }
@@ -775,11 +914,8 @@ pub fn search_path(info: &CompileInfo, builtin: &[PathBuf]) -> SearchPath {
     angled.extend(info.after_dirs.iter().cloned());
     let mut seen = HashSet::new();
     angled.retain(|d| seen.insert(d.clone()));
-    let msvc_source_dirs = if info.style == Some(Style::Msvc) {
-        info.sources.iter().filter_map(|s| s.parent().map(Path::to_path_buf)).collect()
-    } else {
-        Vec::new()
-    };
+    let msvc_source_dirs =
+        if info.style == Some(Style::Msvc) { info.sources.iter().filter_map(|s| s.parent().map(Path::to_path_buf)).collect() } else { Vec::new() };
     SearchPath { quote: info.quote_dirs.clone(), angled, msvc_source_dirs }
 }
 
@@ -811,8 +947,48 @@ mod tests {
             names,
             vec![("stdio.h", true), ("a/b.h", false), ("x.h", true), ("objc.h", false), ("opt.h", true), ("o2.h", false), ("continued.h", false)]
         );
-        assert!(d.computed);
+        assert_eq!(d.computed, vec!["MACRO".to_string()]);
         assert_eq!(d.define_candidates, vec![Include { name: "freetype/freetype.h".into(), angled: true }]);
+        assert_eq!(d.header_macros, vec!["HDR".to_string()]);
+    }
+
+    #[test]
+    fn comments_are_skipped() {
+        let d = parse_directives(
+            b"/* A comment\n   #include's protect themselves\n   #include \"in_comment.h\" */ #include \"after.h\"\n\
+              #define GLOB \"*/*\"  /* \"/*\" in a string doesn't start a comment */\n\
+              int x = 1'000; /* a digit separator\n#include <hidden.h>\n*/\n\
+              #include <real.h> // #include <line_comment.h>\n\
+              #define ALIAS HDR\n#define HDR <h.h>\n#include ALIAS\n#include IT(x)\n",
+        );
+        let names: Vec<&str> = d.includes.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["after.h", "real.h"]);
+        assert_eq!(d.computed, vec!["ALIAS".to_string(), String::new()]);
+        assert_eq!(d.macro_aliases, vec![("ALIAS".to_string(), "HDR".to_string())]);
+        assert_eq!(d.header_macros, vec!["HDR".to_string()]);
+        assert_eq!(strip_comments("a /* b */ c // d", &mut false), "a   c ");
+        assert_eq!(strip_comments("char c = '\\''; /* x", &mut false), "char c = '\\''; ");
+    }
+
+    #[test]
+    fn computed_includes_of_known_macros() {
+        let dir = std::env::temp_dir().join(format!("ninja_rs_scan_computed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("inc/ft")).unwrap();
+        std::fs::write(dir.join("main.c"), "#include <config.h>\n#include FT_HEADER\n#include \"other.h\"\n").unwrap();
+        std::fs::write(dir.join("inc/config.h"), "#define FT_IMPL <ft/impl.h>\n#define FT_HEADER FT_IMPL\n").unwrap();
+        std::fs::write(dir.join("inc/ft/impl.h"), "").unwrap();
+        std::fs::write(dir.join("inc/ft/unused.h"), "").unwrap();
+        // A comment mentioning #include, as glibc's limits.h has.
+        std::fs::write(dir.join("other.h"), "/*\n   #include's protect themselves\n*/\n").unwrap();
+        let cache = ScanCache::default();
+        let scanner = Scanner { cache: &cache, windows: false, volatile_roots: vec![] };
+        let sp = SearchPath { quote: vec![], angled: vec![dir.join("inc")], msvc_source_dirs: vec![] };
+        let r = scanner.scan(&[dir.join("main.c")], &sp);
+        let rel: Vec<String> = r.files.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(rel, vec!["inc/config.h", "inc/ft/impl.h", "main.c", "other.h"]);
+        assert!(r.dirs.is_empty() && r.warnings.is_empty(), "{:?} {:?}", r.dirs, r.warnings);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -876,7 +1052,8 @@ mod tests {
         std::fs::create_dir_all(dir.join("inc/sub")).unwrap();
         std::fs::create_dir_all(dir.join("sys")).unwrap();
         std::fs::create_dir_all(dir.join("comp")).unwrap();
-        std::fs::write(dir.join("src/main.c"), "#include \"local.h\"\n#include <a.h>\n#include <missing.h>\n#ifdef X\n#include \"comp/c.h\"\n#endif\n").unwrap();
+        std::fs::write(dir.join("src/main.c"), "#include \"local.h\"\n#include <a.h>\n#include <missing.h>\n#ifdef X\n#include \"comp/c.h\"\n#endif\n")
+            .unwrap();
         std::fs::write(dir.join("src/local.h"), "#include <sub/b.h>\n").unwrap();
         std::fs::write(dir.join("inc/a.h"), "#include_next <a.h>\n#pragma once\n").unwrap();
         std::fs::write(dir.join("sys/a.h"), "/* the real a.h */\n").unwrap();
