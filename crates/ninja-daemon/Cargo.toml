@@ -1,0 +1,18 @@
+[package]
+name = "ninja-daemon"
+description = "A daemon keeping ninja-rs' caches between builds, watching the files they come from"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+cpp-deps = { path = "../cpp-deps" }
+hex = { workspace = true }
+rbe-client = { path = "../../third_party/cargo-rbe/rbe-client" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

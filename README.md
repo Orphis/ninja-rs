@@ -82,6 +82,9 @@ remote execution (only for manifests with rbe_version = 1):
                                  conservative)
   --disk_cache=DIR               (local action cache + CAS, with or without a remote)
   --disk_cache_max_size=SIZE     (LRU eviction above SIZE, default 10G)
+  --[no]daemon                   (or NINJA_RS_DAEMON=1: a daemon keeps scanned headers,
+                                 compiler profiles, digests and toolchain trees between
+                                 builds, watching their files; -t daemon status|stop)
 
 TLS for grpcs:// endpoints (remote service and BES; flags named as in Bazel):
   --tls_certificate=FILE         (CA trusted besides the public roots, PEM)
@@ -175,8 +178,13 @@ own actions in the same build (action rewinding).
 GNU make's jobserver is supported as a client (FIFO, pipe and Windows
 semaphore) and as a pool (`--jobserver-pool`).
 
+For developers, a daemon (`--daemon`) keeps what builds learn (scanned
+headers, compiler profiles, file digests, toolchain trees) and watches the
+files they come from, so that a build checks again only what changed (see
+docs/design.md, "Daemon").
+
 Not done yet (later phases): lease extension in minimal-download mode,
-daemon mode.
+running whole builds in the daemon.
 
 ## Layout
 
@@ -186,6 +194,7 @@ platforms/                 host platforms for rules_rs/@llvm
 crates/ninja-core/         manifest language, graph, build engine, local runner
 crates/ninja-remote/       REAPI backend, scanner, path mapping, store
 crates/cpp-deps/           C/C++ preprocessor finding a compile's inputs
+crates/ninja-daemon/       daemon keeping caches between builds, file watching
 crates/ninja-rs/           Service + CLI (bin "ninja-rs"), e2e test
 crates/fake-reapi/         in-process fake REAPI server (+ standalone bin)
 third_party/cargo-rbe/     rbe-client copied from cargo-rbe

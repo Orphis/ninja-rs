@@ -95,6 +95,20 @@ pub fn make_deps(text: &str) -> Vec<String> {
     deps
 }
 
+/// A compiler with the flags and the environment it runs with.
+#[derive(Clone, Copy)]
+pub struct Compiler<'a> {
+    pub path: &'a Path,
+    /// The flags that may change what it predefines (see `probe`).
+    pub args: &'a [String],
+    pub style: Style,
+    /// `c` or `c++`.
+    pub lang: &'a str,
+    pub cwd: &'a Path,
+    /// Its environment (None: this process's).
+    pub env: Option<&'a [(String, String)]>,
+}
+
 /// A temporary source file, deleted when dropped.
 struct TempSource(PathBuf);
 
@@ -119,13 +133,19 @@ pub struct Ran {
     pub stderr: String,
 }
 
-/// Runs the compiler on `input` (`lang`: `c` or `c++`) with `args` and the
-/// `extra` flags of the operation; Err when it fails.
-pub fn run(compiler: &Path, args: &[String], style: Style, lang: &str, extra: &[&str], input: &str, cwd: &Path) -> Result<Ran, String> {
+/// Runs the compiler on `input` with its flags and the `extra` flags of the
+/// operation; Err when it fails.
+pub fn run(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, String> {
+    let (compiler, lang) = (c.path, c.lang);
     let mut cmd = Command::new(compiler);
-    cmd.args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    if let Some(env) = c.env {
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    }
+    // GCC translates the `-v` output read below.
+    cmd.env("LC_ALL", "C");
+    cmd.args(c.args).current_dir(c.cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
     let _source;
-    match style {
+    match c.style {
         Style::Gcc => {
             cmd.args(["-x", lang]).args(extra).arg("-").stdin(Stdio::piped());
         }
@@ -162,8 +182,8 @@ fn text_flags(style: Style) -> &'static [&'static str] {
 
 /// The dialect of the compiler's `#if`: whether `true` is 1, and whether
 /// `and` is an operator (an error otherwise).
-fn dialect(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &Path) -> Dialect {
-    let marked = |input: &str, mark: &str| run(compiler, args, style, lang, text_flags(style), input, cwd).is_ok_and(|r| r.stdout.contains(mark));
+fn dialect(c: &Compiler) -> Dialect {
+    let marked = |input: &str, mark: &str| run(c, text_flags(c.style), input).is_ok_and(|r| r.stdout.contains(mark));
     Dialect {
         true_false: marked("#if true\nNINJA_RS_TRUE\n#endif\n", "NINJA_RS_TRUE"),
         alt_operators: marked("#if 1 and 1\nNINJA_RS_AND\n#endif\n", "NINJA_RS_AND"),
@@ -172,14 +192,15 @@ fn dialect(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &Pat
 
 /// The predefined macros, operators, implicit files and dialect, for `args`
 /// (the compile's flags that may change them: without inputs, outputs,
-/// macros and forced includes). `lang`: `c` or `c++`.
-pub fn probe(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &Path) -> Result<Probe, String> {
+/// macros and forced includes).
+pub fn probe(c: &Compiler) -> Result<Probe, String> {
+    let (compiler, style) = (c.path, c.style);
     let mut probe = Probe::default();
     match style {
         Style::Gcc | Style::ClangCl => {
             let input: String = OPERATORS.iter().map(|op| format!("#ifdef {op}\n#define {OPERATOR_MARK}{op} 1\n#endif\n")).collect();
             let flags: &[&str] = if style == Style::Gcc { &["-dM", "-E"] } else { &["/clang:-dM", "/E"] };
-            let out = run(compiler, args, style, lang, flags, &input, cwd)?;
+            let out = run(c, flags, &input)?;
             for line in out.stdout.lines() {
                 match line.strip_prefix("#define ").and_then(|l| l.strip_prefix(OPERATOR_MARK)) {
                     Some(rest) => probe.operators.push(rest.split(' ').next().unwrap_or_default().to_string()),
@@ -192,13 +213,13 @@ pub fn probe(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &P
             }
         }
         Style::Msvc => {
-            let out = run(compiler, args, style, lang, &["/EP", "/Zc:preprocessor", "/PD"], "", cwd)?;
+            let out = run(c, &["/EP", "/Zc:preprocessor", "/PD"], "")?;
             for line in out.stdout.lines().filter(|l| l.starts_with("#define ")) {
                 probe.predefines.push_str(line);
                 probe.predefines.push('\n');
             }
             let input: String = OPERATORS.iter().map(|op| format!("#ifdef {op}\n{OPERATOR_MARK} {op}\n#endif\n")).collect();
-            let out = run(compiler, args, style, lang, &["/EP"], &input, cwd)?;
+            let out = run(c, &["/EP"], &input)?;
             probe.operators = out.stdout.lines().filter_map(|l| l.trim().strip_prefix(OPERATOR_MARK)).map(|op| op.trim().to_string()).collect();
         }
     }
@@ -206,23 +227,23 @@ pub fn probe(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &P
         return Err(format!("{} printed no predefined macros", compiler.display()));
     }
     if style == Style::Gcc {
-        let deps = run(compiler, args, style, lang, &["-E", "-M"], "", cwd)?;
+        let deps = run(c, &["-E", "-M"], "")?;
         probe.implicit = make_deps(&deps.stdout).into_iter().filter(|d| d != "-" && d != "<stdin>").collect();
     }
-    probe.dialect = dialect(compiler, args, style, lang, cwd);
+    probe.dialect = dialect(c);
     Ok(probe)
 }
 
 /// The built-in include directories GCC, Clang and `clang-cl` report
 /// (`-v`): (directory, whether it's a framework directory).
-pub fn builtin_dirs(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &Path) -> Result<Vec<(String, bool)>, String> {
+pub fn builtin_dirs(c: &Compiler) -> Result<Vec<(String, bool)>, String> {
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let extra: Vec<&str> = match style {
+    let extra: Vec<&str> = match c.style {
         Style::Gcc => vec!["-E", "-v", "-o", null],
         Style::ClangCl => vec!["-v", "/E"],
         Style::Msvc => return Err("cl.exe has no built-in directories (INCLUDE)".into()),
     };
-    let out = run(compiler, args, style, lang, &extra, "", cwd)?;
+    let out = run(c, &extra, "")?;
     let mut dirs = Vec::new();
     let mut inside = false;
     for line in out.stderr.lines() {
@@ -238,7 +259,7 @@ pub fn builtin_dirs(compiler: &Path, args: &[String], style: Style, lang: &str, 
             }
         }
     }
-    Err(format!("{} -v printed no search list", compiler.display()))
+    Err(format!("{} -v printed no search list", c.path.display()))
 }
 
 /// Parses a query's answer: an integer literal (`201603L`).
@@ -267,7 +288,7 @@ fn answers_of(text: &str, n: usize) -> Vec<Option<i64>> {
 /// `probe`: their values as the compiler expands them in text, or, for
 /// those it doesn't (MSVC, some GCC operators), whether `#if` finds them
 /// true. None for those the compiler can't evaluate.
-pub fn answer(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &Path, queries: &[(String, String)]) -> Result<Vec<Option<i64>>, String> {
+pub fn answer(c: &Compiler, queries: &[(String, String)]) -> Result<Vec<Option<i64>>, String> {
     let all: Vec<usize> = (0..queries.len()).collect();
     let text = |i: usize| {
         let (op, arg) = &queries[i];
@@ -276,35 +297,25 @@ pub fn answer(compiler: &Path, args: &[String], style: Style, lang: &str, cwd: &
     let mut answers = vec![None; queries.len()];
     // A query the compiler can't evaluate fails the whole run: the others
     // are asked again in halves, so that only it stays unanswered.
-    ask(compiler, args, style, lang, cwd, &all, &text, &mut answers)?;
+    ask(c, &all, &text, &mut answers)?;
     let missing: Vec<usize> = all.into_iter().filter(|&i| answers[i].is_none()).collect();
     let as_if = |i: usize| {
         let (op, arg) = &queries[i];
         format!("#if {op}({arg})\n{QUERY_MARK} {i} 1\n#else\n{QUERY_MARK} {i} 0\n#endif\n")
     };
-    let _ = ask(compiler, args, style, lang, cwd, &missing, &as_if, &mut answers);
+    let _ = ask(c, &missing, &as_if, &mut answers);
     Ok(answers)
 }
 
 /// Asks the queries `which` (lines from `line`), splitting the batch when
 /// the compiler fails on it. Err only when the compiler fails on every
 /// query alone, which likely means it can't run at all.
-#[allow(clippy::too_many_arguments)]
-fn ask(
-    compiler: &Path,
-    args: &[String],
-    style: Style,
-    lang: &str,
-    cwd: &Path,
-    which: &[usize],
-    line: &dyn Fn(usize) -> String,
-    answers: &mut [Option<i64>],
-) -> Result<(), String> {
+fn ask(c: &Compiler, which: &[usize], line: &dyn Fn(usize) -> String, answers: &mut [Option<i64>]) -> Result<(), String> {
     if which.is_empty() {
         return Ok(());
     }
     let input: String = which.iter().map(|&i| line(i)).collect();
-    match run(compiler, args, style, lang, text_flags(style), &input, cwd) {
+    match run(c, text_flags(c.style), &input) {
         Ok(out) => {
             for (i, v) in answers_of(&out.stdout, answers.len()).into_iter().enumerate() {
                 if answers[i].is_none() {
@@ -316,8 +327,8 @@ fn ask(
         Err(e) if which.len() == 1 => Err(e),
         Err(_) => {
             let (a, b) = which.split_at(which.len() / 2);
-            let ra = ask(compiler, args, style, lang, cwd, a, line, answers);
-            let rb = ask(compiler, args, style, lang, cwd, b, line, answers);
+            let ra = ask(c, a, line, answers);
+            let rb = ask(c, b, line, answers);
             // Fine if some half worked.
             ra.or(rb)
         }
@@ -349,38 +360,30 @@ mod tests {
         let Some(cxx) = std::env::var_os("CPP_DEPS_TEST_CXX") else { return };
         let cwd = std::env::temp_dir();
         let style = if crate::external::is_cl_style(&[cxx.to_string_lossy().into_owned()]) { Style::ClangCl } else { Style::Gcc };
-        let std = if style == Style::Gcc { "-std=c++17" } else { "/std:c++17" };
-        let p = probe(Path::new(&cxx), &[std.to_string()], style, "c++", &cwd).unwrap();
+        let std = [if style == Style::Gcc { "-std=c++17" } else { "/std:c++17" }.to_string()];
+        let c = Compiler { path: Path::new(&cxx), args: &std, style, lang: "c++", cwd: &cwd, env: None };
+        let p = probe(&c).unwrap();
         assert!(p.predefines.contains("#define __cplusplus 201703L"), "{}", p.predefines);
         assert!(p.operators.iter().any(|o| o == "__has_include"));
         assert!(p.operators.iter().any(|o| o == "__has_builtin"));
         assert!(p.dialect.true_false);
-        let a = answer(
-            Path::new(&cxx),
-            &[std.to_string()],
-            style,
-            "c++",
-            &cwd,
-            &[("__has_builtin".into(), "__builtin_expect".into()), ("__has_cpp_attribute".into(), "nodiscard".into())],
-        )
-        .unwrap();
+        let a = answer(&c, &[("__has_builtin".into(), "__builtin_expect".into()), ("__has_cpp_attribute".into(), "nodiscard".into())]).unwrap();
         assert_eq!(a[0], Some(1));
         assert!(a[1].is_some_and(|v| v >= 201603));
         // A query the compiler rejects doesn't take the others with it.
         let a = answer(
-            Path::new(&cxx),
-            &[std.to_string()],
-            style,
-            "c++",
-            &cwd,
+            &c,
             &[("__has_builtin".into(), "__builtin_expect".into()), ("__has_builtin".into(), "(".into()), ("__has_cpp_attribute".into(), "nodiscard".into())],
         )
         .unwrap();
         assert_eq!(a[0], Some(1));
         assert_eq!(a[1], None);
         assert!(a[2].is_some());
-        let c = probe(Path::new(&cxx), &[], style, "c", &cwd).unwrap();
-        assert!(!c.dialect.alt_operators);
+        let p = probe(&Compiler { args: &[], lang: "c", ..c }).unwrap();
+        assert!(!p.dialect.alt_operators);
+        // In a given environment.
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        assert!(probe(&Compiler { env: Some(&env), ..c }).is_ok());
     }
 
     /// Against cl.exe, when `CPP_DEPS_TEST_CL` names one.
@@ -388,14 +391,16 @@ mod tests {
     fn real_cl() {
         let Some(cl) = std::env::var_os("CPP_DEPS_TEST_CL") else { return };
         let cwd = std::env::temp_dir();
-        let p = probe(Path::new(&cl), &["/std:c++20".to_string(), "/EHsc".to_string()], Style::Msvc, "c++", &cwd).unwrap();
+        let args = ["/std:c++20".to_string(), "/EHsc".to_string()];
+        let c = Compiler { path: Path::new(&cl), args: &args, style: Style::Msvc, lang: "c++", cwd: &cwd, env: None };
+        let p = probe(&c).unwrap();
         assert!(p.predefines.contains("#define _MSC_VER "), "{}", p.predefines);
         assert!(p.predefines.contains("#define _MSVC_LANG 202002L"), "{}", p.predefines);
         assert!(p.predefines.contains("#define _CPPUNWIND 1"));
         assert!(p.operators.iter().any(|o| o == "__has_include"));
         // C++20 implies /permissive-: `and` is an operator.
         assert!(p.dialect.true_false && p.dialect.alt_operators, "{:?}", p.dialect);
-        let a = answer(Path::new(&cl), &["/std:c++20".to_string()], Style::Msvc, "c++", &cwd, &[("__has_cpp_attribute".into(), "nodiscard".into())]).unwrap();
+        let a = answer(&c, &[("__has_cpp_attribute".into(), "nodiscard".into())]).unwrap();
         assert!(a[0].is_some_and(|v| v > 0), "{a:?}");
     }
 }

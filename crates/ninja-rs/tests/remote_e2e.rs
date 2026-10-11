@@ -1097,6 +1097,55 @@ fn test_include_scanner_fallback() -> Result<(), String> {
     Ok(())
 }
 
+/// Builds through the daemon (started by the first, running this test
+/// binary): an edited header, same size, must reach the remote actions
+/// although the daemon vouched for it after the second build.
+fn test_daemon() -> Result<(), String> {
+    let f = fixture("daemon", true);
+    // A repository: watched.
+    std::fs::create_dir_all(f.root.join(".git")).unwrap();
+    let dir = f.root.join("daemon");
+    // SAFETY: the tests run one at a time; builds read these later.
+    unsafe {
+        std::env::set_var("NINJA_RS_DAEMON_DIR", &dir);
+        std::env::set_var("NINJA_RS_DAEMON_IDLE", "120");
+    }
+    let r = with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let build = || run_ninja(&f, Some(&ep), &["--daemon", "--remote_include_scanner=preprocessor", "--remote_strict"]);
+        check(build() == 0, "first build failed")?;
+        check(server.stats().executions == 2, &format!("expected 2 remote executions, got {:?}", server.stats()))?;
+        let deep = f.root.join("include/nested/deep.h");
+        for (i, value) in ["1", "2"].iter().enumerate() {
+            std::fs::write(
+                &deep,
+                format!(
+                    "#define DEEP {value}
+"
+                ),
+            )
+            .unwrap();
+            check(build() == 0, &format!("build {} failed", i + 2))?;
+            let expected = 4 + 2 * i as u64;
+            check(server.stats().executions == expected, &format!("after editing deep.h: expected {expected} remote executions, got {:?}", server.stats()))?;
+        }
+        let loc = ninja_daemon::Location::for_exe(&std::env::current_exe().unwrap()).unwrap();
+        let status = ninja_daemon::Client::connect(&loc).and_then(|c| c.status()).map_err(|e| format!("daemon status: {e}"))?;
+        check(status.builds == 3, &format!("expected 3 builds, got {status:?}"))?;
+        check(status.digests > 0 && status.trees > 0, &format!("nothing kept: {status:?}"))?;
+        let root = std::fs::canonicalize(&f.root).unwrap();
+        let watched = status.roots.iter().any(|(p, s)| std::fs::canonicalize(p).is_ok_and(|p| p == root) && s == "watched");
+        check(watched, &format!("the fixture isn't watched: {:?}", status.roots))?;
+        Ok::<(), String>(())
+    });
+    ninja_rs::daemon::tool(&["stop".to_string()]);
+    unsafe {
+        std::env::remove_var("NINJA_RS_DAEMON_DIR");
+        std::env::remove_var("NINJA_RS_DAEMON_IDLE");
+    }
+    r
+}
+
 fn test_without_executor_runs_locally() -> Result<(), String> {
     let f = fixture("noexec", true);
     check(run_ninja(&f, None, &[]) == 0, "local build failed")?;
@@ -1120,6 +1169,11 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ExitCode::from(fake_cmake(&args) as u8);
     }
+    // The daemon test_daemon's builds start.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() >= 3 && args[..3] == ["-t", "daemon", "run"] {
+        return ExitCode::from(ninja_rs::daemon::tool(&args[2..]) as u8);
+    }
     let tests: Vec<(&str, fn() -> Result<(), String>)> = vec![
         ("remote_build_and_cache", test_remote_build_and_cache),
         ("local_tool_steps", test_local_tool_steps),
@@ -1136,6 +1190,7 @@ fn main() -> ExitCode {
         ("thin_archives", test_thin_archives),
         ("mtls", test_mtls),
         ("include_scanner_fallback", test_include_scanner_fallback),
+        ("daemon", test_daemon),
         ("split_and_splice_v2_12", || test_split_and_splice(12)),
         ("split_and_splice_v2_13", || test_split_and_splice(13)),
     ];

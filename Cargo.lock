@@ -657,6 +657,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ninja-daemon"
+version = "0.1.0"
+dependencies = [
+ "cpp-deps",
+ "hex",
+ "libc",
+ "rbe-client",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ninja-remote"
 version = "0.1.0"
 dependencies = [
@@ -664,6 +677,7 @@ dependencies = [
  "cpp-deps",
  "hex",
  "ninja-core",
+ "ninja-daemon",
  "prost",
  "rbe-client",
  "serde",
@@ -679,6 +693,7 @@ dependencies = [
  "fake-reapi",
  "libc",
  "ninja-core",
+ "ninja-daemon",
  "ninja-remote",
  "prost",
  "prost-types",

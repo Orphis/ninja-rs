@@ -4,10 +4,16 @@
 //! and queries answered by probing the compiler, then scanning again.
 //!
 //! GCC and Clang command lines, and `cl`-style ones (`cl.exe`, `clang-cl`).
+//!
+//! Profiles can be saved in a directory (`Environment::profile_dir`), so
+//! that later processes don't probe the compiler again: a file per profile,
+//! with its whole key (the compiler's path, size and modification time, the
+//! flags and the variables that matter) checked when loading.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::external::is_cl_style;
 use crate::hmap::HeaderMap;
@@ -63,9 +69,55 @@ fn lang_of(source: &Path) -> Option<&'static str> {
     })
 }
 
+/// What scans run compilers with.
+#[derive(Clone, Debug, Default)]
+pub struct Environment {
+    /// The compilers' environment (None: this process's).
+    pub vars: Option<Arc<Vec<(String, String)>>>,
+    /// Where profiles are saved and found.
+    pub profile_dir: Option<PathBuf>,
+}
+
+impl Environment {
+    pub fn var(&self, name: &str) -> Option<String> {
+        match &self.vars {
+            None => std::env::var(name).ok(),
+            // Names are case-insensitive on Windows.
+            Some(vars) => vars.iter().find(|(k, _)| if cfg!(windows) { k.eq_ignore_ascii_case(name) } else { k == name }).map(|(_, v)| v.clone()),
+        }
+    }
+
+    fn compiler<'a>(&'a self, inv: &'a Invocation, cwd: &'a Path) -> probe::Compiler<'a> {
+        probe::Compiler { path: &inv.compiler, args: &inv.probe_args, style: inv.style, lang: &inv.lang, cwd, env: self.vars.as_ref().map(|v| v.as_slice()) }
+    }
+}
+
+/// Variables that change what compilers predefine or search.
+const PROFILE_VARS: &[&str] = &[
+    "INCLUDE",
+    "EXTERNAL_INCLUDE",
+    "CL",
+    "_CL_",
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "OBJC_INCLUDE_PATH",
+    "OBJCPLUS_INCLUDE_PATH",
+    "SDKROOT",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "GCC_EXEC_PREFIX",
+    "COMPILER_PATH",
+    "CCC_OVERRIDE_OPTIONS",
+];
+
 /// Parses a compile command (response files expanded).
 pub fn parse(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
-    if is_cl_style(argv) { parse_cl(argv, cwd) } else { parse_gcc(argv, cwd) }
+    parse_in(argv, cwd, &Environment::default())
+}
+
+/// Parses a compile command, `/external:env:` reading `env`.
+pub fn parse_in(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation, String> {
+    if is_cl_style(argv) { parse_cl(argv, cwd, env) } else { parse_gcc(argv, cwd) }
 }
 
 fn new_invocation(argv: &[String], style: Style) -> Result<Invocation, String> {
@@ -272,7 +324,7 @@ fn cl_dropped(f: &str) -> bool {
     warning || f == "c" || f == "showIncludes" || f == "nologo" || f == "Gy" || f == "Gw" || PREFIXES.iter().any(|p| f.starts_with(p))
 }
 
-fn parse_cl(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
+fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation, String> {
     let abs = |p: &str| -> PathBuf { scan::normalize(&cwd.join(p)) };
     let mut inv = new_invocation(
         argv,
@@ -327,7 +379,7 @@ fn parse_cl(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
         if let Some(v) = value(f, "external:I", &mut i)? {
             inv.system_dirs.push(Dir::Path(abs(&v)));
         } else if let Some(var) = f.strip_prefix("external:env:") {
-            let dirs = std::env::var(var).unwrap_or_default();
+            let dirs = env.var(var).unwrap_or_default();
             inv.system_dirs.extend(dirs.split(';').filter(|d| !d.is_empty()).map(|d| Dir::Path(abs(d))));
         } else if let Some(v) = value(f, "imsvc", &mut i)? {
             inv.system_dirs.push(Dir::Path(abs(&v)));
@@ -390,6 +442,8 @@ fn parse_cl(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
 
 /// What a compiler predefines and searches, for a set of flags.
 pub struct Profile {
+    /// The `#define` lines `predefined` comes from.
+    predefines: String,
     pub predefined: Arc<MacroTable>,
     pub operators: Arc<HashSet<intern::Sym>>,
     pub dialect: crate::expr::Dialect,
@@ -401,6 +455,120 @@ pub struct Profile {
     /// Held while the compiler answers queries, so that concurrent scans
     /// don't ask the same ones.
     asking: Mutex<()>,
+}
+
+const PROFILE_SIGNATURE: &str = "cpp-deps profile 1";
+
+/// Profiles unused for this long are removed when another is saved.
+const PROFILE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+impl Profile {
+    fn new(predefines: String, operators: Vec<String>, dialect: crate::expr::Dialect, builtin_dirs: Vec<Dir>, implicit: Vec<PathBuf>) -> Profile {
+        Profile {
+            predefined: Arc::new(scan::macro_table(&predefines)),
+            predefines,
+            operators: Arc::new(operators.iter().map(|o| intern::intern(o)).collect()),
+            dialect,
+            builtin_dirs,
+            implicit,
+            answers: Mutex::default(),
+            asking: Mutex::default(),
+        }
+    }
+
+    /// The file of the profile with `key` in `dir`.
+    fn file(dir: &Path, key: &str) -> PathBuf {
+        use std::hash::{Hash, Hasher};
+        let hash = |salt: u8| {
+            let mut h = std::hash::DefaultHasher::new();
+            (salt, key).hash(&mut h);
+            h.finish()
+        };
+        dir.join(format!("{:016x}{:016x}.profile", hash(0), hash(1)))
+    }
+
+    /// Saves the profile with `key` (which it's loaded with): line-based,
+    /// the `#define` lines last.
+    fn save(&self, dir: &Path, key: &str) -> std::io::Result<()> {
+        let bad = |s: &str| s.contains(['\n', '\r', '\t']);
+        if bad(key) {
+            return Ok(());
+        }
+        let mut out = format!("{PROFILE_SIGNATURE}\nkey\t{key}\ndialect\t{}\t{}\n", self.dialect.true_false as u8, self.dialect.alt_operators as u8);
+        let mut operators: Vec<&str> = self.operators.iter().map(|o| o.as_str()).collect();
+        operators.sort();
+        for o in operators {
+            out.push_str(&format!("operator\t{o}\n"));
+        }
+        for d in &self.builtin_dirs {
+            let (kind, p) = match d {
+                Dir::Path(p) => ("dir", p),
+                Dir::Framework(p) => ("framework", p),
+            };
+            out.push_str(&format!("{kind}\t{}\n", p.display()));
+        }
+        for f in &self.implicit {
+            out.push_str(&format!("implicit\t{}\n", f.display()));
+        }
+        let mut answers: Vec<_> = self.answers.lock().unwrap().iter().map(|(q, v)| (q.clone(), *v)).collect();
+        answers.sort();
+        for ((op, arg), v) in answers {
+            if !bad(&op) && !bad(&arg) {
+                out.push_str(&format!("answer\t{op}\t{arg}\t{}\n", v.map_or("-".to_string(), |v| v.to_string())));
+            }
+        }
+        out.push_str("predefines\n");
+        out.push_str(&self.predefines);
+        std::fs::create_dir_all(dir)?;
+        let file = Profile::file(dir, key);
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = file.with_extension(format!("tmp{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, &file)?;
+        // Profiles of compilers gone or changed since.
+        let now = SystemTime::now();
+        for e in std::fs::read_dir(dir)?.flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).unwrap_or_default() > PROFILE_MAX_AGE);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+        Ok(())
+    }
+
+    /// The profile with `key` saved in `dir`, if any.
+    fn load(dir: &Path, key: &str) -> Option<Profile> {
+        let file = Profile::file(dir, key);
+        let text = std::fs::read_to_string(&file).ok()?;
+        let (head, predefines) = text.split_once("\npredefines\n")?;
+        let mut lines = head.lines();
+        if lines.next() != Some(PROFILE_SIGNATURE) || lines.next()?.strip_prefix("key\t") != Some(key) {
+            return None;
+        }
+        let (mut dialect, mut operators, mut dirs, mut implicit, mut answers) = (None, Vec::new(), Vec::new(), Vec::new(), HashMap::new());
+        for line in lines {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f.as_slice() {
+                ["dialect", t, a] => dialect = Some(crate::expr::Dialect { true_false: *t == "1", alt_operators: *a == "1" }),
+                ["operator", o] => operators.push(o.to_string()),
+                ["dir", p] => dirs.push(Dir::Path(PathBuf::from(p))),
+                ["framework", p] => dirs.push(Dir::Framework(PathBuf::from(p))),
+                ["implicit", p] => implicit.push(PathBuf::from(p)),
+                ["answer", op, arg, v] => {
+                    let v = if *v == "-" { None } else { Some(v.parse().ok()?) };
+                    answers.insert((op.to_string(), arg.to_string()), v);
+                }
+                _ => return None,
+            }
+        }
+        let profile = Profile::new(predefines.to_string(), operators, dialect?, dirs, implicit);
+        *profile.answers.lock().unwrap() = answers;
+        // Used: kept by the clean-up of `save`.
+        if let Ok(f) = std::fs::File::options().append(true).open(&file) {
+            let _ = f.set_modified(SystemTime::now());
+        }
+        Some(profile)
+    }
 }
 
 struct ProfileOracle<'a>(&'a Profile);
@@ -433,24 +601,42 @@ impl Driver {
         Driver { cache, profiles: Mutex::default(), overlays: Mutex::default(), header_maps: Mutex::default() }
     }
 
-    /// The profile of a compiler for an invocation's flags (probed once).
-    pub fn profile(&self, inv: &Invocation, cwd: &Path) -> Result<Arc<Profile>, String> {
-        let include_env = if inv.style == Style::Msvc && !inv.no_include_env { std::env::var("INCLUDE").unwrap_or_default() } else { String::new() };
-        let key = format!(
-            "{}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+    /// The key of a compiler's profile for an invocation's flags: what
+    /// may change its answers, the compiler's version included.
+    fn profile_key(inv: &Invocation, cwd: &Path, env: &Environment) -> String {
+        let meta = std::fs::metadata(&inv.compiler).ok();
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+        let vars: Vec<String> = PROFILE_VARS.iter().filter_map(|v| env.var(v).map(|val| format!("{v}={val}"))).collect();
+        format!(
+            "{}\u{1}{}\u{1}{mtime}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
             inv.compiler.display(),
+            meta.map_or(0, |m| m.len()),
             inv.style,
             inv.lang,
             cwd.display(),
             inv.conforming,
-            include_env,
+            inv.no_include_env,
+            vars.join("\u{1}"),
             inv.probe_args.join("\u{1}")
-        );
-        load_once(&self.profiles, key, || {
-            let p = probe::probe(&inv.compiler, &inv.probe_args, inv.style, &inv.lang, cwd)?;
+        )
+    }
+
+    /// The profile of a compiler for an invocation's flags: probed once,
+    /// or loaded from the profile directory.
+    pub fn profile(&self, inv: &Invocation, cwd: &Path, env: &Environment) -> Result<Arc<Profile>, String> {
+        let key = Driver::profile_key(inv, cwd, env);
+        load_once(&self.profiles, key.clone(), || {
+            if let Some(p) = env.profile_dir.as_deref().and_then(|d| Profile::load(d, &key)) {
+                return Ok(Arc::new(p));
+            }
+            let compiler = env.compiler(inv, cwd);
+            let p = probe::probe(&compiler)?;
             let builtin_dirs = match inv.style {
-                Style::Msvc => include_env.split(';').filter(|d| !d.is_empty()).map(|d| Dir::Path(scan::normalize(&cwd.join(d)))).collect(),
-                _ => probe::builtin_dirs(&inv.compiler, &inv.probe_args, inv.style, &inv.lang, cwd)?
+                Style::Msvc if inv.no_include_env => Vec::new(),
+                Style::Msvc => {
+                    env.var("INCLUDE").unwrap_or_default().split(';').filter(|d| !d.is_empty()).map(|d| Dir::Path(scan::normalize(&cwd.join(d)))).collect()
+                }
+                _ => probe::builtin_dirs(&compiler)?
                     .into_iter()
                     .map(|(d, framework)| {
                         let d = scan::normalize(&cwd.join(d));
@@ -458,21 +644,18 @@ impl Driver {
                     })
                     .collect(),
             };
-            let mut predefined = scan::macro_table(&p.predefines);
+            let mut predefines = p.predefines;
             if inv.style == Style::Msvc {
                 // The probe used the conforming preprocessor.
                 let traditional = if inv.conforming { "0" } else { "1" };
-                predefined.extend(scan::macro_table(&format!("#define _MSVC_TRADITIONAL {traditional}\n")));
+                predefines.push_str(&format!("#define _MSVC_TRADITIONAL {traditional}\n"));
             }
-            Ok(Arc::new(Profile {
-                predefined: Arc::new(predefined),
-                operators: Arc::new(p.operators.iter().map(|o| intern::intern(o)).collect()),
-                dialect: p.dialect,
-                builtin_dirs,
-                implicit: p.implicit.iter().map(|f| scan::normalize(&cwd.join(f))).collect(),
-                answers: Mutex::default(),
-                asking: Mutex::default(),
-            }))
+            let implicit = p.implicit.iter().map(|f| scan::normalize(&cwd.join(f))).collect();
+            let profile = Profile::new(predefines, p.operators, p.dialect, builtin_dirs, implicit);
+            if let Some(d) = &env.profile_dir {
+                let _ = profile.save(d, &key);
+            }
+            Ok(Arc::new(profile))
         })
     }
 
@@ -494,8 +677,13 @@ impl Driver {
     /// Scans a compile command run in `cwd`. Unknown queries are asked to
     /// the compiler, then the scan runs again.
     pub fn scan(&self, argv: &[String], cwd: &Path) -> Result<Output, String> {
-        let inv = parse(argv, cwd)?;
-        let profile = self.profile(&inv, cwd)?;
+        self.scan_in(argv, cwd, &Environment::default())
+    }
+
+    /// `scan`, running compilers in `env`.
+    pub fn scan_in(&self, argv: &[String], cwd: &Path, env: &Environment) -> Result<Output, String> {
+        let inv = parse_in(argv, cwd, env)?;
+        let profile = self.profile(&inv, cwd, env)?;
         let dirs = |ds: &[Dir]| ds.iter().map(|d| self.search_dir(d, cwd)).collect::<Result<Vec<_>, _>>();
         let mut angled = dirs(&inv.user_dirs)?;
         angled.extend(dirs(&inv.system_dirs)?);
@@ -549,10 +737,14 @@ impl Driver {
                 return Ok(out);
             }
             asked += 1;
-            let values = probe::answer(&inv.compiler, &inv.probe_args, inv.style, &inv.lang, cwd, &unknown)?;
+            let values = probe::answer(&env.compiler(&inv, cwd), &unknown)?;
             let mut answers = profile.answers.lock().unwrap();
             for (q, v) in unknown.into_iter().zip(values) {
                 answers.insert(q, v);
+            }
+            drop(answers);
+            if let Some(d) = &env.profile_dir {
+                let _ = profile.save(d, &Driver::profile_key(&inv, cwd, env));
             }
         }
     }
@@ -717,5 +909,42 @@ mod tests {
         assert_eq!(names, vec!["main.cc", "a.h", "yes.h", "attr.h", "std20.h"], "{:?}", out.inexact);
         assert!(out.exact(), "{:?} {:?}", out.inexact, out.unknown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_round_trip() {
+        let dir = std::env::temp_dir().join(format!("cpp_deps_profiles_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = Profile::new(
+            "#define __GNUC__ 13\n#define __cplusplus 201703L\n".into(),
+            vec!["__has_include".into(), "__has_builtin".into()],
+            crate::expr::Dialect { true_false: true, alt_operators: true },
+            vec![Dir::Path(p("/usr/include")), Dir::Framework(p("/Library/Frameworks"))],
+            vec![p("/usr/include/stdc-predef.h")],
+        );
+        p.answers.lock().unwrap().insert(("__has_builtin".into(), "__builtin_expect".into()), Some(1));
+        p.answers.lock().unwrap().insert(("__has_builtin".into(), "(".into()), None);
+        p.save(&dir, "k\u{1}1").unwrap();
+        assert!(Profile::load(&dir, "k\u{1}2").is_none());
+        let q = Profile::load(&dir, "k\u{1}1").unwrap();
+        assert_eq!(q.predefines, p.predefines);
+        assert_eq!(q.operators, p.operators);
+        assert_eq!((q.dialect.true_false, q.dialect.alt_operators), (true, true));
+        assert_eq!(q.builtin_dirs, p.builtin_dirs);
+        assert_eq!(q.implicit, p.implicit);
+        assert_eq!(*q.answers.lock().unwrap(), *p.answers.lock().unwrap());
+        assert!(q.predefined.contains_key(&intern::intern("__GNUC__")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn environments() {
+        let env = Environment { vars: Some(Arc::new(vec![("INCLUDE".into(), "C:/inc".into()), ("Path".into(), "x".into())])), profile_dir: None };
+        assert_eq!(env.var("INCLUDE").as_deref(), Some("C:/inc"));
+        assert_eq!(env.var("PATH").as_deref(), if cfg!(windows) { Some("x") } else { None });
+        assert_eq!(env.var("CPATH"), None);
+        let cwd = Path::new("C:/b");
+        let inv = parse_in(&s(&["cl.exe", "/external:env:INCLUDE", "/c", "x.cc"]), cwd, &env).unwrap();
+        assert_eq!(inv.system_dirs.len(), 1);
     }
 }

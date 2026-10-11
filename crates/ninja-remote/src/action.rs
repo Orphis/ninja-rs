@@ -3,11 +3,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, UNIX_EPOCH};
 
 use ninja_core::runner::Task;
 use rbe_client::proto as re;
-use rbe_client::{BlobSet, BlobSource, InputTree};
+use rbe_client::{BlobSet, BlobSource, DigestCache, InputTree};
 
 use crate::cmdline::{join_posix_chain, join_rsp, split_rsp, unwrap_command};
 use crate::paths::{ExecRoot, PathMapper, TreeIndex, normalize_abs};
@@ -55,6 +56,31 @@ pub struct Shared {
     pub log_inputs: bool,
     pub include_scanner: IncludeScanner,
     pub verbose: bool,
+    /// The daemon (`--daemon`): it scans, digests and lists toolchains
+    /// with what it kept from earlier builds.
+    pub daemon: Option<Arc<ninja_daemon::Client>>,
+    /// Why the daemon was given up on during this build.
+    pub daemon_error: Mutex<Option<String>>,
+    /// Where compiler profiles persist (in the disk cache).
+    pub profile_dir: Option<PathBuf>,
+}
+
+impl Shared {
+    /// The daemon, unless it failed during this build.
+    pub fn daemon(&self) -> Option<&ninja_daemon::Client> {
+        if self.daemon_error.lock().unwrap().is_some() { None } else { self.daemon.as_deref() }
+    }
+
+    /// Gives up on the daemon for the rest of the build: the build does
+    /// the work itself.
+    pub fn daemon_failed(&self, e: &std::io::Error) {
+        self.daemon_error.lock().unwrap().get_or_insert_with(|| e.to_string());
+    }
+
+    /// The environment compilers are probed in: the build's own.
+    fn scan_env(&self) -> cpp_deps::driver::Environment {
+        cpp_deps::driver::Environment { vars: None, profile_dir: self.profile_dir.clone() }
+    }
 }
 
 /// An action ready to be looked up or executed.
@@ -161,14 +187,25 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         let mut argv = expanded.clone();
         argv[0] = to_s(exe);
         let found: Result<Vec<PathBuf>, String> = match shared.include_scanner {
-            IncludeScanner::Preprocessor => match shared.store.preprocessor(build_dir, windows).scan(&argv, build_dir) {
-                Ok(out) if out.exact() => Ok(out.files.into_iter().chain(out.found).collect()),
-                Ok(out) => {
-                    let why = out.inexact.first().cloned().or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})"))).unwrap_or_default();
-                    Err(format!("not exact ({why})"))
+            IncludeScanner::Preprocessor => {
+                let scanned = match shared.daemon().map(|d| d.scan(&argv, build_dir)) {
+                    Some(Ok(r)) => r,
+                    failed => {
+                        if let Some(Err(e)) = failed {
+                            shared.daemon_failed(&e);
+                        }
+                        shared.store.preprocessor(build_dir, windows).scan_in(&argv, build_dir, &shared.scan_env())
+                    }
+                };
+                match scanned {
+                    Ok(out) if out.exact() => Ok(out.files.into_iter().chain(out.found).collect()),
+                    Ok(out) => {
+                        let why = out.inexact.first().cloned().or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})"))).unwrap_or_default();
+                        Err(format!("not exact ({why})"))
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
+            }
             IncludeScanner::ClangScanDeps => cpp_deps::external::clang_scan_deps(&argv, build_dir),
             IncludeScanner::Compiler => {
                 let prefix = (!task.msvc_deps_prefix.is_empty()).then_some(task.msvc_deps_prefix.as_str());
@@ -321,7 +358,16 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
             continue;
         }
         let rel = mapper.tree_path(&to_s(d)).ok_or_else(|| format!("{} is outside the exec root", d.display()))?;
-        let t = store.toolchain_tree(d).map_err(|e| format!("toolchain input {}: {e:#}", d.display()))?;
+        let from_daemon = |dir: &Path| {
+            shared.daemon().and_then(|c| match c.tree(dir) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    shared.daemon_failed(&e);
+                    None
+                }
+            })
+        };
+        let t = store.toolchain_tree(d, &from_daemon).map_err(|e| format!("toolchain input {}: {e:#}", d.display()))?;
         tree.add_subtree(&rel, t.digest.clone()).map_err(|e| format!("{e:#}"))?;
         for (h, (dg, src)) in t.blobs.0.iter() {
             blobs.0.entry(h.clone()).or_insert_with(|| (dg.clone(), src.clone()));
@@ -356,6 +402,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     files.dedup();
     let mut seen_keys = std::collections::HashSet::new();
     let mut input_files = 0;
+    let mut inputs: Vec<(String, PathBuf)> = Vec::new();
     for f in &files {
         if under_graft(f) || rsp_files.contains(f) {
             continue;
@@ -365,7 +412,25 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
             continue;
         }
         let rel = mapper.tree_path(&to_s(f)).ok_or_else(|| format!("{} is outside the exec root", f.display()))?;
-        tree.add_file_cached(&rel, f, Some(&store.digests)).map_err(|e| format!("{e:#}"))?;
+        inputs.push((rel, f.clone()));
+    }
+    // Digests: the daemon's, which knows what didn't change, or hashed here
+    // (through the digest cache).
+    let known = shared.daemon().and_then(|d| {
+        let paths: Vec<PathBuf> = inputs.iter().map(|(_, f)| f.clone()).collect();
+        d.files(&paths).map_err(|e| shared.daemon_failed(&e)).ok()
+    });
+    for (i, (rel, f)) in inputs.into_iter().enumerate() {
+        match known.as_ref().map(|k| &k[i]) {
+            Some(Ok(info)) => {
+                let digest = re::Digest { hash: info.hash.clone(), size_bytes: info.size as i64 };
+                // Saved with the build's digests, for a daemon that restarts.
+                store.digests.put(&f, info.size, UNIX_EPOCH + Duration::from_nanos(info.mtime_ns), digest.clone());
+                tree.add_file_with_digest(&rel, &f, digest, info.executable)
+            }
+            _ => tree.add_file_cached(&rel, &f, Some(&store.digests)),
+        }
+        .map_err(|e| format!("{e:#}"))?;
         tree_files.push(rel);
         input_files += 1;
     }

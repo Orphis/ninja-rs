@@ -6,6 +6,7 @@
 //! would keep it alive across builds. There is no global state.
 
 pub mod bes;
+pub mod daemon;
 pub mod exec_runner;
 pub mod jobserver;
 pub mod options;
@@ -167,7 +168,10 @@ impl Service {
         if let Some(t) = &opts.tool
             && tools::find_tool(t).is_some_and(|i| i.when == When::AfterFlags)
         {
-            return tools::tool_restat_after_flags(&opts.tool_args);
+            return match t.as_str() {
+                "daemon" => daemon::tool(&opts.tool_args),
+                _ => tools::tool_restat_after_flags(&opts.tool_args),
+            };
         }
         let tool = match &opts.tool {
             Some(t) => match tools::find_tool(t) {
@@ -386,6 +390,9 @@ impl Service {
                     status.info(&format!("racing: {local} actions finished first locally, {remote} remotely."));
                 }
             }
+            if let Some(e) = backend.as_ref().and_then(|b| b.daemon_error()) {
+                status.warning(&format!("the daemon failed ({e}): the build did its work itself"));
+            }
             // Remote actions that ran locally, which is otherwise silent.
             if let Some(b) = &backend
                 && let Some((summary, after_failures)) = b.fallback_summary()
@@ -481,6 +488,30 @@ impl Service {
         }
         let build_dir = std::env::current_dir().map_err(|e| e.to_string())?;
         let file_var = |name: &str| Some(state.lookup_variable(ROOT_SCOPE, name)).filter(|v| !v.is_empty());
+        let daemon = if opts.remote.daemon {
+            let begin = ninja_daemon::proto::Begin {
+                build_dir: build_dir.clone(),
+                env: std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect(),
+                profile_dir: disk.as_ref().map(|d| d.profile_dir()),
+                digests_file: Some(build_dir.join(in_build_dir(&state.lookup_variable(ROOT_SCOPE, "builddir"), ninja_remote::store::DIGESTS_FILE))),
+            };
+            let started = tokio::task::spawn_blocking(move || {
+                let client = daemon::connect()?;
+                client.begin(begin)?;
+                std::io::Result::Ok(client)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            match started {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    status.warning(&format!("the daemon: {e}; building without it"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let execution_log = match &opts.remote.execution_log {
             Some(f) => Some(Arc::new(std::sync::Mutex::new(std::fs::File::create(f).map_err(|e| format!("creating {f}: {e}"))?))),
             None => None,
@@ -505,6 +536,7 @@ impl Service {
                 requested: Arc::new(requested.iter().map(|p| ninja_remote::remote_outputs::key(p)).collect()),
                 execution_log,
                 include_scanner: opts.remote.include_scanner,
+                daemon,
             },
             client,
             disk,

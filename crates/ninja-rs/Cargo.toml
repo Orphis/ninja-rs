@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 ninja-core = { path = "../ninja-core" }
+ninja-daemon = { path = "../ninja-daemon" }
 ninja-remote = { path = "../ninja-remote" }
 prost = { workspace = true }
 prost-types = { workspace = true }

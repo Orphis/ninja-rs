@@ -201,6 +201,9 @@ pub struct RemoteFlags {
     pub execution_log: Option<String>,
     /// `--remote_include_scanner`: how compiles' inputs are found.
     pub include_scanner: ninja_remote::action::IncludeScanner,
+    /// `--[no]daemon` (`NINJA_RS_DAEMON=1`): use the daemon keeping caches
+    /// between builds.
+    pub daemon: bool,
 }
 
 impl RemoteFlags {
@@ -301,6 +304,9 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
                              itself (-M, /showIncludes). The conservative scanner when
                              the chosen one can't tell [default=conservative]
   --disk_cache_max_size=SIZE evict least recently used entries above SIZE [default=10G]
+  --[no]daemon               keep scanned headers, compiler profiles, digests and
+                             toolchain trees between builds in a daemon watching their
+                             files (-t daemon) [default=off; on with NINJA_RS_DAEMON=1]
 
 TLS (grpcs:// endpoints: the remote service and the Build Event Service):
   --tls_certificate=FILE     CA certificate (PEM) trusted to sign server certificates,
@@ -360,6 +366,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
             upload_local_results: true,
             racing_delay_ms: DEFAULT_RACING_DELAY_MS,
             disk_cache_max_size: DEFAULT_DISK_CACHE_MAX_SIZE,
+            daemon: std::env::var("NINJA_RS_DAEMON").is_ok_and(|v| v == "1"),
             ..Default::default()
         },
         bes: BesFlags::default(),
@@ -466,6 +473,8 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_download_minimal" => o.remote.download_minimal = true,
                 "remote_download_all" => o.remote.download_minimal = false,
                 "remote_include_scanner" => o.remote.include_scanner = value(&mut i)?.parse()?,
+                "daemon" => o.remote.daemon = true,
+                "nodaemon" => o.remote.daemon = false,
                 "execution_log_file" => {
                     let v = value(&mut i)?;
                     let abs = std::path::absolute(&v).map_err(|e| format!("--execution_log_file={v}: {e}"))?;

@@ -15,6 +15,7 @@ rust_library(
     crate_root = "src/lib.rs",
     deps = [
         "//crates/ninja-core",
+        "//crates/ninja-daemon",
         "//crates/ninja-remote",
         "//third_party/cargo-rbe/rbe-bes",
         "//third_party/cargo-rbe/rbe-client",
@@ -60,6 +61,7 @@ rust_test(
         ":ninja_rs_lib",
         "//crates/fake-reapi",
         "//crates/ninja-core",
+        "//crates/ninja-daemon",
         "//crates/ninja-remote",
         "//third_party/cargo-rbe/rbe-bes",
         "//third_party/cargo-rbe/rbe-client",

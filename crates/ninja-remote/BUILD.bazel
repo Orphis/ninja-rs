@@ -10,6 +10,7 @@ rust_library(
     deps = [
         "//crates/cpp-deps",
         "//crates/ninja-core",
+        "//crates/ninja-daemon",
         "//third_party/cargo-rbe/rbe-client",
         "@crates//:anyhow",
         "@crates//:hex",

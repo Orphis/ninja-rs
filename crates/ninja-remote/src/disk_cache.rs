@@ -13,6 +13,8 @@
 //! tmp/                 files being written (renamed into place when done)
 //! size                 estimated total size of cas/, chunked/ and ac/, in bytes
 //! gc/lock              held while collecting garbage
+//! cpp-deps/            compiler profiles of the preprocessor (`cpp_deps::driver`),
+//!                      which removes those unused for a month itself
 //! ```
 //!
 //! Content-defined chunking: a blob larger than [`CHUNK_MAX`] is stored as
@@ -102,6 +104,11 @@ impl DiskCache {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Where the preprocessor saves compiler profiles.
+    pub fn profile_dir(&self) -> PathBuf {
+        self.root.join("cpp-deps")
     }
 
     fn blob_path(&self, hash: &str) -> PathBuf {

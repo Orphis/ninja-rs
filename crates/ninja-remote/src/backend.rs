@@ -65,6 +65,8 @@ pub struct BackendConfig {
     /// `--remote_include_scanner`: how compiles' inputs are found (the
     /// conservative scanner when the chosen one can't tell).
     pub include_scanner: crate::action::IncludeScanner,
+    /// The daemon (`--daemon`), for a build it has begun.
+    pub daemon: Option<Arc<ninja_daemon::Client>>,
 }
 
 pub struct Backend {
@@ -164,6 +166,9 @@ impl Backend {
             log_inputs: config.execution_log.is_some(),
             include_scanner: config.include_scanner,
             verbose: config.verbose,
+            daemon: config.daemon.clone(),
+            daemon_error: Default::default(),
+            profile_dir: disk.as_ref().map(|d| d.profile_dir()),
         };
         shared.store.new_build();
         Ok(Self { inner: Arc::new(Inner { client, upload, disk, shared, config, materializing: Default::default(), fallbacks: Fallbacks::default() }) })
@@ -172,6 +177,11 @@ impl Backend {
     /// Whether results of commands run locally go to the remote cache.
     pub fn uploads_local_results(&self) -> bool {
         self.inner.upload
+    }
+
+    /// Why the build stopped using the daemon, if it did.
+    pub fn daemon_error(&self) -> Option<String> {
+        self.inner.shared.daemon_error.lock().unwrap().clone()
     }
 
     /// How many remote actions ran locally instead, and why: a line for

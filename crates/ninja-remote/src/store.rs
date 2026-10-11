@@ -1,7 +1,7 @@
-//! Caches that outlive a single action (and, in a future daemon, a single
-//! build): file digests, include scanning results, toolchain input trees,
-//! the members of thin archives and the set of blobs known to be in the
-//! remote CAS.
+//! Caches that outlive a single action: file digests, include scanning
+//! results, toolchain input trees, the members of thin archives and the
+//! set of blobs known to be in the remote CAS. (The daemon keeps its own
+//! between builds: see `ninja_daemon`.)
 //!
 //! Everything lives behind this one `Store`, owned by the service; nothing
 //! is global. The file digest cache can be saved to and loaded from disk
@@ -12,11 +12,14 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rbe_client::proto as re;
 use rbe_client::tree::MemDigestCache;
 use rbe_client::{BlobSet, DigestCache, InputTree};
+
+use ninja_daemon::files::{DIGESTS_SIGNATURE, read_digests};
+use ninja_daemon::proto::TreeInfo;
 
 use crate::scanner::ScanCache;
 
@@ -45,6 +48,25 @@ pub fn walk_files(dir: &Path, rel: &str, out: &mut Vec<String>) {
     }
 }
 
+impl ToolchainTree {
+    /// The tree of `dir` from its listing, as `InputTree::add_dir` builds
+    /// it.
+    fn from_listing(dir: &Path, listed: TreeInfo) -> Result<ToolchainTree, String> {
+        let mut tree = InputTree::new();
+        for d in &listed.dirs {
+            tree.ensure_dir(d).map_err(|e| format!("{e:#}"))?;
+        }
+        for (f, info) in &listed.files {
+            let digest = re::Digest { hash: info.hash.clone(), size_bytes: info.size as i64 };
+            tree.add_file_with_digest(f, &dir.join(f), digest, info.executable).map_err(|e| format!("{e:#}"))?;
+        }
+        let mut blobs = BlobSet::default();
+        let digest = tree.build(&mut blobs);
+        let files = listed.files.into_iter().map(|(f, _)| f).collect();
+        Ok(ToolchainTree { digest, blobs: Arc::new(blobs), files: Arc::new(files) })
+    }
+}
+
 type TreeCell = Arc<OnceLock<Result<Arc<ToolchainTree>, String>>>;
 
 /// The members of a file if it's a thin archive, for its size and mtime.
@@ -70,10 +92,14 @@ impl Store {
     }
 
     /// The Merkle tree of a toolchain input directory (cached; concurrent
-    /// callers for the same directory wait for the first one).
-    pub fn toolchain_tree(&self, dir: &Path) -> Result<Arc<ToolchainTree>, String> {
+    /// callers for the same directory wait for the first one): from the
+    /// files `daemon` lists (None: no daemon), or read here.
+    pub fn toolchain_tree(&self, dir: &Path, daemon: &dyn Fn(&Path) -> Option<Result<TreeInfo, String>>) -> Result<Arc<ToolchainTree>, String> {
         let cell = self.toolchain_trees.lock().unwrap().entry(dir.to_path_buf()).or_default().clone();
         cell.get_or_init(|| {
+            if let Some(listed) = daemon(dir) {
+                return ToolchainTree::from_listing(dir, listed?).map(Arc::new);
+            }
             let mut tree = InputTree::new();
             tree.add_dir_cached("", dir, &|_| false, Some(&self.digests)).map_err(|e| format!("{e:#}"))?;
             let mut blobs = BlobSet::default();
@@ -141,19 +167,8 @@ impl Store {
     /// Loads persisted file digests (`path\tsize\tmtime_ns\thash`). Entries
     /// are only used when size and mtime still match.
     pub fn load_digests(&self, file: &Path) {
-        let Ok(text) = std::fs::read_to_string(file) else { return };
-        let mut lines = text.lines();
-        if lines.next() != Some(DIGESTS_SIGNATURE) {
-            return;
-        }
-        for line in lines {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 4 {
-                continue;
-            }
-            let (Ok(size), Ok(ns)) = (f[1].parse::<u64>(), f[2].parse::<u128>()) else { continue };
-            let mtime = UNIX_EPOCH + Duration::from_nanos(ns as u64);
-            self.digests.put(Path::new(f[0]), size, mtime, re::Digest { hash: f[3].to_string(), size_bytes: size as i64 });
+        for (p, size, mtime, hash) in read_digests(file) {
+            self.digests.put(&p, size, mtime, re::Digest { hash, size_bytes: size as i64 });
         }
     }
 
@@ -176,8 +191,6 @@ impl Store {
         std::fs::rename(&tmp, file)
     }
 }
-
-const DIGESTS_SIGNATURE: &str = "# ninja-rs digests v1";
 
 /// Name of the persisted digest cache in the build directory.
 pub const DIGESTS_FILE: &str = ".ninja_rs_digests";
@@ -208,10 +221,16 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/cc"), "x").unwrap();
         let s = Store::default();
-        let a = s.toolchain_tree(&dir).unwrap();
-        let b = s.toolchain_tree(&dir).unwrap();
+        let a = s.toolchain_tree(&dir, &|_| None).unwrap();
+        let b = s.toolchain_tree(&dir, &|_| None).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(*a.files, vec!["bin/cc".to_string()]);
+        // The same tree from a listing.
+        let info = ninja_daemon::proto::FileInfo { hash: rbe_client::digest_of(b"x").hash, size: 1, executable: false, mtime_ns: 0 };
+        let listed = TreeInfo { dirs: vec!["bin".into()], files: vec![("bin/cc".into(), info)] };
+        let c = Store::default().toolchain_tree(&dir, &|_| Some(Ok(listed.clone()))).unwrap();
+        assert_eq!(c.digest, a.digest);
+        assert_eq!(c.files, a.files);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

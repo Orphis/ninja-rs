@@ -31,6 +31,7 @@ pub const TOOLS: &[ToolInfo] = &[
     ToolInfo { name: "compdb", desc: "dump JSON compilation database to stdout", when: When::AfterLoad },
     ToolInfo { name: "compdb-targets", desc: "dump JSON compilation database for a given list of targets to stdout", when: When::AfterLoad },
     ToolInfo { name: "commands", desc: "list all commands required to rebuild given targets", when: When::AfterLoad },
+    ToolInfo { name: "daemon", desc: "the daemon keeping caches between builds (status, start, stop)", when: When::AfterFlags },
     ToolInfo { name: "deps", desc: "show dependencies stored in the deps log", when: When::AfterLogs },
     ToolInfo { name: "missingdeps", desc: "check deps log dependencies on generated files", when: When::AfterLogs },
     ToolInfo { name: "inputs", desc: "list all inputs required to rebuild given targets", when: When::AfterLoad },

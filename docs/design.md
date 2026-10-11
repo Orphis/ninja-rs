@@ -142,6 +142,7 @@ takes 80 ms vs ninja 1.13.2's 69 ms; ~4 ms of that is process startup.
 | `crates/ninja-core` | Manifest language, graph, logs, dirty checking, plan, builder, local subprocesses, status printer. No global state; all I/O through `Disk` and `CommandRunner` traits. |
 | `crates/ninja-remote` | REAPI backend: policy, command unwrapping, include scanner, path mapping, action construction, upload/execute/download, caches (`Store`). |
 | `crates/cpp-deps` | A C/C++ preprocessor that finds the files a compile reads: directives evaluated exactly, text skipped (see "Preprocessor"). No dependencies. |
+| `crates/ninja-daemon` | The daemon keeping the preprocessor's, digests' and toolchain trees' caches between builds, watching their files (see "Daemon"). |
 | `crates/ninja-rs` | `Service` (in-process executor service) and the CLI. |
 | `crates/fake-reapi` | In-process fake REAPI server for tests (CAS, AC, Capabilities, ByteStream, Execution as local subprocesses). |
 | `third_party/cargo-rbe/rbe-client` | REAPI client copied from the user's cargo-rbe project (see its README). |
@@ -600,7 +601,10 @@ directory), so they are interchangeable with a remote cache's.
 - **Lookup order:** disk, then the remote action cache. A disk hit runs the
   edge's local-tool steps, restores the outputs through the same code as a
   download (depfile and `/showIncludes` mapped back to local paths) and
-  reports `ExecKind::DiskCacheHit`.
+  reports `ExecKind::DiskCacheHit`. An output already there with the same
+  contents isn't written again, but its modification time is set to now,
+  as if it had been: older than an input (a header changed and changed
+  back), it would make every later build run the action again.
 - **With a remote:** blobs come from the disk when it has them, else from
   the remote CAS, and are kept on disk; successful results are stored with
   their stdout/stderr inline.
@@ -754,6 +758,85 @@ retried once.
 
 The default stays `all` for now. The design doc's default is `minimal`.
 
+## Daemon
+
+`--daemon` (or `NINJA_RS_DAEMON=1`), for developers' builds: a daemon
+(`crates/ninja-daemon`) keeps what builds learn and watches the files it
+comes from, so that a build checks again only what changed instead of
+every header and toolchain file.
+
+- **What it keeps:** the preprocessor's lexed files, directory listings
+  and compiler profiles (with their query answers), file digests, and
+  toolchain input trees. A build asks it for a compile's scan, for the
+  digests of an action's inputs (one request per action) and for the
+  listing of a toolchain directory, from which it builds the Merkle tree
+  as `InputTree::add_dir` would. The build still does everything else
+  (manifest, dirty checking, execution).
+- **One per user and ninja-rs binary** (its path, size and modification
+  time name it), serving every build: started by the first build that
+  wants it, detached (out of the terminal's process group, or the
+  console), exiting after `NINJA_RS_DAEMON_IDLE` seconds without builds
+  (3 hours). A lock file keeps it single. On Windows it runs a copy of
+  the binary, so that ninja-rs can be rebuilt or upgraded meanwhile.
+  `-t daemon [status|start|stop]`.
+- **Talking:** length-prefixed JSON over a Unix socket in a directory only
+  the user can enter (`$XDG_RUNTIME_DIR/ninja-rs`, else
+  `/tmp/ninja-rs-<uid>`), or a Windows named pipe (which other users can't
+  write to, nor remote clients open). A pool of connections lets
+  concurrent actions ask in parallel. A build begins with the build
+  directory, its environment (compilers are probed in the build's, and
+  `INCLUDE`, `CPATH` and the like are part of a profile's key), the
+  profile directory and its digests file (`.ninja_rs_digests`, to start
+  from after a restart). A build that can't reach the daemon, or whose
+  daemon fails, does the work itself, and says so once.
+- **Watching:** roots are watched recursively: the repository a checked
+  file is in (the nearest directory with `.git`, `.hg`, `.jj`, `.sl` or
+  `.svn`), and toolchain directories listed whole. Events drop the
+  entries they concern: a file's, its directory's names when it's
+  created, removed or renamed, and everything under a directory that
+  was. Build directories are never trusted (their files change during
+  builds; on Linux they aren't even watched, so that compiles writing
+  objects don't flood the queue), nor are paths through symbolic links
+  (events come for real paths). Files outside every root (system headers)
+  are checked once per build, as without the daemon.
+- **Trust:** an entry checked while its root is in sync, with no event
+  meanwhile, stays valid until an event says otherwise (`WATCHED` in
+  `cpp_deps::scan::Cache` and `ninja_daemon::files`); other entries are
+  valid for one build. A root is in sync after the daemon created a file
+  in it (a cookie, in `.git` when there is one) and saw its event, which
+  comes after every change made before (Watchman's technique): before
+  each build. A root found during a build is trusted from the next one.
+  Lost events (an inotify queue overflow, an overflowed
+  `ReadDirectoryChangesW` buffer) and broken watches put a root out of
+  sync and drop everything under it; a cookie that doesn't come back
+  within two seconds restarts the watch. Roots the daemon can't write to
+  are trusted without a cookie.
+- **Backends:** inotify on Linux (a watch per directory, added as they
+  appear; `IN_OPEN` isn't watched, so compilers reading headers aren't
+  events), `ReadDirectoryChangesW` per root on Windows (synchronous reads
+  in a thread each; directories' own "modified" events, which follow
+  their files', are ignored; short names are expanded). Not the `notify`
+  crate: it watches opens on Linux and, in 8.x, misreads overflowed
+  buffers on Windows. Elsewhere nothing is watched yet: every entry is
+  checked once per build, which still saves lexing, probing and hashing.
+- **Profiles persist** in the disk cache (`cpp-deps/`), with or without
+  the daemon: a file per profile, its whole key checked when loading;
+  profiles unused for a month are removed when another is saved.
+
+Measured on 256 compiles (36 standard headers each, a chain of project
+headers), from the disk cache, 32 threads; median of five builds:
+
+| | Windows (clang-cl, MSVC STL) | Linux (Clang, libc++) |
+|---|---|---|
+| no-op, without / with the daemon | 86 / 85 ms | 41 / 42 ms |
+| all compiles again (clean), without / with | 2723 / 1347 ms | 992 / 869 ms |
+| a header every file includes changed (cache hits) | 2706 / 1287 ms | 1011 / 850 ms |
+| the daemon's first build | 2437 ms | 1073 ms |
+
+Windows gains most: its file system calls are expensive, and the build
+then neither scans nor stats the headers. Neither toolchain declared
+input directories here; with them, the daemon also skips walking them.
+
 ## Later phases (designed for, not built)
 
 - **Minimal downloads, further**: lease extension (keeping remote-only
@@ -761,8 +844,11 @@ The default stays `all` for now. The design doc's default is `minimal`.
   state (an output whose digest didn't change doesn't dirty
   what depends on it, ninja's `restat` for every remote edge); a regex mode
   (download generated headers for IDEs).
-- **Daemon with file watching**: `Service` is already reusable across
-  builds; the remaining work is keeping `State` between builds (it has
-  `reset()`), invalidating `Store` entries from file watcher events, and
-  replacing the process-wide `chdir` in the CLI with per-build working
-  directories in `Disk` and the runners.
+- **Builds in the daemon**: the daemon serves caches, not builds. Running
+  them there (`Service` is already reusable across builds) would also keep
+  the manifest, logs and `State` (it has `reset()`) and the remote
+  connections between builds, and skip ninja's own stats from watcher
+  events; it needs per-build working directories in `Disk` and the
+  runners instead of the CLI's process-wide `chdir`, and each build's
+  environment and terminal for local commands. macOS watching (FSEvents)
+  is missing too.

@@ -5,10 +5,11 @@
 //! malformed expression) processes every branch it can't rule out, and the
 //! result is marked inexact: it's then likely a superset, but no guarantee.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::SystemTime;
 
 use crate::expr;
@@ -124,24 +125,62 @@ pub struct Stats {
 /// A directory's files (None: not a directory), and the session it's from.
 type Listing = (u64, Option<Arc<HashSet<String>>>);
 
+/// A file's key, size and modification time.
+type Version = (PathBuf, u64, Option<SystemTime>);
+type Lexing = Arc<OnceLock<Option<Arc<FileDirectives>>>>;
+
+/// The session of entries a watch vouches for: valid until it reports a
+/// change (`Cache::changed`).
+const WATCHED: u64 = u64::MAX;
+
 struct Entry {
     len: u64,
     mtime: Option<SystemTime>,
-    /// The session it was last checked in.
+    /// The session it was last checked in, or `WATCHED`.
     session: AtomicU64,
     fd: Arc<FileDirectives>,
 }
 
+/// Tells which files need no checking: a file watcher. What the cache
+/// checks under a watch stays valid, across sessions, until the watcher
+/// reports a change with `Cache::changed`.
+pub trait Watch: Send + Sync {
+    /// Taken before checking `path` (a file, or a directory's names): a
+    /// token when the watch covers it.
+    fn token(&self, path: &Path) -> Option<u64>;
+    /// Whether no change was seen since `token` was taken (a change seen
+    /// meanwhile may have been missed by the check).
+    fn unchanged_since(&self, token: u64) -> bool;
+}
+
+/// What a watcher saw change (see `Cache::changed`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A file's contents, or a directory's names.
+    Content,
+    /// A directory's names (files created, removed or renamed).
+    Names,
+    /// Everything under a directory (it was replaced or removed, or the
+    /// watcher lost track).
+    Tree,
+}
+
 /// Lexed files and directory listings, shared by every scan (and thread).
 /// Within a session, files and directories outside the volatile ones are
-/// assumed unchanged; a new session checks them again. Lookups only take
-/// read locks, so that concurrent scans don't wait for each other.
+/// assumed unchanged; a new session checks them again, except for those a
+/// watch vouches for (`set_watch`). Lookups only take read locks, so that
+/// concurrent scans don't wait for each other.
 pub struct Cache {
     files: RwLock<HashMap<PathBuf, Arc<Entry>>>,
+    /// Files being lexed (key, size, modification time): concurrent scans
+    /// wait for the one lexing.
+    lexing: Mutex<HashMap<Version, Lexing>>,
     dirs: RwLock<HashMap<PathBuf, Listing>>,
     session: AtomicU64,
-    volatile: Vec<PathBuf>,
+    /// As keys (see `key`).
+    volatile: RwLock<Vec<PathBuf>>,
     case_insensitive: bool,
+    watch: OnceLock<Arc<dyn Watch>>,
     files_lexed: AtomicU64,
     files_reused: AtomicU64,
 }
@@ -150,15 +189,84 @@ impl Cache {
     /// `volatile`: directories whose contents may change during a session
     /// (the build directory). `case_insensitive`: the file system's names.
     pub fn new(volatile: Vec<PathBuf>, case_insensitive: bool) -> Self {
-        Cache {
+        let cache = Cache {
             files: RwLock::default(),
+            lexing: Mutex::default(),
             dirs: RwLock::default(),
             session: AtomicU64::new(1),
-            volatile,
+            volatile: RwLock::default(),
             case_insensitive,
+            watch: OnceLock::new(),
             files_lexed: AtomicU64::new(0),
             files_reused: AtomicU64::new(0),
+        };
+        for v in volatile {
+            cache.add_volatile(&v);
         }
+        cache
+    }
+
+    /// Another directory whose contents may change during a session.
+    pub fn add_volatile(&self, dir: &Path) {
+        let key = self.key(dir).into_owned();
+        let mut volatile = self.volatile.write().unwrap();
+        if !volatile.contains(&key) {
+            volatile.push(key);
+        }
+    }
+
+    /// Lets `watch` vouch for files (once).
+    pub fn set_watch(&self, watch: Arc<dyn Watch>) {
+        let _ = self.watch.set(watch);
+    }
+
+    /// What a watcher saw change: entries it concerns are checked again.
+    pub fn changed(&self, path: &Path, change: Change) {
+        let key = self.key(path);
+        match change {
+            Change::Content => {
+                self.files.write().unwrap().remove(key.as_ref());
+                self.dirs.write().unwrap().remove(key.as_ref());
+            }
+            Change::Names => {
+                self.dirs.write().unwrap().remove(key.as_ref());
+            }
+            Change::Tree => {
+                self.files.write().unwrap().retain(|k, _| !k.starts_with(&key));
+                self.dirs.write().unwrap().retain(|k, _| !k.starts_with(&key));
+            }
+        }
+    }
+
+    /// The number of lexed files and directory listings kept.
+    pub fn len(&self) -> (usize, usize) {
+        (self.files.read().unwrap().len(), self.dirs.read().unwrap().len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == (0, 0)
+    }
+
+    /// `p` as a key of the maps: lowercase on case-insensitive file systems.
+    fn key<'a>(&self, p: &'a Path) -> Cow<'a, Path> {
+        if self.case_insensitive { Cow::Owned(PathBuf::from(p.to_string_lossy().to_lowercase())) } else { Cow::Borrowed(p) }
+    }
+
+    /// Whether an entry checked in `session` is still valid.
+    fn current(&self, session: u64) -> bool {
+        session == WATCHED || session == self.session.load(Ordering::Relaxed)
+    }
+
+    /// The session to record for a check that started with `token`.
+    fn checked(&self, token: Option<u64>) -> u64 {
+        match (token, self.watch.get()) {
+            (Some(t), Some(w)) if w.unchanged_since(t) => WATCHED,
+            _ => self.session.load(Ordering::Relaxed),
+        }
+    }
+
+    fn token(&self, p: &Path) -> Option<u64> {
+        self.watch.get().and_then(|w| w.token(p))
     }
 
     pub fn stats(&self) -> Stats {
@@ -171,7 +279,8 @@ impl Cache {
     }
 
     fn is_volatile(&self, p: &Path) -> bool {
-        self.volatile.iter().any(|v| p.starts_with(v))
+        let key = self.key(p);
+        self.volatile.read().unwrap().iter().any(|v| key.starts_with(v))
     }
 
     fn name_key(&self, name: &str) -> String {
@@ -180,12 +289,13 @@ impl Cache {
 
     /// The regular files (and links to them) of a directory.
     fn listing(&self, dir: &Path) -> Option<Arc<HashSet<String>>> {
-        let session = self.session.load(Ordering::Relaxed);
-        if let Some((s, l)) = self.dirs.read().unwrap().get(dir)
-            && *s == session
+        let key = self.key(dir);
+        if let Some((s, l)) = self.dirs.read().unwrap().get(key.as_ref())
+            && self.current(*s)
         {
             return l.clone();
         }
+        let token = self.token(dir);
         let l = std::fs::read_dir(dir).ok().map(|rd| {
             Arc::new(
                 rd.flatten()
@@ -198,7 +308,7 @@ impl Cache {
                     .collect(),
             )
         });
-        self.dirs.write().unwrap().insert(dir.to_path_buf(), (session, l.clone()));
+        self.dirs.write().unwrap().insert(key.into_owned(), (self.checked(token), l.clone()));
         l
     }
 
@@ -212,31 +322,46 @@ impl Cache {
 
     /// A file's directives, lexed once per version.
     pub fn directives(&self, p: &Path) -> Option<Arc<FileDirectives>> {
-        let session = self.session.load(Ordering::Relaxed);
+        let key = self.key(p);
         let volatile = self.is_volatile(p);
-        let known = self.files.read().unwrap().get(p).cloned();
+        let known = self.files.read().unwrap().get(key.as_ref()).cloned();
         if let Some(e) = &known
             && !volatile
-            && e.session.load(Ordering::Relaxed) == session
+            && self.current(e.session.load(Ordering::Relaxed))
         {
             self.files_reused.fetch_add(1, Ordering::Relaxed);
             return Some(e.fd.clone());
         }
+        let token = if volatile { None } else { self.token(p) };
         let meta = std::fs::metadata(p).ok().filter(|m| m.is_file())?;
         let (len, mtime) = (meta.len(), meta.modified().ok());
         if let Some(e) = known
             && e.len == len
             && e.mtime == mtime
         {
-            e.session.store(session, Ordering::Relaxed);
+            e.session.store(self.checked(token), Ordering::Relaxed);
             self.files_reused.fetch_add(1, Ordering::Relaxed);
             return Some(e.fd.clone());
         }
-        let content = std::fs::read(p).ok()?;
-        let fd = Arc::new(lex::lex(&content));
-        self.files_lexed.fetch_add(1, Ordering::Relaxed);
-        self.files.write().unwrap().insert(p.to_path_buf(), Arc::new(Entry { len, mtime, session: AtomicU64::new(session), fd: fd.clone() }));
-        Some(fd)
+        let version = (key.into_owned(), len, mtime);
+        let cell = self.lexing.lock().unwrap().entry(version.clone()).or_default().clone();
+        let mut lexed = false;
+        let fd = cell
+            .get_or_init(|| {
+                lexed = true;
+                let fd = Arc::new(lex::lex(&std::fs::read(p).ok()?));
+                self.files_lexed.fetch_add(1, Ordering::Relaxed);
+                let entry = Entry { len, mtime, session: AtomicU64::new(self.checked(token)), fd: fd.clone() };
+                self.files.write().unwrap().insert(version.0.clone(), Arc::new(entry));
+                Some(fd)
+            })
+            .clone();
+        if lexed {
+            self.lexing.lock().unwrap().remove(&version);
+        } else {
+            self.files_reused.fetch_add(1, Ordering::Relaxed);
+        }
+        fd
     }
 }
 
@@ -939,6 +1064,93 @@ mod tests {
         // The real files are reported (they're the inputs).
         assert_eq!(d.rel(&out.files), vec!["main.c", "sdk/real/windows.h", "sdk/real/sub/inner.h", "sdk/real/shared.h", "inc/plain.h"]);
         assert!(out.missing.is_empty(), "{:?}", out.missing);
+    }
+
+    /// A watch covering every path, whose changes the test makes.
+    #[derive(Default)]
+    struct FakeWatch {
+        seq: AtomicU64,
+        covers: std::sync::atomic::AtomicBool,
+    }
+    impl Watch for FakeWatch {
+        fn token(&self, _: &Path) -> Option<u64> {
+            self.covers.load(Ordering::Relaxed).then(|| self.seq.load(Ordering::Relaxed))
+        }
+        fn unchanged_since(&self, token: u64) -> bool {
+            self.seq.load(Ordering::Relaxed) == token
+        }
+    }
+
+    #[test]
+    fn watched_entries() {
+        let d = Dir::new("watched");
+        let a = d.file(
+            "a.h",
+            "#define A 1
+",
+        );
+        let cache = Cache::new(vec![], cfg!(windows));
+        let watch = Arc::new(FakeWatch::default());
+        watch.covers.store(true, Ordering::Relaxed);
+        cache.set_watch(watch.clone());
+        let lexed = || cache.stats().files_lexed;
+        let first = cache.directives(&a).unwrap();
+        assert_eq!(lexed(), 1);
+        // A new session doesn't check what the watch vouches for.
+        d.file(
+            "a.h",
+            "#define A 22
+",
+        );
+        cache.new_session();
+        assert!(Arc::ptr_eq(&cache.directives(&a).unwrap(), &first));
+        assert!(cache.exists(&a));
+        // Until it reports a change (with the case on disk, which may
+        // differ from the include's on Windows).
+        cache.changed(&d.0.join(if cfg!(windows) { "A.H" } else { "a.h" }), Change::Content);
+        assert!(!Arc::ptr_eq(&cache.directives(&a).unwrap(), &first));
+        assert_eq!(lexed(), 2);
+        // Names: a file created in a listed directory.
+        let b = d.0.join("b.h");
+        assert!(!cache.exists(&b));
+        d.file("b.h", "");
+        cache.new_session();
+        assert!(!cache.exists(&b));
+        cache.changed(&d.0, Change::Names);
+        assert!(cache.exists(&b));
+        // A change seen during a check: valid for the session only.
+        d.file(
+            "a.h",
+            "#define A 333
+",
+        );
+        cache.changed(&a, Change::Content);
+        watch.seq.store(7, Ordering::Relaxed);
+        let racing = Cache::new(vec![], cfg!(windows));
+        struct Racing(Arc<FakeWatch>);
+        impl Watch for Racing {
+            fn token(&self, _: &Path) -> Option<u64> {
+                let t = self.0.seq.fetch_add(1, Ordering::Relaxed);
+                Some(t)
+            }
+            fn unchanged_since(&self, token: u64) -> bool {
+                self.0.seq.load(Ordering::Relaxed) == token
+            }
+        }
+        racing.set_watch(Arc::new(Racing(watch.clone())));
+        racing.directives(&a).unwrap();
+        d.file(
+            "a.h",
+            "#define A 4444
+",
+        );
+        racing.new_session();
+        racing.directives(&a).unwrap();
+        assert_eq!(racing.stats().files_lexed, 2);
+        // Tree: everything under a directory.
+        cache.directives(&a).unwrap();
+        cache.changed(&d.0, Change::Tree);
+        assert!(cache.is_empty());
     }
 
     #[test]
