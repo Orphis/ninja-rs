@@ -1,3 +1,5 @@
 # Patches must apply byte-for-byte to LF sources: never convert line endings.
 *.patch -text
 crates/ninja-remote/testdata/** binary
+# Hooks run with sh on every platform: no carriage returns.
+.githooks/* text eol=lf
