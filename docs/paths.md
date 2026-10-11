@@ -44,8 +44,14 @@ A path ends at `;`, `,`, a quote or `=` (and `:` on POSIX): both sides of a
 prefix map (`-ffile-prefix-map=OLD=NEW`, `/pathmap:`) are rewritten.
 
 A path is rewritten to a path **relative to the working directory** when it
-lies under the exec root and its first tree component exists in the input
-tree (so `/dev/null` or unrelated system paths are left alone). Backslashes
+lies under the exec root, in the input tree or not: an include directory
+no header came from (`-isystem <src>/Utilities` in a compile reading none
+of its headers) must not leave the checkout's location in the command,
+or two checkouts never share the action. When the exec root is a file
+system's root (`/`, `C:/`, or several drives), only paths whose first tree
+component exists in the input tree are, so that `/dev/null` or unrelated
+system paths are left alone. Diagnostics in the output of local runs are
+only rewritten for paths into the tree. Backslashes
 are kept on Windows if the original used them. argv[0] is always replaced by
 the relative path of the resolved executable (with `./` if it has no
 separator, so the worker doesn't search `PATH`).

@@ -89,6 +89,12 @@ impl ExecRoot {
         self.root.as_deref()
     }
 
+    /// Whether it's a file system's root (`/`, `C:/`) or spans drives:
+    /// paths under it may then name the host's own files (`/dev/null`).
+    pub fn is_fs_root(&self) -> bool {
+        self.root.as_deref().is_none_or(|r| components(r).len() <= usize::from(self.windows))
+    }
+
     /// Tree path ('/'-separated, relative) of a normalized absolute local
     /// path, or `None` if it is outside the exec root.
     pub fn to_tree(&self, abs: &str) -> Option<String> {
@@ -166,8 +172,9 @@ pub struct PathMapper {
     pub build_dir: String,
     /// Canonical spelling of each tree path prefix (Windows: case folding).
     spelling: HashMap<String, String>,
-    /// Top-level tree entries (case-folded on Windows): absolute paths in
-    /// arguments are only rewritten when they point into the tree.
+    /// Top-level tree entries (case-folded on Windows): under a file
+    /// system's root, absolute paths in arguments are only rewritten when
+    /// they point into the tree.
     top_level: HashSet<String>,
 }
 
@@ -241,11 +248,13 @@ impl PathMapper {
         relative(&self.work_dir, tree, self.windows)
     }
 
-    fn rewrite_one(&mut self, path: &str) -> Option<String> {
+    /// `beside_tree`: also paths under the exec root that aren't in the
+    /// tree (unless the root is a file system's).
+    fn rewrite_one(&mut self, path: &str, beside_tree: bool) -> Option<String> {
         let abs = normalize_abs(path, self.windows);
         let tree = self.exec_root.to_tree(&abs)?;
         let first = tree.split('/').next().unwrap_or("");
-        if !first.is_empty() && !self.top_level.contains(&self.key(first)) {
+        if !first.is_empty() && !self.top_level.contains(&self.key(first)) && (!beside_tree || self.exec_root.is_fs_root()) {
             return None;
         }
         let tree = self.fold(&tree);
@@ -260,8 +269,9 @@ impl PathMapper {
     }
 
     /// Rewrites absolute local paths inside one argument to paths relative
-    /// to the working directory. Paths that don't point into the input tree
-    /// (e.g. `/dev/null`) are left alone.
+    /// to the working directory. Paths outside the exec root, or outside the
+    /// input tree when the exec root is a file system's (`/dev/null`), are
+    /// left alone.
     pub fn rewrite_arg(&mut self, arg: &str) -> String {
         let spans = find_abs_paths(arg, self.windows);
         if spans.is_empty() {
@@ -271,7 +281,11 @@ impl PathMapper {
         let mut last = 0;
         for (s, e) in spans {
             out.push_str(&arg[last..s]);
-            match self.rewrite_one(&arg[s..e]) {
+            // A path under the exec root names the same place remotely,
+            // in the tree or not (an include directory no header came
+            // from): rewritten, the command doesn't depend on where the
+            // checkout is.
+            match self.rewrite_one(&arg[s..e], true) {
                 Some(r) => out.push_str(&r),
                 None => out.push_str(&arg[s..e]),
             }
@@ -314,7 +328,7 @@ impl PathMapper {
                 e += 1;
             }
             if let Ok(path) = std::str::from_utf8(&text[i..e])
-                && let Some(rel) = self.rewrite_one(path)
+                && let Some(rel) = self.rewrite_one(path, false)
             {
                 out.extend_from_slice(&text[last..i]);
                 out.extend_from_slice(rel.as_bytes());
@@ -535,8 +549,18 @@ mod tests {
         assert_eq!(m.rewrite_arg("-I/home/u/proj/src"), "-I../src");
         assert_eq!(m.rewrite_arg("-o/home/u/proj/build/a.o"), "-oa.o");
         assert_eq!(m.rewrite_arg("/dev/null"), "/dev/null");
-        // Not in the tree: left alone.
-        assert_eq!(m.rewrite_arg("/home/u/other/x"), "/home/u/other/x");
+        // Under the exec root but not in the tree (an include directory
+        // no header came from): relative all the same.
+        assert_eq!(m.rewrite_arg("/home/u/other/x"), "../../other/x");
+        // Under a file system's root, only what's in the tree.
+        let root = ExecRoot::common(&["/build".into(), "/src/a.c".into()], false);
+        assert!(root.is_fs_root());
+        let mut m = PathMapper::new(root, "/build", false).unwrap();
+        m.tree_path("/src/a.c").unwrap();
+        assert_eq!(m.rewrite_arg("-I/src"), "-I../src");
+        assert_eq!(m.rewrite_arg("/dev/null"), "/dev/null");
+        assert!(ExecRoot::common(&["C:/a".into(), "C:/b".into()], true).is_fs_root());
+        assert!(!ExecRoot::common(&["C:/x/a".into(), "C:/x/b".into()], true).is_fs_root());
     }
 
     #[test]
