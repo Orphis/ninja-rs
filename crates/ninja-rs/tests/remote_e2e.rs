@@ -261,11 +261,7 @@ fn fixture(name: &str, rbe: bool) -> Fixture {
     let cm = cmake.to_string_lossy().to_string();
     let thin_ar = ar.to_string_lossy().to_string();
     let inc = root.join("include").to_string_lossy().to_string();
-    let header = if rbe {
-        "rbe_version = 1\nrbe_toolchains = CMakeFiles/rbe_toolchains.json\nrbe_targets = CMakeFiles/rbe_targets.json\n"
-    } else {
-        ""
-    };
+    let header = if rbe { "rbe_version = 1\nrbe_toolchains = CMakeFiles/rbe_toolchains.json\nrbe_targets = CMakeFiles/rbe_targets.json\n" } else { "" };
     // Chains need a shell: cmd.exe on Windows (ninja runs commands directly
     // there), /bin/sh elsewhere (ninja's default).
     let chain = |steps: &[String]| {
@@ -519,9 +515,12 @@ fn test_remote_cache_only() -> Result<(), String> {
 
         // 3. Read only: a changed source misses, runs locally, and nothing
         //    is stored.
-        write(&g.root.join("src/lib.c"), "#include \"lib.h\"
+        write(
+            &g.root.join("src/lib.c"),
+            "#include \"lib.h\"
 int lib() { return DEEP + 1; }
-");
+",
+        );
         check(run_ninja(&g, None, &[&flag, "--noremote_upload_local_results"]) == 0, "read-only build failed")?;
         let st = server.stats();
         check(st.executions == 0 && st.action_cache_updates == 2, &format!("a read-only build stored results: {st:?}"))?;
@@ -624,9 +623,9 @@ fn test_disk_cache_with_remote() -> Result<(), String> {
 }
 
 fn test_build_events() -> Result<(), String> {
-    use rbe_bes::proto::build_event_stream as bep;
     use bep::build_event::Payload;
     use bep::build_event_id::Id;
+    use rbe_bes::proto::build_event_stream as bep;
     fn id_of(e: &bep::BuildEvent) -> Option<Id> {
         e.id.as_ref().and_then(|i| i.id.clone())
     }
@@ -658,6 +657,32 @@ fn test_build_events() -> Result<(), String> {
             _ => None,
         });
         check(started.is_some_and(|s| s.uuid == inv), "BuildStarted with the invocation id")?;
+        // BuildStarted announces the requested targets (BES services show
+        // them as the invocation's title) and the structured command lines.
+        let pattern = |e: &bep::BuildEvent| {
+            e.children.iter().find_map(|c| match &c.id {
+                Some(Id::Pattern(p)) => Some(p.pattern.clone()),
+                _ => None,
+            })
+        };
+        check(pattern(&events[0]) == Some(vec!["app.bin".into(), "lib.a".into()]), &format!("announced pattern: {:?}", pattern(&events[0])))?;
+        let canonical = events.iter().find_map(|e| match &e.payload {
+            Some(Payload::StructuredCommandLine(c)) if c.command_line_label == "canonical" => Some(c.clone()),
+            _ => None,
+        });
+        let canonical = canonical.ok_or("no canonical command line")?;
+        use rbe_bes::proto::command_line::command_line_section::SectionType;
+        let section = |label: &str| canonical.sections.iter().find(|s| s.section_label == label).and_then(|s| s.section_type.clone());
+        check(
+            matches!(section("residual"), Some(SectionType::ChunkList(c)) if c.chunk == ["app.bin", "lib.a"]),
+            &format!("residual: {:?}", section("residual")),
+        )?;
+        check(matches!(section("command"), Some(SectionType::ChunkList(c)) if c.chunk == ["build"]), &format!("command: {:?}", section("command")))?;
+        check(
+            matches!(section("command options"), Some(SectionType::OptionList(o))
+                if o.option.iter().any(|o| o.option_name == "invocation_id" && o.option_value == inv && o.combined_form == format!("--invocation_id={inv}"))),
+            &format!("command options: {:?}", section("command options")),
+        )?;
 
         // 2. The configuration, the target and its completion with its output.
         let config_id = events
@@ -743,9 +768,9 @@ fn test_build_events() -> Result<(), String> {
         #[allow(deprecated)]
         let ok = action.is_some_and(|a| !a.success && a.exit_code == 1 && a.r#type == "CCompile" && a.label == "//:broken");
         check(ok, "ActionExecuted for the failed compile")?;
-        let broken = events.iter().any(|e| {
-            matches!((id_of(e), &e.payload), (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) if t.label == "//:broken" && !c.success)
-        });
+        let broken = events
+            .iter()
+            .any(|e| matches!((id_of(e), &e.payload), (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) if t.label == "//:broken" && !c.success));
         check(broken, "//:broken completed as failed")?;
         let skipped = events.iter().any(|e| {
             matches!((id_of(e), &e.payload), (Some(Id::TargetCompleted(t)), Some(Payload::Aborted(a)))
@@ -757,6 +782,24 @@ fn test_build_events() -> Result<(), String> {
             _ => None,
         });
         check(finished.is_some_and(|c| c.code == 1), "BuildFinished BUILD_FAILURE")?;
+
+        // 4. Without targets, the defaults are announced (app.bin here).
+        let file3 = f.root.join("events3.bin");
+        let flag = format!("--build_event_binary_file={}", file3.to_string_lossy());
+        check(run_ninja(&f, Some(&ep), &[&flag, "-j", "2"]) == 0, "the default build failed")?;
+        let events = ninja_rs::bes::read_binary_file(&file3).map_err(|e| e.to_string())?;
+        rbe_bes::events::validate(&events)?;
+        check(pattern(&events[0]) == Some(vec!["app.bin".into()]), &format!("default pattern: {:?}", pattern(&events[0])))?;
+        let given = events.iter().find_map(|e| match &e.payload {
+            Some(Payload::StructuredCommandLine(c)) if c.command_line_label == "original" => {
+                c.sections.iter().find(|s| s.section_label == "command options").and_then(|s| s.section_type.clone())
+            }
+            _ => None,
+        });
+        check(
+            matches!(&given, Some(SectionType::OptionList(o)) if o.option.iter().any(|o| o.option_name == "j" && o.option_value == "2" && o.combined_form == "-j 2")),
+            &format!("short options: {given:?}"),
+        )?;
         Ok(())
     })
 }
@@ -804,10 +847,7 @@ fn test_split_and_splice(minor: u32) -> Result<(), String> {
         write(&f.root.join("src/big.c"), &source(&lines));
         check(run_ninja(&f, Some(&ep), &[&flag, "obj/big.o"]) == 0, "rebuild failed")?;
         let after = server.stats();
-        check(
-            after.executions == 2 && after.splices == st.splices + 1 && after.splits == 2,
-            &format!("expected another splice and split, got {after:?}"),
-        )?;
+        check(after.executions == 2 && after.splices == st.splices + 1 && after.splits == 2, &format!("expected another splice and split, got {after:?}"))?;
         let (up, down) = (after.bytes_uploaded - st.bytes_uploaded, after.bytes_read - st.bytes_read);
         println!("after the edit: {up} bytes uploaded, {down} downloaded, of {size}");
         check(up < size / 4, &format!("uploaded {up} of {size} bytes"))?;
@@ -963,6 +1003,85 @@ fn test_thin_archives() -> Result<(), String> {
     })
 }
 
+/// The test certificates (crates/fake-reapi/testdata/tls).
+fn tls_file(name: &str) -> String {
+    let dir = match std::env::var_os("TEST_SRCDIR") {
+        // Bazel: the data files under the runfiles tree.
+        Some(r) => PathBuf::from(r).join(std::env::var("TEST_WORKSPACE").unwrap_or_else(|_| "_main".into())).join("crates/fake-reapi/testdata/tls"),
+        // Cargo: the package directory, set when tests run.
+        None => PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default()).join("../fake-reapi/testdata/tls"),
+    };
+    dir.join(name).to_string_lossy().into_owned()
+}
+
+/// mTLS: the server requires a client certificate signed by its CA. With
+/// the CA and a client certificate, remote execution and build events work
+/// (also when the server's name differs from the endpoint's host, with
+/// --tls_authority_override); without the CA, the client certificate, or
+/// with one signed by another CA, connecting fails.
+fn test_mtls() -> Result<(), String> {
+    let f = fixture("mtls", true);
+    let read = |n: &str| std::fs::read(tls_file(n)).map_err(|e| format!("{}: {e}", tls_file(n)));
+    let tls = fake_reapi::ServerTls { cert_pem: read("server.pem")?, key_pem: read("server-key.pem")?, client_ca_pem: Some(read("ca.pem")?) };
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let server = rt.block_on(fake_reapi::FakeServer::start_with(&f.root.join("server"), 0, Some(tls))).map_err(|e| e.to_string())?;
+    let r = (|| {
+        let ep = server.endpoint.clone();
+        check(ep.starts_with("grpcs://localhost:"), &format!("endpoint {ep}"))?;
+        let ca = format!("--tls_certificate={}", tls_file("ca.pem"));
+        let cert = format!("--tls_client_certificate={}", tls_file("client.pem"));
+        let key = format!("--tls_client_key={}", tls_file("client-key.pem"));
+        let bes = format!("--bes_backend={ep}");
+        check(run_ninja(&f, Some(&ep), &[&ca, &cert, &key, &bes, "--remote_strict"]) == 0, "build over mTLS failed")?;
+        check(server.stats().executions == 2, &format!("expected 2 remote executions, got {:?}", server.stats()))?;
+        check(!server.state.build_events.lock().unwrap().is_empty(), "no build events over mTLS")?;
+
+        // The server's certificate names rbe.test too: connecting by address
+        // with that name works.
+        let port = ep.rsplit(':').next().unwrap();
+        let by_ip = format!("grpcs://127.0.0.1:{port}");
+        run_ninja(&f, None, &["-t", "clean"]);
+        check(
+            run_ninja(&f, Some(&by_ip), &[&ca, &cert, &key, "--tls_authority_override=rbe.test", "--remote_strict"]) == 0,
+            "build with --tls_authority_override failed",
+        )?;
+        check(server.stats().action_cache_hits == 2, &format!("expected 2 cache hits, got {:?}", server.stats()))?;
+
+        // Refused: no client certificate, one from another CA, or a server
+        // the client doesn't trust. Every action needs the server, strictly.
+        let other_cert = format!("--tls_client_certificate={}", tls_file("other-client.pem"));
+        let other_key = format!("--tls_client_key={}", tls_file("other-client-key.pem"));
+        for (what, flags) in [
+            ("without a client certificate", vec![ca.as_str()]),
+            ("with an untrusted client certificate", vec![&ca, &other_cert, &other_key]),
+            ("without trusting the server's CA", vec![&cert, &key]),
+        ] {
+            run_ninja(&f, None, &["-t", "clean"]);
+            let mut args = flags.clone();
+            args.push("--remote_strict");
+            check(run_ninja(&f, Some(&ep), &args) != 0, &format!("a build {what} succeeded"))?;
+        }
+        let stats = server.stats();
+        check(stats.executions == 2 && stats.action_cache_hits == 2, &format!("refused clients got through: {stats:?}"))?;
+        Ok(())
+    })();
+    drop(server);
+    rt.shutdown_background();
+    r
+}
+
+/// `--remote_include_scanner=preprocessor` with a compiler it can't probe
+/// (the fake one): the conservative scanner takes over.
+fn test_preprocessor_fallback() -> Result<(), String> {
+    let f = fixture("preprocessor", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["--remote_include_scanner=preprocessor", "--remote_strict"]) == 0, "build failed")?;
+        check(server.stats().executions == 2, &format!("expected 2 remote executions, got {:?}", server.stats()))?;
+        Ok(())
+    })
+}
+
 fn test_without_executor_runs_locally() -> Result<(), String> {
     let f = fixture("noexec", true);
     check(run_ninja(&f, None, &[]) == 0, "local build failed")?;
@@ -1000,6 +1119,8 @@ fn main() -> ExitCode {
         ("minimal_downloads", test_minimal_downloads),
         ("action_rewinding", test_action_rewinding),
         ("thin_archives", test_thin_archives),
+        ("mtls", test_mtls),
+        ("preprocessor_fallback", test_preprocessor_fallback),
         ("split_and_splice_v2_12", || test_split_and_splice(12)),
         ("split_and_splice_v2_13", || test_split_and_splice(13)),
     ];

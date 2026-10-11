@@ -59,6 +59,9 @@ pub struct Store {
     thin_archives: Mutex<HashMap<PathBuf, ThinEntry>>,
     /// Hashes of blobs uploaded to (or found in) the CAS during this session.
     uploaded: Mutex<HashSet<String>>,
+    /// The preprocessor scanning compiles (`--remote_include_scanner`):
+    /// lexed headers, directory listings and what compilers answered.
+    preprocessor: Mutex<Option<Arc<cpp_deps::Driver>>>,
 }
 
 impl Store {
@@ -95,6 +98,23 @@ impl Store {
         let members = crate::archive::read_members(path).map_err(|e| format!("{}: {e}", path.display()))?.map(Arc::new);
         self.thin_archives.lock().unwrap().insert(path.to_path_buf(), (len, mtime, members.clone()));
         Ok(members)
+    }
+
+    /// The preprocessor, created on first use; `build_dir`'s contents may
+    /// change during a build (generated headers), so they aren't cached.
+    pub fn preprocessor(&self, build_dir: &Path, case_insensitive: bool) -> Arc<cpp_deps::Driver> {
+        self.preprocessor
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| Arc::new(cpp_deps::Driver::new(cpp_deps::Cache::new(vec![build_dir.to_path_buf()], case_insensitive))))
+            .clone()
+    }
+
+    /// A new build: the preprocessor checks headers and directories again.
+    pub fn new_build(&self) {
+        if let Some(p) = self.preprocessor.lock().unwrap().as_ref() {
+            p.cache.new_session();
+        }
     }
 
     /// Keeps only the blobs not yet known to be in the CAS.

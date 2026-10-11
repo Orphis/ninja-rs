@@ -20,8 +20,8 @@ pub mod backend;
 pub mod cmdline;
 pub mod disk_cache;
 pub mod link;
-pub mod remote_outputs;
 pub mod paths;
+pub mod remote_outputs;
 pub mod scanner;
 pub mod store;
 pub mod targets;
@@ -37,18 +37,39 @@ pub struct ConnectOptions {
     pub endpoint: String,
     pub instance_name: String,
     pub headers: Vec<(String, String)>,
+    pub tls: Tls,
 }
 
-/// Connects to a REAPI endpoint. TLS (`grpcs://`) uses the web PKI roots;
-/// no credentials are configured here (use `--remote_header` for tokens).
+/// TLS settings for `grpcs://` endpoints (unused for `grpc://`): servers
+/// are checked against the web PKI roots plus `ca`; a client certificate
+/// and its key authenticate the client (mTLS). PEM contents.
+#[derive(Clone, Debug, Default)]
+pub struct Tls {
+    pub ca: Option<Vec<u8>>,
+    pub client_cert: Option<Vec<u8>>,
+    pub client_key: Option<Vec<u8>>,
+    /// The name the server's certificate must have, instead of the
+    /// endpoint's host.
+    pub authority_override: Option<String>,
+}
+
+impl Tls {
+    /// Connection options for `endpoint` with these settings.
+    pub fn connect_options(&self, endpoint: &str, instance_name: &str, headers: &[(String, String)]) -> rbe_client::ConnectOptions {
+        rbe_client::ConnectOptions {
+            endpoint: endpoint.to_string(),
+            instance_name: instance_name.to_string(),
+            client_cert_pem: self.client_cert.clone(),
+            client_key_pem: self.client_key.clone(),
+            ca_pem: self.ca.clone(),
+            authority_override: self.authority_override.clone(),
+            headers: headers.to_vec(),
+        }
+    }
+}
+
+/// Connects to a REAPI endpoint (`--remote_header` carries tokens, `tls`
+/// certificates).
 pub async fn connect(opts: &ConnectOptions) -> anyhow::Result<Client> {
-    Client::connect(rbe_client::ConnectOptions {
-        endpoint: opts.endpoint.clone(),
-        instance_name: opts.instance_name.clone(),
-        client_cert_pem: None,
-        client_key_pem: None,
-        ca_pem: None,
-        headers: opts.headers.clone(),
-    })
-    .await
+    Client::connect(opts.tls.connect_options(&opts.endpoint, &opts.instance_name, &opts.headers)).await
 }

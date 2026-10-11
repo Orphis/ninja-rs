@@ -20,6 +20,12 @@ rust_library(
     ],
 )
 
+# Test certificates (see testdata/tls/README.md).
+filegroup(
+    name = "test_certs",
+    srcs = glob(["testdata/tls/*.pem"]),
+)
+
 rust_binary(
     name = "fake-reapi-server",
     srcs = ["src/main.rs"],

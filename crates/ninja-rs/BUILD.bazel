@@ -54,6 +54,7 @@ rust_test(
 rust_test(
     name = "remote_e2e",
     srcs = ["tests/remote_e2e.rs"],
+    data = ["//crates/fake-reapi:test_certs"],
     use_libtest_harness = False,
     deps = [
         ":ninja_rs_lib",

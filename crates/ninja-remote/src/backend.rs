@@ -9,7 +9,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
 use ninja_core::depfile::parse_depfile;
-use ninja_core::runner::{CasOutput, ExecKind, ExitStatus, LocalCapture, LocalCommand, MapBack, MaterializeError, MaterializeFuture, Race, RemoteBackend, RemoteFuture, RemoteOutcome, Task, TaskResult};
+use ninja_core::runner::{
+    CasOutput, ExecKind, ExitStatus, LocalCapture, LocalCommand, MapBack, MaterializeError, MaterializeFuture, Race, RemoteBackend, RemoteFuture,
+    RemoteOutcome, Task, TaskResult,
+};
 use rbe_client::proto as re;
 use rbe_client::{ActionMeta, Client};
 
@@ -59,6 +62,9 @@ pub struct BackendConfig {
     /// `--execution_log_file`: one JSON line per remote action (key,
     /// command, inputs), to compare the actions of two builds.
     pub execution_log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    /// `--remote_include_scanner=preprocessor`: compiles' inputs from the
+    /// `cpp-deps` preprocessor, the conservative scanner as the fallback.
+    pub preprocessor: bool,
 }
 
 pub struct Backend {
@@ -156,7 +162,10 @@ impl Backend {
             windows,
             remote_outputs: config.remote_outputs.clone(),
             log_inputs: config.execution_log.is_some(),
+            preprocessor: config.preprocessor,
+            verbose: config.verbose,
         };
+        shared.store.new_build();
         Ok(Self { inner: Arc::new(Inner { client, upload, disk, shared, config, materializing: Default::default(), fallbacks: Fallbacks::default() }) })
     }
 
@@ -319,7 +328,13 @@ fn map_depfile(data: &[u8], mapper: &crate::paths::PathMapper, tree_index: &crat
 }
 
 /// `/showIncludes` lines in remote form with local paths.
-fn map_show_includes(stdout: &[u8], task: &Task, mapper: &crate::paths::PathMapper, tree_index: &crate::paths::TreeIndex, build_dir: &std::path::Path) -> Vec<u8> {
+fn map_show_includes(
+    stdout: &[u8],
+    task: &Task,
+    mapper: &crate::paths::PathMapper,
+    tree_index: &crate::paths::TreeIndex,
+    build_dir: &std::path::Path,
+) -> Vec<u8> {
     let prefix = if task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { task.msvc_deps_prefix.as_str() };
     let text = String::from_utf8_lossy(stdout);
     let mut out = String::new();
@@ -463,7 +478,14 @@ impl Inner {
                 msg.extend_from_slice(&output);
                 output = msg;
             }
-            return Ok(TaskResult { edge: task.edge, status: ExitStatus::Success, output, kind: ExecKind::DiskCacheHit, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
+            return Ok(TaskResult {
+                edge: task.edge,
+                status: ExitStatus::Success,
+                output,
+                kind: ExecKind::DiskCacheHit,
+                cas_outputs: Vec::new(),
+                lost_inputs: Vec::new(),
+            });
         }
         let Some(client) = &self.client else { return Err(Failure::RunLocally(Box::new(prepared))) };
         let client = client.for_action(&meta, &prepared.action_digest.hash);
@@ -502,8 +524,7 @@ impl Inner {
                 if let Err(e) = client.upload_blobs(&to_upload).await {
                     // Inputs that only existed remotely are gone: rewind.
                     if let Some(missing) = e.downcast_ref::<rbe_client::MissingRemoteBlobs>() {
-                        let lost: Vec<String> =
-                            prepared.remote_inputs.iter().filter(|(p, _, _)| missing.0.contains(p)).map(|(_, i, _)| i.clone()).collect();
+                        let lost: Vec<String> = prepared.remote_inputs.iter().filter(|(p, _, _)| missing.0.contains(p)).map(|(_, i, _)| i.clone()).collect();
                         if let Some(outputs) = &self.config.remote_outputs {
                             for i in &lost {
                                 outputs.forget(i);
@@ -572,13 +593,9 @@ impl Inner {
                 },
                 None => String::new(),
             };
-            let mut msg = format!(
-                "ninja-rs: {} {} ({} inputs{target})\n",
-                if hit { "remote cache hit" } else { "executed remotely" },
-                digest.hash,
-                prepared.input_files
-            )
-            .into_bytes();
+            let mut msg =
+                format!("ninja-rs: {} {} ({} inputs{target})\n", if hit { "remote cache hit" } else { "executed remotely" }, digest.hash, prepared.input_files)
+                    .into_bytes();
             for w in &prepared.warnings {
                 msg.extend_from_slice(format!("ninja-rs: warning: {w}\n").as_bytes());
             }
@@ -634,7 +651,14 @@ impl Inner {
                     1
                 }
             };
-            return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(code), output: std::mem::take(output), kind: ExecKind::Remote, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
+            return Some(TaskResult {
+                edge: task.edge,
+                status: ExitStatus::Failure(code),
+                output: std::mem::take(output),
+                kind: ExecKind::Remote,
+                cas_outputs: Vec::new(),
+                lost_inputs: Vec::new(),
+            });
         }
         None
     }
@@ -664,7 +688,10 @@ impl Inner {
             let tree = client.fetch_tree(&tree_digest).await?;
             for (rel, f) in rbe_client::tree::tree_files(&tree)? {
                 let local = self.shared.build_dir.join(&d.path).join(rel);
-                files.push((local, re::OutputFile { path: String::new(), digest: f.digest, is_executable: f.is_executable, contents: vec![], node_properties: None }));
+                files.push((
+                    local,
+                    re::OutputFile { path: String::new(), digest: f.digest, is_executable: f.is_executable, contents: vec![], node_properties: None },
+                ));
             }
         }
         let depfile_local = p.depfile.as_ref().map(|(_, l)| l.clone());
@@ -674,10 +701,7 @@ impl Inner {
         let minimal = self.config.download_minimal && client.is_some() && result.output_directories.is_empty();
         let deliverable = task.binding("rbe_deliverable") == Some("1");
         let may_stay_remote = |local: &PathBuf, f: &re::OutputFile| {
-            minimal
-                && !deliverable
-                && Some(local) != depfile_local.as_ref()
-                && !self.config.requested.contains(&crate::remote_outputs::key(&f.path))
+            minimal && !deliverable && Some(local) != depfile_local.as_ref() && !self.config.requested.contains(&crate::remote_outputs::key(&f.path))
         };
         // A thin archive left remote is recorded with its members, read with
         // ranged reads, so that the actions reading it get them without
@@ -974,7 +998,12 @@ impl Capture {
     /// Runs on a blocking thread.
     fn store(&mut self, output: &[u8]) -> Result<()> {
         let disk = self.inner.disk.clone();
-        let client = self.inner.client.as_ref().filter(|_| self.inner.upload).map(|c| c.for_action(&self.inner.action_meta(&self.task), &self.prepared.action_digest.hash));
+        let client = self
+            .inner
+            .client
+            .as_ref()
+            .filter(|_| self.inner.upload)
+            .map(|c| c.for_action(&self.inner.action_meta(&self.task), &self.prepared.action_digest.hash));
         if disk.is_none() && client.is_none() {
             return Ok(());
         }
@@ -1106,13 +1135,8 @@ fn is_executable(_: &std::path::Path) -> bool {
 fn log_action(log: &std::sync::Mutex<std::fs::File>, task: &Task, meta: &ActionMeta, p: &Prepared) {
     use std::io::Write;
     #[allow(deprecated)] // The Action carries it too.
-    let platform: serde_json::Map<String, serde_json::Value> = p
-        .command
-        .platform
-        .iter()
-        .flat_map(|pl| &pl.properties)
-        .map(|prop| (prop.name.clone(), prop.value.clone().into()))
-        .collect();
+    let platform: serde_json::Map<String, serde_json::Value> =
+        p.command.platform.iter().flat_map(|pl| &pl.properties).map(|prop| (prop.name.clone(), prop.value.clone().into())).collect();
     let environment: serde_json::Map<String, serde_json::Value> =
         p.command.environment_variables.iter().map(|e| (e.name.clone(), e.value.clone().into())).collect();
     let inputs: serde_json::Map<String, serde_json::Value> = p.input_digests.iter().map(|(path, d)| (path.clone(), d.clone().into())).collect();

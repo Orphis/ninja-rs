@@ -26,6 +26,9 @@ pub struct Shared {
     pub remote_outputs: Option<Arc<crate::remote_outputs::RemoteOutputs>>,
     /// List every input's digest in `Prepared::input_digests`.
     pub log_inputs: bool,
+    /// Scan compiles with the preprocessor (see `BackendConfig`).
+    pub preprocessor: bool,
+    pub verbose: bool,
 }
 
 /// An action ready to be looked up or executed.
@@ -126,7 +129,33 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     } else {
         None
     };
-    if style.is_some() && !driver_link {
+    // The preprocessor first, for GCC and Clang style compiles: exact when
+    // it can evaluate everything; otherwise the conservative scanner.
+    let mut scanned = false;
+    if shared.preprocessor && style == Some(Style::Gcc) && !driver_link && steps.len() == 1 {
+        let mut argv = expanded.clone();
+        argv[0] = to_s(exe);
+        match shared.store.preprocessor(build_dir, windows).scan(&argv, build_dir) {
+            Ok(out) if out.exact() => {
+                files.extend(out.files);
+                files.extend(out.found);
+                files.extend(parse_compile(&expanded, build_dir).extra_files);
+                scanned = true;
+            }
+            Ok(out) => {
+                if shared.verbose {
+                    let why = out.inexact.first().cloned().or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})"))).unwrap_or_default();
+                    warnings.push(format!("preprocessor: not exact ({why}); scanning conservatively"));
+                }
+            }
+            Err(e) => {
+                if shared.verbose {
+                    warnings.push(format!("preprocessor: {e}; scanning conservatively"));
+                }
+            }
+        }
+    }
+    if style.is_some() && !driver_link && !scanned {
         let info = parse_compile(&expanded, build_dir);
         let scanner = Scanner { cache: &shared.store.scan, windows, volatile_roots: vec![build_dir.clone()] };
         let builtin = match scanner.builtin_dirs(exe, &info) {
@@ -349,11 +378,8 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         }
         remote_steps.push(arguments);
     }
-    let arguments = if remote_steps.len() == 1 {
-        remote_steps.pop().unwrap()
-    } else {
-        vec!["/bin/sh".to_string(), "-c".to_string(), join_posix_chain(&remote_steps)]
-    };
+    let arguments =
+        if remote_steps.len() == 1 { remote_steps.pop().unwrap() } else { vec!["/bin/sh".to_string(), "-c".to_string(), join_posix_chain(&remote_steps)] };
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     if style == Some(Style::Msvc)
         && let Ok(inc) = std::env::var("INCLUDE")
@@ -388,10 +414,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     output_paths.sort();
     output_paths.dedup();
 
-    let props: Vec<(String, String)> = toolchain
-        .as_ref()
-        .map(|t| t.platform.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
+    let props: Vec<(String, String)> = toolchain.as_ref().map(|t| t.platform.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
     let platform = rbe_client::platform(&props);
     let env_vec: Vec<(String, String)> = env.into_iter().collect();
     #[allow(deprecated)]

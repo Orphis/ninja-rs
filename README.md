@@ -75,8 +75,16 @@ remote execution (only for manifests with rbe_version = 1):
   --remote_download_outputs=all|minimal    (minimal: deliverables, named targets,
                                             local inputs; alias --remote_download_minimal)
   --execution_log_file=FILE      (JSON line per remote action: key, command, inputs)
+  --remote_include_scanner=conservative|preprocessor
+                                 (preprocessor: exact inputs for GCC/Clang compiles,
+                                 from crates/cpp-deps; default conservative)
   --disk_cache=DIR               (local action cache + CAS, with or without a remote)
   --disk_cache_max_size=SIZE     (LRU eviction above SIZE, default 10G)
+
+TLS for grpcs:// endpoints (remote service and BES; flags named as in Bazel):
+  --tls_certificate=FILE         (CA trusted besides the public roots, PEM)
+  --tls_client_certificate=FILE  --tls_client_key=FILE  (mTLS client identity, PEM)
+  --tls_authority_override=NAME  (name the server's certificate must have)
 
 build events (Bazel's Build Event Protocol, flags named as in Bazel):
   --bes_backend=grpc://host:port | grpcs://host:port
@@ -94,6 +102,16 @@ It can be used as CMake's make program:
 State files live in the build directory (or `$builddir`):
 `.ninja_rs_log`, `.ninja_rs_deps` (ninja-rs formats, so ninja's own files are
 left alone) and `.ninja_rs_digests` (file digest cache for remote builds).
+
+## Formatting
+
+Rust code is formatted with `cargo fmt --all` (`rustfmt.toml`; the code
+copied from cargo-rbe keeps its own). A pre-commit hook refuses commits
+with unformatted Rust files; enable it once per clone:
+
+```
+git config core.hooksPath .githooks
+```
 
 ## Tests
 
@@ -165,6 +183,7 @@ MODULE.bazel .bazelversion .bazelrc BUILD.bazel Cargo.toml Cargo.lock
 platforms/                 host platforms for rules_rs/@llvm
 crates/ninja-core/         manifest language, graph, build engine, local runner
 crates/ninja-remote/       REAPI backend, scanner, path mapping, store
+crates/cpp-deps/           C/C++ preprocessor finding a compile's inputs
 crates/ninja-rs/           Service + CLI (bin "ninja-rs"), e2e test
 crates/fake-reapi/         in-process fake REAPI server (+ standalone bin)
 third_party/cargo-rbe/     rbe-client copied from cargo-rbe

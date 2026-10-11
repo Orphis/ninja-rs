@@ -31,8 +31,85 @@ pub struct Options {
     pub targets: Vec<String>,
     pub remote: RemoteFlags,
     pub bes: BesFlags,
+    /// Certificates for `grpcs://` endpoints: the remote service and the
+    /// Build Event Service.
+    pub tls: TlsFlags,
     /// The whole command line (for build events).
     pub argv: Vec<String>,
+    /// The options given, in order (for build events).
+    pub given: Vec<GivenOption>,
+}
+
+/// An option as given on the command line.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GivenOption {
+    /// As written: `--remote_executor=grpcs://...`, `-j 8`.
+    pub combined_form: String,
+    /// Without dashes: `remote_executor`, `j`.
+    pub name: String,
+    pub value: String,
+}
+
+/// TLS for `grpcs://` endpoints, with Bazel's flag names. Paths are
+/// absolute (relative ones are resolved where ninja-rs started, not -C).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TlsFlags {
+    /// `--tls_certificate`: a CA (PEM) trusted to sign server certificates,
+    /// besides the web PKI roots.
+    pub certificate: Option<String>,
+    /// `--tls_client_certificate` and `--tls_client_key`: the client's
+    /// certificate and private key (PEM), for mTLS.
+    pub client_certificate: Option<String>,
+    pub client_key: Option<String>,
+    /// `--tls_authority_override`: the name server certificates are checked
+    /// against, instead of the endpoint's host.
+    pub authority_override: Option<String>,
+}
+
+impl TlsFlags {
+    /// Reads the certificate files.
+    pub fn load(&self) -> Result<ninja_remote::Tls, String> {
+        let read = |flag: &str, p: &Option<String>| -> Result<Option<Vec<u8>>, String> {
+            p.as_ref().map(|p| std::fs::read(p).map_err(|e| format!("--{flag}={p}: {e}"))).transpose()
+        };
+        Ok(ninja_remote::Tls {
+            ca: read("tls_certificate", &self.certificate)?,
+            client_cert: read("tls_client_certificate", &self.client_certificate)?,
+            client_key: read("tls_client_key", &self.client_key)?,
+            authority_override: self.authority_override.clone(),
+        })
+    }
+}
+
+/// Explains a failed connection to a `grpcs://` endpoint (or one without a
+/// scheme, which means TLS): what was sent, and what the error usually
+/// means. Empty for other errors.
+pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags) -> String {
+    if !(endpoint.starts_with("grpcs://") || endpoint.starts_with("https://") || !endpoint.contains("://")) {
+        return String::new();
+    }
+    let e = error.to_ascii_lowercase();
+    let cert = match &tls.client_certificate {
+        Some(c) => format!("the client certificate {c}"),
+        None => "no client certificate (--tls_client_certificate)".to_string(),
+    };
+    if e.contains("unknownissuer") || e.contains("invalid peer certificate") {
+        let ca = match &tls.certificate {
+            Some(c) => format!("the public roots and {c}"),
+            None => "the public roots only (--tls_certificate adds a CA)".to_string(),
+        };
+        format!(
+            "
+  the server's certificate isn't trusted: checked against {ca}"
+        )
+    } else if e.contains("broken pipe") || e.contains("connection closed") || e.contains("connection reset") || e.contains("certificate") {
+        format!(
+            "
+  the server closed the connection after the TLS handshake, as when it refuses the client's certificate: sent {cert}"
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// Build event reporting, with Bazel's flag names.
@@ -122,6 +199,9 @@ pub struct RemoteFlags {
     pub download_minimal: bool,
     /// `--execution_log_file`: where to log every remote action (absolute).
     pub execution_log: Option<String>,
+    /// `--remote_include_scanner=preprocessor`: find compiles' inputs with
+    /// the preprocessor (`cpp-deps`) instead of the conservative scanner.
+    pub preprocessor: bool,
 }
 
 impl RemoteFlags {
@@ -215,7 +295,18 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
                              deliverables, named targets and local inputs [default=all]
   --remote_download_minimal  same as --remote_download_outputs=minimal
   --execution_log_file=FILE  log every remote action (key, command, inputs) as JSON lines
+  --remote_include_scanner=conservative|preprocessor
+                             how compiles' inputs are found: following every #include,
+                             or evaluating the preprocessor exactly (GCC and Clang
+                             commands; the conservative scanner otherwise) [default=conservative]
   --disk_cache_max_size=SIZE evict least recently used entries above SIZE [default=10G]
+
+TLS (grpcs:// endpoints: the remote service and the Build Event Service):
+  --tls_certificate=FILE     CA certificate (PEM) trusted to sign server certificates,
+                             besides the public roots
+  --tls_client_certificate=FILE  client certificate (PEM), for mTLS
+  --tls_client_key=FILE      the client certificate's private key (PEM)
+  --tls_authority_override=NAME  check server certificates against NAME, not the host
 
 build events (Bazel's Build Event Protocol):
   --bes_backend=URL          grpc://host:port or grpcs://host:port of a Build Event Service
@@ -233,9 +324,7 @@ build events (Bazel's Build Event Protocol):
 ";
 
 pub fn usage() -> String {
-    USAGE
-        .replace("{version}", ninja_core::parser::NINJA_VERSION)
-        .replace("{jobs}", &guess_parallelism().to_string())
+    USAGE.replace("{version}", ninja_core::parser::NINJA_VERSION).replace("{jobs}", &guess_parallelism().to_string())
 }
 
 fn parse_int(flag: &str, v: &str) -> Result<i64, String> {
@@ -262,6 +351,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         tool: None,
         tool_args: Vec::new(),
         targets: Vec::new(),
+        tls: TlsFlags::default(),
         remote: RemoteFlags {
             jobs: 50,
             mnemonic_suffixes: vec!["Compile".into()],
@@ -273,6 +363,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         },
         bes: BesFlags::default(),
         argv: std::iter::once("ninja-rs".to_string()).chain(args.iter().cloned()).collect(),
+        given: Vec::new(),
     };
     let key_value = |flag: &str, v: &str| -> Result<(String, String), String> {
         v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or_else(|| format!("--{flag} expects KEY=VALUE, got '{v}'"))
@@ -281,6 +372,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
     let mut positional = Vec::new();
     while i < args.len() {
         let a = &args[i];
+        let first = i;
         i += 1;
         if a == "--" {
             positional.extend(args[i..].iter().cloned());
@@ -306,6 +398,17 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "status" => o.status_format = Some(value(&mut i)?),
                 "jobserver-pool" => o.jobserver_pool = true,
                 "help" => return Ok(ParseOutcome::Exit(usage(), 1)),
+                "tls_certificate" | "tls_client_certificate" | "tls_client_key" => {
+                    // Relative to where ninja-rs was started, not to -C.
+                    let v = value(&mut i)?;
+                    let abs = std::path::absolute(&v).map_err(|e| format!("--{name}={v}: {e}"))?.to_string_lossy().into_owned();
+                    match name {
+                        "tls_certificate" => o.tls.certificate = Some(abs),
+                        "tls_client_certificate" => o.tls.client_certificate = Some(abs),
+                        _ => o.tls.client_key = Some(abs),
+                    }
+                }
+                "tls_authority_override" => o.tls.authority_override = Some(value(&mut i)?),
                 "remote_executor" => o.remote.executor = Some(value(&mut i)?),
                 "remote_cache" => o.remote.cache = Some(value(&mut i)?),
                 "remote_upload_local_results" => o.remote.upload_local_results = true,
@@ -325,10 +428,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                     o.remote.jobs = n as usize;
                 }
                 "exec_root" => o.remote.exec_root = Some(value(&mut i)?),
-                "remote_mnemonics" => {
-                    o.remote.mnemonic_suffixes =
-                        value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()
-                }
+                "remote_mnemonics" => o.remote.mnemonic_suffixes = value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
                 "remote_local_fallback" => o.remote.local_fallback = true,
                 "noremote_local_fallback" => o.remote.local_fallback = false,
                 "remote_strict" => o.remote.strict = true,
@@ -364,6 +464,13 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 }
                 "remote_download_minimal" => o.remote.download_minimal = true,
                 "remote_download_all" => o.remote.download_minimal = false,
+                "remote_include_scanner" => {
+                    o.remote.preprocessor = match value(&mut i)?.as_str() {
+                        "conservative" => false,
+                        "preprocessor" => true,
+                        v => return Err(format!("invalid --remote_include_scanner '{v}' (conservative or preprocessor)")),
+                    }
+                }
                 "execution_log_file" => {
                     let v = value(&mut i)?;
                     let abs = std::path::absolute(&v).map_err(|e| format!("--execution_log_file={v}: {e}"))?;
@@ -377,8 +484,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 }
                 "disk_cache_max_size" => {
                     let v = value(&mut i)?;
-                    o.remote.disk_cache_max_size =
-                        ninja_remote::disk_cache::parse_size(&v).ok_or_else(|| format!("invalid --disk_cache_max_size '{v}'"))?;
+                    o.remote.disk_cache_max_size = ninja_remote::disk_cache::parse_size(&v).ok_or_else(|| format!("invalid --disk_cache_max_size '{v}'"))?;
                 }
                 "bes_backend" => o.bes.backend = Some(value(&mut i)?),
                 "bes_instance_name" => o.bes.instance_name = value(&mut i)?,
@@ -398,6 +504,12 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "build_request_id" => o.bes.build_request_id = Some(value(&mut i)?),
                 _ => return Err(format!("unrecognized option '--{name}'")),
             }
+            let value = match &inline {
+                Some(v) => v.clone(),
+                None if i > first + 1 => args[i - 1].clone(),
+                None => String::new(),
+            };
+            o.given.push(GivenOption { combined_form: args[first..i].join(" "), name: name.to_string(), value });
             continue;
         }
         if a.len() > 1 && a.starts_with('-') {
@@ -408,6 +520,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 let c = chars[ci];
                 ci += 1;
                 let takes_arg = matches!(c, 'd' | 'f' | 'j' | 'k' | 'l' | 't' | 'w' | 'C');
+                let before = i;
                 let arg = if takes_arg {
                     if ci < chars.len() {
                         let v: String = chars[ci..].iter().collect();
@@ -421,6 +534,15 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 } else {
                     None
                 };
+                o.given.push(GivenOption {
+                    combined_form: match &arg {
+                        Some(v) if i > before => format!("-{c} {v}"),
+                        Some(v) => format!("-{c}{v}"),
+                        None => format!("-{c}"),
+                    },
+                    name: c.to_string(),
+                    value: arg.clone().unwrap_or_default(),
+                });
                 match c {
                     'd' => match arg.as_deref().unwrap() {
                         "explain" => o.explain = true,
@@ -471,10 +593,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                         "phonycycle=warn" => o.phonycycle_err = false,
                         "dupbuild=err" | "dupbuild=warn" => {}
                         "list" => {
-                            return Ok(ParseOutcome::Exit(
-                                "warning flags:\n  phonycycle={err,warn}  phony build statement references itself\n".into(),
-                                1,
-                            ));
+                            return Ok(ParseOutcome::Exit("warning flags:\n  phonycycle={err,warn}  phony build statement references itself\n".into(), 1));
                         }
                         other => return Err(format!("unknown warning flag '{other}'")),
                     },
@@ -491,6 +610,9 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         positional.push(a.clone());
     }
     o.targets = positional;
+    if o.tls.client_certificate.is_some() != o.tls.client_key.is_some() {
+        return Err("--tls_client_certificate and --tls_client_key go together".into());
+    }
     if o.remote.racing && o.remote.strict {
         return Err("--remote_racing runs actions locally, which --remote_strict forbids".into());
     }
@@ -586,6 +708,12 @@ mod tests {
         assert_eq!(o.remote.racing_delay_ms, DEFAULT_RACING_DELAY_MS);
         assert_eq!(p(&["--remote_racing_delay=0"]).remote.racing_delay_ms, 0);
         assert!(parse_args(&["--remote_racing".to_string(), "--remote_strict".to_string()]).is_err());
+        assert!(parse_args(&["--tls_client_certificate=c.pem".to_string()]).is_err());
+        let tls = TlsFlags { client_certificate: Some("/c.pem".into()), ..Default::default() };
+        assert!(tls_hint("transport error: broken pipe", "grpcs://h:1", &tls).contains("sent the client certificate /c.pem"));
+        assert!(tls_hint("invalid peer certificate: UnknownIssuer", "h:1", &TlsFlags::default()).contains("--tls_certificate adds a CA"));
+        assert!(tls_hint("transport error: broken pipe", "grpc://h:1", &tls).is_empty());
+        assert!(tls_hint("not found", "grpcs://h:1", &tls).is_empty());
     }
 
     #[test]

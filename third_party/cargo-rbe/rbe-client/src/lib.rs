@@ -44,6 +44,9 @@ pub struct ConnectOptions {
     pub client_cert_pem: Option<Vec<u8>>,
     pub client_key_pem: Option<Vec<u8>>,
     pub ca_pem: Option<Vec<u8>>,
+    /// The name the server's certificate is checked against (and sent as
+    /// SNI) instead of the endpoint's host.
+    pub authority_override: Option<String>,
     /// Extra gRPC headers sent with every call (`--remote_header`).
     pub headers: Vec<(String, String)>,
 }
@@ -88,7 +91,8 @@ pub async fn connect_channel(opts: &ConnectOptions) -> Result<Channel> {
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_while_idle(true);
     if tls {
-        let mut cfg = ClientTlsConfig::new().domain_name(host).with_webpki_roots();
+        let domain = opts.authority_override.clone().unwrap_or(host);
+        let mut cfg = ClientTlsConfig::new().domain_name(domain).with_webpki_roots();
         if let Some(ca) = &opts.ca_pem {
             cfg = cfg.ca_certificate(Certificate::from_pem(ca));
         }

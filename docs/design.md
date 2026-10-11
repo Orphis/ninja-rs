@@ -141,6 +141,7 @@ takes 80 ms vs ninja 1.13.2's 69 ms; ~4 ms of that is process startup.
 |---|---|
 | `crates/ninja-core` | Manifest language, graph, logs, dirty checking, plan, builder, local subprocesses, status printer. No global state; all I/O through `Disk` and `CommandRunner` traits. |
 | `crates/ninja-remote` | REAPI backend: policy, command unwrapping, include scanner, path mapping, action construction, upload/execute/download, caches (`Store`). |
+| `crates/cpp-deps` | A C/C++ preprocessor that finds the files a compile reads: directives evaluated exactly, text skipped (see "Preprocessor"). No dependencies. |
 | `crates/ninja-rs` | `Service` (in-process executor service) and the CLI. |
 | `crates/fake-reapi` | In-process fake REAPI server for tests (CAS, AC, Capabilities, ByteStream, Execution as local subprocesses). |
 | `third_party/cargo-rbe/rbe-client` | REAPI client copied from the user's cargo-rbe project (see its README). |
@@ -237,6 +238,22 @@ CLI runs one build in-process. `Store` contains:
 
 All keys are plain data (paths, sizes, mtimes, digests) so the store can be
 persisted wholesale later, which the daemon needs.
+
+### Connections
+
+`grpcs://` endpoints (and endpoints without a scheme) use TLS through
+tonic and rustls: server certificates are checked against the web PKI
+roots plus `--tls_certificate`, and `--tls_client_certificate` with
+`--tls_client_key` (PEM; PKCS#8, PKCS#1 or SEC1 keys) authenticate the
+client (mTLS). `--tls_authority_override` checks the server's certificate
+against another name than the endpoint's host. The flags are Bazel's, and
+apply to the remote service and the Build Event Service alike; `grpc://`
+endpoints ignore them. Tokens go in `--remote_header` / `--bes_header`.
+With TLS 1.3 the server refuses a client certificate after the handshake,
+so the client sees a closed connection on its first call: errors on TLS
+endpoints say which certificate was sent and which CAs were trusted
+(`options::tls_hint`). The fake server can require client certificates
+(`ServerTls`; test certificates in `crates/fake-reapi/testdata/tls`).
 
 ## Remote execution flow
 
@@ -348,11 +365,80 @@ on an empty input and parsing the search list (cl.exe: `INCLUDE`).
 Scanning follows `#include`, `#include_next`, `#import` and
 `__has_include(...)` conservatively: conditionals are ignored and *every*
 search directory that contains a candidate contributes it (which also covers
-`include_next`). Header-like strings in `#define` lines are treated as
-candidates too. A computed include (`#include MACRO`) sends the containing
-directory whole with a warning. Files under toolchain input directories are
-not added individually (the grafted subtree has them). Declared edge inputs
-(including deps from earlier builds) are always sent.
+`include_next`). Comments are skipped (glibc's `limits.h` says
+`#include's` in one). Header-like strings in `#define` lines are treated as
+candidates too, so a computed include (`#include MACRO`) whose macro the
+scanned files define as a header (directly or through other macros) is
+covered; otherwise it sends the containing directory whole, with a warning.
+Files under toolchain input directories are not added individually (the
+grafted subtree has them). Declared edge inputs (including deps from
+earlier builds) are always sent.
+
+### Preprocessor
+
+`--remote_include_scanner=preprocessor` finds a GCC or Clang compile's
+inputs with `crates/cpp-deps`, a preprocessor that evaluates directives
+exactly and skips everything else; when it can't (a `cl`-style command,
+unsupported flags such as `-include-pch` or `-ivfsoverlay`, a compiler it
+can't probe, or a result it marks inexact), the conservative scanner above
+runs instead.
+
+- **Lexing** (`lex`): each file is reduced once per version to its
+  directive lines, tokenized, with `#define`s parsed and include guards
+  detected; text is skipped, exactly about what hides a `#` (comments,
+  string and raw string literals, digit separators, line splices). The
+  lexed files and directory listings are shared by every compile, and
+  trusted for a build outside the build directory (`Cache` sessions).
+- **Macros** (`macros`): expansion with hide sets (Prosser's algorithm),
+  `#`, `##` with placemarkers, `__VA_ARGS__`, `__VA_OPT__`, GNU's
+  `, ## __VA_ARGS__`, `push_macro`/`pop_macro`. Only `#if`/`#elif` and
+  `#include` operands are expanded; in `#if`, `defined`, `__has_include`
+  and the compiler's queries are evaluated as they appear.
+- **`#if`** (`expr`): C's 64-bit integer arithmetic; `true`/`false` and
+  the alternative operators (`and`, `or`, `not`, `bitand`...) by dialect
+  (C++; `<iso646.h>` macros in C). A value may be unknown: `&&`, `||` and
+  `?:` still decide when one side is enough; otherwise every branch that
+  can't be ruled out is processed and the result is inexact.
+- **Includes** (`scan`): quote, `-iquote`, `-I`, `-isystem`, built-in,
+  `-idirafter` chains, `#include_next`, `#pragma once`, guards (a guarded
+  header isn't processed again), `#import`, MSVC's includer-stack lookup.
+  Files `__has_include` finds are inputs too (absent remotely, the answer
+  would differ; Clang lists them in its depfiles).
+- **The compiler's knowledge** (`probe`, `driver`), once per compiler and
+  flags that matter (`-std`, `-target`, `-O`, `-m`, `-f`, sysroot...;
+  not `-I`, `-D`, outputs): predefined macros and operators from
+  `-dM -E`, built-in directories from `-E -v`, files every compile reads
+  from `-E -M` on an empty source (GCC pre-includes `stdc-predef.h`).
+  Queries (`__has_builtin(x)`, `__has_cpp_attribute(x)`...) are answered
+  by running the compiler on generated lines, in batches, then the compile
+  is scanned again; answers are kept per profile. Static profiles per
+  compiler and target could replace probing later.
+
+Checked against the compiler's own `-M` (`crates/cpp-deps/examples/compare.rs`,
+a compilation database in, differences out) with the hermetic toolchain and
+GCC 13 in WSL:
+
+| Corpus | Compiles | Files from `-M` | Missing | Extra | Scan | `-M` |
+|---|---|---|---|---|---|---|
+| 256 files including random sets of 36 libc++ headers | 256 | 187,385 | 0 | 0 | 9.0 ms | 98 ms |
+| every libc++ header alone, C++17/20/23 | 324 | 70,922 | 0 | 0 | 4.2 ms | 28 ms |
+| every glibc header alone, C17 and `_GNU_SOURCE` | 390 | 6,435 | 0 | 0 | 0.8 ms | 9.7 ms |
+| every libstdc++ header alone with GCC, C++17/23 | 210 | 18,159 | 0 | 35 | 2.0 ms | 16 ms |
+
+All exact; the extras are headers `__has_include` found, which GCC's `-M`
+doesn't list (and which are inputs either way). Times are per compile on
+one thread, warm (the first compile of a profile also probes the compiler:
+40–180 ms). For comparison on the first corpus: `clang-scan-deps` in one
+batch 18–25 ms per compile and thread, the conservative scanner 24–26 ms
+with 2.5 times the files. The NativeLink test passes with the preprocessor
+(`NINJA_RS_FLAGS=--remote_include_scanner=preprocessor`): the sample's C++
+compiles send 460–574 files instead of 1,478–1,539, and outputs are
+identical.
+
+Not handled yet: `cl.exe` command lines (their predefined macros come from
+neither `-dM` nor a query), Apple frameworks (`-F`), header maps, `-ivfsoverlay`,
+`#embed`/`__has_embed` (a query, so inexact), `_Pragma` in text (e.g.
+`push_macro` through it), raw string literals spanning a line splice.
 
 ## Build events (BES)
 
@@ -361,6 +447,16 @@ Protocol, to a Build Event Service (`--bes_backend`) through `rbe-bes`
 (copied from cargo-rbe: ordered stream with acks, retries and lifecycle
 events) and/or to a file (`--build_event_binary_file`):
 
+- `BuildStarted` waits for the manifest: once it is loaded (before any
+  regeneration), `Bes::announce` sends the invocation's events, and
+  `BuildStarted` announces as its `pattern` child what the build builds:
+  the targets named on the command line, or else the manifest's defaults
+  (`all` for CMake), a target of the `rbe_targets` file by its label. BES
+  services take the invocation's title from there. Console messages from
+  before are sent after it. The structured command lines (`original`,
+  `canonical`) have Bazel's sections: executable, startup options (none),
+  command (`build`), the options as given (`Options::given`) and the
+  targets named as the residual; UIs show the command line from them.
 - `ReportingStatus` wraps the status printer: every edge start/finish and
   message goes to both. `EdgeInfo` carries the edge's `rbe_*` bindings and,
   when it ran remotely, the digests of its outputs (`TaskResult::cas_outputs`,
@@ -387,6 +483,9 @@ events) and/or to a file (`--build_event_binary_file`):
 
 Build events never fail the build. Edges a dyndep file adds during the
 build are not counted in their target's remaining edges.
+
+`NINJA_RS_BES_DEBUG=1` traces the upload on stderr (stream, acks,
+lifecycle events).
 
 ## Disk cache
 

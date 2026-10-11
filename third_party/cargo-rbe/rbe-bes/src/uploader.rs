@@ -49,6 +49,8 @@ pub struct BesConfig {
     pub initial_backoff: Duration,
     /// Extra gRPC headers on every call (e.g. an API key).
     pub headers: Vec<(String, String)>,
+    /// Traces the upload on stderr (stream, acks, lifecycle events).
+    pub trace: bool,
 }
 
 impl BesConfig {
@@ -62,6 +64,7 @@ impl BesConfig {
             max_retries: 4,
             initial_backoff: Duration::from_secs(1),
             headers: Vec::new(),
+            trace: false,
         }
     }
 }
@@ -93,6 +96,7 @@ pub struct BesUploader {
 impl BesUploader {
     /// Starts the background task on the current Tokio runtime.
     pub fn start(channel: Channel, config: BesConfig) -> Self {
+        TRACE.store(config.trace, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(run(PublishBuildEventClient::new(channel), config, rx));
         Self { tx, task }
@@ -210,21 +214,6 @@ where
     }
 }
 
-/// Wraps a message (or a request stream) with the configured headers.
-/// Headers that aren't valid gRPC metadata are left out.
-fn request<T>(config: &BesConfig, message: T) -> tonic::Request<T> {
-    let mut r = tonic::Request::new(message);
-    for (k, v) in &config.headers {
-        if let (Ok(k), Ok(v)) = (
-            tonic::metadata::AsciiMetadataKey::from_bytes(k.to_ascii_lowercase().as_bytes()),
-            tonic::metadata::AsciiMetadataValue::try_from(v.as_str()),
-        ) {
-            r.metadata_mut().insert(k, v);
-        }
-    }
-    r
-}
-
 fn retryable(s: &tonic::Status) -> bool {
     !matches!(
         s.code(),
@@ -259,13 +248,48 @@ async fn publish_lifecycle(
     requests: Vec<bes::PublishLifecycleEventRequest>,
 ) -> Result<()> {
     for r in requests {
+        let what = r.build_event.as_ref().and_then(|e| e.event.as_ref()).and_then(|e| e.event.as_ref()).map(|e| match e {
+            Event::BuildEnqueued(_) => "BuildEnqueued",
+            Event::InvocationAttemptStarted(_) => "InvocationAttemptStarted",
+            Event::InvocationAttemptFinished(_) => "InvocationAttemptFinished",
+            Event::BuildFinished(_) => "BuildFinished",
+            _ => "other",
+        });
         with_retries(config, "BES lifecycle event", || {
             let (r, mut c) = (r.clone(), client.clone());
             async move { c.publish_lifecycle_event(request(config, r)).await }
         })
         .await?;
+        trace(format_args!("lifecycle {} sent", what.unwrap_or_default()));
     }
     Ok(())
+}
+
+/// Whether `trace` prints: `BesConfig::trace` of the last uploader started.
+static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Traces the upload on stderr, with `BesConfig::trace`.
+fn trace(what: std::fmt::Arguments<'_>) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    if TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[bes {:>8.3}s] {what}", start.elapsed().as_secs_f64());
+    }
+}
+
+/// Wraps a message (or a request stream) with the configured headers.
+/// Headers that aren't valid gRPC metadata are left out.
+fn request<T>(config: &BesConfig, message: T) -> tonic::Request<T> {
+    let mut r = tonic::Request::new(message);
+    for (k, v) in &config.headers {
+        if let (Ok(k), Ok(v)) = (
+            tonic::metadata::AsciiMetadataKey::from_bytes(k.to_ascii_lowercase().as_bytes()),
+            tonic::metadata::AsciiMetadataValue::try_from(v.as_str()),
+        ) {
+            r.metadata_mut().insert(k, v);
+        }
+    }
+    r
 }
 
 fn seq_of(r: &bes::PublishBuildToolEventStreamRequest) -> i64 {
@@ -296,6 +320,7 @@ async fn stream_events(
         let (tx, req_rx) = mpsc::unbounded_channel();
         let mut tx = Some(tx);
         let mut sent_upto = 0i64;
+        trace(format_args!("opening the stream ({} events pending)", pending.len()));
         let call = client.publish_build_tool_event_stream(request(config, UnboundedReceiverStream::new(req_rx)));
         tokio::pin!(call);
         let mut responses: Option<tonic::Streaming<bes::PublishBuildToolEventStreamResponse>> = None;
@@ -308,12 +333,16 @@ async fn stream_events(
                 }
                 // The final event is queued once there's an outcome: half-close.
                 if outcome.is_some() {
+                    trace(format_args!("half-closing after event {sent_upto}"));
                     tx = None;
                 }
             }
             tokio::select! {
                 r = &mut call, if responses.is_none() => match r {
-                    Ok(resp) => responses = Some(resp.into_inner()),
+                    Ok(resp) => {
+                        trace(format_args!("stream open"));
+                        responses = Some(resp.into_inner());
+                    }
                     Err(e) => break e,
                 },
                 cmd = rx.recv(), if outcome.is_none() => {
@@ -330,18 +359,23 @@ async fn stream_events(
                             backoff = config.initial_backoff;
                         }
                         if let (Some(o), true) = (outcome, pending.is_empty()) {
+                            trace(format_args!("all {} events acked", ack.sequence_number));
                             return Ok((summary, o));
                         }
                     }
                     Some(Err(e)) => break e,
                     None => match (outcome, pending.is_empty()) {
-                        (Some(o), true) => return Ok((summary, o)),
+                        (Some(o), true) => {
+                            trace(format_args!("stream closed by the server, all acked"));
+                            return Ok((summary, o));
+                        }
                         _ => break tonic::Status::unavailable("stream closed before every event was acked"),
                     },
                 },
             }
         };
         failures += 1;
+        trace(format_args!("stream failed ({} pending): {err}", pending.len()));
         if failures > config.max_retries || !retryable(&err) {
             bail!("BES upload failed after {failures} attempts: {err}");
         }

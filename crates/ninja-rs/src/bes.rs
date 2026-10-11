@@ -30,6 +30,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use bep::build_event::Payload;
 use ninja_core::build::{Plan, Want};
 use ninja_core::graph::{EdgeId, State};
 use ninja_core::runner::ExecKind;
@@ -39,8 +40,8 @@ use ninja_remote::targets::{Configuration, Targets};
 use prost::Message;
 use rbe_bes::events::{EventStream, id};
 use rbe_bes::proto::build_event_stream as bep;
+use rbe_bes::proto::command_line as cl;
 use rbe_bes::uploader::{BesConfig, BesUploader, BuildOutcome};
-use bep::build_event::Payload;
 
 use crate::options::BesFlags;
 
@@ -56,10 +57,7 @@ pub struct InvocationIds {
 
 impl InvocationIds {
     pub fn new(flags: &BesFlags) -> Self {
-        Self {
-            invocation_id: flags.invocation_id.clone().unwrap_or_else(new_uuid),
-            build_request_id: flags.build_request_id.clone().unwrap_or_else(new_uuid),
-        }
+        Self { invocation_id: flags.invocation_id.clone().unwrap_or_else(new_uuid), build_request_id: flags.build_request_id.clone().unwrap_or_else(new_uuid) }
     }
 }
 
@@ -108,6 +106,19 @@ fn user_name() -> String {
     std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default()
 }
 
+/// What a build builds, as `BuildStarted` announces it: the targets named
+/// on the command line, or else the manifest's defaults (`all` for CMake),
+/// a target of the targets file by its label.
+pub fn patterns(state: &State, typed: &[String], targets_file: &Targets) -> Vec<String> {
+    let names: Vec<String> = if typed.is_empty() {
+        let defaults = state.default_nodes().unwrap_or_default();
+        defaults.iter().map(|&n| state.path(n).to_string()).collect()
+    } else {
+        typed.to_vec()
+    };
+    names.into_iter().map(|n| if targets_file.get(&n).is_some() { targets_file.label(&n) } else { n }).collect()
+}
+
 /// The configuration used when the targets file has none.
 fn default_configuration() -> Configuration {
     Configuration { name: "default".into(), mnemonic: "ninja".into(), ..Default::default() }
@@ -147,6 +158,10 @@ struct Inner {
     runners: BTreeMap<&'static str, (i32, &'static str)>,
     named_sets: usize,
     targets_configured: i64,
+    /// The patterns `BuildStarted` announced, once it was sent.
+    patterns: Option<Vec<String>>,
+    /// Console messages from before `BuildStarted`, sent after it.
+    early_console: String,
 }
 
 pub struct Bes {
@@ -159,40 +174,37 @@ pub struct Bes {
     file: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
     inner: Mutex<Inner>,
     started: Instant,
+    start_time: SystemTime,
+    argv: Vec<String>,
+    given: Vec<crate::options::GivenOption>,
+    /// The targets named on the command line.
+    typed: Vec<String>,
 }
 
 impl Bes {
-    /// Connects to the backend and opens the file (when given), and sends
-    /// the events describing the invocation. `patterns` are the targets named
-    /// on the command line.
-    pub async fn start(
-        flags: &BesFlags,
-        ids: &InvocationIds,
-        argv: &[String],
-        patterns: &[String],
-        bytestream: Option<String>,
-        store: Arc<Store>,
-    ) -> Arc<Bes> {
+    /// Connects to the backend and opens the file (when given). The events
+    /// describing the invocation go first, once the build's targets are known
+    /// (`announce`), or with the first other event.
+    pub async fn start(opts: &crate::options::Options, ids: &InvocationIds, bytestream: Option<String>, store: Arc<Store>) -> Arc<Bes> {
+        let (flags, tls) = (&opts.bes, &opts.tls);
         let mut uploader = None;
         if let Some(backend) = &flags.backend {
-            let connect = rbe_client::ConnectOptions {
-                endpoint: backend.clone(),
-                instance_name: String::new(),
-                client_cert_pem: None,
-                client_key_pem: None,
-                ca_pem: None,
-                headers: Vec::new(),
+            let connect = tls.load().map(|t| t.connect_options(backend, "", &[]));
+            let channel = match &connect {
+                Ok(c) => rbe_client::connect_channel(c).await.map_err(|e| format!("{e:#}")),
+                Err(e) => Err(e.clone()),
             };
-            match rbe_client::connect_channel(&connect).await {
+            match channel {
                 Ok(channel) => {
                     let mut config = BesConfig::new(&flags.instance_name, &ids.build_request_id, &ids.invocation_id);
                     config.keywords = flags.keywords.clone();
                     config.keywords.extend(["command_name=build".to_string(), "protocol_name=BEP".to_string()]);
                     config.lifecycle_events = flags.lifecycle_events;
                     config.headers = flags.headers.clone();
+                    config.trace = std::env::var_os("NINJA_RS_BES_DEBUG").is_some_and(|v| !v.is_empty());
                     uploader = Some(BesUploader::start(channel, config));
                 }
-                Err(e) => eprintln!("ninja: warning: build events won't be uploaded: connecting to {backend}: {e:#}"),
+                Err(e) => eprintln!("ninja: warning: build events won't be uploaded: {e}{}", crate::options::tls_hint(&e, backend, tls)),
             }
         }
         let file = flags.binary_file.as_ref().and_then(|p| match std::fs::File::create(p) {
@@ -205,7 +217,7 @@ impl Bes {
         if let (Some(url), true) = (&flags.results_url, uploader.is_some()) {
             eprintln!("ninja: streaming build results to: {url}{}", ids.invocation_id);
         }
-        let bes = Arc::new(Bes {
+        Arc::new(Bes {
             flags: flags.clone(),
             ids: ids.clone(),
             bytestream,
@@ -214,15 +226,47 @@ impl Bes {
             file: Mutex::new(file),
             inner: Mutex::default(),
             started: Instant::now(),
-        });
-        bes.invocation_events(argv, patterns, SystemTime::now());
-        bes
+            start_time: SystemTime::now(),
+            argv: opts.argv.clone(),
+            given: opts.given.clone(),
+            typed: opts.targets.clone(),
+        })
     }
 
-    /// Runs `f` on the stream and sends what it produced, in order.
+    /// Sends the events describing the invocation, if they weren't sent yet:
+    /// `BuildStarted` announces `patterns`, the targets this build builds
+    /// (BES services show them as the invocation's title).
+    pub fn announce(&self, patterns: &[String]) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.patterns.is_none() {
+            let events = self.start_events(&mut inner, patterns.to_vec());
+            self.send(events);
+        }
+    }
+
+    /// The invocation's events, then the console messages kept until them.
+    fn start_events(&self, inner: &mut Inner, patterns: Vec<String>) -> Vec<bep::BuildEvent> {
+        let mut events = self.invocation_events(inner, patterns);
+        let early = std::mem::take(&mut inner.early_console);
+        if !early.is_empty() {
+            events.extend(inner.stream.progress("", &early));
+        }
+        events
+    }
+
+    /// Runs `f` on the stream and sends what it produced, in order, after
+    /// the invocation's events (announcing the targets named on the command
+    /// line, when nothing announced others before).
     fn emit(&self, f: impl FnOnce(&mut Inner) -> Vec<bep::BuildEvent>) {
         let mut inner = self.inner.lock().unwrap();
-        let events = f(&mut inner);
+        let mut events = if inner.patterns.is_none() { self.start_events(&mut inner, self.typed.clone()) } else { Vec::new() };
+        events.extend(f(&mut inner));
+        self.send(events);
+    }
+
+    /// Writes events to the file and the uploader. Callers hold `inner`, so
+    /// that events go out in the stream's order.
+    fn send(&self, events: Vec<bep::BuildEvent>) {
         let uploader = self.uploader.lock().unwrap();
         let mut file = self.file.lock().unwrap();
         for e in events {
@@ -238,7 +282,34 @@ impl Bes {
         }
     }
 
-    fn invocation_events(&self, argv: &[String], patterns: &[String], start: SystemTime) {
+    /// Bazel's structured command line: its sections, which UIs show, with
+    /// the options as given and the targets named on the command line as
+    /// the residual.
+    fn structured_command_line(&self, label: &str) -> cl::CommandLine {
+        let chunk = |label: &str, chunk: Vec<String>| cl::CommandLineSection {
+            section_label: label.into(),
+            section_type: Some(cl::command_line_section::SectionType::ChunkList(cl::ChunkList { chunk })),
+        };
+        let options = |option: Vec<cl::Option>| cl::command_line_section::SectionType::OptionList(cl::OptionList { option });
+        let given = self
+            .given
+            .iter()
+            .map(|g| cl::Option { combined_form: g.combined_form.clone(), option_name: g.name.clone(), option_value: g.value.clone(), ..Default::default() })
+            .collect();
+        cl::CommandLine {
+            command_line_label: label.into(),
+            sections: vec![
+                chunk("executable", vec![self.argv.first().cloned().unwrap_or_default()]),
+                cl::CommandLineSection { section_label: "startup options".into(), section_type: Some(options(vec![])) },
+                chunk("command", vec!["build".into()]),
+                cl::CommandLineSection { section_label: "command options".into(), section_type: Some(options(given)) },
+                chunk("residual", self.typed.clone()),
+            ],
+        }
+    }
+
+    fn invocation_events(&self, inner: &mut Inner, patterns: Vec<String>) -> Vec<bep::BuildEvent> {
+        let (argv, start) = (&self.argv, self.start_time);
         let workspace = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
         let started = bep::BuildStarted {
             uuid: self.ids.invocation_id.clone(),
@@ -253,30 +324,31 @@ impl Bes {
             user: user_name(),
             ..Default::default()
         };
-        let children = vec![
+        let mut children = vec![
             id::unstructured_command_line(),
+            id::structured_command_line("original"),
+            id::structured_command_line("canonical"),
             id::options_parsed(),
             id::workspace_status(),
             id::build_metadata(),
             id::workspace(),
-            id::pattern(patterns),
-            id::build_finished(),
         ];
+        if !patterns.is_empty() {
+            children.push(id::pattern(&patterns));
+        }
+        children.push(id::build_finished());
+        let command_lines: Vec<_> = ["original", "canonical"].iter().map(|l| (*l, self.structured_command_line(l))).collect();
         let options: Vec<String> = argv.iter().skip(1).cloned().collect();
-        let status = [
-            ("BUILD_HOST", host_name()),
-            ("BUILD_USER", user_name()),
-            ("BUILD_TIMESTAMP", (millis(start) / 1000).to_string()),
-        ];
+        let status = [("BUILD_HOST", host_name()), ("BUILD_USER", user_name()), ("BUILD_TIMESTAMP", (millis(start) / 1000).to_string())];
         let metadata = self.flags.build_metadata.iter().cloned().collect();
-        self.emit(|i| {
-            let s = &mut i.stream;
+        inner.patterns = Some(patterns);
+        {
+            let s = &mut inner.stream;
             let mut out = s.started(started, children);
-            out.extend(s.post(
-                id::unstructured_command_line(),
-                vec![],
-                Payload::UnstructuredCommandLine(bep::UnstructuredCommandLine { args: argv.to_vec() }),
-            ));
+            out.extend(s.post(id::unstructured_command_line(), vec![], Payload::UnstructuredCommandLine(bep::UnstructuredCommandLine { args: argv.to_vec() })));
+            for (label, cmd) in command_lines {
+                out.extend(s.post(id::structured_command_line(label), vec![], Payload::StructuredCommandLine(cmd)));
+            }
             out.extend(s.post(
                 id::options_parsed(),
                 vec![],
@@ -295,19 +367,17 @@ impl Bes {
                 }),
             ));
             out.extend(s.post(id::build_metadata(), vec![], Payload::BuildMetadata(bep::BuildMetadata { metadata })));
-            out.extend(s.post(
-                id::workspace(),
-                vec![],
-                Payload::WorkspaceInfo(bep::WorkspaceConfig { local_exec_root: workspace }),
-            ));
+            out.extend(s.post(id::workspace(), vec![], Payload::WorkspaceInfo(bep::WorkspaceConfig { local_exec_root: workspace })));
             out
-        });
+        }
     }
 
     /// The build's targets, once the requested targets are in `plan`:
     /// configurations, the pattern's expansion and `TargetConfigured`
-    /// events; targets with nothing to build complete at once.
+    /// events; targets with nothing to build complete at once. `patterns`
+    /// are the targets built (see `announce`).
     pub fn plan(&self, state: &State, plan: &Plan, targets_file: Arc<Targets>, patterns: &[String]) {
+        self.announce(patterns);
         let mut targets: BTreeMap<TargetKey, TargetState> = BTreeMap::new();
         let mut configs: BTreeMap<Option<String>, Configuration> = BTreeMap::new();
         for (&edge, &want) in &plan.want {
@@ -362,11 +432,16 @@ impl Bes {
                     }),
                 ));
             }
-            out.extend(s.post(
-                id::pattern(patterns),
-                labels.keys().map(|l| id::target_configured(l)).collect(),
-                Payload::Expanded(bep::PatternExpanded::default()),
-            ));
+            // The pattern BuildStarted announced (the targets named on the
+            // command line, if events went out before the plan).
+            let announced = i.patterns.clone().unwrap_or_default();
+            if !announced.is_empty() {
+                out.extend(s.post(
+                    id::pattern(&announced),
+                    labels.keys().map(|l| id::target_configured(l)).collect(),
+                    Payload::Expanded(bep::PatternExpanded::default()),
+                ));
+            }
             for (label, (kind, config_ids)) in &labels {
                 out.extend(s.post(
                     id::target_configured(label),
@@ -406,11 +481,7 @@ impl Bes {
             if !files.is_empty() {
                 let set = i.named_sets.to_string();
                 i.named_sets += 1;
-                out.extend(i.stream.post(
-                    id::named_set(&set),
-                    vec![],
-                    Payload::NamedSetOfFiles(bep::NamedSetOfFiles { files, file_sets: vec![] }),
-                ));
+                out.extend(i.stream.post(id::named_set(&set), vec![], Payload::NamedSetOfFiles(bep::NamedSetOfFiles { files, file_sets: vec![] })));
                 file_sets.push(bep::build_event_id::NamedSetOfFilesId { id: set });
             }
             let output_group = if success { vec![bep::OutputGroup { name: "default".into(), file_sets, ..Default::default() }] } else { vec![] };
@@ -428,10 +499,8 @@ impl Bes {
     fn file_entry(&self, path: &str, cas: &HashMap<String, (String, i64)>) -> Option<bep::File> {
         let p = Path::new(path);
         let name = p.file_name()?.to_string_lossy().into_owned();
-        let path_prefix = p
-            .parent()
-            .map(|d| d.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).filter(|c| !c.is_empty()).collect())
-            .unwrap_or_default();
+        let path_prefix =
+            p.parent().map(|d| d.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).filter(|c| !c.is_empty()).collect()).unwrap_or_default();
         let (uri, digest, length) = match (cas.get(path), &self.bytestream) {
             (Some((hash, size)), Some(bs)) => (format!("{bs}/blobs/{hash}/{size}"), hash.clone(), *size),
             _ => {
@@ -478,11 +547,7 @@ impl Bes {
             match key.as_ref().and_then(|k| inner.targets.get(k)) {
                 Some(t) => (t.label.clone(), t.config_id.clone(), start),
                 None => {
-                    let config = inner
-                        .targets_file
-                        .configuration(info.binding("rbe_config"))
-                        .cloned()
-                        .unwrap_or_else(default_configuration);
+                    let config = inner.targets_file.configuration(info.binding("rbe_config")).cloned().unwrap_or_else(default_configuration);
                     (target.as_deref().map(|t| inner.targets_file.label(t)).unwrap_or_default(), config.id(), start)
                 }
             }
@@ -543,6 +608,14 @@ impl Bes {
 
     /// A message (`ninja: ...`), as console output.
     pub fn message(&self, text: &str) {
+        // Before the targets are known, kept for after BuildStarted.
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.patterns.is_none() {
+                inner.early_console.push_str(text);
+                return;
+            }
+        }
         self.emit(|i| i.stream.progress("", text));
     }
 
@@ -566,10 +639,7 @@ impl Bes {
                 out.extend(i.stream.post(
                     id::target_completed(&t.label, &t.config_id),
                     vec![],
-                    Payload::Aborted(bep::Aborted {
-                        reason: reason as i32,
-                        description: "the target's actions did not all run".into(),
-                    }),
+                    Payload::Aborted(bep::Aborted { reason: reason as i32, description: "the target's actions did not all run".into() }),
                 ));
             }
             let metrics = bep::BuildMetrics {
@@ -626,10 +696,7 @@ impl Bes {
                     ..Default::default()
                 }),
             ));
-            out.extend(i.stream.finish(vec![
-                (id::build_metrics(), Payload::BuildMetrics(metrics)),
-                (id::build_tool_logs(), Payload::BuildToolLogs(logs)),
-            ]));
+            out.extend(i.stream.finish(vec![(id::build_metrics(), Payload::BuildMetrics(metrics)), (id::build_tool_logs(), Payload::BuildToolLogs(logs))]));
             out
         });
         if let Some(mut f) = self.file.lock().unwrap().take() {

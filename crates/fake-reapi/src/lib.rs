@@ -219,9 +219,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
         let responses: Vec<Result<re::GetChunkMappingResponse, Status>> = chunks
             .chunks(3)
             .enumerate()
-            .map(|(i, part)| {
-                Ok(re::GetChunkMappingResponse { chunk_digests: part.to_vec(), chunking_function: if i == 0 { FAST_CDC } else { 0 } })
-            })
+            .map(|(i, part)| Ok(re::GetChunkMappingResponse { chunk_digests: part.to_vec(), chunking_function: if i == 0 { FAST_CDC } else { 0 } }))
             .collect();
         Ok(Response::new(Box::pin(tokio_stream::iter(responses))))
     }
@@ -326,8 +324,7 @@ impl bs::byte_stream_server::ByteStream for Svc {
                 stats.ranged_reads += 1;
             }
         }
-        let chunks: Vec<Result<bs::ReadResponse, Status>> =
-            data[start..end].chunks(64 * 1024).map(|c| Ok(bs::ReadResponse { data: c.to_vec() })).collect();
+        let chunks: Vec<Result<bs::ReadResponse, Status>> = data[start..end].chunks(64 * 1024).map(|c| Ok(bs::ReadResponse { data: c.to_vec() })).collect();
         Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
     }
 
@@ -521,10 +518,7 @@ impl bes::publish_build_event_server::PublishBuildEvent for Svc {
                     Some(bes::build_event::Event::ComponentStreamFinished(_)) => *state.bes_streams_finished.lock().unwrap() += 1,
                     _ => {}
                 }
-                let ack = bes::PublishBuildToolEventStreamResponse {
-                    stream_id: ordered.stream_id.clone(),
-                    sequence_number: ordered.sequence_number,
-                };
+                let ack = bes::PublishBuildToolEventStreamResponse { stream_id: ordered.stream_id.clone(), sequence_number: ordered.sequence_number };
                 if tx.send(Ok(ack)).await.is_err() {
                     break;
                 }
@@ -532,6 +526,15 @@ impl bes::publish_build_event_server::PublishBuildEvent for Svc {
         });
         Ok(Response::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))))
     }
+}
+
+/// TLS for the fake server: its certificate and key, and the CA client
+/// certificates must chain to (mTLS: clients without one are refused). PEM.
+#[derive(Clone)]
+pub struct ServerTls {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    pub client_ca_pem: Option<Vec<u8>>,
 }
 
 /// A running fake server.
@@ -550,6 +553,12 @@ impl FakeServer {
 
     /// Like `start`, on a given port (0 for an ephemeral one).
     pub async fn start_on(work_base: &Path, port: u16) -> std::io::Result<Self> {
+        Self::start_with(work_base, port, None).await
+    }
+
+    /// Like `start_on`, with TLS (the endpoint is then
+    /// `grpcs://localhost:<port>`).
+    pub async fn start_with(work_base: &Path, port: u16, tls: Option<ServerTls>) -> std::io::Result<Self> {
         std::fs::create_dir_all(work_base)?;
         let state = Arc::new(State { base: work_base.to_path_buf(), ..Default::default() });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
@@ -557,8 +566,21 @@ impl FakeServer {
         let svc = Svc(state.clone());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let mut builder = tonic::transport::Server::builder();
+        let endpoint = match &tls {
+            Some(t) => {
+                use tonic::transport::{Certificate, Identity, ServerTlsConfig};
+                let mut cfg = ServerTlsConfig::new().identity(Identity::from_pem(&t.cert_pem, &t.key_pem));
+                if let Some(ca) = &t.client_ca_pem {
+                    cfg = cfg.client_ca_root(Certificate::from_pem(ca));
+                }
+                builder = builder.tls_config(cfg).map_err(std::io::Error::other)?;
+                format!("grpcs://localhost:{}", addr.port())
+            }
+            None => format!("grpc://{addr}"),
+        };
         tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
+            let _ = builder
                 .add_service(re::content_addressable_storage_server::ContentAddressableStorageServer::new(svc.clone()))
                 .add_service(re::action_cache_server::ActionCacheServer::new(svc.clone()))
                 .add_service(re::capabilities_server::CapabilitiesServer::new(svc.clone()))
@@ -570,7 +592,7 @@ impl FakeServer {
                 })
                 .await;
         });
-        Ok(Self { endpoint: format!("grpc://{addr}"), state, shutdown: Some(tx) })
+        Ok(Self { endpoint, state, shutdown: Some(tx) })
     }
 
     pub fn stats(&self) -> Stats {

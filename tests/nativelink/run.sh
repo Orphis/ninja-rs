@@ -38,6 +38,10 @@
 #   NINJA_RS    ninja-rs binary (default: bazel-linux-bin/crates/ninja-rs/ninja-rs)
 #   WORK        scratch directory (default: /tmp/ninja-rs-nativelink-hermetic)
 #   PORT        NativeLink frontend port (default: 50985; worker API uses PORT+1)
+#   TLS         1: the frontend requires client certificates (mTLS), with
+#               the fake server's test certificates
+#   NINJA_RS_FLAGS  more ninja-rs flags for every build (e.g.
+#               --remote_include_scanner=preprocessor)
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -50,6 +54,15 @@ NINJA_RS=${NINJA_RS:-$here/bazel-linux-bin/crates/ninja-rs/ninja-rs}
 WORK=${WORK:-/tmp/ninja-rs-nativelink-hermetic}
 PORT=${PORT:-50985}
 WORKER_PORT=$((PORT + 1))
+REMOTE=grpc://127.0.0.1:$PORT
+TLS_LISTENER=
+TLS_FLAGS=()
+if [[ ${TLS:-} == 1 ]]; then
+  certs=$here/crates/fake-reapi/testdata/tls
+  REMOTE=grpcs://localhost:$PORT
+  TLS_LISTENER=", tls: { cert_file: \"$certs/server.pem\", key_file: \"$certs/server-key.pem\", client_ca_file: \"$certs/ca.pem\" }"
+  TLS_FLAGS=(--tls_certificate="$certs/ca.pem" --tls_client_certificate="$certs/client.pem" --tls_client_key="$certs/client-key.pem")
+fi
 for p in "$NINJA_RS" "$CMAKE" "$HERMETIC/toolchain.cmake" "$HERMETIC/tests/hello/CMakeLists.txt"; do
   [[ -e $p ]] || { echo "missing $p"; exit 1; }
 done
@@ -72,7 +85,7 @@ cat > "$WORK/nl/config.json5" <<EOF
     platform_properties: {},
   } }],
   servers: [
-    { listener: { http: { socket_address: "127.0.0.1:$PORT" } }, services: {
+    { listener: { http: { socket_address: "127.0.0.1:$PORT"$TLS_LISTENER } }, services: {
       cas: [{ instance_name: "main", cas_store: "CAS" }],
       ac: [{ instance_name: "main", ac_store: "AC" }],
       execution: [{ instance_name: "main", cas_store: "CAS", scheduler: "S" }],
@@ -108,10 +121,11 @@ B=$WORK/deeper/path/co2
 checkout "$A"
 checkout "$B"
 
-COMMON=(--remote_instance_name=main --remote_verbose --remote_mnemonics=Compile,Archive,Link)
+read -r -a EXTRA_FLAGS <<< "${NINJA_RS_FLAGS:-}"
+COMMON=("${TLS_FLAGS[@]}" "${EXTRA_FLAGS[@]}" --remote_instance_name=main --remote_verbose --remote_mnemonics=Compile,Archive,Link)
 # Strict: every action the policy sends remotely must run there.
-EXEC=(--remote_executor=grpc://127.0.0.1:$PORT --remote_strict "${COMMON[@]}")
-CACHE=(--remote_cache=grpc://127.0.0.1:$PORT "${COMMON[@]}")
+EXEC=(--remote_executor=$REMOTE --remote_strict "${COMMON[@]}")
+CACHE=(--remote_cache=$REMOTE "${COMMON[@]}")
 
 build() {  # $1 = checkout, $2 = log name, rest = flags
   local dir=$1 log=$WORK/$2.log
@@ -174,7 +188,7 @@ same_outputs
 
 echo "=== 5. racing in checkout 1, local runs starting at once: outputs still identical"
 "$NINJA_RS" -C "$A/build" -t clean > /dev/null
-build "$A" race --remote_executor=grpc://127.0.0.1:$PORT --remote_racing --remote_racing_delay=0 "${COMMON[@]}"
+build "$A" race --remote_executor=$REMOTE --remote_racing --remote_racing_delay=0 "${COMMON[@]}"
 grep "racing:" "$WORK/race.log" | sed 's/^/  /'
 "$A/build/hello_c" > /dev/null
 same_outputs
@@ -182,7 +196,7 @@ no_checkout_paths "$A"
 
 echo "=== 6. a change raced in checkout 1 (local runs may win), executed remotely in checkout 2: identical"
 echo 'const char* ninja_rs_rbe_race = "raced";' >> "$A/hello.c"
-build "$A" race2 --remote_executor=grpc://127.0.0.1:$PORT --remote_racing --remote_racing_delay=0 "${COMMON[@]}"
+build "$A" race2 --remote_executor=$REMOTE --remote_racing --remote_racing_delay=0 "${COMMON[@]}"
 grep "racing:" "$WORK/race2.log" | sed 's/^/  /'
 no_checkout_paths "$A"
 cp "$A/hello.c" "$B/hello.c"

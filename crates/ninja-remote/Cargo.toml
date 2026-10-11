@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+cpp-deps = { path = "../cpp-deps" }
 hex = { workspace = true }
 ninja-core = { path = "../ninja-core" }
 prost = { workspace = true }

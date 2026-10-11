@@ -21,11 +21,11 @@ use ninja_core::canon::canonicalize_path;
 use ninja_core::deps_log::{DEPS_LOG_FILE, DepsLog};
 use ninja_core::disk::{Disk, RealDisk, StatCounters};
 use ninja_core::graph::{ROOT_SCOPE, State};
-use ninja_remote::remote_outputs::{REMOTE_OUTPUTS_FILE, RemoteDisk, RemoteOutputs};
 use ninja_core::parser::{ManifestParser, ParserOptions, PhonyCycleAction, RealFileReader};
 use ninja_core::runner::{CommandRunner, DryRunRunner, RemoteBackend};
 use ninja_core::status::{Status, StatusPrinter, Verbosity};
 use ninja_core::subprocess::Interrupt;
+use ninja_remote::remote_outputs::{REMOTE_OUTPUTS_FILE, RemoteDisk, RemoteOutputs};
 
 use crate::bes::{Bes, InvocationIds, ReportingStatus};
 use crate::exec_runner::ExecRunner;
@@ -133,15 +133,12 @@ impl Service {
 
     async fn run_invocation(&mut self, opts: &Options) -> i32 {
         self.remote_verbose = opts.remote.verbose;
-        self.racing = opts.remote.racing.then(|| exec_runner::Racing {
-            delay: Duration::from_millis(opts.remote.racing_delay_ms),
-            stats: Arc::default(),
-        });
+        self.racing = opts.remote.racing.then(|| exec_runner::Racing { delay: Duration::from_millis(opts.remote.racing_delay_ms), stats: Arc::default() });
         self.ids = InvocationIds::new(&opts.bes);
         // Build events cover builds, not tools.
         let bes = if opts.bes.enabled() && opts.tool.is_none() {
             let bytestream = opts.remote.endpoint().map(|e| bes::bytestream_prefix(e, &opts.remote.instance_name));
-            Some(Bes::start(&opts.bes, &self.ids, &opts.argv, &opts.targets, bytestream, self.store.clone()).await)
+            Some(Bes::start(opts, &self.ids, bytestream, self.store.clone()).await)
         } else {
             None
         };
@@ -192,8 +189,7 @@ impl Service {
                 quiet: opts.verbosity == Verbosity::Quiet,
             };
             let reader = RealFileReader;
-            let parsed =
-                self.timed(".ninja parse", || ManifestParser::new(&mut state, &reader, parser_opts).load(&opts.input_file));
+            let parsed = self.timed(".ninja parse", || ManifestParser::new(&mut state, &reader, parser_opts).load(&opts.input_file));
             if let Err(e) = parsed {
                 status.error(&e);
                 return EXIT_FAILURE;
@@ -270,6 +266,11 @@ impl Service {
             }
 
             let targets = Arc::new(self.load_targets(&state, status));
+            // The build's targets are known: the invocation's build events
+            // can start (before any regeneration reports its own).
+            if let Some(b) = &status.bes {
+                b.announce(&bes::patterns(&state, &opts.targets, &targets));
+            }
             // Outputs of remote actions that weren't downloaded, from earlier
             // builds (whatever the download mode).
             let remote_outputs = (opts.remote.endpoint().is_some() && !opts.dry_run)
@@ -320,10 +321,7 @@ impl Service {
             };
 
             // Attempt to rebuild the manifest before building anything else.
-            match self
-                .rebuild_manifest(&opts.input_file, &mut state, &mut build_log, &mut deps_log, &config, status, remote.clone())
-                .await
-            {
+            match self.rebuild_manifest(&opts.input_file, &mut state, &mut build_log, &mut deps_log, &config, status, remote.clone()).await {
                 Ok(true) => {
                     // In dry_run mode the regeneration will succeed without
                     // changing the manifest forever. Better to return immediately.
@@ -340,11 +338,8 @@ impl Service {
                 }
             }
 
-            let digests_file = if build_dir.is_empty() {
-                ninja_remote::store::DIGESTS_FILE.to_string()
-            } else {
-                format!("{build_dir}/{}", ninja_remote::store::DIGESTS_FILE)
-            };
+            let digests_file =
+                if build_dir.is_empty() { ninja_remote::store::DIGESTS_FILE.to_string() } else { format!("{build_dir}/{}", ninja_remote::store::DIGESTS_FILE) };
             let use_remote = remote.is_some();
             let jobserver_settings = jobserver::Settings {
                 parallelism: opts.parallelism,
@@ -385,7 +380,8 @@ impl Service {
             if let Some(racing) = &self.racing
                 && opts.verbosity != Verbosity::Quiet
             {
-                let (local, remote) = (racing.stats.local.load(std::sync::atomic::Ordering::Relaxed), racing.stats.remote.load(std::sync::atomic::Ordering::Relaxed));
+                let (local, remote) =
+                    (racing.stats.local.load(std::sync::atomic::Ordering::Relaxed), racing.stats.remote.load(std::sync::atomic::Ordering::Relaxed));
                 if local + remote > 0 {
                     status.info(&format!("racing: {local} actions finished first locally, {remote} remotely."));
                 }
@@ -450,39 +446,33 @@ impl Service {
                 return Ok(None);
             }
             other => {
-                status.warning(&format!(
-                    "remote execution disabled: the manifest uses RBE interface version {other}, this executor supports {RBE_VERSION}"
-                ));
+                status.warning(&format!("remote execution disabled: the manifest uses RBE interface version {other}, this executor supports {RBE_VERSION}"));
                 return Ok(None);
             }
         }
         let disk = self.open_disk_cache(opts, status);
         let client = match opts.remote.endpoint() {
             Some(endpoint) => {
-                let key = format!("{endpoint}|{}|{:?}", opts.remote.instance_name, opts.remote.headers);
+                let key = format!("{endpoint}|{}|{:?}|{:?}", opts.remote.instance_name, opts.remote.headers, opts.tls);
                 if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
                     let client = ninja_remote::connect(&ninja_remote::ConnectOptions {
                         endpoint: endpoint.clone(),
                         instance_name: opts.remote.instance_name.clone(),
                         headers: opts.remote.headers.clone(),
+                        tls: opts.tls.load()?,
                     })
                     .await
-                    .map_err(|e| format!("connecting to {endpoint}: {e:#}"))?;
+                    .map_err(|e| format!("{e:#}{}", options::tls_hint(&format!("{e:#}"), endpoint, &opts.tls)))?;
                     self.remote_client = Some((key, client));
                 }
                 // Requests carry the invocation's ids, which build events
                 // report too.
-                Some(self.remote_client.as_ref().expect("connected").1.clone().with_request_metadata(
-                    rbe_client::proto::RequestMetadata {
-                        tool_details: Some(rbe_client::proto::ToolDetails {
-                            tool_name: "ninja-rs".into(),
-                            tool_version: env!("CARGO_PKG_VERSION").into(),
-                        }),
-                        tool_invocation_id: self.ids.invocation_id.clone(),
-                        correlated_invocations_id: self.ids.build_request_id.clone(),
-                        ..Default::default()
-                    },
-                ))
+                Some(self.remote_client.as_ref().expect("connected").1.clone().with_request_metadata(rbe_client::proto::RequestMetadata {
+                    tool_details: Some(rbe_client::proto::ToolDetails { tool_name: "ninja-rs".into(), tool_version: env!("CARGO_PKG_VERSION").into() }),
+                    tool_invocation_id: self.ids.invocation_id.clone(),
+                    correlated_invocations_id: self.ids.build_request_id.clone(),
+                    ..Default::default()
+                }))
             }
             None => None,
         };
@@ -514,13 +504,18 @@ impl Service {
                 download_minimal: opts.remote.download_minimal,
                 requested: Arc::new(requested.iter().map(|p| ninja_remote::remote_outputs::key(p)).collect()),
                 execution_log,
+                preprocessor: opts.remote.preprocessor,
             },
             client,
             disk,
             self.store.clone(),
         )
         .await
-        .map_err(|e| format!("remote execution: {e:#}"))?;
+        .map_err(|e| {
+            let e = format!("{e:#}");
+            let hint = opts.remote.endpoint().map(|ep| options::tls_hint(&e, ep, &opts.tls)).unwrap_or_default();
+            format!("remote execution: {e}{hint}")
+        })?;
         if opts.remote.cache_only() && opts.remote.upload_local_results && !backend.uploads_local_results() {
             status.warning("the remote cache doesn't accept results from clients: local results aren't stored");
         }
@@ -705,7 +700,8 @@ impl Service {
         }
         disk.allow_stat_cache(false);
         if let Some(b) = &bes {
-            b.plan(builder.state, &builder.plan, targets_file, targets);
+            let patterns = bes::patterns(builder.state, targets, &targets_file);
+            b.plan(builder.state, &builder.plan, targets_file, &patterns);
         }
         let code = if builder.already_up_to_date() {
             if config.verbosity != Verbosity::NoStatusUpdate {
