@@ -1,0 +1,12 @@
+[package]
+name = "cpp-deps"
+description = "Finds the files a C/C++ compile reads, with a fast preprocessor that only evaluates directives"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = { workspace = true }
