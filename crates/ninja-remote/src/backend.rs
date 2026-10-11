@@ -62,9 +62,9 @@ pub struct BackendConfig {
     /// `--execution_log_file`: one JSON line per remote action (key,
     /// command, inputs), to compare the actions of two builds.
     pub execution_log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
-    /// `--remote_include_scanner=preprocessor`: compiles' inputs from the
-    /// `cpp-deps` preprocessor, the conservative scanner as the fallback.
-    pub preprocessor: bool,
+    /// `--remote_include_scanner`: how compiles' inputs are found (the
+    /// conservative scanner when the chosen one can't tell).
+    pub include_scanner: crate::action::IncludeScanner,
 }
 
 pub struct Backend {
@@ -162,7 +162,7 @@ impl Backend {
             windows,
             remote_outputs: config.remote_outputs.clone(),
             log_inputs: config.execution_log.is_some(),
-            preprocessor: config.preprocessor,
+            include_scanner: config.include_scanner,
             verbose: config.verbose,
         };
         shared.store.new_build();

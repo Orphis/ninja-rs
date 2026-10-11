@@ -54,6 +54,13 @@ known! {
     PUSH_MACRO = "push_macro",
     POP_MACRO = "pop_macro",
     PRAGMA = "pragma",
+    PRAGMA_OPERATOR = "_Pragma",
+    HAS_EMBED = "__has_embed",
+    DATE = "__DATE__",
+    TIME = "__TIME__",
+    TIMESTAMP = "__TIMESTAMP__",
+    ZERO = "0",
+    ONE = "1",
     EMPTY = "",
 }
 

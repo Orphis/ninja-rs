@@ -504,7 +504,7 @@ impl Service {
                 download_minimal: opts.remote.download_minimal,
                 requested: Arc::new(requested.iter().map(|p| ninja_remote::remote_outputs::key(p)).collect()),
                 execution_log,
-                preprocessor: opts.remote.preprocessor,
+                include_scanner: opts.remote.include_scanner,
             },
             client,
             disk,

@@ -75,9 +75,11 @@ remote execution (only for manifests with rbe_version = 1):
   --remote_download_outputs=all|minimal    (minimal: deliverables, named targets,
                                             local inputs; alias --remote_download_minimal)
   --execution_log_file=FILE      (JSON line per remote action: key, command, inputs)
-  --remote_include_scanner=conservative|preprocessor
+  --remote_include_scanner=conservative|preprocessor|clang-scan-deps|compiler
                                  (preprocessor: exact inputs for GCC/Clang compiles,
-                                 from crates/cpp-deps; default conservative)
+                                 from crates/cpp-deps; clang-scan-deps, compiler (-M,
+                                 /showIncludes): external alternatives; default
+                                 conservative)
   --disk_cache=DIR               (local action cache + CAS, with or without a remote)
   --disk_cache_max_size=SIZE     (LRU eviction above SIZE, default 10G)
 

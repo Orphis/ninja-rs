@@ -97,6 +97,8 @@ pub enum DirKind {
     Include,
     IncludeNext,
     Import,
+    /// C23's `#embed` (the file is read as data).
+    Embed,
     If,
     Ifdef,
     Ifndef,
@@ -105,6 +107,7 @@ pub enum DirKind {
     Elifndef,
     Else,
     Endif,
+    /// `#pragma`, and `_Pragma("...")` operators written in text.
     Pragma,
     /// `#error`, `#warning`, `#line`, `#ident`, unknown directives, `#`.
     Other,
@@ -546,7 +549,7 @@ impl<'a> Lexer<'a> {
     /// The rest of a directive line, after its name, and the newline.
     fn directive_tokens(&mut self, kind: DirKind) -> Vec<Token> {
         let mut toks = Vec::new();
-        if matches!(kind, DirKind::Include | DirKind::IncludeNext | DirKind::Import)
+        if matches!(kind, DirKind::Include | DirKind::IncludeNext | DirKind::Import | DirKind::Embed)
             && let Some(t) = self.lex_header_name()
         {
             toks.push(t);
@@ -572,6 +575,7 @@ fn directive_kind(name: &[u8]) -> DirKind {
         b"include" => DirKind::Include,
         b"include_next" => DirKind::IncludeNext,
         b"import" => DirKind::Import,
+        b"embed" => DirKind::Embed,
         b"if" => DirKind::If,
         b"ifdef" => DirKind::Ifdef,
         b"ifndef" => DirKind::Ifndef,
@@ -606,7 +610,13 @@ pub fn lex(content: &[u8]) -> FileDirectives {
                 text_first = true;
             }
             text_last = true;
+            let start = lx.pos;
             lx.skip_text_line();
+            let text = &content[start..lx.pos];
+            if text.windows(7).any(|w| w == b"_Pragma") {
+                let line = lx.line_at(start);
+                dirs.extend(pragma_operators(text).into_iter().map(|toks| Directive { kind: DirKind::Pragma, toks: toks.into_boxed_slice(), line, mac: None }));
+            }
             continue;
         }
         let line = lx.line_at(lx.pos);
@@ -628,6 +638,28 @@ pub fn lex(content: &[u8]) -> FileDirectives {
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
     FileDirectives { dirs, guard }
+}
+
+/// The `_Pragma("...")` operators of a line of text, each as the tokens
+/// of the `#pragma` it stands for (macros that expand to them aren't
+/// seen: text isn't expanded).
+fn pragma_operators(text: &[u8]) -> Vec<Vec<Token>> {
+    let toks = tokens(text);
+    let mut out = Vec::new();
+    for w in toks.windows(4) {
+        if let [p, l, s, r] = w
+            && p.sym == intern::PRAGMA_OPERATOR
+            && l.is(P::LParen)
+            && s.kind == Kind::Str
+            && r.is(P::RParen)
+        {
+            // Destringize: no prefix nor quotes, \" and \ unescaped.
+            let lit = s.sym.as_str();
+            let body = lit.trim_start_matches(|c| c != '"').trim_matches('"');
+            out.push(tokens(body.replace("\\\"", "\"").replace("\\\\", "\\").as_bytes()));
+        }
+    }
+    out
 }
 
 /// The macro of an include guard: the first directive is `#ifndef G` (or

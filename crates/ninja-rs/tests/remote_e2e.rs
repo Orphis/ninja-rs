@@ -1070,16 +1070,20 @@ fn test_mtls() -> Result<(), String> {
     r
 }
 
-/// `--remote_include_scanner=preprocessor` with a compiler it can't probe
-/// (the fake one): the conservative scanner takes over.
-fn test_preprocessor_fallback() -> Result<(), String> {
-    let f = fixture("preprocessor", true);
-    with_server(&f, |server| {
-        let ep = server.endpoint.clone();
-        check(run_ninja(&f, Some(&ep), &["--remote_include_scanner=preprocessor", "--remote_strict"]) == 0, "build failed")?;
-        check(server.stats().executions == 2, &format!("expected 2 remote executions, got {:?}", server.stats()))?;
-        Ok(())
-    })
+/// The include scanners other than the conservative one, with a compiler
+/// none of them can use (the fake one): the conservative scanner takes over.
+fn test_include_scanner_fallback() -> Result<(), String> {
+    for scanner in ["preprocessor", "clang-scan-deps", "compiler"] {
+        let f = fixture(&format!("scanner-{scanner}"), true);
+        let flag = format!("--remote_include_scanner={scanner}");
+        with_server(&f, |server| {
+            let ep = server.endpoint.clone();
+            check(run_ninja(&f, Some(&ep), &[&flag, "--remote_strict"]) == 0, &format!("build with {flag} failed"))?;
+            check(server.stats().executions == 2, &format!("{flag}: expected 2 remote executions, got {:?}", server.stats()))?;
+            Ok::<(), String>(())
+        })?;
+    }
+    Ok(())
 }
 
 fn test_without_executor_runs_locally() -> Result<(), String> {
@@ -1120,7 +1124,7 @@ fn main() -> ExitCode {
         ("action_rewinding", test_action_rewinding),
         ("thin_archives", test_thin_archives),
         ("mtls", test_mtls),
-        ("preprocessor_fallback", test_preprocessor_fallback),
+        ("include_scanner_fallback", test_include_scanner_fallback),
         ("split_and_splice_v2_12", || test_split_and_splice(12)),
         ("split_and_splice_v2_13", || test_split_and_splice(13)),
     ];

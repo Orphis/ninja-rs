@@ -137,6 +137,8 @@ pub trait Context {
     fn dynamic(&mut self, name: Sym) -> Option<Token>;
     /// `__has_include` / `__has_include_next`.
     fn has_include(&mut self, name: &str, angled: bool, next: bool) -> bool;
+    /// `__has_embed`: 0 (not found), 1 (found) or 2 (empty, or `limit(0)`).
+    fn has_embed(&mut self, name: &str, angled: bool, limit_zero: bool) -> i64;
     /// Whether `op` is a compiler query (`__has_builtin` and the like) the
     /// compiler has.
     fn is_query(&self, op: Sym) -> bool;
@@ -144,8 +146,14 @@ pub trait Context {
     fn query(&mut self, op: Sym, arg: &str) -> Option<i64>;
 }
 
-fn number(v: i64) -> Token {
-    Token { kind: Kind::Number, sym: intern::intern(&v.to_string()), space: true }
+/// A number token (0 and 1, the usual results, without interning).
+pub(crate) fn number(v: i64) -> Token {
+    let sym = match v {
+        0 => intern::ZERO,
+        1 => intern::ONE,
+        v => intern::intern(&v.to_string()),
+    };
+    Token { kind: Kind::Number, sym, space: true }
 }
 
 #[cfg(test)]
@@ -295,6 +303,26 @@ impl<'c> Expander<'c> {
                 Some((h, angled)) => number(self.ctx.has_include(&h, angled, name == intern::HAS_INCLUDE_NEXT) as i64),
                 None => {
                     self.fail("malformed __has_include()");
+                    unknown()
+                }
+            });
+        }
+        if name == intern::HAS_EMBED && self.ctx.is_defined(name) {
+            let Some(op) = self.operand(input, false) else {
+                self.fail("malformed __has_embed()");
+                return Some(unknown());
+            };
+            // The resource, then its parameters.
+            let end = match op.first().map(|t| t.t.kind) {
+                Some(Kind::Punct(P::Lt)) => op.iter().position(|t| t.t.is(P::Gt)).map_or(op.len(), |i| i + 1),
+                _ => 1.min(op.len()),
+            };
+            let params: Vec<&str> = op[end..].iter().map(|t| t.t.sym.as_str()).collect();
+            let limit_zero = params.windows(4).any(|w| w == ["limit", "(", "0", ")"]);
+            return Some(match self.header_name(op[..end].to_vec(), true) {
+                Some((h, angled)) => number(self.ctx.has_embed(&h, angled, limit_zero)),
+                None => {
+                    self.fail("malformed __has_embed()");
                     unknown()
                 }
             });
@@ -565,6 +593,13 @@ mod tests {
         }
         fn has_include(&mut self, name: &str, angled: bool, _next: bool) -> bool {
             name == "yes.h" || (angled && name == "sys/yes.h")
+        }
+        fn has_embed(&mut self, name: &str, _angled: bool, limit_zero: bool) -> i64 {
+            match name {
+                "data.bin" if limit_zero => 2,
+                "data.bin" => 1,
+                _ => 0,
+            }
         }
         fn is_query(&self, op: Sym) -> bool {
             op.as_str() == "__has_builtin"

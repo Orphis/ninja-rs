@@ -15,6 +15,33 @@ use crate::scanner::{self, Scanner, Style, decode_rsp, expand_response_files, pa
 use crate::store::Store;
 use crate::toolchains::{Toolchains, long_path, resolve_program};
 
+/// How compiles' inputs are found (`--remote_include_scanner`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IncludeScanner {
+    /// Following every `#include`, whatever the conditionals (`scanner`).
+    #[default]
+    Conservative,
+    /// The `cpp-deps` preprocessor: exact for GCC and Clang commands.
+    Preprocessor,
+    /// The `clang-scan-deps` next to the compiler (Clang).
+    ClangScanDeps,
+    /// The compiler's own preprocessor (`-M`, `/E /showIncludes`).
+    Compiler,
+}
+
+impl std::str::FromStr for IncludeScanner {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        Ok(match s {
+            "conservative" => Self::Conservative,
+            "preprocessor" => Self::Preprocessor,
+            "clang-scan-deps" => Self::ClangScanDeps,
+            "compiler" => Self::Compiler,
+            _ => return Err(format!("unknown include scanner '{s}' (conservative, preprocessor, clang-scan-deps or compiler)")),
+        })
+    }
+}
+
 /// Per-build settings shared by all actions.
 pub struct Shared {
     pub build_dir: PathBuf,
@@ -26,8 +53,7 @@ pub struct Shared {
     pub remote_outputs: Option<Arc<crate::remote_outputs::RemoteOutputs>>,
     /// List every input's digest in `Prepared::input_digests`.
     pub log_inputs: bool,
-    /// Scan compiles with the preprocessor (see `BackendConfig`).
-    pub preprocessor: bool,
+    pub include_scanner: IncludeScanner,
     pub verbose: bool,
 }
 
@@ -129,28 +155,36 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     } else {
         None
     };
-    // The preprocessor first, for GCC and Clang style compiles: exact when
-    // it can evaluate everything; otherwise the conservative scanner.
+    // The chosen scanner first; the conservative one when it can't tell.
     let mut scanned = false;
-    if shared.preprocessor && style == Some(Style::Gcc) && !driver_link && steps.len() == 1 {
+    if style.is_some() && !driver_link && steps.len() == 1 && shared.include_scanner != IncludeScanner::Conservative {
         let mut argv = expanded.clone();
         argv[0] = to_s(exe);
-        match shared.store.preprocessor(build_dir, windows).scan(&argv, build_dir) {
-            Ok(out) if out.exact() => {
-                files.extend(out.files);
-                files.extend(out.found);
+        let found: Result<Vec<PathBuf>, String> = match shared.include_scanner {
+            IncludeScanner::Preprocessor => match shared.store.preprocessor(build_dir, windows).scan(&argv, build_dir) {
+                Ok(out) if out.exact() => Ok(out.files.into_iter().chain(out.found).collect()),
+                Ok(out) => {
+                    let why = out.inexact.first().cloned().or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})"))).unwrap_or_default();
+                    Err(format!("not exact ({why})"))
+                }
+                Err(e) => Err(e),
+            },
+            IncludeScanner::ClangScanDeps => cpp_deps::external::clang_scan_deps(&argv, build_dir),
+            IncludeScanner::Compiler => {
+                let prefix = (!task.msvc_deps_prefix.is_empty()).then_some(task.msvc_deps_prefix.as_str());
+                cpp_deps::external::compiler_deps(&argv, build_dir, prefix)
+            }
+            IncludeScanner::Conservative => unreachable!(),
+        };
+        match found {
+            Ok(found) => {
+                files.extend(found);
                 files.extend(parse_compile(&expanded, build_dir).extra_files);
                 scanned = true;
             }
-            Ok(out) => {
-                if shared.verbose {
-                    let why = out.inexact.first().cloned().or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})"))).unwrap_or_default();
-                    warnings.push(format!("preprocessor: not exact ({why}); scanning conservatively"));
-                }
-            }
             Err(e) => {
                 if shared.verbose {
-                    warnings.push(format!("preprocessor: {e}; scanning conservatively"));
+                    warnings.push(format!("{:?} include scanner: {e}; scanning conservatively", shared.include_scanner));
                 }
             }
         }

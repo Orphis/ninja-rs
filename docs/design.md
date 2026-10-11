@@ -404,15 +404,33 @@ runs instead.
   header isn't processed again), `#import`, MSVC's includer-stack lookup.
   Files `__has_include` finds are inputs too (absent remotely, the answer
   would differ; Clang lists them in its depfiles).
+- **Rarer inputs**: Apple frameworks (`-F`, `-iframework`, and built-in
+  framework directories: `<Foo/Bar.h>` in `Foo.framework/Headers` or
+  `PrivateHeaders`), Clang header maps (an `-I` that is a `.hmap` file),
+  VFS overlays (`-ivfsoverlay`, `-Xclang -ivfsoverlay`, `/vfsoverlay:`;
+  their flow-style YAML, case-insensitive views, `directory-remap`,
+  fallthrough, fallback and redirect-only; lookups use the virtual paths,
+  the real files are reported), C23's `#embed` (with `--embed-dir`) and
+  `__has_embed`, and `_Pragma("...")` written in text (`once`,
+  `push_macro`).
 - **The compiler's knowledge** (`probe`, `driver`), once per compiler and
   flags that matter (`-std`, `-target`, `-O`, `-m`, `-f`, sysroot...;
-  not `-I`, `-D`, outputs): predefined macros and operators from
-  `-dM -E`, built-in directories from `-E -v`, files every compile reads
-  from `-E -M` on an empty source (GCC pre-includes `stdc-predef.h`).
-  Queries (`__has_builtin(x)`, `__has_cpp_attribute(x)`...) are answered
-  by running the compiler on generated lines, in batches, then the compile
-  is scanned again; answers are kept per profile. Static profiles per
-  compiler and target could replace probing later.
+  not `-I`, `-D`, outputs), for three command styles. GCC and Clang:
+  predefined macros and operators from `-dM -E`, built-in directories
+  from `-E -v`, files every compile reads from `-E -M` on an empty source
+  (GCC pre-includes `stdc-predef.h`). `clang-cl`: `/clang:-dM /E` and
+  `-v /E`. `cl.exe`: `/EP /Zc:preprocessor /PD` (MSVC prints its macros
+  only with the conforming preprocessor; `_MSVC_TRADITIONAL` is set back
+  to 1 for compiles without it), operators from `#ifdef` lines through
+  `/EP`, built-in directories from `INCLUDE` (unless `/X`). The `#if`
+  dialect is probed too: `true` (C++, C23) and the alternative operators
+  (`and`, `or`...: C++, or MSVC's conforming mode). Queries
+  (`__has_builtin(x)`, `__has_cpp_attribute(x)`...) are answered by running
+  the compiler on generated lines, in batches (as `#if` tests for those it
+  doesn't expand in text), then the compile is scanned again; answers are
+  kept per profile. `cl`-style compiles search the directories of every
+  includer. Static profiles per compiler and target could replace probing
+  later.
 
 Checked against the compiler's own `-M` (`crates/cpp-deps/examples/compare.rs`,
 a compilation database in, differences out) with the hermetic toolchain and
@@ -435,10 +453,95 @@ with 2.5 times the files. The NativeLink test passes with the preprocessor
 compiles send 460–574 files instead of 1,478–1,539, and outputs are
 identical.
 
-Not handled yet: `cl.exe` command lines (their predefined macros come from
-neither `-dM` nor a query), Apple frameworks (`-F`), header maps, `-ivfsoverlay`,
-`#embed`/`__has_embed` (a query, so inexact), `_Pragma` in text (e.g.
-`push_macro` through it), raw string literals spanning a line splice.
+Two alternatives, smaller and exact by construction but a process per
+compile (`cpp_deps::external`): `--remote_include_scanner=clang-scan-deps`
+runs the `clang-scan-deps` next to the compiler on the command
+(`-format=make`), and `--remote_include_scanner=compiler` runs the
+compiler itself without its outputs, with `-M` (GCC, Clang; GCC doesn't
+list what `__has_include` finds) or `/E /showIncludes` (`cl`, `clang-cl`;
+the build's `msvc_deps_prefix`). In the NativeLink test both send exactly
+the preprocessor's inputs (70 for the C compile, 460 and 574 for the C++
+ones), and the outputs are identical.
+
+On Windows, against the compilers' `/showIncludes` (`compare.rs` uses
+`/E /showIncludes` for `cl`-style commands): the hermetic toolchain's
+`clang-cl` building for the MSVC ABI (its headers through a case-insensitive
+VFS overlay), 5 compiles, 720 files, none missing (3 extra: a header
+`__has_include_next` found, which `/showIncludes` doesn't list); and
+`cl.exe` 14.44 with the system Windows SDK, every MSVC standard library
+header and common Windows headers alone in C++17, C++20 and C++latest with
+`/Zc:preprocessor`, 393 compiles (21 more that `cl.exe` itself rejects),
+27,979 files, none missing or extra. Warm scans take 1 to 14 ms; probing a
+profile takes 0.3 to 0.7 s on Windows (process starts).
+
+Not handled yet: `-include-pch` (the precompiled header's macros are
+unknown; `/Yu` is fine, its header is scanned), Apple sub-frameworks and
+header-map lookups relative to a framework, `_Pragma` produced by macros
+in text (text isn't expanded), MSVC's traditional preprocessor's own
+expansion rules (only `#if` and `#include` operands are expanded, where they
+rarely differ), raw string literals spanning a line splice.
+
+### Benchmarks
+
+`crates/ninja-remote/examples/scanbench.rs` runs every way of finding a
+compile's inputs over a compilation database, twice with their caches kept
+(cold: probing compilers and reading headers; warm: as a daemon would),
+with N threads taking compiles from a queue as a build does; the compiler
+(`-M`, `/E /showIncludes`) is the reference for accuracy. Per compile, in
+milliseconds (32 threads: wall time divided by the compiles), on a 32-thread
+machine, Linux in WSL and Windows:
+
+| Corpus | Method | 1 thread cold | warm | 32 threads cold | warm | Inputs | Missing | Extra |
+|---|---|---|---|---|---|---|---|---|
+| 256 files, random sets of 36 libc++ headers (Clang) | compiler | 97.6 | | 7.57 | | 732 | | |
+| | conservative scanner | 26.0 | 25.3 | 4.33 | 3.16 | 1,629 | 0 | 229,642 |
+| | preprocessor | 9.71 | 8.89 | 2.05 | 0.94 | 732 | 0 | 0 |
+| | clang-scan-deps per compile | 72.0 | | 5.88 | | 732 | 0 | 0 |
+| | clang-scan-deps one batch | 16.2 | | 12.8 | | | | |
+| every libc++ header alone, C++17/20/23 (324) | compiler | 27.3 | | 2.05 | | 219 | | |
+| | conservative scanner | 10.4 | 10.3 | 1.99 | 1.33 | 816 | 0 | 193,486 |
+| | preprocessor | 4.84 | 2.33 | 2.94 | 0.26 | 219 | 0 | 0 |
+| | clang-scan-deps per compile | 26.5 | | 1.89 | | 219 | 0 | 0 |
+| | clang-scan-deps one batch | 5.86 | | 4.38 | | | | |
+| every glibc header alone (390) | compiler | 9.25 | | 0.61 | | 17 | | |
+| | conservative scanner | 0.40 | 0.10 | 0.48 | 0.04 | 25 | 0 | 3,383 |
+| | preprocessor | 1.01 | 0.17 | 0.91 | 0.02 | 16 | 0 | 0 |
+| | clang-scan-deps per compile | 11.3 | | 0.69 | | 16 | 0 | 0 |
+| every libstdc++ header alone, GCC 13 (210) | compiler | 16.0 | | 1.31 | | 87 | | |
+| | conservative scanner | 1.19 | 0.63 | 0.28 | 0.17 | 159 | 0 | 15,248 |
+| | preprocessor | 1.93 | 0.88 | 1.08 | 0.13 | 87 | 0 | 35 |
+| MSVC STL and Windows headers alone, `cl.exe` 14.44 (414) | compiler | 124.8 | | 17.2 | | 71 | | |
+| | conservative scanner | 7.03 | 5.58 | 0.92 | 0.49 | 96 | 0 | 11,144 |
+| | preprocessor | 6.62 | 2.85 | 3.32 | 0.25 | 69 | 0 | 0 |
+| the same with the hermetic `clang-cl` and VFS overlay (402) | compiler | 134.6 | | 19.2 | | 149 | | |
+| | conservative scanner | 15.6 | 14.3 | 2.15 | 1.40 | 250 | 0 | 41,005 |
+| | preprocessor | 8.91 | 4.61 | 5.45 | 0.37 | 148 | 0 | 305 |
+| | clang-scan-deps per compile | 137.7 | | 19.0 | | 152 | 0 | 692 |
+| | clang-scan-deps one batch | 34.8 | | 6.14 | | | | |
+
+- Nothing is missing anywhere: the conservative scanner is a superset (1.4
+  to 4 times the files), the preprocessor is exact. Its extras are headers
+  `__has_include` found, which GCC's `-M` and `/showIncludes` don't list
+  (inputs either way); clang-scan-deps's are the same kind.
+- Warm, the preprocessor is the fastest on every heavy corpus: 2 to 4.5
+  times faster than the conservative scanner on one thread, 2 to 5 times
+  with 32 (it scales about 9 times). On the small C corpora (16 to 25
+  files per compile) all scanners take well under a millisecond.
+- Cold, probing the compiler (three to five processes per profile, 0.1 to
+  0.7 s) dominates the small corpora; the conservative scanner only runs
+  `-v` once per profile.
+- Per compile, `clang-scan-deps` costs about what the compiler's own `-M`
+  does (a process reading every header each time). As one batch it's 4 to
+  5 times faster on one thread, but it scaled poorly here (on Linux, 32
+  threads were slower than per-compile processes).
+- The compiler is 10 to 50 times slower than the preprocessor warm.
+
+Making the preprocessor scale needed: read locks only on cached files and
+directory listings, atomic counters, one probe per profile (concurrent
+scans wait for it), one scan at a time asking the compiler queries, and
+scans whose unknown queries another scan answered scanning again. A batch
+of queries the compiler rejects is split in halves, so that one bad query
+doesn't leave the others unanswered.
 
 ## Build events (BES)
 

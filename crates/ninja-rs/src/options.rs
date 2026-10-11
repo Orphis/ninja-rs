@@ -199,9 +199,8 @@ pub struct RemoteFlags {
     pub download_minimal: bool,
     /// `--execution_log_file`: where to log every remote action (absolute).
     pub execution_log: Option<String>,
-    /// `--remote_include_scanner=preprocessor`: find compiles' inputs with
-    /// the preprocessor (`cpp-deps`) instead of the conservative scanner.
-    pub preprocessor: bool,
+    /// `--remote_include_scanner`: how compiles' inputs are found.
+    pub include_scanner: ninja_remote::action::IncludeScanner,
 }
 
 impl RemoteFlags {
@@ -295,10 +294,12 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
                              deliverables, named targets and local inputs [default=all]
   --remote_download_minimal  same as --remote_download_outputs=minimal
   --execution_log_file=FILE  log every remote action (key, command, inputs) as JSON lines
-  --remote_include_scanner=conservative|preprocessor
-                             how compiles' inputs are found: following every #include,
-                             or evaluating the preprocessor exactly (GCC and Clang
-                             commands; the conservative scanner otherwise) [default=conservative]
+  --remote_include_scanner=conservative|preprocessor|clang-scan-deps|compiler
+                             how compiles' inputs are found: following every #include;
+                             evaluating the preprocessor exactly (GCC and Clang commands);
+                             the clang-scan-deps next to the compiler; or the compiler
+                             itself (-M, /showIncludes). The conservative scanner when
+                             the chosen one can't tell [default=conservative]
   --disk_cache_max_size=SIZE evict least recently used entries above SIZE [default=10G]
 
 TLS (grpcs:// endpoints: the remote service and the Build Event Service):
@@ -464,13 +465,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 }
                 "remote_download_minimal" => o.remote.download_minimal = true,
                 "remote_download_all" => o.remote.download_minimal = false,
-                "remote_include_scanner" => {
-                    o.remote.preprocessor = match value(&mut i)?.as_str() {
-                        "conservative" => false,
-                        "preprocessor" => true,
-                        v => return Err(format!("invalid --remote_include_scanner '{v}' (conservative or preprocessor)")),
-                    }
-                }
+                "remote_include_scanner" => o.remote.include_scanner = value(&mut i)?.parse()?,
                 "execution_log_file" => {
                     let v = value(&mut i)?;
                     let abs = std::path::absolute(&v).map_err(|e| format!("--execution_log_file={v}: {e}"))?;

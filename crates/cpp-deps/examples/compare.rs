@@ -1,79 +1,48 @@
-//! Compares the scanner with the compiler's own dependency list (`-M`) over
-//! a compilation database, and times both.
+//! Compares the scanner with the compiler's own dependency list over a
+//! compilation database (`-M` for GCC and Clang, `/E /showIncludes` for
+//! `cl` and `clang-cl`), and times both.
 //!
 //! `compare <compile_commands.json>`
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cpp_deps::scan::normalize;
-use cpp_deps::{Cache, Driver};
+use cpp_deps::vfs::Overlay;
+use cpp_deps::{Cache, Driver, driver, external};
 
-/// The compile command without its outputs, asking for the dependencies.
-fn deps_command(argv: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < argv.len() {
-        let a = &argv[i];
-        i += 1;
-        if matches!(a.as_str(), "-o" | "-MF" | "-MT" | "-MQ") {
-            i += 1;
-            continue;
-        }
-        if a == "-c" || a == "-MD" || a == "-MMD" || a == "-MP" {
-            continue;
-        }
-        out.push(a.clone());
-    }
-    out.push("-M".into());
-    out
-}
-
-/// The files of a make rule (`target: dep dep \`).
-fn make_deps(text: &str, cwd: &Path) -> BTreeSet<PathBuf> {
-    let joined = text.replace("\\\n", " ");
-    let body = joined.split_once(": ").map(|(_, b)| b).unwrap_or("");
-    let mut deps = BTreeSet::new();
-    let mut cur = String::new();
-    let mut chars = body.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if chars.peek() == Some(&' ') => {
-                cur.push(' ');
-                chars.next();
-            }
-            ' ' | '\n' | '\t' => {
-                if !cur.is_empty() {
-                    deps.insert(normalize(&cwd.join(&cur)));
-                    cur.clear();
-                }
-            }
-            c => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        deps.insert(normalize(&cwd.join(&cur)));
-    }
-    deps
+/// A path as a comparison key (case and separators ignored on Windows).
+fn key(p: &Path) -> String {
+    let s = normalize(p).to_string_lossy().into_owned();
+    if cfg!(windows) { s.replace('\\', "/").to_lowercase() } else { s }
 }
 
 fn main() {
     let db = std::env::args().nth(1).expect("compile_commands.json");
     let entries: Vec<serde_json::Value> = serde_json::from_str(&std::fs::read_to_string(&db).unwrap()).unwrap();
-    let driver = Driver::new(Cache::new(vec![], false));
-    let (mut scan_time, mut ref_time, mut first) = (Duration::ZERO, Duration::ZERO, None);
+    let driver = Driver::new(Cache::new(vec![], cfg!(windows)));
+    let (mut scan_time, mut ref_time, mut first, mut n) = (Duration::ZERO, Duration::ZERO, None, 0);
     let (mut exact, mut inexact, mut errors, mut missing_total, mut extra_total, mut files_total) = (0, 0, 0, 0, 0, 0);
-    for (n, e) in entries.iter().enumerate() {
+    for e in &entries {
+        let file = e["file"].as_str().unwrap_or_default();
+        if !["c", "cc", "cpp", "cxx"].iter().any(|x| file.to_ascii_lowercase().ends_with(&format!(".{x}"))) {
+            continue;
+        }
         let cwd = PathBuf::from(e["directory"].as_str().unwrap());
         let argv: Vec<String> = match e.get("arguments") {
             Some(a) => a.as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect(),
-            None => e["command"].as_str().unwrap().split_whitespace().map(str::to_string).collect(),
+            None => external::split_command(e["command"].as_str().unwrap()),
         };
+        n += 1;
         let t = Instant::now();
         let out = driver.scan(&argv, &cwd);
         let dt = t.elapsed();
-        if n == 0 {
+        if std::env::var_os("COMPARE_VERBOSE").is_some() {
+            println!("{file}: scanned in {:.1} ms", dt.as_secs_f64() * 1000.0);
+        }
+        if first.is_none() {
             first = Some(dt);
         } else {
             scan_time += dt;
@@ -82,16 +51,28 @@ fn main() {
             Ok(o) => o,
             Err(err) => {
                 errors += 1;
-                println!("{}: scan failed: {err}", e["file"]);
+                println!("{file}: scan failed: {err}");
                 continue;
             }
         };
         let t = Instant::now();
-        let r = std::process::Command::new(&argv[0]).args(&deps_command(&argv)[1..]).current_dir(&cwd).output().unwrap();
+        let reference = match external::compiler_deps(&argv, &cwd, None) {
+            Ok(r) => r,
+            Err(err) => {
+                errors += 1;
+                println!("{file}: the compiler failed: {err}");
+                continue;
+            }
+        };
         ref_time += t.elapsed();
-        let reference = make_deps(&String::from_utf8_lossy(&r.stdout), &cwd);
+        // The compiler may name files by their virtual paths (VFS
+        // overlays): compare the real ones.
+        let overlays: Vec<Arc<Overlay>> =
+            driver::parse(&argv, &cwd).map(|inv| inv.overlays.iter().filter_map(|o| Overlay::load(o, &cwd).ok().map(Arc::new)).collect()).unwrap_or_default();
+        let real = |p: &PathBuf| overlays.iter().rev().find_map(|o| o.map(p)).unwrap_or_else(|| p.clone());
+        let reference: BTreeSet<String> = reference.iter().map(|p| key(&real(p))).collect();
         // Clang lists files __has_include found too.
-        let ours: BTreeSet<PathBuf> = out.files.iter().chain(&out.found).cloned().collect();
+        let ours: BTreeSet<String> = out.files.iter().chain(&out.found).map(|p| key(p)).collect();
         let missing: Vec<_> = reference.difference(&ours).collect();
         let extra: Vec<_> = ours.difference(&reference).collect();
         files_total += reference.len();
@@ -103,12 +84,12 @@ fn main() {
             inexact += 1;
         }
         if !missing.is_empty() || !extra.is_empty() || !out.exact() {
-            println!("{}: {} files, {} missing, {} extra, exact: {}", e["file"], reference.len(), missing.len(), extra.len(), out.exact());
+            println!("{file}: {} files, {} missing, {} extra, exact: {}", reference.len(), missing.len(), extra.len(), out.exact());
             for m in missing.iter().take(5) {
-                println!("  missing {}", m.display());
+                println!("  missing {m}");
             }
             for x in extra.iter().take(5) {
-                println!("  extra {}", x.display());
+                println!("  extra {x}");
             }
             for w in out.inexact.iter().take(5) {
                 println!("  inexact: {w}");
@@ -118,14 +99,15 @@ fn main() {
             }
         }
     }
-    let n = entries.len();
-    let stats = *driver.cache.stats.lock().unwrap();
-    println!("{n} compiles: {exact} exact, {inexact} inexact, {errors} errors; {files_total} files from -M, {missing_total} missing, {extra_total} extra");
+    let stats = driver.cache.stats();
     println!(
-        "scan: first {:.1} ms (probing the compiler), then {:.2} ms/compile; compiler -M: {:.1} ms/compile; {} files lexed, {} reused",
+        "{n} compiles: {exact} exact, {inexact} inexact, {errors} errors; {files_total} files from the compiler, {missing_total} missing, {extra_total} extra"
+    );
+    println!(
+        "scan: first {:.1} ms (probing the compiler), then {:.2} ms/compile; the compiler: {:.1} ms/compile; {} files lexed, {} reused",
         first.unwrap_or_default().as_secs_f64() * 1000.0,
         scan_time.as_secs_f64() * 1000.0 / (n.max(2) - 1) as f64,
-        ref_time.as_secs_f64() * 1000.0 / n as f64,
+        ref_time.as_secs_f64() * 1000.0 / n.max(1) as f64,
         stats.files_lexed,
         stats.files_reused
     );

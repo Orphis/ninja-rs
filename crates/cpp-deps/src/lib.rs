@@ -8,6 +8,8 @@
 //! - [`probe`]: what a compiler predefines and answers to `__has_*`.
 //! - [`driver`]: a GCC or Clang command line scanned, with the compiler
 //!   probed and its answers cached.
+//! - [`external`]: the alternatives, asking `clang-scan-deps` or the
+//!   compiler itself (`-M`, `/showIncludes`).
 //!
 //! Compiler-specific knowledge comes from outside: the predefined macros,
 //! the `__has_*` operators the compiler has, and an [`scan::Oracle`]
@@ -15,11 +17,14 @@
 
 pub mod driver;
 pub mod expr;
+pub mod external;
+pub mod hmap;
 pub mod intern;
 pub mod lex;
 pub mod macros;
 pub mod probe;
 pub mod scan;
+pub mod vfs;
 
 pub use driver::Driver;
 pub use scan::{Cache, CommandMacro, Config, NoOracle, Oracle, Output, scan};
