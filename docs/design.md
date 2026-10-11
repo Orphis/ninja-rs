@@ -607,7 +607,9 @@ directory), so they are interchangeable with a remote cache's.
   back), it would make every later build run the action again.
 - **With a remote:** blobs come from the disk when it has them, else from
   the remote CAS, and are kept on disk; successful results are stored with
-  their stdout/stderr inline.
+  their stdout/stderr inline. With minimal downloads, a result is stored
+  with the outputs that were downloaded; those left remote stay in the
+  remote CAS (see "Minimal downloads").
 - **Without a remote:** a miss returns `RemoteOutcome::RunLocally` with a
   `LocalCapture`: the runner runs the command locally (within `-j`), then the
   capture stores its declared outputs, its depfile and `/showIncludes` lines
@@ -734,8 +736,21 @@ downloaded when it is read.
 
 Eviction: at the start of a build, one `FindMissingBlobs` over the recorded
 digests drops the records the remote CAS lost, so the build runs the
-actions producing them again. The disk cache only keeps results whose
-outputs were all downloaded.
+actions producing them again.
+
+**With a disk cache**, results whose outputs stayed remote are kept too
+(the downloaded ones on disk), and a later build trusts them without
+asking the remote: a build after a clean then makes no remote lookups.
+That is what Bazel does with action rewinding on (its disk cache only
+checks that a result's blobs are present without it): an output that
+proves gone is cheap to recover. Such a result is used when every output
+this build downloads (deliverables, named targets, depfiles) is on disk;
+with full downloads it isn't. Hashes found gone from the remote CAS during
+the build (lost inputs, evicted records at its start) make the results
+referencing them stale: removed, and the remote path runs, whose hits
+are checked (below) and whose executions bring the outputs back. Without
+that, a rewound action would find the same result again until rewinding
+gave up, as Bazel found ("Bust caches for rewound actions").
 
 **Action rewinding**, for blobs lost during the build. The backend notices
 when an upload's `FindMissingBlobs` misses a remote-only input

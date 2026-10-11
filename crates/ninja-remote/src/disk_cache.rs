@@ -293,17 +293,27 @@ impl DiskCache {
     /// The action's result, if cached and if the CAS still holds all its
     /// outputs (eviction may have removed some).
     pub fn get_action_result(&self, action: &re::Digest) -> Option<re::ActionResult> {
+        self.get_action_result_and_absent(action).filter(|(_, absent)| absent.is_empty()).map(|(r, _)| r)
+    }
+
+    /// An action's result, and the blobs it references that the cache
+    /// doesn't hold: outputs left in a remote CAS (minimal downloads).
+    pub fn get_action_result_and_absent(&self, action: &re::Digest) -> Option<(re::ActionResult, Vec<re::Digest>)> {
         let p = self.ac_path(&action.hash);
         let data = std::fs::read(&p).ok()?;
         let result = re::ActionResult::decode(data.as_slice()).ok()?;
         let blobs = result.output_files.iter().filter_map(|f| f.digest.as_ref()).chain(result.stdout_digest.as_ref()).chain(result.stderr_digest.as_ref());
-        for d in blobs {
-            if !self.contains_blob(d) {
-                return None;
-            }
-        }
+        // The blobs are refreshed after the result, so that eviction, which
+        // removes results first among files of the same age, never leaves a
+        // result whose blobs it removed.
         touch(&p);
-        Some(result)
+        let absent = blobs.filter(|d| d.size_bytes > 0 && !self.contains_blob(d)).cloned().collect();
+        Some((result, absent))
+    }
+
+    /// Forgets an action's result (its outputs proved gone).
+    pub fn remove_action_result(&self, action: &re::Digest) {
+        let _ = std::fs::remove_file(self.ac_path(&action.hash));
     }
 
     /// Records an action's result. Its blobs must be stored first.

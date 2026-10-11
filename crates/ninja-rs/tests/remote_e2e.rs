@@ -957,6 +957,53 @@ fn test_action_rewinding() -> Result<(), String> {
     })
 }
 
+/// Minimal downloads with a disk cache: results whose outputs stayed remote
+/// are kept, and trusted without asking the remote. Outputs gone from the
+/// remote CAS make the result stale once an action reading them reports
+/// them lost: the rewound action runs again instead of finding it.
+fn test_disk_cache_minimal() -> Result<(), String> {
+    let f = fixture("diskminimal", true);
+    let disk = f.root.join("disk-cache");
+    let disk_flag = format!("--disk_cache={}", disk.to_string_lossy());
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let flags = ["--remote_download_minimal", "--remote_mnemonics=Compile,Link", &disk_flag];
+        // 1. Executed remotely; the compiles' results are kept although
+        //    their objects stayed remote.
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "first build failed")?;
+        check(server.stats().executions == 3, &format!("expected 3 remote executions, got {:?}", server.stats()))?;
+        check(remote_only(&f) == ["obj/lib.o", "obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        check(disk_cache_entries(&disk) == 3, &format!("expected 3 cached results, got {}", disk_cache_entries(&disk)))?;
+
+        // 2. After a clean, all from the disk cache, without a remote lookup.
+        let hits = server.stats().action_cache_hits;
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "build from the disk cache failed")?;
+        let st = server.stats();
+        check(st.executions == 3 && st.action_cache_hits == hits, &format!("the remote was asked: {st:?}"))?;
+        check(remote_only(&f) == ["obj/lib.o", "obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        check(std::fs::read_to_string(f.build.join("app.bin")).is_ok_and(|s| s.starts_with("LINKED")), "app.bin")?;
+
+        // 3. The remote CAS loses everything, and a local link needs the
+        //    objects: they're lost, the compiles rewound, their disk
+        //    results stale. They run again rather than loop.
+        server.state.clear_cas();
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        let local_link = ["--remote_download_minimal", "--remote_mnemonics=Compile", &disk_flag];
+        check(run_ninja(&f, Some(&ep), &local_link) == 0, "build with lost objects failed")?;
+        check(server.stats().executions == 5, &format!("expected the 2 compiles again, got {:?}", server.stats()))?;
+        let app = std::fs::read_to_string(f.build.join("app.bin")).map_err(|e| e.to_string())?;
+        check(app.starts_with("LINKED") && app.contains("int main()"), "app.bin content")?;
+
+        // 4. The fresh results replaced the stale ones: a clean build is all
+        //    disk cache hits again.
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "last build failed")?;
+        check(server.stats().executions == 5, &format!("expected no more executions, got {:?}", server.stats()))?;
+        Ok(())
+    })
+}
+
 /// The members of a thin archive recorded as remote-only.
 fn recorded_members(f: &Fixture, archive: &str) -> Vec<String> {
     let text = std::fs::read_to_string(f.build.join(".ninja_remote")).unwrap_or_default();
@@ -1187,6 +1234,7 @@ fn main() -> ExitCode {
         ("without_executor_runs_locally", test_without_executor_runs_locally),
         ("minimal_downloads", test_minimal_downloads),
         ("action_rewinding", test_action_rewinding),
+        ("disk_cache_minimal", test_disk_cache_minimal),
         ("thin_archives", test_thin_archives),
         ("mtls", test_mtls),
         ("include_scanner_fallback", test_include_scanner_fallback),

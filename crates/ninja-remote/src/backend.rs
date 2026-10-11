@@ -86,6 +86,9 @@ struct Inner {
     /// reading the same file don't both write it.
     materializing: tokio::sync::Mutex<()>,
     fallbacks: Fallbacks,
+    /// Hashes of blobs found gone from the remote CAS during this build: a
+    /// disk cache result referencing one is stale (see `try_execute`).
+    lost: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Remote actions that ran locally instead, with the first reason of each
@@ -171,7 +174,18 @@ impl Backend {
             profile_dir: disk.as_ref().map(|d| d.profile_dir()),
         };
         shared.store.new_build();
-        Ok(Self { inner: Arc::new(Inner { client, upload, disk, shared, config, materializing: Default::default(), fallbacks: Fallbacks::default() }) })
+        Ok(Self {
+            inner: Arc::new(Inner {
+                client,
+                upload,
+                disk,
+                shared,
+                config,
+                materializing: Default::default(),
+                fallbacks: Fallbacks::default(),
+                lost: Default::default(),
+            }),
+        })
     }
 
     /// Whether results of commands run locally go to the remote cache.
@@ -269,6 +283,7 @@ impl Backend {
                 dropped += 1;
             }
         }
+        self.inner.lost.lock().unwrap().extend(missing);
         Ok(dropped)
     }
 }
@@ -468,17 +483,52 @@ impl Inner {
         let disk_hit = match &self.disk {
             Some(disk) => {
                 let (disk, d) = (disk.clone(), digest.clone());
-                tokio::task::spawn_blocking(move || disk.get_action_result(&d)).await.ok().flatten().filter(|r| r.exit_code == 0)
+                tokio::task::spawn_blocking(move || disk.get_action_result_and_absent(&d)).await.ok().flatten().filter(|(r, _)| r.exit_code == 0)
             }
             None => None,
         };
-        if let Some(result) = disk_hit {
+        // A result whose outputs stayed in the remote CAS (minimal downloads)
+        // is trusted without asking the remote, as Bazel does with action
+        // rewinding: should they be gone, the action reading them reports
+        // them lost, the build rewinds this one, and the result is then
+        // stale (`lost`). Unless this build needs them downloaded.
+        let disk_hit = match disk_hit {
+            Some((result, absent)) if absent.is_empty() => Some((result, false)),
+            Some((result, absent)) => {
+                let lost = {
+                    let lost = self.lost.lock().unwrap();
+                    absent.iter().any(|d| lost.contains(&d.hash))
+                };
+                let needed: std::collections::HashSet<&str> = result
+                    .output_files
+                    .iter()
+                    .filter(|f| self.must_download(task, &prepared, &f.path))
+                    .filter_map(|f| f.digest.as_ref())
+                    .map(|d| d.hash.as_str())
+                    .collect();
+                if lost {
+                    if let Some(disk) = &self.disk {
+                        disk.remove_action_result(&digest);
+                    }
+                    None
+                } else if self.client.is_some() && self.config.download_minimal && !absent.iter().any(|d| needed.contains(d.hash.as_str())) {
+                    Some((result, true))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        if let Some((result, remote)) = disk_hit {
             claim(race).await?;
             let mut output = Vec::new();
             if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
                 return Ok(failed);
             }
-            output.extend(self.download(None, task, &prepared, &result, false).await.map_err(Failure::Infra)?);
+            // Outputs left remote are recorded as a remote hit's would be
+            // (thin archives' members read from the remote CAS).
+            let client = if remote { self.client.as_ref().map(|c| c.for_action(&meta, &digest.hash)) } else { None };
+            output.extend(self.download(client.as_ref(), task, &prepared, &result, false).await.map_err(Failure::Infra)?);
             if let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await {
                 failed.kind = ExecKind::DiskCacheHit;
                 return Ok(failed);
@@ -488,14 +538,9 @@ impl Inner {
                 msg.extend_from_slice(&output);
                 output = msg;
             }
-            return Ok(TaskResult {
-                edge: task.edge,
-                status: ExitStatus::Success,
-                output,
-                kind: ExecKind::DiskCacheHit,
-                cas_outputs: Vec::new(),
-                lost_inputs: Vec::new(),
-            });
+            // Outputs in the remote CAS: build events can point there.
+            let cas_outputs = if remote { cas_outputs(task, &prepared, &result) } else { Vec::new() };
+            return Ok(TaskResult { edge: task.edge, status: ExitStatus::Success, output, kind: ExecKind::DiskCacheHit, cas_outputs, lost_inputs: Vec::new() });
         }
         let Some(client) = &self.client else { return Err(Failure::RunLocally(Box::new(prepared))) };
         let client = client.for_action(&meta, &prepared.action_digest.hash);
@@ -534,6 +579,10 @@ impl Inner {
                 if let Err(e) = client.upload_blobs(&to_upload).await {
                     // Inputs that only existed remotely are gone: rewind.
                     if let Some(missing) = e.downcast_ref::<rbe_client::MissingRemoteBlobs>() {
+                        self.lost
+                            .lock()
+                            .unwrap()
+                            .extend(prepared.remote_inputs.iter().filter(|(p, _, _)| missing.0.contains(p)).map(|(_, _, d)| d.hash.clone()));
                         let lost: Vec<String> = prepared.remote_inputs.iter().filter(|(p, _, _)| missing.0.contains(p)).map(|(_, i, _)| i.clone()).collect();
                         if let Some(outputs) = &self.config.remote_outputs {
                             for i in &lost {
@@ -585,6 +634,14 @@ impl Inner {
                 (resp.result.ok_or_else(|| Failure::Infra(anyhow::anyhow!("Execute returned no result")))?, hit)
             }
         };
+        // Its outputs are in the remote CAS (checked for a hit in minimal
+        // mode, uploaded by an execution).
+        if result.exit_code == 0 {
+            let mut lost = self.lost.lock().unwrap();
+            for d in result.output_files.iter().filter_map(|f| f.digest.as_ref()) {
+                lost.remove(&d.hash);
+            }
+        }
         let keep = self.disk.is_some() && result.exit_code == 0;
         claim(race).await?;
         output.extend(self.download(Some(&client), task, &prepared, &result, keep).await.map_err(Failure::Infra)?);
@@ -614,16 +671,19 @@ impl Inner {
         }
         let status = if result.exit_code == 0 { ExitStatus::Success } else { ExitStatus::Failure(result.exit_code) };
         // The outputs are in the CAS now: build events can point there.
-        let cas_outputs = result
-            .output_files
-            .iter()
-            .filter_map(|f| {
-                let i = prepared.outputs.iter().position(|(rel, _)| *rel == f.path)?;
-                let d = f.digest.as_ref()?;
-                Some(CasOutput { path: task.outputs.get(i)?.clone(), hash: d.hash.clone(), size: d.size_bytes })
-            })
-            .collect();
+        let cas_outputs = cas_outputs(task, &prepared, &result);
         Ok(TaskResult { edge: task.edge, status, output, kind, cas_outputs, lost_inputs: Vec::new() })
+    }
+
+    /// Whether this build downloads an output of `task` (`path` relative to
+    /// the working directory): all of them, or in minimal mode the
+    /// deliverables', those named on the command line, and the depfile
+    /// (which the build reads).
+    fn must_download(&self, task: &Task, p: &Prepared, path: &str) -> bool {
+        !self.config.download_minimal
+            || task.binding("rbe_deliverable") == Some("1")
+            || p.depfile.as_ref().is_some_and(|(rel, _)| rel == path)
+            || self.config.requested.contains(&crate::remote_outputs::key(path))
     }
 
     /// The request metadata of `task`'s action.
@@ -708,11 +768,8 @@ impl Inner {
         // In minimal mode a remote action's outputs stay in the remote CAS,
         // recorded, unless they are deliverables, named on the command line,
         // or the depfile (which the build reads).
-        let minimal = self.config.download_minimal && client.is_some() && result.output_directories.is_empty();
-        let deliverable = task.binding("rbe_deliverable") == Some("1");
-        let may_stay_remote = |local: &PathBuf, f: &re::OutputFile| {
-            minimal && !deliverable && Some(local) != depfile_local.as_ref() && !self.config.requested.contains(&crate::remote_outputs::key(&f.path))
-        };
+        let minimal = client.is_some() && result.output_directories.is_empty();
+        let may_stay_remote = |_: &PathBuf, f: &re::OutputFile| minimal && !self.must_download(task, p, &f.path);
         // A thin archive left remote is recorded with its members, read with
         // ranged reads, so that the actions reading it get them without
         // downloading it. When that fails, it's downloaded. Archives are
@@ -756,7 +813,7 @@ impl Inner {
             }
         }
         let blobs = self.fetch_blobs(client, &needed).await?;
-        let mut left_remote = false;
+        let mut left_remote: std::collections::HashSet<&str> = Default::default();
         for (local, f) in &files {
             let d = f.digest.clone().unwrap_or_default();
             let is_depfile = Some(local) == depfile_local.as_ref();
@@ -786,7 +843,7 @@ impl Inner {
                         members: thin.get(&f.path).cloned(),
                     });
                 }
-                left_remote = true;
+                left_remote.insert(&f.path);
                 continue;
             }
             if let Some(outputs) = &self.config.remote_outputs {
@@ -802,9 +859,9 @@ impl Inner {
             let data = if is_depfile { self.map_depfile(&data, p) } else { data };
             write_output(local, &data, f.is_executable)?;
         }
-        // The disk cache only keeps results whose outputs it can hold.
+        // The disk cache keeps the result with the outputs it can hold;
+        // those left remote stay in the remote CAS (see `try_execute`).
         if keep
-            && !left_remote
             && result.output_directories.is_empty()
             && let Some(disk) = &self.disk
         {
@@ -812,6 +869,9 @@ impl Inner {
             // files they matched, or inline.
             for (local, f) in &files {
                 let d = f.digest.clone().unwrap_or_default();
+                if left_remote.contains(f.path.as_str()) {
+                    continue;
+                }
                 if !f.contents.is_empty() {
                     disk.put_bytes(&d, &f.contents)?;
                 } else if !disk.contains_blob(&d) {
@@ -909,6 +969,7 @@ impl Inner {
         let Some(client) = &self.client else { return Vec::new() };
         let Ok(missing) = client.find_missing(inputs.iter().map(|(_, d)| d.clone()).collect()).await else { return Vec::new() };
         let missing: std::collections::HashSet<String> = missing.into_iter().map(|d| d.hash).collect();
+        self.lost.lock().unwrap().extend(missing.iter().cloned());
         let mut lost = Vec::new();
         for (path, d) in inputs {
             if missing.contains(&d.hash) {
@@ -1183,6 +1244,19 @@ async fn outputs_in_cas(client: &Client, result: &re::ActionResult) -> Result<bo
         return Ok(true);
     }
     Ok(client.find_missing(digests).await?.is_empty())
+}
+
+/// A result's outputs, as the task names them, with their digests.
+fn cas_outputs(task: &Task, prepared: &Prepared, result: &re::ActionResult) -> Vec<CasOutput> {
+    result
+        .output_files
+        .iter()
+        .filter_map(|f| {
+            let i = prepared.outputs.iter().position(|(rel, _)| *rel == f.path)?;
+            let d = f.digest.as_ref()?;
+            Some(CasOutput { path: task.outputs.get(i)?.clone(), hash: d.hash.clone(), size: d.size_bytes })
+        })
+        .collect()
 }
 
 /// The result of a task whose inputs were lost from the remote CAS: the
