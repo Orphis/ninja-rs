@@ -138,7 +138,13 @@ declaration is sent as an ordinary input with the default platform.
 
 CMake writes one entry per enabled language (`CMAKE_<LANG>_COMPILER`, with
 `CMAKE_<LANG>_COMPILER_REMOTE_INPUTS` and `CMAKE_REMOTE_PLATFORM` from the
-toolchain file) and declares itself a local tool.
+toolchain file), one per other tool its build statements run (the archiver,
+ranlib and a linker run directly: `CMAKE_AR`, `CMAKE_RANLIB`,
+`CMAKE_LINKER` and their `CMAKE_<LANG>_COMPILER_*` variants), with the same
+platform, and declares itself a local tool. A step whose tool isn't
+declared gets the platform of another declared tool of the command, or
+none: on a real cluster, an action without platform properties usually
+finds no worker.
 
 ## Targets file
 
