@@ -754,6 +754,12 @@ impl Inner {
                 if let Some(outputs) = &self.config.remote_outputs {
                     outputs.forget(&f.path);
                 }
+                // Left as is, but made newer than the inputs, as if
+                // written: an output older than an input would be dirty
+                // forever.
+                if let Ok(file) = std::fs::File::options().write(true).open(local) {
+                    let _ = file.set_modified(std::time::SystemTime::now());
+                }
                 continue;
             }
             if stays_remote(local, f) {

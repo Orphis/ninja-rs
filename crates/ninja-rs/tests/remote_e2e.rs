@@ -486,6 +486,17 @@ fn test_disk_cache_alone() -> Result<(), String> {
     let deep = f.root.join("include/nested/deep.h").to_string_lossy().replace('\\', "/");
     let deps = deps_of(&f, "obj/main.o");
     check(deps.iter().any(|d| d.replace('\\', "/").eq_ignore_ascii_case(&deep)), &format!("deps of obj/main.o: {deps:?}"))?;
+
+    // 3. A hit whose output is already there (the header's line endings
+    //    changed and changed back: the object is the same): the output is
+    //    made newer than the header, or every later build would run it.
+    let header = f.root.join("include/nested/deep.h");
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).unwrap();
+    std::fs::write(&header, "#define DEEP 0\r\n").unwrap();
+    check(run_ninja(&f, None, &[&flag]) == 0, "build after CRLF failed")?;
+    std::fs::write(&header, "#define DEEP 0\n").unwrap();
+    check(run_ninja(&f, None, &[&flag]) == 0, "build after LF failed")?;
+    check(mtime(&f.build.join("obj/main.o")) >= mtime(&header), "obj/main.o is older than deep.h after a disk cache hit")?;
     Ok(())
 }
 
