@@ -74,6 +74,10 @@ pub struct Client {
 /// Blobs smaller than this travel uncompressed: too little to gain.
 const MIN_COMPRESSED: usize = 1024;
 
+/// Chunks of one blob uploaded at once through ByteStream (as Bazel's
+/// `ChunkedBlobUploader`).
+const CHUNK_STREAMS: usize = 16;
+
 #[derive(Default)]
 struct TransferCounters {
     read: AtomicU64,
@@ -311,6 +315,9 @@ impl Client {
     /// Uploads every blob the server doesn't already have. Small blobs are
     /// batched, large ones go through ByteStream, or, when the server
     /// splices blobs, as their chunks (only those it lacks), then spliced.
+    /// Chunks are batched too, unless the server compresses ByteStream
+    /// writes and not batches: then each goes through ByteStream,
+    /// compressed, several at once, as Bazel uploads them.
     /// Returns the number of blobs uploaded and the bytes sent.
     pub async fn upload_blobs(&self, blobs: &BlobSet) -> Result<(usize, u64)> {
         let digests = blobs.0.values().map(|(d, _)| d.clone()).collect();
@@ -335,9 +342,27 @@ impl Client {
                 let chunks: Vec<(re::Digest, &[u8])> = cdc.chunks(&data).map(|c| (digest_of(c), c)).collect();
                 let mut lacking: HashSet<String> =
                     self.find_missing(chunks.iter().map(|(cd, _)| cd.clone()).collect()).await?.into_iter().map(|cd| cd.hash).collect();
-                for (cd, c) in &chunks {
-                    if lacking.remove(&cd.hash) {
-                        up.add(cd, c.to_vec()).await?;
+                if self.zstd && !self.batch_zstd {
+                    let mut streams = tokio::task::JoinSet::new();
+                    for (cd, c) in &chunks {
+                        if !lacking.remove(&cd.hash) {
+                            continue;
+                        }
+                        if streams.len() >= CHUNK_STREAMS {
+                            streams.join_next().await.expect("uploads in flight")??;
+                        }
+                        up.sent += c.len() as u64;
+                        let (client, cd, c) = (self.clone(), cd.clone(), c.to_vec());
+                        streams.spawn(async move { client.bytestream_write(&cd, &c).await });
+                    }
+                    while let Some(r) = streams.join_next().await {
+                        r??;
+                    }
+                } else {
+                    for (cd, c) in &chunks {
+                        if lacking.remove(&cd.hash) {
+                            up.add(cd, c.to_vec()).await?;
+                        }
                     }
                 }
                 spliced.push((d.clone(), chunks.into_iter().map(|(cd, _)| cd).collect::<Vec<_>>()));

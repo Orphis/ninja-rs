@@ -692,9 +692,12 @@ EngFlow's glass advertises zstd for ByteStream and batch reads, not for
 batch updates. Rebuilding CMake after a clean, every action cached, took
 10.9 s instead of 23.1 s with minimal downloads (199 MiB, 98 on the wire)
 and 13.6 s instead of 22.9 s with all of them (318 MiB, 175 on the wire).
-Uploads to it are only compressed through ByteStream: blobs past its 10
-MB batches that aren't spliced, while spliced blobs' chunks go in
-uncompressed batches.
+Spliced blobs' chunks are batched, unless the server compresses
+ByteStream writes and not batches, as glass does: then each missing chunk
+goes through ByteStream, compressed, 16 at a time per blob, as Bazel's
+`ChunkedBlobUploader` sends them (it never batches uploads). A new 12 MB
+source spliced to glass went over as 0.1 MiB instead of 9.9 (a
+repetitive comment: real sources compress far less).
 
 ## Remote cache only
 

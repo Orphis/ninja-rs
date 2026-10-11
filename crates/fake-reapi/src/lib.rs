@@ -77,8 +77,10 @@ pub struct State {
     pub bes_streams_finished: Mutex<u32>,
     /// The RE API minor version whose split/splice RPCs are served, if any.
     chunking: Mutex<Option<u32>>,
-    /// zstd advertised and served.
+    /// zstd advertised and served, and for batch updates (unless
+    /// `set_batch_compression(false)`).
     compression: std::sync::atomic::AtomicBool,
+    no_batch_compression: std::sync::atomic::AtomicBool,
     /// Empties the CAS when the next Execute arrives (an eviction during a
     /// build).
     evict_on_execute: std::sync::atomic::AtomicBool,
@@ -130,8 +132,16 @@ impl State {
     pub fn set_compression(&self, on: bool) {
         self.compression.store(on, Ordering::SeqCst);
     }
+    /// Whether batch updates may be compressed too, when compression is on
+    /// (EngFlow's don't).
+    pub fn set_batch_compression(&self, on: bool) {
+        self.no_batch_compression.store(!on, Ordering::SeqCst);
+    }
     fn compressing(&self) -> bool {
         self.compression.load(Ordering::SeqCst)
+    }
+    fn compressing_batches(&self) -> bool {
+        self.compressing() && !self.no_batch_compression.load(Ordering::SeqCst)
     }
     fn chunking_api(&self, minor: u32) -> Result<(), Status> {
         if *self.chunking.lock().unwrap() == Some(minor) { Ok(()) } else { Err(Status::unimplemented("not with this API version")) }
@@ -191,7 +201,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
             let wire = req.data.len() as u64;
             let data = match req.compressor {
                 0 => Ok(req.data),
-                c if c == zstd && self.0.compressing() => zstd::bulk::decompress(&req.data, d.size_bytes as usize).map_err(|e| e.to_string()),
+                c if c == zstd && self.0.compressing_batches() => zstd::bulk::decompress(&req.data, d.size_bytes as usize).map_err(|e| e.to_string()),
                 c => Err(format!("compressor {c} not supported")),
             };
             let st = match data {
@@ -314,7 +324,7 @@ impl re::capabilities_server::Capabilities for Svc {
                 splice_blob_support: chunking.is_some(),
                 fast_cdc_2020_params: chunking.map(|_| re::FastCdc2020Params { avg_chunk_size_bytes: 512 * 1024, seed: 0 }),
                 supported_compressors: if self.0.compressing() { vec![re::compressor::Value::Zstd as i32] } else { vec![] },
-                supported_batch_update_compressors: if self.0.compressing() { vec![re::compressor::Value::Zstd as i32] } else { vec![] },
+                supported_batch_update_compressors: if self.0.compressing_batches() { vec![re::compressor::Value::Zstd as i32] } else { vec![] },
                 ..Default::default()
             }),
             execution_capabilities: Some(re::ExecutionCapabilities {

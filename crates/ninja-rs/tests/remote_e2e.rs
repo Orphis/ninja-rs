@@ -869,6 +869,49 @@ fn test_split_and_splice(minor: u32) -> Result<(), String> {
     })
 }
 
+/// Spliced uploads with zstd: a server compressing ByteStream writes but
+/// not batches (EngFlow's) gets each chunk through compressed ByteStream,
+/// as Bazel sends them; one compressing batches gets compressed batches.
+fn test_splice_compressed() -> Result<(), String> {
+    for batches in [false, true] {
+        let f = fixture(&format!("splicezstd-{batches}"), true);
+        with_server(&f, |server| {
+            server.state.set_chunking(Some(12));
+            server.state.set_compression(true);
+            server.state.set_batch_compression(batches);
+            let ep = server.endpoint.clone();
+            // About 5 MB: spliced, as ten chunks or so.
+            let text: String = (0..160_000)
+                .map(|i| {
+                    format!(
+                        "int v{i} = {i}; /* repetitive */
+"
+                    )
+                })
+                .collect();
+            write(&f.root.join("src/big.c"), &text);
+            check(run_ninja(&f, Some(&ep), &["obj/big.o"]) == 0, "build failed")?;
+            let st = server.stats();
+            check(st.splices >= 1 && st.compressed_writes >= 8, &format!("expected compressed chunks: {st:?}"))?;
+            if batches {
+                check(st.bytestream_writes == 0, &format!("expected batches only: {st:?}"))?;
+            } else {
+                check(st.bytestream_writes >= 8, &format!("expected chunks through ByteStream: {st:?}"))?;
+            }
+            let big_o = std::fs::read_to_string(f.build.join("obj/big.o")).map_err(|e| e.to_string())?;
+            check(
+                big_o.ends_with(
+                    "int v159999 = 159999; /* repetitive */
+",
+                ),
+                "obj/big.o content",
+            )?;
+            Ok::<(), String>(())
+        })?;
+    }
+    Ok(())
+}
+
 /// The outputs recorded as remote-only.
 fn remote_only(f: &Fixture) -> Vec<String> {
     let text = std::fs::read_to_string(f.build.join(".ninja_remote")).unwrap_or_default();
@@ -1299,6 +1342,7 @@ fn main() -> ExitCode {
         ("action_rewinding", test_action_rewinding),
         ("disk_cache_minimal", test_disk_cache_minimal),
         ("compression", test_compression),
+        ("splice_compressed", test_splice_compressed),
         ("thin_archives", test_thin_archives),
         ("mtls", test_mtls),
         ("include_scanner_fallback", test_include_scanner_fallback),
