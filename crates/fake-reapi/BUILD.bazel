@@ -17,6 +17,7 @@ rust_library(
         "@crates//:tokio",
         "@crates//:tokio-stream",
         "@crates//:tonic",
+        "@crates//:zstd",
     ],
 )
 

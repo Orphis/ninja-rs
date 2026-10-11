@@ -193,6 +193,11 @@ impl Backend {
         self.inner.upload
     }
 
+    /// Blob bytes transferred with the remote service in this build.
+    pub fn transfers(&self) -> Option<rbe_client::Transfers> {
+        self.inner.client.as_ref().map(|c| c.transfers())
+    }
+
     /// Why the build stopped using the daemon, if it did.
     pub fn daemon_error(&self) -> Option<String> {
         self.inner.shared.daemon_error.lock().unwrap().clone()

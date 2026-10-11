@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 bazel-remote-apis = { workspace = true }
 fastcdc = { workspace = true }
+zstd = { workspace = true }
 hex = { workspace = true }
 prost = { workspace = true }
 rbe-bes = { path = "../../third_party/cargo-rbe/rbe-bes" }

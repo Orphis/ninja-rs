@@ -2,8 +2,8 @@
 //! Capabilities, ByteStream and an Execution service that runs actions as
 //! local subprocesses in temporary exec roots (like a single local worker).
 //!
-//! It is deliberately simple (no compression, no output directories) but
-//! follows the protocol closely enough to exercise a real client.
+//! It is deliberately simple (no output directories) but follows the
+//! protocol closely enough to exercise a real client.
 //!
 //! It is also a Build Event Service: it records the build events it
 //! receives (decoded) and acks each one.
@@ -12,6 +12,9 @@
 //! turns them on, as in RE API v2.12 (`SplitBlob` / `SpliceBlob`) or v2.13
 //! (`GetChunkMapping` / `RegisterChunkMapping`), with FastCDC 2020 and
 //! REAPI's recommended parameters.
+//!
+//! zstd compression is off by default too; [`State::set_compression`]
+//! advertises it for ByteStream, batch reads and batch updates.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -53,6 +56,9 @@ pub struct Stats {
     /// Blobs split, and blobs spliced.
     pub splits: u64,
     pub splices: u64,
+    /// Blobs read and written compressed (batches and ByteStream).
+    pub compressed_reads: u64,
+    pub compressed_writes: u64,
 }
 
 #[derive(Default)]
@@ -71,6 +77,8 @@ pub struct State {
     pub bes_streams_finished: Mutex<u32>,
     /// The RE API minor version whose split/splice RPCs are served, if any.
     chunking: Mutex<Option<u32>>,
+    /// zstd advertised and served.
+    compression: std::sync::atomic::AtomicBool,
     /// Empties the CAS when the next Execute arrives (an eviction during a
     /// build).
     evict_on_execute: std::sync::atomic::AtomicBool,
@@ -117,6 +125,13 @@ impl State {
     /// or not at all. Clients see it in the capabilities they fetch next.
     pub fn set_chunking(&self, minor: Option<u32>) {
         *self.chunking.lock().unwrap() = minor;
+    }
+    /// Advertises and serves zstd (ByteStream, batch reads and updates).
+    pub fn set_compression(&self, on: bool) {
+        self.compression.store(on, Ordering::SeqCst);
+    }
+    fn compressing(&self) -> bool {
+        self.compression.load(Ordering::SeqCst)
     }
     fn chunking_api(&self, minor: u32) -> Result<(), Status> {
         if *self.chunking.lock().unwrap() == Some(minor) { Ok(()) } else { Err(Status::unimplemented("not with this API version")) }
@@ -170,16 +185,26 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
 
     async fn batch_update_blobs(&self, r: Request<re::BatchUpdateBlobsRequest>) -> Result<Response<re::BatchUpdateBlobsResponse>, Status> {
         let mut responses = Vec::new();
+        let zstd = re::compressor::Value::Zstd as i32;
         for req in r.into_inner().requests {
             let d = req.digest.unwrap_or_default();
-            let st = if digest_of(&req.data) == d {
-                let mut stats = self.0.stats.lock().unwrap();
-                stats.blobs_uploaded += 1;
-                stats.bytes_uploaded += req.data.len() as u64;
-                self.0.cas.lock().unwrap().insert(d.hash.clone(), req.data);
-                status(0, "")
-            } else {
-                status(3, "digest mismatch")
+            let wire = req.data.len() as u64;
+            let data = match req.compressor {
+                0 => Ok(req.data),
+                c if c == zstd && self.0.compressing() => zstd::bulk::decompress(&req.data, d.size_bytes as usize).map_err(|e| e.to_string()),
+                c => Err(format!("compressor {c} not supported")),
+            };
+            let st = match data {
+                Ok(data) if digest_of(&data) == d => {
+                    let mut stats = self.0.stats.lock().unwrap();
+                    stats.blobs_uploaded += 1;
+                    stats.bytes_uploaded += wire;
+                    stats.compressed_writes += (req.compressor == zstd) as u64;
+                    self.0.cas.lock().unwrap().insert(d.hash.clone(), data);
+                    status(0, "")
+                }
+                Ok(_) => status(3, "digest mismatch"),
+                Err(e) => status(3, e),
             };
             responses.push(re::batch_update_blobs_response::Response { digest: Some(d), status: Some(st) });
         }
@@ -188,15 +213,21 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
 
     async fn batch_read_blobs(&self, r: Request<re::BatchReadBlobsRequest>) -> Result<Response<re::BatchReadBlobsResponse>, Status> {
         let mut responses = Vec::new();
-        for d in r.into_inner().digests {
-            let (data, st) = match self.0.get(&d) {
+        let r = r.into_inner();
+        let zstd = re::compressor::Value::Zstd as i32;
+        let compress = self.0.compressing() && r.acceptable_compressors.contains(&zstd);
+        for d in r.digests {
+            let (data, compressor, st) = match self.0.get(&d) {
                 Some(data) => {
-                    self.0.stats.lock().unwrap().bytes_read += data.len() as u64;
-                    (data, status(0, ""))
+                    let (data, compressor) = if compress { (zstd::bulk::compress(&data, 1).unwrap(), zstd) } else { (data, 0) };
+                    let mut stats = self.0.stats.lock().unwrap();
+                    stats.bytes_read += data.len() as u64;
+                    stats.compressed_reads += compress as u64;
+                    (data, compressor, status(0, ""))
                 }
-                None => (vec![], status(5, "not found")),
+                None => (vec![], 0, status(5, "not found")),
             };
-            responses.push(re::batch_read_blobs_response::Response { digest: Some(d), data, compressor: 0, status: Some(st) });
+            responses.push(re::batch_read_blobs_response::Response { digest: Some(d), data, compressor, status: Some(st) });
         }
         Ok(Response::new(re::BatchReadBlobsResponse { responses }))
     }
@@ -282,6 +313,8 @@ impl re::capabilities_server::Capabilities for Svc {
                 split_blob_support: chunking.is_some(),
                 splice_blob_support: chunking.is_some(),
                 fast_cdc_2020_params: chunking.map(|_| re::FastCdc2020Params { avg_chunk_size_bytes: 512 * 1024, seed: 0 }),
+                supported_compressors: if self.0.compressing() { vec![re::compressor::Value::Zstd as i32] } else { vec![] },
+                supported_batch_update_compressors: if self.0.compressing() { vec![re::compressor::Value::Zstd as i32] } else { vec![] },
                 ..Default::default()
             }),
             execution_capabilities: Some(re::ExecutionCapabilities {
@@ -297,12 +330,17 @@ impl re::capabilities_server::Capabilities for Svc {
     }
 }
 
-fn parse_resource(name: &str) -> Option<re::Digest> {
+/// The blob a ByteStream resource names, and whether it's compressed
+/// (`compressed-blobs/zstd/<hash>/<size>`).
+fn parse_resource(name: &str) -> Option<(re::Digest, bool)> {
     let parts: Vec<&str> = name.split('/').collect();
-    let i = parts.iter().position(|p| *p == "blobs")?;
+    let (i, compressed) = match parts.iter().position(|p| *p == "blobs") {
+        Some(i) => (i, false),
+        None => (parts.iter().position(|p| *p == "compressed-blobs").filter(|&i| parts.get(i + 1) == Some(&"zstd"))? + 1, true),
+    };
     let hash = parts.get(i + 1)?.to_string();
     let size = parts.get(i + 2)?.parse().ok()?;
-    Some(re::Digest { hash, size_bytes: size })
+    Some((re::Digest { hash, size_bytes: size }, compressed))
 }
 
 #[tonic::async_trait]
@@ -310,8 +348,19 @@ impl bs::byte_stream_server::ByteStream for Svc {
     type ReadStream = BoxStream<bs::ReadResponse>;
     async fn read(&self, r: Request<bs::ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
         let r = r.into_inner();
-        let d = parse_resource(&r.resource_name).ok_or_else(|| Status::invalid_argument("bad resource name"))?;
+        let (d, compressed) = parse_resource(&r.resource_name).ok_or_else(|| Status::invalid_argument("bad resource name"))?;
         let data = self.0.get(&d).ok_or_else(|| Status::not_found("blob not found"))?;
+        if compressed {
+            if !self.0.compressing() || r.read_offset != 0 || r.read_limit != 0 {
+                return Err(Status::invalid_argument("compressed reads: zstd, whole blobs only"));
+            }
+            let data = zstd::bulk::compress(&data, 1).map_err(|e| Status::internal(e.to_string()))?;
+            let mut stats = self.0.stats.lock().unwrap();
+            stats.bytes_read += data.len() as u64;
+            stats.compressed_reads += 1;
+            let chunks: Vec<Result<bs::ReadResponse, Status>> = data.chunks(64 * 1024).map(|c| Ok(bs::ReadResponse { data: c.to_vec() })).collect();
+            return Ok(Response::new(Box::pin(tokio_stream::iter(chunks))));
+        }
         if r.read_offset < 0 || r.read_limit < 0 || r.read_offset as usize > data.len() {
             return Err(Status::out_of_range("bad read_offset or read_limit"));
         }
@@ -342,16 +391,26 @@ impl bs::byte_stream_server::ByteStream for Svc {
                 break;
             }
         }
-        let d = parse_resource(&resource).ok_or_else(|| Status::invalid_argument("bad resource name"))?;
+        let (d, compressed) = parse_resource(&resource).ok_or_else(|| Status::invalid_argument("bad resource name"))?;
+        let wire = data.len() as i64;
+        let data = if compressed {
+            if !self.0.compressing() {
+                return Err(Status::invalid_argument("compressed writes aren't supported"));
+            }
+            zstd::bulk::decompress(&data, d.size_bytes as usize).map_err(|e| Status::invalid_argument(e.to_string()))?
+        } else {
+            data
+        };
         if digest_of(&data) != d {
             return Err(Status::invalid_argument("digest mismatch"));
         }
-        let len = data.len() as i64;
         self.0.cas.lock().unwrap().insert(d.hash, data);
         let mut stats = self.0.stats.lock().unwrap();
         stats.bytestream_writes += 1;
-        stats.bytes_uploaded += len as u64;
-        Ok(Response::new(bs::WriteResponse { committed_size: len }))
+        stats.bytes_uploaded += wire as u64;
+        stats.compressed_writes += compressed as u64;
+        // The bytes received; -1 would do for a compressed write.
+        Ok(Response::new(bs::WriteResponse { committed_size: wire }))
     }
 
     async fn query_write_status(&self, _r: Request<bs::QueryWriteStatusRequest>) -> Result<Response<bs::QueryWriteStatusResponse>, Status> {

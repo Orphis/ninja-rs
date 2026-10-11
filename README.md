@@ -82,6 +82,8 @@ remote execution (only for manifests with rbe_version = 1):
                                  conservative)
   --disk_cache=DIR               (local action cache + CAS, with or without a remote)
   --disk_cache_max_size=SIZE     (LRU eviction above SIZE, default 10G)
+  --[no]remote_cache_compression (zstd transfers when the remote supports them,
+                                 default on)
   --[no]daemon                   (or NINJA_RS_DAEMON=1: a daemon keeps scanned headers,
                                  compiler profiles, digests and toolchain trees between
                                  builds, watching their files; -t daemon status|stop)

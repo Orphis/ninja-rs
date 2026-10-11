@@ -1004,6 +1004,69 @@ fn test_disk_cache_minimal() -> Result<(), String> {
     })
 }
 
+/// zstd: with a remote that supports it, blobs travel compressed, batched
+/// and through ByteStream, both ways; `--noremote_cache_compression` sends
+/// them as they are.
+fn test_compression() -> Result<(), String> {
+    let text = |n: usize| {
+        (0..n)
+            .map(|i| {
+                format!(
+                    "int v{i} = {i}; /* a line of a large, repetitive source */
+"
+                )
+            })
+            .collect::<String>()
+    };
+    let mut stats = Vec::new();
+    for compress in [true, false] {
+        let f = fixture(&format!("zstd-{compress}"), true);
+        // Past the fake server's 4 MiB batches (ByteStream), and within.
+        write(&f.root.join("src/big.c"), &text(100_000));
+        write(
+            &f.root.join("src/main.c"),
+            &format!(
+                "#include \"lib.h\"
+int main() {{ return lib(); }}
+{}",
+                text(15_000)
+            ),
+        );
+        with_server(&f, |server| {
+            server.state.set_compression(true);
+            let ep = server.endpoint.clone();
+            let mut args = vec!["obj/big.o", "obj/main.o"];
+            if !compress {
+                args.push("--noremote_cache_compression");
+            }
+            check(run_ninja(&f, Some(&ep), &args) == 0, "build failed")?;
+            let st = server.stats();
+            if compress {
+                check(st.compressed_writes >= 2 && st.compressed_reads >= 2, &format!("expected compressed transfers both ways: {st:?}"))?;
+            } else {
+                check(st.compressed_writes == 0 && st.compressed_reads == 0, &format!("compressed although asked not to: {st:?}"))?;
+            }
+            stats.push(st);
+            let big_o = std::fs::read_to_string(f.build.join("obj/big.o")).map_err(|e| e.to_string())?;
+            check(
+                big_o.ends_with(
+                    "int v99999 = 99999; /* a line of a large, repetitive source */
+",
+                ),
+                "obj/big.o content",
+            )?;
+            let main_o = std::fs::read_to_string(f.build.join("obj/main.o")).map_err(|e| e.to_string())?;
+            check(main_o.contains("int main()") && main_o.contains("int v14999 = 14999;"), "obj/main.o content")?;
+            Ok::<(), String>(())
+        })?;
+    }
+    // The sources (7 MB) and objects went over in a fraction of their size.
+    let (on, off) = (&stats[0], &stats[1]);
+    check(on.bytes_uploaded + 5_000_000 < off.bytes_uploaded, &format!("uploads weren't smaller: {} against {}", on.bytes_uploaded, off.bytes_uploaded))?;
+    check(on.bytes_read * 5 < off.bytes_read, &format!("downloads weren't smaller: {} against {}", on.bytes_read, off.bytes_read))?;
+    Ok(())
+}
+
 /// The members of a thin archive recorded as remote-only.
 fn recorded_members(f: &Fixture, archive: &str) -> Vec<String> {
     let text = std::fs::read_to_string(f.build.join(".ninja_remote")).unwrap_or_default();
@@ -1235,6 +1298,7 @@ fn main() -> ExitCode {
         ("minimal_downloads", test_minimal_downloads),
         ("action_rewinding", test_action_rewinding),
         ("disk_cache_minimal", test_disk_cache_minimal),
+        ("compression", test_compression),
         ("thin_archives", test_thin_archives),
         ("mtls", test_mtls),
         ("include_scanner_fallback", test_include_scanner_fallback),

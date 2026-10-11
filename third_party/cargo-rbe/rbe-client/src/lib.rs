@@ -56,14 +56,48 @@ pub struct Client {
     channel: Channel,
     instance: String,
     max_batch_bytes: i64,
+    /// Whether blobs may travel compressed (`with_compression`).
+    compression: bool,
+    /// zstd for ByteStream reads and writes and batch reads, and for batch
+    /// updates (the server lists those separately).
     zstd: bool,
+    batch_zstd: bool,
     /// What the server supports of split and spliced blobs.
     chunking: Arc<Chunking>,
-    wire_read: Arc<AtomicU64>,
+    transfers: Arc<TransferCounters>,
     /// Sent with every call. Per-action fields are set by [`Client::for_action`].
     metadata: Option<Arc<re::RequestMetadata>>,
     /// Extra headers sent with every call.
     headers: Arc<Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>>,
+}
+
+/// Blobs smaller than this travel uncompressed: too little to gain.
+const MIN_COMPRESSED: usize = 1024;
+
+#[derive(Default)]
+struct TransferCounters {
+    read: AtomicU64,
+    wire_read: AtomicU64,
+    sent: AtomicU64,
+    wire_sent: AtomicU64,
+}
+
+/// Blob bytes read from and sent to the CAS since connecting, as blobs and
+/// as they travelled (compressed or not).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Transfers {
+    pub read: u64,
+    pub wire_read: u64,
+    pub sent: u64,
+    pub wire_sent: u64,
+}
+
+/// `data` compressed with zstd when that makes it smaller, for sending.
+fn compressed(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < MIN_COMPRESSED {
+        return None;
+    }
+    zstd::bulk::compress(data, 3).ok().filter(|c| c.len() < data.len())
 }
 
 /// What a call is for: the per-action part of [`re::RequestMetadata`].
@@ -147,9 +181,11 @@ impl Client {
             channel,
             instance: instance.to_string(),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+            compression: true,
             zstd: false,
+            batch_zstd: false,
             chunking: Default::default(),
-            wire_read: Default::default(),
+            transfers: Default::default(),
             metadata: None,
             headers: Arc::new(Vec::new()),
         }
@@ -157,6 +193,32 @@ impl Client {
 
     pub fn instance(&self) -> &str {
         &self.instance
+    }
+
+    /// Whether blobs may travel compressed with zstd, when the server
+    /// supports it (known after [`Client::capabilities`]). On by default.
+    pub fn with_compression(mut self, on: bool) -> Self {
+        self.compression = on;
+        self.zstd &= on;
+        self.batch_zstd &= on;
+        self
+    }
+
+    /// Whether blobs travel compressed (ByteStream, batch reads), and
+    /// whether batch uploads do.
+    pub fn compressing(&self) -> (bool, bool) {
+        (self.zstd, self.batch_zstd)
+    }
+
+    /// Blob bytes transferred since connecting.
+    pub fn transfers(&self) -> Transfers {
+        let t = &self.transfers;
+        Transfers {
+            read: t.read.load(Ordering::Relaxed),
+            wire_read: t.wire_read.load(Ordering::Relaxed),
+            sent: t.sent.load(Ordering::Relaxed),
+            wire_sent: t.wire_sent.load(Ordering::Relaxed),
+        }
     }
 
     pub fn channel(&self) -> &Channel {
@@ -211,10 +273,10 @@ impl Client {
         {
             self.max_batch_bytes = cache.max_batch_total_size_bytes.min(DEFAULT_MAX_BATCH_BYTES);
         }
-        self.zstd = caps
-            .cache_capabilities
-            .as_ref()
-            .is_some_and(|c| c.supported_compressors.contains(&(re::compressor::Value::Zstd as i32)));
+        let zstd = re::compressor::Value::Zstd as i32;
+        let cache = caps.cache_capabilities.as_ref();
+        self.zstd = self.compression && cache.is_some_and(|c| c.supported_compressors.contains(&zstd));
+        self.batch_zstd = self.compression && cache.is_some_and(|c| c.supported_batch_update_compressors.contains(&zstd));
         self.chunking = Arc::new(Chunking::from_capabilities(&caps));
         Ok(caps)
     }
@@ -412,12 +474,10 @@ impl Client {
     }
 
     async fn bytestream_write(&self, d: &re::Digest, data: &[u8]) -> Result<()> {
-        let compressed;
-        let (kind, data) = if self.zstd {
-            compressed = zstd::bulk::compress(data, 3)?;
-            ("compressed-blobs/zstd", compressed.as_slice())
-        } else {
-            ("blobs", data)
+        let packed = if self.zstd { compressed(data) } else { None };
+        let (kind, data) = match &packed {
+            Some(c) => ("compressed-blobs/zstd", c.as_slice()),
+            None => ("blobs", data),
         };
         let resource = format!(
             "{}uploads/{}/{kind}/{}/{}",
@@ -445,6 +505,8 @@ impl Client {
             .write(self.req(tokio_stream::iter(reqs)))
             .await
             .with_context(|| format!("ByteStream write {}", digest_str(d)))?;
+        self.transfers.sent.fetch_add(d.size_bytes as u64, Ordering::Relaxed);
+        self.transfers.wire_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -499,9 +561,14 @@ impl Client {
     }
 
     fn decode(&self, compressor: i32, data: Vec<u8>, size: i64) -> Result<Vec<u8>> {
-        self.wire_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.transfers.wire_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.transfers.read.fetch_add(size.max(0) as u64, Ordering::Relaxed);
         if compressor == re::compressor::Value::Zstd as i32 {
-            Ok(zstd::bulk::decompress(&data, size as usize)?)
+            let data = zstd::bulk::decompress(&data, size as usize)?;
+            if data.len() as i64 != size {
+                bail!("a compressed blob of {size} bytes decompressed to {}", data.len());
+            }
+            Ok(data)
         } else {
             Ok(data)
         }
@@ -567,16 +634,12 @@ impl Client {
         while let Some(chunk) = stream.message().await? {
             data.extend_from_slice(&chunk.data);
         }
-        self.wire_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.transfers.wire_read.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.transfers.read.fetch_add(data.len() as u64, Ordering::Relaxed);
         if limit > 0 && data.len() as i64 > limit {
             data.truncate(limit as usize);
         }
         Ok(data)
-    }
-
-    /// Bytes received for blob reads (after compression), since connect.
-    pub fn wire_bytes_read(&self) -> u64 {
-        self.wire_read.load(Ordering::Relaxed)
     }
 
     pub async fn get_action_result(&self, action: &re::Digest) -> Result<Option<re::ActionResult>> {
@@ -719,11 +782,19 @@ impl<'a> Uploader<'a> {
         if d.size_bytes > limit {
             return self.client.bytestream_write(d, &data).await;
         }
-        if self.batch_bytes + d.size_bytes > limit {
+        let (data, compressor) = match self.client.batch_zstd.then(|| compressed(&data)).flatten() {
+            Some(c) => (c, re::compressor::Value::Zstd as i32),
+            None => (data, re::compressor::Value::Identity as i32),
+        };
+        let wire = data.len() as i64;
+        if self.batch_bytes + wire > limit {
             self.flush().await?;
         }
-        self.batch_bytes += d.size_bytes;
-        self.batch.push(re::batch_update_blobs_request::Request { digest: Some(d.clone()), data, compressor: 0 });
+        self.batch_bytes += wire;
+        let transfers = &self.client.transfers;
+        transfers.sent.fetch_add(d.size_bytes as u64, Ordering::Relaxed);
+        transfers.wire_sent.fetch_add(wire as u64, Ordering::Relaxed);
+        self.batch.push(re::batch_update_blobs_request::Request { digest: Some(d.clone()), data, compressor });
         Ok(())
     }
 
@@ -754,6 +825,27 @@ pub fn env_vars(vars: &[(String, String)]) -> Vec<re::command::EnvironmentVariab
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compresses_what_shrinks() {
+        assert_eq!(compressed(b"tiny"), None);
+        let text = "int x = 1;
+".repeat(1000);
+        let c = compressed(text.as_bytes()).unwrap();
+        assert!(c.len() < text.len() / 10);
+        assert_eq!(zstd::bulk::decompress(&c, text.len()).unwrap(), text.as_bytes());
+        // Random bytes don't shrink: sent as they are.
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let noise: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        assert_eq!(compressed(&noise), None);
+    }
 
     fn decode_header<T>(r: &tonic::Request<T>) -> Option<re::RequestMetadata> {
         let v = r.metadata().get_bin(REQUEST_METADATA_HEADER)?;

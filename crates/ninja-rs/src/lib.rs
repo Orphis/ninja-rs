@@ -390,6 +390,19 @@ impl Service {
                     status.info(&format!("racing: {local} actions finished first locally, {remote} remotely."));
                 }
             }
+            if let Some(t) = backend.as_ref().and_then(|b| b.transfers())
+                && opts.remote.verbose
+                && t.read + t.sent > 0
+            {
+                let mib = |b: u64| format!("{:.1} MiB", b as f64 / (1 << 20) as f64);
+                status.info(&format!(
+                    "remote transfers: {} downloaded ({} on the wire), {} uploaded ({} on the wire).",
+                    mib(t.read),
+                    mib(t.wire_read),
+                    mib(t.sent),
+                    mib(t.wire_sent)
+                ));
+            }
             if let Some(e) = backend.as_ref().and_then(|b| b.daemon_error()) {
                 status.warning(&format!("the daemon failed ({e}): the build did its work itself"));
             }
@@ -474,12 +487,20 @@ impl Service {
                 }
                 // Requests carry the invocation's ids, which build events
                 // report too.
-                Some(self.remote_client.as_ref().expect("connected").1.clone().with_request_metadata(rbe_client::proto::RequestMetadata {
-                    tool_details: Some(rbe_client::proto::ToolDetails { tool_name: "ninja-rs".into(), tool_version: env!("CARGO_PKG_VERSION").into() }),
-                    tool_invocation_id: self.ids.invocation_id.clone(),
-                    correlated_invocations_id: self.ids.build_request_id.clone(),
-                    ..Default::default()
-                }))
+                Some(
+                    self.remote_client
+                        .as_ref()
+                        .expect("connected")
+                        .1
+                        .clone()
+                        .with_request_metadata(rbe_client::proto::RequestMetadata {
+                            tool_details: Some(rbe_client::proto::ToolDetails { tool_name: "ninja-rs".into(), tool_version: env!("CARGO_PKG_VERSION").into() }),
+                            tool_invocation_id: self.ids.invocation_id.clone(),
+                            correlated_invocations_id: self.ids.build_request_id.clone(),
+                            ..Default::default()
+                        })
+                        .with_compression(opts.remote.cache_compression),
+                )
             }
             None => None,
         };

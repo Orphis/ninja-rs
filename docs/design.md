@@ -675,6 +675,27 @@ before by a few edits only sends the chunks around them:
   edit in the middle of a 10 MB source, about 6% of it is uploaded and of
   its object downloaded.
 
+### Compression
+
+Blobs travel compressed with zstd when the remote advertises it
+(`supported_compressors`), unless `--noremote_cache_compression` (Bazel's
+flag; on by default here): ByteStream reads and writes use
+`compressed-blobs/zstd/` resource names, batch reads list zstd as
+acceptable, and batch updates are compressed when the server lists zstd
+for them too (`supported_batch_update_compressors`). A blob under 1 KiB,
+or one compression doesn't shrink, is sent as it is. Ranged reads (thin
+archives' members) stay uncompressed, since their offsets are the blob's.
+`--remote_verbose` prints the bytes transferred and those on the wire.
+The fake server serves all of it (`State::set_compression`).
+
+EngFlow's glass advertises zstd for ByteStream and batch reads, not for
+batch updates. Rebuilding CMake after a clean, every action cached, took
+10.9 s instead of 23.1 s with minimal downloads (199 MiB, 98 on the wire)
+and 13.6 s instead of 22.9 s with all of them (318 MiB, 175 on the wire).
+Uploads to it are only compressed through ByteStream: blobs past its 10
+MB batches that aren't spliced, while spliced blobs' chunks go in
+uncompressed batches.
+
 ## Remote cache only
 
 `--remote_cache=URL` uses a remote cache without remote execution: builds
