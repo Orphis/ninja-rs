@@ -316,11 +316,7 @@ fn quoted_only_meta(seg: &str) -> bool {
 /// Tokenizes response file contents: Windows rules on Windows hosts, GNU
 /// (`clang`/`gcc`) rules otherwise.
 pub fn split_rsp(content: &str, windows: bool) -> Vec<String> {
-    if windows {
-        split_windows(content, false)
-    } else {
-        split_gnu_rsp(content)
-    }
+    if windows { split_windows(content, false) } else { split_gnu_rsp(content) }
 }
 
 /// GNU response file tokenizing (as in LLVM's `TokenizeGNUCommandLine`).
@@ -427,10 +423,7 @@ mod tests {
         );
         assert_eq!(
             steps(r#""C:\Program Files\LLVM\bin\llvm-ar.exe" qc greet.lib a.obj && "C:\Program Files\LLVM\bin\llvm-ranlib.exe" greet.lib"#, true),
-            vec![
-                s(&[r"C:\Program Files\LLVM\bin\llvm-ar.exe", "qc", "greet.lib", "a.obj"]),
-                s(&[r"C:\Program Files\LLVM\bin\llvm-ranlib.exe", "greet.lib"])
-            ]
+            vec![s(&[r"C:\Program Files\LLVM\bin\llvm-ar.exe", "qc", "greet.lib", "a.obj"]), s(&[r"C:\Program Files\LLVM\bin\llvm-ranlib.exe", "greet.lib"])]
         );
         // A plain compile.
         let cc = r#""C:\Program Files\LLVM\bin\clang++.exe" -IC:/src -MD -MT a.obj -MF a.obj.d -o a.obj -c C:/src/a.cpp"#;

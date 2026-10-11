@@ -83,7 +83,16 @@ impl CommandRunner for FakeRunner<'_> {
             && (last.rule == "interrupt" || last.rule == "touch-interrupt")
         {
             let edge = last.edge;
-            return Box::pin(async move { Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() }) });
+            return Box::pin(async move {
+                Some(TaskResult {
+                    edge,
+                    status: ExitStatus::Interrupted,
+                    output: Vec::new(),
+                    kind: ExecKind::Local,
+                    cas_outputs: Vec::new(),
+                    lost_inputs: Vec::new(),
+                })
+            });
         }
         let now = self.fs.now();
         // "lose-once" reports its inputs lost the first time it runs,
@@ -161,11 +170,7 @@ impl BuildTest {
         let mut t = Self {
             state: State::new(),
             fs: VirtualDisk::new(),
-            config: BuildConfig {
-                verbosity: Verbosity::Quiet,
-                task_bindings: vec!["test_dependency".into()],
-                ..Default::default()
-            },
+            config: BuildConfig { verbosity: Verbosity::Quiet, task_bindings: vec!["test_dependency".into()], ..Default::default() },
             commands_ran: Arc::new(Mutex::new(Vec::new())),
             build_log: None,
             deps_log: None,
@@ -182,9 +187,7 @@ impl BuildTest {
 
     fn parse(&mut self, manifest: &str) {
         let files = MemFiles::default();
-        ManifestParser::new(&mut self.state, &files, ParserOptions { quiet: true, ..Default::default() })
-            .parse_test(manifest)
-            .unwrap();
+        ManifestParser::new(&mut self.state, &files, ParserOptions { quiet: true, ..Default::default() }).parse_test(manifest).unwrap();
     }
 
     fn commands(&self) -> Vec<String> {
@@ -259,9 +262,7 @@ fn two_step() {
     t.build(&["cat12"]).unwrap();
     let c = t.commands();
     assert_eq!(c.len(), 3);
-    assert!(
-        (c[0] == "cat in1 > cat1" && c[1] == "cat in1 in2 > cat2") || (c[1] == "cat in1 > cat1" && c[0] == "cat in1 in2 > cat2")
-    );
+    assert!((c[0] == "cat in1 > cat1" && c[1] == "cat in1 in2 > cat2") || (c[1] == "cat in1 > cat1" && c[0] == "cat in1 in2 > cat2"));
     assert_eq!(c[2], "cat cat1 cat2 > cat12");
     t.fs.tick();
     // Modifying in2 requires rebuilding one intermediate file and the final file.
@@ -634,10 +635,12 @@ fn not_in_log_but_on_disk() {
 #[test]
 fn rebuild_after_failure() {
     let mut t = BuildTest::with_log();
-    t.parse("rule touch-fail-tick2
+    t.parse(
+        "rule touch-fail-tick2
   command = touch-fail-tick2
 build out1: touch-fail-tick2 in
-");
+",
+    );
     t.fs.create("in", "");
     // Run once successfully to get out1 in the log.
     t.build(&["out1"]).unwrap();
@@ -660,7 +663,9 @@ build out1: touch-fail-tick2 in
 #[test]
 fn restat_test() {
     let mut t = BuildTest::with_log();
-    t.parse("rule true\n  command = true\n  restat = 1\nrule cc\n  command = cc\n  restat = 1\nbuild out1: cc in\nbuild out2: true out1\nbuild out3: cat out2\n");
+    t.parse(
+        "rule true\n  command = true\n  restat = 1\nrule cc\n  command = cc\n  restat = 1\nbuild out1: cc in\nbuild out2: true out1\nbuild out3: cat out2\n",
+    );
     t.fs.create("out1", "");
     t.fs.create("out2", "");
     t.fs.create("out3", "");
@@ -711,7 +716,9 @@ fn restat_missing_file() {
 #[test]
 fn restat_single_dependent_output_dirty() {
     let mut t = BuildTest::with_log();
-    t.parse("rule true\n  command = true\n  restat = 1\nrule touch\n  command = touch\nbuild out1: true in\nbuild out2 out3: touch out1\nbuild out4: touch out2\n");
+    t.parse(
+        "rule true\n  command = true\n  restat = 1\nrule touch\n  command = touch\nbuild out1: true in\nbuild out2 out3: touch out1\nbuild out4: touch out2\n",
+    );
     t.fs.create("in", "");
     t.build(&["out4"]).unwrap();
     assert_eq!(t.commands().len(), 3);
@@ -727,7 +734,9 @@ fn restat_single_dependent_output_dirty() {
 fn dry_run_all_commands_shown() {
     let mut t = BuildTest::with_log();
     t.config.dry_run = true;
-    t.parse("rule true\n  command = true\n  restat = 1\nrule cc\n  command = cc\n  restat = 1\nbuild out1: cc in\nbuild out2: true out1\nbuild out3: cat out2\n");
+    t.parse(
+        "rule true\n  command = true\n  restat = 1\nrule cc\n  command = cc\n  restat = 1\nbuild out1: cc in\nbuild out2: true out1\nbuild out3: cat out2\n",
+    );
     t.fs.create("out1", "");
     t.fs.create("out2", "");
     t.fs.create("out3", "");
@@ -985,7 +994,9 @@ fn dyndep_build_discover_new_output_with_multiple_rules() {
 #[test]
 fn dyndep_build_discover_new_input() {
     let mut t = BuildTest::new();
-    t.parse("rule touch\n  command = touch $out\nrule cp\n  command = cp $in $out\nbuild dd: cp dd-in\nbuild in: touch\nbuild out: touch || dd\n  dyndep = dd\n");
+    t.parse(
+        "rule touch\n  command = touch $out\nrule cp\n  command = cp $in $out\nbuild dd: cp dd-in\nbuild in: touch\nbuild out: touch || dd\n  dyndep = dd\n",
+    );
     t.fs.create("dd-in", "ninja_dyndep_version = 1\nbuild out: dyndep | in\n");
     t.fs.tick();
     t.fs.create("out", "");
@@ -1034,10 +1045,7 @@ fn dyndep_build_discover_circular() {
     let err = t.build(&["out"]).unwrap_err();
     // Depending on when cycle detection happens, the cycle is reported from
     // a different starting point.
-    assert!(
-        err == "dependency cycle: circ -> in -> circ" || err == "dependency cycle: in -> circ -> in",
-        "{err}"
-    );
+    assert!(err == "dependency cycle: circ -> in -> circ" || err == "dependency cycle: in -> circ -> in", "{err}");
 }
 
 #[test]
@@ -1311,13 +1319,18 @@ fn dyndep_output_to_dyndep_input_in_any_order() {
 #[test]
 fn manifest_input_dirty_no_depfile_load() {
     let mut t = BuildTest::empty();
-    t.parse("rule deprule
+    t.parse(
+        "rule deprule
   depfile = dep.d
   command = unused
 build a b: deprule input
-");
-    t.fs.create("dep.d", "a: input_deps
-");
+",
+    );
+    t.fs.create(
+        "dep.d",
+        "a: input_deps
+",
+    );
     t.fs.create("input", "");
     t.fs.create("input_deps", "");
     assert!(!t.add(&["a"]).unwrap());
@@ -1331,7 +1344,8 @@ build a b: deprule input
 #[test]
 fn cycle_with_old_depfile() {
     let mut t = BuildTest::empty();
-    t.parse("rule cp
+    t.parse(
+        "rule cp
   command = cp $in $out
 rule cp-deps
   command = cp-deps $in $out
@@ -1339,7 +1353,8 @@ build b: cp-deps a
   depfile = d.d
 build c: cp b
 build d: cp c
-");
+",
+    );
     // The depfile this run generates, and last run's: d -> c -> b -> d.
     t.fs.create("a", "b: X");
     t.fs.create("d.d", "b: d");
@@ -1354,14 +1369,19 @@ build d: cp c
 #[test]
 fn dirty_edge_gets_discovered_deps_as_hints() {
     let mut t = BuildTest::empty();
-    t.parse("rule list-inputs
+    t.parse(
+        "rule list-inputs
   command = list $in
   depfile = $out.d
 build out: list-inputs in
-");
+",
+    );
     t.fs.create("out", "");
-    t.fs.create("out.d", "out: h1.h sub/../h2.h
-");
+    t.fs.create(
+        "out.d",
+        "out: h1.h sub/../h2.h
+",
+    );
     t.fs.tick();
     t.fs.create("in", "");
     t.build(&["out"]).unwrap();
@@ -1383,12 +1403,16 @@ build B: true A
 fn restat_pseudo_stale_depfile() {
     let mut t = BuildTest::empty();
     t.parse(RESTAT_STALE_DEPFILE);
-    t.parse("build C: cp B
-");
+    t.parse(
+        "build C: cp B
+",
+    );
     t.fs.create("B", "");
     t.fs.create("C", "");
-    t.fs.create("C.d", "C: X
-");
+    t.fs.create(
+        "C.d", "C: X
+",
+    );
     t.fs.tick();
     t.fs.create("A", "");
     t.fs.create("X", "");
@@ -1411,13 +1435,17 @@ fn restat_pseudo_stale_depfile() {
 fn restat_pseudo_stale_depfile_generated() {
     let mut t = BuildTest::empty();
     t.parse(RESTAT_STALE_DEPFILE);
-    t.parse("build X: cat in_X
+    t.parse(
+        "build X: cat in_X
 build C: cp B
-");
+",
+    );
     t.fs.create("B", "");
     t.fs.create("C", "");
-    t.fs.create("C.d", "C: X
-");
+    t.fs.create(
+        "C.d", "C: X
+",
+    );
     t.fs.tick();
     t.fs.create("A", "");
     t.fs.tick();
@@ -1432,14 +1460,18 @@ build C: cp B
 fn restat_pseudo_stale_depfile_cycle() {
     let mut t = BuildTest::empty();
     t.parse(RESTAT_STALE_DEPFILE);
-    t.parse("build X: cat in_X
+    t.parse(
+        "build X: cat in_X
 build C: cp B
 build in_X: cat C
-");
+",
+    );
     t.fs.create("B", "");
     t.fs.create("C", "");
-    t.fs.create("C.d", "C: X
-");
+    t.fs.create(
+        "C.d", "C: X
+",
+    );
     t.fs.tick();
     t.fs.create("A", "");
     t.fs.tick();

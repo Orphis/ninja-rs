@@ -176,11 +176,7 @@ pub fn expand(inputs: &[String], build_dir: &Path, remote: Option<&RemoteOutputs
     let mut out = Vec::new();
     while let Some(input) = queue.pop() {
         let local = build_dir.join(&input);
-        let names = if local.is_file() {
-            store.thin_members(&local)?
-        } else {
-            remote.and_then(|r| r.get(&input)).and_then(|e| e.members)
-        };
+        let names = if local.is_file() { store.thin_members(&local)? } else { remote.and_then(|r| r.get(&input)).and_then(|e| e.members) };
         for name in names.iter().flat_map(|n| n.iter()) {
             let m = member_path(&input, name)?;
             if seen.insert(crate::remote_outputs::key(&m)) {

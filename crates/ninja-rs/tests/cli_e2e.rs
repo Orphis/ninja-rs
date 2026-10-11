@@ -190,21 +190,15 @@ fn test_status_format() -> Result<(), String> {
     let r = ninja(&dir, &["-n", "--status", "[$started/$finished/$total|$running] $description"], &[]);
     check_eq(&r.stdout, "[2/1/4|2] gen gen.h\n[3/2/4|2] CC a.o\n[3/3/4|1] CC b.o\n[4/4/4|1] link a.o b.o -o app\n", "--status")?;
     let r = ninja(&dir, &["-n", "--status", "$nope"], &[]);
-    check(
-        r.code == 1 && r.stderr.contains("unknown variable 'nope' in --status format"),
-        &format!("an unknown --status variable must fail:\n{}", r.stderr),
-    )
+    check(r.code == 1 && r.stderr.contains("unknown variable 'nope' in --status format"), &format!("an unknown --status variable must fail:\n{}", r.stderr))
 }
 
 /// Failed commands are shown again before "build stopped" when other output
 /// followed them (ninja issue 2378), not when the only one is still last.
 fn test_failure_summary() -> Result<(), String> {
     let dir = test_dir("summary");
-    let (fail, noisy) = if cfg!(windows) {
-        ("cmd /c \"echo $out: error& exit 1\"", "cmd /c \"echo $out: output\"")
-    } else {
-        ("echo $out: error; exit 1", "echo $out: output")
-    };
+    let (fail, noisy) =
+        if cfg!(windows) { ("cmd /c \"echo $out: error& exit 1\"", "cmd /c \"echo $out: output\"") } else { ("echo $out: error; exit 1", "echo $out: output") };
     let manifest = format!(
         "rule fail
   command = {fail}
@@ -220,19 +214,39 @@ default all
     );
     std::fs::write(dir.join("build.ninja"), manifest).unwrap();
     let r = ninja(&dir, &["-k", "0", "-j1"], &[]);
-    let summary = format!("ninja: 2 commands failed:
+    let summary = format!(
+        "ninja: 2 commands failed:
 FAILED: a.o
 {}
 a.o: error
 FAILED: c.o
-", fail.replace("$out", "a.o"));
-    let at = r.stdout.find(&summary).ok_or_else(|| format!("no summary:
-{}", r.stdout))?;
-    check(r.code == 1 && r.stdout[at..].contains("ninja: build stopped"), &format!("summary not before build stopped:
-{}", r.stdout))?;
+",
+        fail.replace("$out", "a.o")
+    );
+    let at = r.stdout.find(&summary).ok_or_else(|| {
+        format!(
+            "no summary:
+{}",
+            r.stdout
+        )
+    })?;
+    check(
+        r.code == 1 && r.stdout[at..].contains("ninja: build stopped"),
+        &format!(
+            "summary not before build stopped:
+{}",
+            r.stdout
+        ),
+    )?;
     let r = ninja(&dir, &["-j1", "a.o"], &[]);
-    check(r.code == 1 && !r.stdout.contains("failed:"), &format!("summary of a failure still last:
-{}", r.stdout))
+    check(
+        r.code == 1 && !r.stdout.contains("failed:"),
+        &format!(
+            "summary of a failure still last:
+{}",
+            r.stdout
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -306,10 +320,7 @@ fn test_jobserver_pipe() -> Result<(), String> {
     let dir = jobs_fixture("pipe", 4, "");
     let out = ninja(&dir, &[], &[("MAKEFLAGS", &flags)]);
     check(out.code == 0, &format!("build failed:\n{}", out.stdout))?;
-    check(
-        out.stderr.contains("ninja: warning: Jobserver 'pipe' mode detected"),
-        &format!("no pipe warning:\n{}", out.stderr),
-    )?;
+    check(out.stderr.contains("ninja: warning: Jobserver 'pipe' mode detected"), &format!("no pipe warning:\n{}", out.stderr))?;
     let results = job_results(&dir, 4);
     check(max_running(&results) <= 2, &format!("more than 2 jobs at once: {results:?}"))?;
     // The token is back.

@@ -91,7 +91,9 @@ fn ignore_indented_blank_lines() {
 
 #[test]
 fn response_files() {
-    let s = assert_parse("rule cat_rsp\n  command = cat $rspfile > $out\n  rspfile = $rspfile\n  rspfile_content = $in\n\nbuild out: cat_rsp in\n  rspfile=out.rsp\n");
+    let s = assert_parse(
+        "rule cat_rsp\n  command = cat $rspfile > $out\n  rspfile = $rspfile\n  rspfile_content = $in\n\nbuild out: cat_rsp in\n  rspfile=out.rsp\n",
+    );
     let r = &s.rules[1];
     assert_eq!(r.bindings["command"].serialize(), "[cat ][$rspfile][ > ][$out]");
     assert_eq!(r.bindings["rspfile"].serialize(), "[$rspfile]");
@@ -270,7 +272,10 @@ fn errors() {
         ("rule cat\n  command = echo\n  rspfile = cat.rsp\n", "input:4: rspfile and rspfile_content need to be both specified\n"),
         ("rule cat\n  command = ${fafsd\nfoo = bar\n", "input:2: bad $-escape (literal $ must be written as $$)\n  command = ${fafsd\n            ^ near here"),
         ("rule cat\n  command = cat\nbuild $.: cat foo\n", "input:3: bad $-escape (literal $ must be written as $$)\nbuild $.: cat foo\n      ^ near here"),
-        ("rule cat\n  command = cat\nbuild $: cat foo\n", "input:3: expected ':', got newline ($ also escapes ':')\nbuild $: cat foo\n                ^ near here"),
+        (
+            "rule cat\n  command = cat\nbuild $: cat foo\n",
+            "input:3: expected ':', got newline ($ also escapes ':')\nbuild $: cat foo\n                ^ near here",
+        ),
         ("rule %foo\n", "input:1: expected rule name\nrule %foo\n     ^ near here"),
         ("rule cc\n  command = foo\n  othervar = bar\n", "input:3: unexpected variable 'othervar'\n  othervar = bar\n                ^ near here"),
         ("rule cc\n  command = foo\n  && bar", "input:3: expected variable name\n  && bar\n  ^ near here"),
@@ -328,10 +333,7 @@ fn sub_ninja() {
 
 #[test]
 fn missing_sub_ninja() {
-    assert_eq!(
-        parse_err("subninja foo.ninja\n"),
-        "input:1: loading 'foo.ninja': No such file or directory\nsubninja foo.ninja\n                  ^ near here"
-    );
+    assert_eq!(parse_err("subninja foo.ninja\n"), "input:1: loading 'foo.ninja': No such file or directory\nsubninja foo.ninja\n                  ^ near here");
 }
 
 #[test]
@@ -366,10 +368,7 @@ fn broken_include() {
     let mut files = MemFiles::default();
     files.create("include.ninja", "build\n");
     let mut s = State::new();
-    assert_eq!(
-        parse_with(&mut s, &files, "include include.ninja\n").unwrap_err(),
-        "include.ninja:1: expected path\nbuild\n     ^ near here"
-    );
+    assert_eq!(parse_with(&mut s, &files, "include include.ninja\n").unwrap_err(), "include.ninja:1: expected path\nbuild\n     ^ near here");
 }
 
 #[test]
@@ -467,10 +466,7 @@ fn dyndep_not_specified() {
 
 #[test]
 fn dyndep_not_input() {
-    assert_eq!(
-        parse_err("rule touch\n  command = touch $out\nbuild result: touch\n  dyndep = notin\n"),
-        "input:5: dyndep 'notin' is not an input\n"
-    );
+    assert_eq!(parse_err("rule touch\n  command = touch $out\nbuild result: touch\n  dyndep = notin\n"), "input:5: dyndep 'notin' is not an input\n");
 }
 
 #[test]

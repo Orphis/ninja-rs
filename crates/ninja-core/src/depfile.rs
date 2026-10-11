@@ -11,8 +11,27 @@ fn is_plain(c: u8) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
             c,
-            b'+' | b'?' | b'"' | b'\'' | b'&' | b',' | b'/' | b'_' | b':' | b'.' | b'~' | b'(' | b')' | b'}' | b'{' | b'%'
-                | b'=' | b'@' | b'[' | b']' | b'!' | b'-'
+            b'+' | b'?'
+                | b'"'
+                | b'\''
+                | b'&'
+                | b','
+                | b'/'
+                | b'_'
+                | b':'
+                | b'.'
+                | b'~'
+                | b'('
+                | b')'
+                | b'}'
+                | b'{'
+                | b'%'
+                | b'='
+                | b'@'
+                | b'['
+                | b']'
+                | b'!'
+                | b'-'
         )
         || c >= 0x80
 }
@@ -218,7 +237,9 @@ mod tests {
 
     #[test]
     fn back_slashes() {
-        let d = p("Project\\Dir\\Build\\Release8\\Foo\\Foo.res : \\\n  Dir\\Library\\Foo.rc \\\n  Dir\\Library\\Version\\Bar.h \\\n  Dir\\Library\\Foo.ico \\\n  Project\\Thing\\Bar.tlb \\\n");
+        let d = p(
+            "Project\\Dir\\Build\\Release8\\Foo\\Foo.res : \\\n  Dir\\Library\\Foo.rc \\\n  Dir\\Library\\Version\\Bar.h \\\n  Dir\\Library\\Foo.ico \\\n  Project\\Thing\\Bar.tlb \\\n",
+        );
         assert_eq!(d.outs, vec!["Project\\Dir\\Build\\Release8\\Foo\\Foo.res"]);
         assert_eq!(d.ins.len(), 4);
     }
@@ -266,12 +287,11 @@ mod tests {
 
     #[test]
     fn special_chars() {
-        let d = p("C:/Program\\ Files\\ (x86)/Microsoft\\ crtdefs.h: \\\n en@quot.header~ t+t-x!=1 \\\n openldap/slapd.d/cn=config/cn=schema/cn={0}core.ldif\\\n Fu\u{e4}ball\\\n a[1]b@2%c");
-        assert_eq!(d.outs, vec!["C:/Program Files (x86)/Microsoft crtdefs.h"]);
-        assert_eq!(
-            d.ins,
-            vec!["en@quot.header~", "t+t-x!=1", "openldap/slapd.d/cn=config/cn=schema/cn={0}core.ldif", "Fu\u{e4}ball", "a[1]b@2%c"]
+        let d = p(
+            "C:/Program\\ Files\\ (x86)/Microsoft\\ crtdefs.h: \\\n en@quot.header~ t+t-x!=1 \\\n openldap/slapd.d/cn=config/cn=schema/cn={0}core.ldif\\\n Fu\u{e4}ball\\\n a[1]b@2%c",
         );
+        assert_eq!(d.outs, vec!["C:/Program Files (x86)/Microsoft crtdefs.h"]);
+        assert_eq!(d.ins, vec!["en@quot.header~", "t+t-x!=1", "openldap/slapd.d/cn=config/cn=schema/cn={0}core.ldif", "Fu\u{e4}ball", "a[1]b@2%c"]);
     }
 
     #[test]

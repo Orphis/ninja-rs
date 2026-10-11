@@ -19,8 +19,8 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ninja_core::disk::Disk;
 use ninja_core::graph::TimeStamp;
@@ -82,13 +82,17 @@ impl RemoteOutputs {
                 }
                 last = None;
                 let mut parts = line.splitn(5, ' ');
-                let (Some(mtime), Some(hash), Some(size), Some(x), Some(path)) =
-                    (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
-                else {
+                let (Some(mtime), Some(hash), Some(size), Some(x), Some(path)) = (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) else {
                     continue;
                 };
                 let (Ok(mtime), Ok(size)) = (mtime.parse(), size.parse()) else { continue };
-                let e = Entry { path: path.to_string(), digest: re::Digest { hash: hash.to_string(), size_bytes: size }, executable: x == "x", mtime, members: None };
+                let e = Entry {
+                    path: path.to_string(),
+                    digest: re::Digest { hash: hash.to_string(), size_bytes: size },
+                    executable: x == "x",
+                    mtime,
+                    members: None,
+                };
                 entries.insert(key(path), e);
                 last = Some(key(path));
             }
@@ -264,9 +268,16 @@ mod tests {
     #[test]
     fn reads_version_1() {
         let file = std::env::temp_dir().join(format!("ninja-rs-remote-outputs-v1-{}", std::process::id()));
-        std::fs::write(&file, format!("{HEADER_V1}
+        std::fs::write(
+            &file,
+            format!(
+                "{HEADER_V1}
 5 {} 3 - obj/a.o
-", "ab".repeat(32))).unwrap();
+",
+                "ab".repeat(32)
+            ),
+        )
+        .unwrap();
         let t = RemoteOutputs::load(&file);
         assert_eq!(t.get("obj/a.o").unwrap().mtime, 5);
         let _ = std::fs::remove_file(&file);

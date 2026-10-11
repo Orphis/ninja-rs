@@ -10,8 +10,8 @@ use std::time::Instant;
 use crate::build_log::{BuildLog, LogEntry, hash_command};
 use crate::canon::canonicalize_path;
 use crate::clparser::parse_cl_output;
-use crate::deps_log::DepsLog;
 use crate::depfile::parse_depfile;
+use crate::deps_log::DepsLog;
 use crate::disk::Disk;
 use crate::dyndep::{DyndepFile, apply_dyndeps, parse_dyndep};
 use crate::graph::{EdgeId, Existence, NodeId, State, TimeStamp, VisitMark};
@@ -264,10 +264,7 @@ impl Scanner<'_> {
             return Ok(());
         }
         // We have this edge earlier in the call stack. Find it.
-        let start = stack
-            .iter()
-            .position(|&n| self.state.node(n).in_edge == Some(edge))
-            .expect("edge in stack");
+        let start = stack.iter().position(|&n| self.state.node(n).in_edge == Some(edge)).expect("edge in stack");
         // Make the cycle clear by reporting its start as the node at its end
         // instead of some other output of the starting edge.
         stack[start] = node;
@@ -1263,12 +1260,7 @@ impl<'a> Builder<'a> {
         // Previous elapsed times from the build log.
         for &e in &sorted {
             let out0 = self.state.edge(e).outputs[0];
-            let prev = self
-                .build_log
-                .as_deref()
-                .and_then(|log| log.lookup_by_output(self.state.path(out0)))
-                .map(|l| l.end_time - l.start_time)
-                .unwrap_or(-1);
+            let prev = self.build_log.as_deref().and_then(|log| log.lookup_by_output(self.state.path(out0))).map(|l| l.end_time - l.start_time).unwrap_or(-1);
             self.state.edge_mut(e).prev_elapsed_time_millis = prev;
         }
         let heuristic = |s: &State, e: EdgeId| -> i64 {
@@ -1298,13 +1290,7 @@ impl<'a> Builder<'a> {
     }
 
     fn schedule_initial_edges(&mut self) {
-        let mut wanted: Vec<EdgeId> = self
-            .plan
-            .want
-            .iter()
-            .filter(|(_, w)| **w == Want::ToStart)
-            .map(|(e, _)| *e)
-            .collect();
+        let mut wanted: Vec<EdgeId> = self.plan.want.iter().filter(|(_, w)| **w == Want::ToStart).map(|(e, _)| *e).collect();
         wanted.sort();
         let mut pools = BTreeSet::new();
         for edge in wanted {
@@ -1514,9 +1500,7 @@ impl<'a> Builder<'a> {
             generator: self.state.edge_binding_bool(edge, "generator"),
             bindings,
         };
-        runner
-            .start_command(task)
-            .map_err(|e| format!("command '{}' failed: {e}", info.command))
+        runner.start_command(task).map_err(|e| format!("command '{}' failed: {e}", info.command))
     }
 
     /// Action rewinding: `edge` couldn't read `lost` inputs, outputs of

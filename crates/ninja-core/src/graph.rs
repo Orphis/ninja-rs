@@ -148,17 +148,7 @@ impl Rule {
     pub fn is_reserved_binding(var: &str) -> bool {
         matches!(
             var,
-            "command"
-                | "depfile"
-                | "dyndep"
-                | "description"
-                | "deps"
-                | "generator"
-                | "pool"
-                | "restat"
-                | "rspfile"
-                | "rspfile_content"
-                | "msvc_deps_prefix"
+            "command" | "depfile" | "dyndep" | "description" | "deps" | "generator" | "pool" | "restat" | "rspfile" | "rspfile_content" | "msvc_deps_prefix"
         )
     }
 }
@@ -465,10 +455,7 @@ impl State {
     }
 
     pub fn all_inputs_ready(&self, e: EdgeId) -> bool {
-        self.edges[e.idx()]
-            .inputs
-            .iter()
-            .all(|&i| self.nodes[i.idx()].in_edge.is_none_or(|ie| self.edges[ie.idx()].outputs_ready))
+        self.edges[e.idx()].inputs.iter().all(|&i| self.nodes[i.idx()].in_edge.is_none_or(|ie| self.edges[ie.idx()].outputs_ready))
     }
 
     /// CMake 2.8.12.x and 3.0.x produced self-referencing phony rules of the
@@ -537,14 +524,7 @@ impl State {
         out
     }
 
-    fn edge_lookup(
-        &self,
-        e: EdgeId,
-        var: &str,
-        escape: Escape,
-        lookups: &mut Vec<String>,
-        recursive: bool,
-    ) -> Result<String, String> {
+    fn edge_lookup(&self, e: EdgeId, var: &str, escape: Escape, lookups: &mut Vec<String>, recursive: bool) -> Result<String, String> {
         let edge = &self.edges[e.idx()];
         if var == "in" || var == "in_newline" {
             let n = edge.inputs.len() - edge.implicit_deps - edge.order_only_deps;

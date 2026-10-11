@@ -179,7 +179,9 @@ fn parse_linker_args(args: &[String], flavor: Flavor, cwd: &Path) -> LinkInfo {
                     file(&mut info, &v);
                 } else if let Some(v) = value_of(&["-Map", "--Map", "--out-implib"], &mut i) {
                     info.outputs.push(v);
-                } else if value_of(&["-o", "-l", "-m", "-z", "-e", "-u", "--sysroot", "-soname", "-rpath", "-plugin", "-plugin-opt", "-dynamic-linker"], &mut i).is_some() {
+                } else if value_of(&["-o", "-l", "-m", "-z", "-e", "-u", "--sysroot", "-soname", "-rpath", "-plugin", "-plugin-opt", "-dynamic-linker"], &mut i)
+                    .is_some()
+                {
                     // Values that aren't input files.
                 } else if !a.starts_with('-') {
                     file(&mut info, a);
@@ -219,10 +221,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.obj"), "").unwrap();
         std::fs::write(dir.join("over.yaml"), "").unwrap();
-        let args: Vec<String> = ["-out:app.exe", "a.obj", "kernel32.lib", "/LIBPATH:lib/x64", "-pdb:app.pdb", "/implib:app.lib", "/vfsoverlay:over.yaml", "-defaultlib:libcmt"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> =
+            ["-out:app.exe", "a.obj", "kernel32.lib", "/LIBPATH:lib/x64", "-pdb:app.pdb", "/implib:app.lib", "/vfsoverlay:over.yaml", "-defaultlib:libcmt"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         let info = parse_linker_args(&args, Flavor::Msvc, &dir);
         assert_eq!(info.files, vec![dir.join("a.obj"), dir.join("over.yaml")]);
         assert_eq!(info.lib_dirs, vec![dir.join("lib").join("x64")]);

@@ -29,11 +29,7 @@ pub const TOOLS: &[ToolInfo] = &[
     ToolInfo { name: "clean", desc: "clean built files", when: When::AfterLoad },
     ToolInfo { name: "cleandead", desc: "clean built files that are no longer produced by the manifest", when: When::AfterLogs },
     ToolInfo { name: "compdb", desc: "dump JSON compilation database to stdout", when: When::AfterLoad },
-    ToolInfo {
-        name: "compdb-targets",
-        desc: "dump JSON compilation database for a given list of targets to stdout",
-        when: When::AfterLoad,
-    },
+    ToolInfo { name: "compdb-targets", desc: "dump JSON compilation database for a given list of targets to stdout", when: When::AfterLoad },
     ToolInfo { name: "commands", desc: "list all commands required to rebuild given targets", when: When::AfterLoad },
     ToolInfo { name: "deps", desc: "show dependencies stored in the deps log", when: When::AfterLogs },
     ToolInfo { name: "missingdeps", desc: "check deps log dependencies on generated files", when: When::AfterLogs },
@@ -254,7 +250,9 @@ fn tool_commands(state: &State, args: &[String]) -> i32 {
         match a.as_str() {
             "-s" => all = false,
             "-h" => {
-                println!("usage: ninja -t commands [options] [targets]\n\noptions:\n  -s     only print the final command to build [target], not the whole chain");
+                println!(
+                    "usage: ninja -t commands [options] [targets]\n\noptions:\n  -s     only print the final command to build [target], not the whole chain"
+                );
                 return 1;
             }
             _ => rest.push(a.clone()),
@@ -795,14 +793,8 @@ impl Cleaner<'_> {
 
 fn load_all_dyndeps(state: &mut State) {
     let disk = RealDisk::default();
-    let pending: Vec<NodeId> = state
-        .edges
-        .iter()
-        .filter_map(|e| e.dyndep)
-        .filter(|&d| state.node(d).dyndep_pending)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
+    let pending: Vec<NodeId> =
+        state.edges.iter().filter_map(|e| e.dyndep).filter(|&d| state.node(d).dyndep_pending).collect::<BTreeSet<_>>().into_iter().collect();
     for d in pending {
         if !state.node(d).dyndep_pending {
             continue;
@@ -836,7 +828,9 @@ fn tool_clean(ctx: &mut ToolCtx, args: &[String]) -> i32 {
                     if f != 'h' {
                         eprintln!("ninja: invalid option -- '{f}'");
                     }
-                    println!("usage: ninja -t clean [options] [targets]\n\noptions:\n  -g     also clean files marked as ninja generator output\n  -r     interpret targets as a list of rules to clean instead");
+                    println!(
+                        "usage: ninja -t clean [options] [targets]\n\noptions:\n  -g     also clean files marked as ninja generator output\n  -r     interpret targets as a list of rules to clean instead"
+                    );
                     return 1;
                 }
             }
@@ -979,12 +973,7 @@ fn tool_deps(ctx: &mut ToolCtx, args: &[String]) -> i32 {
             continue;
         };
         let mtime = disk.stat(&o).unwrap_or(0);
-        println!(
-            "{o}: #deps {}, deps mtime {} ({})",
-            deps.len(),
-            deps.mtime,
-            if mtime == 0 || mtime > deps.mtime { "STALE" } else { "VALID" }
-        );
+        println!("{o}: #deps {}, deps mtime {} ({})", deps.len(), deps.mtime, if mtime == 0 || mtime > deps.mtime { "STALE" } else { "VALID" });
         for d in deps.paths() {
             println!("    {d}");
         }
@@ -1097,11 +1086,8 @@ pub fn tool_restat_after_flags(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    let path = if build_dir.is_empty() {
-        ninja_core::build_log::BUILD_LOG_FILE.to_string()
-    } else {
-        format!("{build_dir}/{}", ninja_core::build_log::BUILD_LOG_FILE)
-    };
+    let path =
+        if build_dir.is_empty() { ninja_core::build_log::BUILD_LOG_FILE.to_string() } else { format!("{build_dir}/{}", ninja_core::build_log::BUILD_LOG_FILE) };
     if !std::path::Path::new(&path).exists() {
         // Nothing to restat, ignore this.
         return 0;

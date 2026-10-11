@@ -4,7 +4,7 @@ use crate::hash::HashMap;
 
 use crate::canon::canonicalize_path;
 use crate::eval::EvalString;
-use crate::graph::{NodeId, Rule, ScopeId, State, ROOT_SCOPE};
+use crate::graph::{NodeId, ROOT_SCOPE, Rule, ScopeId, State};
 use crate::lexer::{Lexer, Token};
 
 /// Reads manifest files (real disk or an in-memory fake in tests).
@@ -204,10 +204,7 @@ impl<'s, 'r> ManifestParser<'s, 'r> {
         }
         expect_token(lexer, Token::Colon)?;
         let rule_name = lexer.read_ident().ok_or_else(|| lexer.error("expected build command name"))?;
-        let rule = self
-            .state
-            .lookup_rule(scope, &rule_name)
-            .ok_or_else(|| lexer.error(&format!("unknown build rule '{rule_name}'")))?;
+        let rule = self.state.lookup_rule(scope, &rule_name).ok_or_else(|| lexer.error(&format!("unknown build rule '{rule_name}'")))?;
 
         let mut ins = Vec::new();
         Self::read_paths(lexer, &mut ins)?;
@@ -238,17 +235,12 @@ impl<'s, 'r> ManifestParser<'s, 'r> {
 
         let pool_name = self.state.edge_binding(edge, "pool").map_err(|e| lexer.error(&e))?;
         if !pool_name.is_empty() {
-            let pool = self
-                .state
-                .lookup_pool(&pool_name)
-                .ok_or_else(|| lexer.error(&format!("unknown pool name '{pool_name}'")))?;
+            let pool = self.state.lookup_pool(&pool_name).ok_or_else(|| lexer.error(&format!("unknown pool name '{pool_name}'")))?;
             self.state.edge_mut(edge).pool = pool;
         }
 
         // Paths are evaluated in the edge's environment.
-        let eval_edge = |state: &State, e: &EvalString| -> String {
-            e.evaluate(&mut |v| edge_scope_lookup(state, edge, scope, v))
-        };
+        let eval_edge = |state: &State, e: &EvalString| -> String { e.evaluate(&mut |v| edge_scope_lookup(state, edge, scope, v)) };
         for o in &outs {
             let path = eval_edge(self.state, o);
             if path.is_empty() {
@@ -312,10 +304,7 @@ impl<'s, 'r> ManifestParser<'s, 'r> {
         let mut eval = EvalString::new();
         lexer.read_path(&mut eval)?;
         let path = self.eval_in_scope(&eval, scope);
-        let contents = self
-            .reader
-            .read_file(&path)
-            .map_err(|e| lexer.error(&format!("loading '{path}': {e}")))?;
+        let contents = self.reader.read_file(&path).map_err(|e| lexer.error(&format!("loading '{path}': {e}")))?;
         let sub_scope = if new_scope { self.state.new_scope(Some(scope)) } else { scope };
         self.parse(&path, &contents, sub_scope)?;
         expect_token(lexer, Token::Newline)
@@ -366,9 +355,7 @@ fn check_ninja_version(required: &str) -> Result<(), String> {
         return Ok(());
     }
     if (bin_major == file_major && bin_minor < file_minor) || bin_major < file_major {
-        return Err(format!(
-            "ninja version ({NINJA_VERSION}) incompatible with build file ninja_required_version version ({required})."
-        ));
+        return Err(format!("ninja version ({NINJA_VERSION}) incompatible with build file ninja_required_version version ({required})."));
     }
     Ok(())
 }

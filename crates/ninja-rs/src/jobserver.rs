@@ -25,7 +25,10 @@ pub enum Mode {
     #[default]
     None,
     /// Pipe descriptors inherited from the parent.
-    Pipe { read: i32, write: i32 },
+    Pipe {
+        read: i32,
+        write: i32,
+    },
     Fifo(String),
     /// Name of a Windows semaphore.
     Semaphore(String),
@@ -111,12 +114,7 @@ pub struct Slot {
 impl Client {
     pub fn new(mode: &Mode) -> Result<Arc<Self>, String> {
         let sys = sys::Client::new(mode)?;
-        Ok(Arc::new(Self {
-            sys,
-            implicit_free: AtomicBool::new(true),
-            turn: tokio::sync::Mutex::new(()),
-            released: tokio::sync::Notify::new(),
-        }))
+        Ok(Arc::new(Self { sys, implicit_free: AtomicBool::new(true), turn: tokio::sync::Mutex::new(()), released: tokio::sync::Notify::new() }))
     }
 
     /// Waits for a job slot: the implicit one, or a token from the pool.
@@ -412,12 +410,8 @@ mod sys {
             // From here, dropping the pool removes the FIFO.
             let mut pool = Self { path, _keep: None };
             // Non-blocking: more tokens than the FIFO holds (`-j0`) fail.
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&pool.path)
-                .map_err(|e| format!("Could not open fifo: {e}"))?;
+            let file =
+                OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open(&pool.path).map_err(|e| format!("Could not open fifo: {e}"))?;
             // '+' like GNU make.
             (&file).write_all(&vec![b'+'; jobs - 1]).map_err(|e| format!("Could not fill job slots pool: {e}"))?;
             pool._keep = Some(file);

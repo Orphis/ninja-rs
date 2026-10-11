@@ -1,0 +1,30 @@
+#!/bin/sh
+# Refuses a commit whose Rust files aren't formatted as rustfmt.toml says.
+# It checks what is staged, not the working tree. Code copied from
+# cargo-rbe (third_party/) keeps its own formatting.
+#
+# Enable it once per clone:   git config core.hooksPath .githooks
+# Format everything:          cargo fmt --all
+
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+status=0
+git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs' | tr '\0' '\n' > "$tmp/files"
+while IFS= read -r f; do
+    case "$f" in third_party/*) continue ;; esac
+    git show ":$f" > "$tmp/staged" || { status=1; continue; }
+    # rustfmt --check exits 0 on stdin even with differences: compare the
+    # formatted text instead.
+    if ! rustfmt --edition 2024 --config-path rustfmt.toml --emit stdout < "$tmp/staged" > "$tmp/formatted" 2> "$tmp/err"; then
+        echo "pre-commit: rustfmt failed on $f:" >&2
+        sed 's/^/  /' "$tmp/err" >&2
+        status=1
+    elif ! cmp -s "$tmp/staged" "$tmp/formatted"; then
+        echo "pre-commit: $f is not formatted" >&2
+        status=1
+    fi
+done < "$tmp/files"
+if [ "$status" -ne 0 ]; then
+    echo "pre-commit: run 'cargo fmt --all' and stage the result" >&2
+fi
+exit "$status"

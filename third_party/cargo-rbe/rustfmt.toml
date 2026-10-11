@@ -1,0 +1,2 @@
+# Code copied from cargo-rbe keeps its own formatting (see README.md).
+disable_all_formatting = true

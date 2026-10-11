@@ -139,16 +139,11 @@ impl BuildLog {
             if f.len() != 5 {
                 continue;
             }
-            let (Ok(start), Ok(end), Ok(mtime), Ok(hash)) =
-                (f[0].parse(), f[1].parse(), f[2].parse(), u64::from_str_radix(f[4], 16))
-            else {
+            let (Ok(start), Ok(end), Ok(mtime), Ok(hash)) = (f[0].parse(), f[1].parse(), f[2].parse(), u64::from_str_radix(f[4], 16)) else {
                 continue;
             };
             total += 1;
-            self.entries.insert(
-                f[3].to_string(),
-                LogEntry { output: f[3].to_string(), command_hash: hash, start_time: start, end_time: end, mtime },
-            );
+            self.entries.insert(f[3].to_string(), LogEntry { output: f[3].to_string(), command_hash: hash, start_time: start, end_time: end, mtime });
         }
         // Rebuild the log if there are too many dead lines.
         const MIN_COMPACTION_ENTRY_COUNT: usize = 100;
@@ -177,11 +172,7 @@ impl BuildLog {
             {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| format!("opening build log: {e}"))?;
+            let mut f = OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("opening build log: {e}"))?;
             if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
                 f.write_all(SIGNATURE.as_bytes()).map_err(|e| e.to_string())?;
             }
@@ -245,10 +236,7 @@ mod tests {
     #[test]
     fn hash_command_matches_ninja() {
         // Hashes from a .ninja_log written by ninja 1.13.2 for these commands.
-        assert_eq!(
-            hash_command("cmd.exe /c type nul > obj/t0/s0.cpp.obj && echo obj/t0/s0.cpp.obj: src/common.h> obj/t0/s0.cpp.obj.d"),
-            0x9c46_9d71_333c_72b6
-        );
+        assert_eq!(hash_command("cmd.exe /c type nul > obj/t0/s0.cpp.obj && echo obj/t0/s0.cpp.obj: src/common.h> obj/t0/s0.cpp.obj.d"), 0x9c46_9d71_333c_72b6);
         assert_eq!(hash_command("cmd.exe /c type nul > bin/t0.exe"), 0x68c9_7677_6b0c_9780);
     }
 

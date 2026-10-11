@@ -168,9 +168,30 @@ mod tests {
     #[test]
     fn fast_path_agrees_with_general_algorithm() {
         let samples = [
-            "foo.h", "foo/bar.h", "a/bcd/efh/foo.h", "/foo", "/foo/bar", "//foo", "//foo/bar", "C:/foo/bar.h",
-            "foo/.hidden", "foo/.._bar", "../foo", "./foo", "foo/./bar", "foo//bar", "foo/", "/", "//", ".", "..",
-            "foo\\bar", "\\\\foo", "C:\\foo", "a/b/../c", "x.y/z.w",
+            "foo.h",
+            "foo/bar.h",
+            "a/bcd/efh/foo.h",
+            "/foo",
+            "/foo/bar",
+            "//foo",
+            "//foo/bar",
+            "C:/foo/bar.h",
+            "foo/.hidden",
+            "foo/.._bar",
+            "../foo",
+            "./foo",
+            "foo/./bar",
+            "foo//bar",
+            "foo/",
+            "/",
+            "//",
+            ".",
+            "..",
+            "foo\\bar",
+            "\\\\foo",
+            "C:\\foo",
+            "a/b/../c",
+            "x.y/z.w",
         ];
         for windows in [false, true] {
             for p in samples {

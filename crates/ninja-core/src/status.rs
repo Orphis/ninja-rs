@@ -394,8 +394,7 @@ impl StatusPrinter {
         let secs = self.time_millis as f64 / 1e3;
         let rate = if secs > 0.0 { self.finished_edges as f64 / secs } else { 0.0 };
         // Remaining time, from the average time per finished edge.
-        let eta = (self.finished_edges > 0)
-            .then(|| secs * self.total_edges.saturating_sub(self.finished_edges) as f64 / self.finished_edges as f64);
+        let eta = (self.finished_edges > 0).then(|| secs * self.total_edges.saturating_sub(self.finished_edges) as f64 / self.finished_edges as f64);
         let clock = |sec: f64| {
             let s = sec as i64;
             if s >= 3600 { format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60) } else { format!("{:02}:{:02}", s / 60, s % 60) }
@@ -468,9 +467,7 @@ impl StatusPrinter {
                 }
                 Some('E') | Some('W') => {
                     let s = if self.finished_edges > 0 {
-                        (time_millis as f64 * (self.total_edges.saturating_sub(self.finished_edges)) as f64
-                            / self.finished_edges as f64
-                            / 1e3) as i64
+                        (time_millis as f64 * (self.total_edges.saturating_sub(self.finished_edges)) as f64 / self.finished_edges as f64 / 1e3) as i64
                     } else {
                         0
                     };

@@ -305,7 +305,13 @@ impl<'a> Lexer<'a> {
                         p += 1;
                         break;
                     }
-                    eval.add_text(if c == b' ' { " " } else if c == b':' { ":" } else { "|" });
+                    eval.add_text(if c == b' ' {
+                        " "
+                    } else if c == b':' {
+                        ":"
+                    } else {
+                        "|"
+                    });
                     p += 1;
                 }
                 b'$' => {

@@ -83,9 +83,7 @@ impl DepsLog {
 
     /// All outputs with deps, in no particular order.
     pub fn outputs(&self) -> impl Iterator<Item = (&str, Deps<'_>)> {
-        self.deps
-            .iter()
-            .map(|(&id, r)| (self.paths[id as usize].as_str(), Deps { mtime: r.mtime, nodes: &r.nodes, log: self }))
+        self.deps.iter().map(|(&id, r)| (self.paths[id as usize].as_str(), Deps { mtime: r.mtime, nodes: &r.nodes, log: self }))
     }
 
     /// The path with id `id`. Ids are stable while the log is loaded.
@@ -172,11 +170,7 @@ impl DepsLog {
             {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let mut f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .map_err(|e| format!("opening deps log: {e}"))?;
+            let mut f = OpenOptions::new().create(true).append(true).open(&self.path).map_err(|e| format!("opening deps log: {e}"))?;
             if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
                 f.write_all(SIGNATURE.as_bytes()).map_err(|e| e.to_string())?;
                 // A fresh file holds none of the interned paths.

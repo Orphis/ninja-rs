@@ -76,11 +76,75 @@ pub fn split_windows_program(command: &str) -> (String, &str) {
 /// Shell builtins and keywords: a command starting with one needs the
 /// shell, even when a program of that name exists (`pwd`, `time`).
 const SHELL_WORDS: &[&str] = &[
-    ".", ":", "alias", "bg", "bind", "break", "builtin", "caller", "case", "cd", "command", "compgen", "complete", "continue",
-    "declare", "dirs", "disown", "do", "done", "elif", "else", "enable", "esac", "eval", "exec", "exit", "export", "fc", "fg",
-    "fi", "for", "function", "getopts", "hash", "help", "history", "if", "in", "jobs", "let", "local", "logout", "mapfile",
-    "popd", "pushd", "pwd", "read", "readarray", "readonly", "return", "select", "set", "shift", "shopt", "source", "suspend",
-    "then", "time", "times", "trap", "type", "typeset", "ulimit", "umask", "unalias", "unset", "until", "wait", "while",
+    ".",
+    ":",
+    "alias",
+    "bg",
+    "bind",
+    "break",
+    "builtin",
+    "caller",
+    "case",
+    "cd",
+    "command",
+    "compgen",
+    "complete",
+    "continue",
+    "declare",
+    "dirs",
+    "disown",
+    "do",
+    "done",
+    "elif",
+    "else",
+    "enable",
+    "esac",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "fc",
+    "fg",
+    "fi",
+    "for",
+    "function",
+    "getopts",
+    "hash",
+    "help",
+    "history",
+    "if",
+    "in",
+    "jobs",
+    "let",
+    "local",
+    "logout",
+    "mapfile",
+    "popd",
+    "pushd",
+    "pwd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "select",
+    "set",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "then",
+    "time",
+    "times",
+    "trap",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "until",
+    "wait",
+    "while",
 ];
 
 /// The words of `command`, when `/bin/sh -c` would just run a program with
@@ -108,11 +172,7 @@ fn build_command(command: &str, direct: bool) -> tokio::process::Command {
         let _ = direct;
         let (program, rest) = split_windows_program(command);
         // CreateProcess also searches the current directory; std does not.
-        let program = if !program.contains(['/', '\\']) && std::path::Path::new(&program).is_file() {
-            format!(".\\{program}")
-        } else {
-            program
-        };
+        let program = if !program.contains(['/', '\\']) && std::path::Path::new(&program).is_file() { format!(".\\{program}") } else { program };
         let mut c = tokio::process::Command::new(program);
         if !rest.is_empty() {
             c.raw_arg(rest);
@@ -519,7 +579,14 @@ impl CommandRunner for LocalRunner {
                     // A panicking task: report it as a failure of some edge.
                     let edge = self.active.iter().next().copied().unwrap_or_default();
                     self.active.remove(&edge);
-                    Some(TaskResult { edge, status: ExitStatus::Failure(1), output: format!("internal error: {e}\n").into_bytes(), kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() })
+                    Some(TaskResult {
+                        edge,
+                        status: ExitStatus::Failure(1),
+                        output: format!("internal error: {e}\n").into_bytes(),
+                        kind: ExecKind::Local,
+                        cas_outputs: Vec::new(),
+                        lost_inputs: Vec::new(),
+                    })
                 }
             }
         })

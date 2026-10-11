@@ -29,9 +29,7 @@ pub fn normalize_abs(p: &str, windows: bool) -> String {
 pub fn is_abs(p: &str, windows: bool) -> bool {
     if windows {
         let b = p.as_bytes();
-        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\'))
-            || p.starts_with("\\\\")
-            || p.starts_with("//")
+        (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')) || p.starts_with("\\\\") || p.starts_with("//")
     } else {
         p.starts_with('/')
     }
@@ -176,9 +174,7 @@ pub struct PathMapper {
 impl PathMapper {
     pub fn new(exec_root: ExecRoot, build_dir: &str, windows: bool) -> Result<Self, String> {
         let build_dir = normalize_abs(build_dir, windows);
-        let work_dir = exec_root
-            .to_tree(&build_dir)
-            .ok_or_else(|| format!("build directory {build_dir} is outside the exec root {:?}", exec_root.root()))?;
+        let work_dir = exec_root.to_tree(&build_dir).ok_or_else(|| format!("build directory {build_dir} is outside the exec root {:?}", exec_root.root()))?;
         let mut m = Self { windows, exec_root, work_dir: String::new(), build_dir, spelling: HashMap::new(), top_level: HashSet::new() };
         m.work_dir = m.fold(&work_dir);
         m.note_top_level(&m.work_dir.clone());
@@ -296,11 +292,7 @@ impl PathMapper {
         let Some(root) = self.exec_root.root().map(str::to_string) else { return text.to_vec() };
         let root = root.trim_end_matches('/').to_string();
         let windows = self.windows;
-        let spellings: Vec<Vec<u8>> = if windows {
-            vec![root.clone().into_bytes(), root.replace('/', "\\").into_bytes()]
-        } else {
-            vec![root.into_bytes()]
-        };
+        let spellings: Vec<Vec<u8>> = if windows { vec![root.clone().into_bytes(), root.replace('/', "\\").into_bytes()] } else { vec![root.into_bytes()] };
         let matches_at = |i: usize, s: &[u8]| {
             let Some(t) = text.get(i..i + s.len()) else { return false };
             if windows { t.eq_ignore_ascii_case(s) } else { t == s }
@@ -416,8 +408,7 @@ pub fn find_abs_paths(arg: &str, windows: bool) -> Vec<(usize, usize)> {
             return true;
         }
         // A flag glued to its value: "-I/x", "/FoC:\x", "/external:IC:\x".
-        (b[0] == b'-' || (windows && b[0] == b'/'))
-            && b[1..i].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b':'))
+        (b[0] == b'-' || (windows && b[0] == b'/')) && b[1..i].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b':'))
     };
     let mut i = begin;
     while i < b.len() {
@@ -565,7 +556,8 @@ mod tests {
         let mut m = PathMapper::new(root, "/home/u/proj/build", false).unwrap();
         m.tree_path("/home/u/proj/src/a.c").unwrap();
         m.tree_path("/home/u/tc/bin/clang").unwrap();
-        let out = m.rewrite_text(b"/home/u/proj/src/a.c:3:13: warning: x [-Wy]\nIn file included from /home/u/proj/src/my dir/b.h:1:\n/usr/include/z.h:1: note\n");
+        let out =
+            m.rewrite_text(b"/home/u/proj/src/a.c:3:13: warning: x [-Wy]\nIn file included from /home/u/proj/src/my dir/b.h:1:\n/usr/include/z.h:1: note\n");
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "../src/a.c:3:13: warning: x [-Wy]\nIn file included from ../src/my dir/b.h:1:\n/usr/include/z.h:1: note\n"
@@ -587,10 +579,8 @@ mod tests {
     fn map_back_paths() {
         let root = ExecRoot::common(&["/home/u/proj/build".into(), "/home/u/proj/src/a.c".into(), "/home/u/tc/lib/clang/include/stddef.h".into()], false);
         let mut m = PathMapper::new(root, "/home/u/proj/build", false).unwrap();
-        let files: Vec<String> = ["/home/u/proj/src/a.c", "/home/u/tc/lib/clang/include/stddef.h", "/home/u/proj/build/gen/g.h"]
-            .iter()
-            .map(|p| m.tree_path(p).unwrap())
-            .collect();
+        let files: Vec<String> =
+            ["/home/u/proj/src/a.c", "/home/u/tc/lib/clang/include/stddef.h", "/home/u/proj/build/gen/g.h"].iter().map(|p| m.tree_path(p).unwrap()).collect();
         let idx = TreeIndex::new(files, false);
         assert_eq!(m.map_back("../src/a.c", &idx), "/home/u/proj/src/a.c");
         assert_eq!(m.map_back("gen/g.h", &idx), "gen/g.h");

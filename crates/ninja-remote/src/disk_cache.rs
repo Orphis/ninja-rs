@@ -87,11 +87,7 @@ impl DiskCache {
         match std::fs::read_to_string(&version) {
             Ok(v) if v.trim() == VERSION => {}
             Ok(v) => {
-                return Err(std::io::Error::other(format!(
-                    "{} has format version {}, this ninja-rs uses {VERSION}",
-                    root.display(),
-                    v.trim()
-                )));
+                return Err(std::io::Error::other(format!("{} has format version {}, this ninja-rs uses {VERSION}", root.display(), v.trim())));
             }
             Err(_) => {
                 std::fs::create_dir_all(root)?;
@@ -293,12 +289,7 @@ impl DiskCache {
         let p = self.ac_path(&action.hash);
         let data = std::fs::read(&p).ok()?;
         let result = re::ActionResult::decode(data.as_slice()).ok()?;
-        let blobs = result
-            .output_files
-            .iter()
-            .filter_map(|f| f.digest.as_ref())
-            .chain(result.stdout_digest.as_ref())
-            .chain(result.stderr_digest.as_ref());
+        let blobs = result.output_files.iter().filter_map(|f| f.digest.as_ref()).chain(result.stdout_digest.as_ref()).chain(result.stderr_digest.as_ref());
         for d in blobs {
             if !self.contains_blob(d) {
                 return None;
@@ -435,10 +426,8 @@ mod tests {
         assert!(c.read_blob(&re::Digest { hash: d.hash.clone(), size_bytes: 3 }).is_none());
 
         let action = rbe_client::digest_of(b"action");
-        let result = re::ActionResult {
-            output_files: vec![re::OutputFile { path: "a.o".into(), digest: Some(d.clone()), ..Default::default() }],
-            ..Default::default()
-        };
+        let result =
+            re::ActionResult { output_files: vec![re::OutputFile { path: "a.o".into(), digest: Some(d.clone()), ..Default::default() }], ..Default::default() };
         c.put_action_result(&action, &result).unwrap();
         assert_eq!(c.get_action_result(&action).unwrap(), result);
         // Without its output, the result is a miss.

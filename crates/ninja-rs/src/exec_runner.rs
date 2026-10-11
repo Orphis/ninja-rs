@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ninja_core::graph::EdgeId;
-use ninja_core::runner::{CommandRunner, ExecKind, ExitStatus, LocalCapture, LocalCommand, Race, RemoteBackend, RemoteOutcome, Side, Task, TaskResult, WaitFuture};
+use ninja_core::runner::{
+    CommandRunner, ExecKind, ExitStatus, LocalCapture, LocalCommand, Race, RemoteBackend, RemoteOutcome, Side, Task, TaskResult, WaitFuture,
+};
 use ninja_core::subprocess::{Interrupt, run_argv, run_argv_cancellable, run_local_command_cancellable, run_local_command_env};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
@@ -149,7 +151,13 @@ impl ExecRunner {
 /// Runs a task on the host, once its inputs that only exist remotely are
 /// downloaded: the remote action's `command` when the backend prepared
 /// one, else the build file's.
-async fn run_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], remote: Option<&Arc<dyn RemoteBackend>>, command: Option<&LocalCommand>) -> TaskResult {
+async fn run_local(
+    task: &Task,
+    slots: &LocalSlots,
+    env: &[(String, String)],
+    remote: Option<&Arc<dyn RemoteBackend>>,
+    command: Option<&LocalCommand>,
+) -> TaskResult {
     if let Some(backend) = remote
         && let Err(e) = backend.materialize(task).await
     {
@@ -198,7 +206,14 @@ fn with_env(env: &[(String, String)], cmd: &LocalCommand) -> Vec<(String, String
 /// gave up, it queues like any local task, with the task's own command if
 /// the action couldn't be prepared. `None` when the remote branch won, or
 /// the inputs couldn't be fetched while the remote branch still runs.
-async fn race_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], backend: &Arc<dyn RemoteBackend>, race: &Race, delay: Duration) -> Option<TaskResult> {
+async fn race_local(
+    task: &Task,
+    slots: &LocalSlots,
+    env: &[(String, String)],
+    backend: &Arc<dyn RemoteBackend>,
+    race: &Race,
+    delay: Duration,
+) -> Option<TaskResult> {
     let mut rx = race.subscribe();
     tokio::select! {
         _ = tokio::time::sleep(delay) => {}
@@ -228,7 +243,14 @@ async fn race_local(task: &Task, slots: &LocalSlots, env: &[(String, String)], b
             return None;
         }
         let output = format!("ninja-rs: fetching inputs: {}\n", e.message).into_bytes();
-        return Some(TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: e.lost });
+        return Some(TaskResult {
+            edge: task.edge,
+            status: ExitStatus::Failure(1),
+            output,
+            kind: ExecKind::Local,
+            cas_outputs: Vec::new(),
+            lost_inputs: e.lost,
+        });
     }
     if !race.start_local() {
         return None;
