@@ -493,8 +493,15 @@ impl Svc {
         for o in &outputs {
             let p = cwd.join(o);
             if let Ok(data) = std::fs::read(&p) {
+                #[cfg(unix)]
+                let is_executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::metadata(&p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                };
+                #[cfg(not(unix))]
+                let is_executable = false;
                 let d = self.0.put(data);
-                result.output_files.push(re::OutputFile { path: o.clone(), digest: Some(d), ..Default::default() });
+                result.output_files.push(re::OutputFile { path: o.clone(), digest: Some(d), is_executable, ..Default::default() });
             }
         }
         let _ = std::fs::remove_dir_all(&root);

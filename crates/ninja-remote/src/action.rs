@@ -267,6 +267,27 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
             remote_inputs.push((p, e, i.clone()));
         }
     }
+    // So do files the scan found that only exist remotely (a precompiled
+    // header in `-Xclang -include-pch`).
+    if let Some(outputs) = &shared.remote_outputs {
+        files.retain(|f| {
+            if remote_inputs.iter().any(|(p, _, _)| p == f) {
+                return false;
+            }
+            if f.exists() {
+                return true;
+            }
+            let Ok(rel) = f.strip_prefix(build_dir) else { return true };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            match outputs.get(&rel) {
+                Some(e) => {
+                    remote_inputs.push((f.clone(), e, rel));
+                    false
+                }
+                None => true,
+            }
+        });
+    }
     // Thin archives bring their members, which aren't declared inputs (a
     // compile reads none).
     if style.is_none() || driver_link {

@@ -356,6 +356,22 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             }
             continue;
         }
+        // cc1's spellings through the driver: "-Xclang -include -Xclang F"
+        // (CMake's precompiled headers with Clang), "-Xclang -include-pch".
+        if a == "-Xclang"
+            && argv.get(i + 1).is_some_and(|n| n == "-Xclang")
+            && let Some(flag) = argv.get(i).filter(|f| matches!(f.as_str(), "-include" | "-imacros" | "-include-pch"))
+        {
+            if let Some(v) = argv.get(i + 2) {
+                if flag == "-include-pch" {
+                    info.extra_files.push(abs(v, cwd));
+                } else {
+                    info.forced_includes.push(abs(v, cwd));
+                }
+            }
+            i += 3;
+            continue;
+        }
         // Virtual file system overlays: the overlay file is an input (its
         // entries name files the include scan finds where they really are).
         // "-ivfsoverlay F", "-vfsoverlay F", or cc1's through "-Xclang".
@@ -1008,6 +1024,15 @@ mod tests {
             "/after",
             "-include",
             "/forced.h",
+            // CMake's precompiled headers with Clang.
+            "-Xclang",
+            "-include-pch",
+            "-Xclang",
+            "/pch.hxx.pch",
+            "-Xclang",
+            "-include",
+            "-Xclang",
+            "/pch.hxx",
             "--sysroot=/sr",
             "--target=x86_64-linux-gnu",
             "-DX=1",
@@ -1027,7 +1052,8 @@ mod tests {
         assert_eq!(info.system_dirs, vec![a("/sys")]);
         assert_eq!(info.quote_dirs, vec![a("/q")]);
         assert_eq!(info.after_dirs, vec![a("/after")]);
-        assert_eq!(info.forced_includes, vec![a("/forced.h")]);
+        assert_eq!(info.forced_includes, vec![a("/forced.h"), a("/pch.hxx")]);
+        assert!(info.extra_files.contains(&a("/pch.hxx.pch")));
         assert_eq!(info.sysroot, Some(a("/sr")));
         assert_eq!(info.lang, Some(Lang::Cxx));
         assert_eq!(info.sources.len(), 1);

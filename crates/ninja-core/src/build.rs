@@ -1472,7 +1472,23 @@ impl<'a> Builder<'a> {
             rsp = Some((rspfile, content));
         }
 
-        let mut inputs: Vec<String> = self.state.edge(edge).non_order_only_inputs().iter().map(|&i| self.state.path(i).to_string()).collect();
+        // A phony input stands for its inputs (CMake's `install` depends on
+        // `all`): those are what the command reads. A phony with none names
+        // a file (CMake's rules for headers that may go away).
+        let mut inputs: Vec<String> = Vec::new();
+        let mut stack: Vec<NodeId> = self.state.edge(edge).non_order_only_inputs().iter().rev().copied().collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            match self.state.node(n).in_edge {
+                Some(e) if self.state.is_phony(e) && !self.state.edge(e).non_order_only_inputs().is_empty() => {
+                    stack.extend(self.state.edge(e).non_order_only_inputs().iter().rev().copied());
+                }
+                _ => inputs.push(self.state.path(n).to_string()),
+            }
+        }
         if !self.state.edge(edge).deps_added && !self.config.dry_run {
             // Deps an earlier build discovered, as hints: remote actions
             // send them, local ones download them first.

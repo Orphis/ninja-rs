@@ -168,6 +168,11 @@ impl Disk for RealDisk {
     }
 
     fn remove_file(&self, path: &str) -> Result<bool, String> {
+        // A directory goes if it's empty, as with ninja (C's `remove()`, or
+        // `RemoveDirectory` on Windows).
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+            return std::fs::remove_dir(path).map(|_| true).map_err(|e| format!("remove({path}): {e}"));
+        }
         match std::fs::remove_file(path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -310,6 +315,24 @@ mod tests {
         }
         disk.allow_stat_cache(false);
         assert!(disk.stat(&format!("{root}/new.txt")).unwrap() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removes_empty_directories() {
+        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-remove", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::create_dir_all(dir.join("full")).unwrap();
+        std::fs::write(dir.join("full/f"), "x").unwrap();
+        let disk = RealDisk::default();
+        let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
+        // As ninja: an empty directory goes, a full one is an error.
+        assert_eq!(disk.remove_file(&p("empty")), Ok(true));
+        assert!(!dir.join("empty").exists());
+        assert!(disk.remove_file(&p("full")).is_err());
+        assert_eq!(disk.remove_file(&p("full/f")), Ok(true));
+        assert_eq!(disk.remove_file(&p("gone")), Ok(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

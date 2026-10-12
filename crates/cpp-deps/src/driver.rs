@@ -63,6 +63,8 @@ fn lang_of(source: &Path) -> Option<&'static str> {
     let ext = source.extension()?.to_string_lossy();
     Some(match ext.to_ascii_lowercase().as_str() {
         _ if ext == "C" => "c++",
+        // Assembly the compiler preprocesses (`.s` it doesn't).
+        _ if ext == "S" || ext == "sx" => "assembler-with-cpp",
         "c" => "c",
         "cc" | "cpp" | "cxx" | "c++" | "cp" | "ixx" | "cppm" => "c++",
         _ => return None,
@@ -144,11 +146,14 @@ fn finish(mut inv: Invocation, lang: Option<String>) -> Result<Invocation, Strin
     if inv.source.as_os_str().is_empty() {
         return Err("no source file".into());
     }
-    inv.lang = match lang {
-        Some(l) => l,
+    inv.lang = match lang.as_deref() {
+        // A header (a precompiled one's): preprocessed as its language.
+        Some("c-header") => "c".into(),
+        Some("c++-header") => "c++".into(),
+        Some(l) => l.to_string(),
         None => lang_of(&inv.source).ok_or_else(|| format!("unknown language of {}", inv.source.display()))?.to_string(),
     };
-    if !matches!(inv.lang.as_str(), "c" | "c++") {
+    if !matches!(inv.lang.as_str(), "c" | "c++" | "assembler-with-cpp") {
         return Err(format!("unsupported language {}", inv.lang));
     }
     Ok(inv)
@@ -179,7 +184,6 @@ const WITH_ARG: &[(&str, bool)] = &[
     ("-isysroot", true),
     ("--sysroot", true),
     ("-arch", true),
-    ("-Xclang", true),
     ("-mllvm", true),
     ("-resource-dir", true),
     ("-stdlib", true),
@@ -203,8 +207,35 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
             }
             break;
         }
+        // cc1's spellings through the driver: "-Xclang -include -Xclang F"
+        // (CMake's precompiled headers with Clang). A precompiled header
+        // stands for the header it was made of, which CMake includes too:
+        // the scan reads that one. Options about precompiled headers alone
+        // don't concern the probe.
+        if a == "-Xclang" {
+            let v = argv.get(i).ok_or("-Xclang needs an argument")?;
+            let operand = (argv.get(i + 1).map(String::as_str) == Some("-Xclang")).then(|| argv.get(i + 2)).flatten();
+            match (v.as_str(), operand) {
+                ("-include" | "-imacros", Some(f)) => {
+                    inv.forced.push(abs(f));
+                    i += 3;
+                }
+                ("-include-pch", Some(_)) => i += 3,
+                ("-emit-pch" | "-fno-pch-timestamp" | "-fno-validate-pch", _) => i += 1,
+                _ => {
+                    inv.probe_args.push(a.clone());
+                    inv.probe_args.push(v.clone());
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if a == "-include-pch" {
+            i += 1;
+            continue;
+        }
         // Unsupported: what changes file lookup or macros beyond flags.
-        for bad in ["-include-pch", "-iprefix", "-iwithprefix", "-iwithprefixbefore", "-I-", "--driver-mode=cl"] {
+        for bad in ["-iprefix", "-iwithprefix", "-iwithprefixbefore", "-I-", "--driver-mode=cl"] {
             if a == bad || (a.starts_with(bad) && bad.len() > 3) {
                 return Err(format!("unsupported flag {a}"));
             }
@@ -818,9 +849,52 @@ mod tests {
         assert_eq!(inv.commands, vec![CommandMacro::Define("A=1".into()), CommandMacro::Define("B".into()), CommandMacro::Undef("C".into())]);
         assert_eq!(inv.forced, vec![p("/b/pre.h")]);
         assert_eq!(inv.probe_args, s(&["--target=x86_64-linux-gnu", "-O2", "-std=c++17"]));
-        assert!(parse(&s(&["cc", "-include-pch", "x.pch", "-c", "a.c"]), cwd).is_err());
+        assert!(parse(&s(&["cc", "-iprefix", "p/", "-c", "a.c"]), cwd).is_err());
         assert!(parse(&s(&["cc", "-c", "a.f90"]), cwd).is_err());
         assert_eq!(parse(&s(&["cc", "-x", "c", "-c", "a.inc"]), cwd).unwrap().lang, "c");
+        // CMake's precompiled headers with Clang: made from a header, then
+        // used with it forced.
+        let pch = parse(
+            &s(&[
+                "clang++",
+                "-Xclang",
+                "-fno-pch-timestamp",
+                "-Xclang",
+                "-emit-pch",
+                "-Xclang",
+                "-include",
+                "-Xclang",
+                "/b/pch.hxx",
+                "-x",
+                "c++-header",
+                "-c",
+                "pch.hxx.cxx",
+            ]),
+            cwd,
+        )
+        .unwrap();
+        assert_eq!((pch.lang.as_str(), pch.forced.clone(), pch.probe_args.clone()), ("c++", vec![p("/b/pch.hxx")], Vec::<String>::new()));
+        let user = parse(
+            &s(&[
+                "clang++",
+                "-Xclang",
+                "-include-pch",
+                "-Xclang",
+                "/b/pch.hxx.pch",
+                "-Xclang",
+                "-include",
+                "-Xclang",
+                "/b/pch.hxx",
+                "-Xclang",
+                "-fno-x",
+                "-c",
+                "a.cpp",
+            ]),
+            cwd,
+        )
+        .unwrap();
+        assert_eq!((user.forced.clone(), user.probe_args.clone()), (vec![p("/b/pch.hxx")], s(&["-Xclang", "-fno-x"])));
+        assert_eq!(parse(&s(&["cc", "-c", "blake3.S"]), cwd).unwrap().lang, "assembler-with-cpp");
     }
 
     #[test]
