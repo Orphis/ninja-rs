@@ -119,6 +119,38 @@ pub fn patterns(state: &State, typed: &[String], targets_file: &Targets) -> Vec<
     names.into_iter().map(|n| if targets_file.get(&n).is_some() { targets_file.label(&n) } else { n }).collect()
 }
 
+/// Runners reported in `BuildMetrics`: name, exec kind.
+const RUNNERS: [(&str, &str); 4] = [("remote", "Remote"), ("remote cache hit", "Remote"), ("disk cache hit", "Local"), ("local", "Local")];
+
+/// A nested invocation sending events (see `Bes::relayed`).
+struct RelaySource {
+    /// Its build directory, relative to this one's when inside it.
+    rel: String,
+    /// `rel` as path components, for its files.
+    prefix: Vec<String>,
+    /// Tells its configurations and file sets apart.
+    tag: String,
+}
+
+impl RelaySource {
+    fn new(build_dir: &Path, nested: &str) -> RelaySource {
+        let nested = Path::new(nested);
+        let rel = nested.strip_prefix(build_dir).unwrap_or(nested);
+        let prefix: Vec<String> =
+            rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).filter(|c| !c.is_empty() && c != "/" && c != "\\").collect();
+        let rel = prefix.join("/");
+        RelaySource { tag: rel.clone(), rel, prefix }
+    }
+
+    fn config(&self, id: &str) -> String {
+        format!("{id}-{}", self.tag)
+    }
+
+    fn path(&self, p: &str) -> String {
+        if self.rel.is_empty() { p.to_string() } else { format!("{}/{p}", self.rel) }
+    }
+}
+
 /// The configuration used when the targets file has none.
 fn default_configuration() -> Configuration {
     Configuration { name: "default".into(), mnemonic: "ninja".into(), ..Default::default() }
@@ -172,21 +204,45 @@ pub struct Bes {
     store: Arc<Store>,
     uploader: Mutex<Option<BesUploader>>,
     file: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
+    /// A nested invocation: its events go to the outermost one instead.
+    relay_out: Mutex<Option<ninja_daemon::ipc::Stream>>,
+    /// The outermost invocation: where nested ones send their events.
+    relay_in: Option<crate::nested::RelayAddress>,
+    /// This invocation's build directory.
+    build_dir: std::path::PathBuf,
     inner: Mutex<Inner>,
     started: Instant,
     start_time: SystemTime,
     argv: Vec<String>,
     given: Vec<crate::options::GivenOption>,
-    /// The targets named on the command line.
+    /// The targets named on the command line (`-t exec`: the command).
     typed: Vec<String>,
+    /// Bazel's command: `build`, or `exec` for `-t exec`.
+    command: &'static str,
 }
 
 impl Bes {
     /// Connects to the backend and opens the file (when given). The events
     /// describing the invocation go first, once the build's targets are known
     /// (`announce`), or with the first other event.
-    pub async fn start(opts: &crate::options::Options, ids: &InvocationIds, bytestream: Option<String>, store: Arc<Store>) -> Arc<Bes> {
+    pub async fn start(
+        opts: &crate::options::Options,
+        ids: &InvocationIds,
+        bytestream: Option<String>,
+        store: Arc<Store>,
+        relay: Option<crate::nested::Relay>,
+    ) -> Arc<Bes> {
         let (flags, tls) = (&opts.bes, &opts.tls);
+        let exec = opts.tool.as_deref() == Some("exec");
+        let command = if exec { "exec" } else { "build" };
+        let build_dir = std::env::current_dir().unwrap_or_default();
+        let relay_out = flags.relay.as_ref().and_then(|r| match crate::nested::connect(r, &build_dir) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("ninja: warning: this build's events won't reach the invocation running it: {e}");
+                None
+            }
+        });
         let mut uploader = None;
         if let Some(backend) = &flags.backend {
             let connect = tls.load().map(|t| t.connect_options(backend, "", &[]));
@@ -198,7 +254,7 @@ impl Bes {
                 Ok(channel) => {
                     let mut config = BesConfig::new(&flags.instance_name, &ids.build_request_id, &ids.invocation_id);
                     config.keywords = flags.keywords.clone();
-                    config.keywords.extend(["command_name=build".to_string(), "protocol_name=BEP".to_string()]);
+                    config.keywords.extend([format!("command_name={command}"), "protocol_name=BEP".to_string()]);
                     config.lifecycle_events = flags.lifecycle_events;
                     config.headers = flags.headers.clone();
                     config.trace = std::env::var_os("NINJA_RS_BES_DEBUG").is_some_and(|v| !v.is_empty());
@@ -217,20 +273,149 @@ impl Bes {
         if let (Some(url), true) = (&flags.results_url, uploader.is_some()) {
             eprintln!("ninja: streaming build results to: {url}{}", ids.invocation_id);
         }
-        Arc::new(Bes {
+        let relay_in = relay.as_ref().map(|r| r.address.clone());
+        let bes = Arc::new(Bes {
             flags: flags.clone(),
             ids: ids.clone(),
             bytestream,
             store,
             uploader: Mutex::new(uploader),
             file: Mutex::new(file),
+            relay_out: Mutex::new(relay_out),
+            relay_in,
+            build_dir,
             inner: Mutex::default(),
             started: Instant::now(),
             start_time: SystemTime::now(),
             argv: opts.argv.clone(),
             given: opts.given.clone(),
-            typed: opts.targets.clone(),
-        })
+            typed: if exec { opts.tool_args.iter().skip_while(|a| *a == "--").cloned().collect() } else { opts.targets.clone() },
+            command,
+        });
+        if let Some(r) = relay {
+            bes.serve_relay(r.listener);
+        }
+        bes
+    }
+
+    /// A nested invocation's events stop going to the outer one (before any
+    /// was sent: they start with the build's targets).
+    pub fn leave_relay(&self) {
+        self.relay_out.lock().unwrap().take();
+    }
+
+    /// Accepts nested invocations' connections: each sends its build
+    /// directory, then its events.
+    fn serve_relay(self: &Arc<Self>, mut listener: ninja_daemon::ipc::Listener) {
+        let me = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            while let Ok(mut stream) = listener.accept() {
+                let me = me.clone();
+                std::thread::spawn(move || {
+                    let Ok(Some(dir)) = crate::nested::read_frame(&mut stream) else { return };
+                    let source = RelaySource::new(&me.upgrade().map(|b| b.build_dir.clone()).unwrap_or_default(), &String::from_utf8_lossy(&dir));
+                    while let Ok(Some(frame)) = crate::nested::read_frame(&mut stream) {
+                        // The end: everything before it is merged.
+                        if frame.is_empty() {
+                            let _ = std::io::Write::write_all(&mut stream, &[1]);
+                            return;
+                        }
+                        let (Some(bes), Ok(event)) = (me.upgrade(), bep::BuildEvent::decode(frame.as_slice())) else { return };
+                        bes.relayed(&source, event);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Merges a nested invocation's event into this stream: its targets,
+    /// failed actions, console output and action counts. Its configurations
+    /// (and so its targets' completions) are told apart by its build
+    /// directory: LLVM builds `llvm-tblgen` in both.
+    fn relayed(&self, source: &RelaySource, event: bep::BuildEvent) {
+        use bep::build_event_id::Id;
+        let (Some(id), Some(payload)) = (event.id.and_then(|i| i.id), event.payload) else { return };
+        let config = |c: &str| source.config(c);
+        let set = |s: &str| format!("{}:{s}", source.tag);
+        let sets = |sets: Vec<bep::build_event_id::NamedSetOfFilesId>| -> Vec<bep::build_event_id::NamedSetOfFilesId> {
+            sets.into_iter().map(|s| bep::build_event_id::NamedSetOfFilesId { id: set(&s.id) }).collect()
+        };
+        let rewrite_children = |children: Vec<bep::BuildEventId>| -> Vec<bep::BuildEventId> {
+            children
+                .into_iter()
+                .filter_map(|c| match c.id? {
+                    Id::TargetCompleted(t) => Some(id::target_completed(&t.label, &config(&t.configuration.unwrap_or_default().id))),
+                    _ => None,
+                })
+                .collect()
+        };
+        match (id, payload) {
+            (Id::Progress(_), Payload::Progress(p)) => {
+                if !p.stdout.is_empty() || !p.stderr.is_empty() {
+                    self.emit(|i| i.stream.progress(&p.stdout, &p.stderr));
+                }
+            }
+            (Id::Configuration(c), Payload::Configuration(mut cfg)) => {
+                cfg.mnemonic = format!("{} ({})", cfg.mnemonic, source.rel);
+                self.emit(|i| i.stream.post(id::configuration(&config(&c.id)), vec![], Payload::Configuration(cfg)));
+            }
+            (Id::TargetConfigured(t), payload) => {
+                // A label this invocation configured too keeps its event:
+                // the nested completions are announced as they come.
+                let children = rewrite_children(event.children);
+                self.emit(|i| i.stream.post(id::target_configured(&t.label), children, payload));
+            }
+            (Id::TargetCompleted(t), mut payload) => {
+                if let Payload::Completed(c) = &mut payload {
+                    for g in &mut c.output_group {
+                        g.file_sets = sets(std::mem::take(&mut g.file_sets));
+                    }
+                }
+                let config_id = config(&t.configuration.unwrap_or_default().id);
+                self.emit(|i| i.stream.post(id::target_completed(&t.label, &config_id), vec![], payload));
+            }
+            (Id::NamedSet(s), Payload::NamedSetOfFiles(mut files)) => {
+                for f in &mut files.files {
+                    let mut prefix = source.prefix.clone();
+                    prefix.append(&mut f.path_prefix);
+                    f.path_prefix = prefix;
+                }
+                files.file_sets = sets(std::mem::take(&mut files.file_sets));
+                self.emit(|i| i.stream.post(id::named_set(&set(&s.id)), vec![], Payload::NamedSetOfFiles(files)));
+            }
+            (Id::ActionCompleted(a), Payload::Action(mut action)) => {
+                let config_id = config(&a.configuration.unwrap_or_default().id);
+                let primary = source.path(&a.primary_output);
+                #[allow(deprecated)]
+                {
+                    action.configuration = Some(bep::build_event_id::ConfigurationId { id: config_id.clone() });
+                }
+                if let Some(f) = &mut action.primary_output {
+                    f.name = source.path(&f.name);
+                }
+                self.emit(|i| i.stream.post(id::action_completed(&primary, &a.label, &config_id), vec![], Payload::Action(action)));
+            }
+            (_, Payload::BuildMetrics(m)) => {
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(s) = m.action_summary {
+                    for a in s.action_data {
+                        let e = inner.mnemonics.entry(a.mnemonic).or_default();
+                        e.created += a.actions_created;
+                        e.executed += a.actions_executed;
+                        e.first_ms = if e.first_ms == 0 { a.first_started_ms } else { e.first_ms.min(a.first_started_ms) };
+                        e.last_ms = e.last_ms.max(a.last_ended_ms);
+                    }
+                    for r in s.runner_count.into_iter().filter(|r| r.name != "total") {
+                        let name = RUNNERS.iter().find(|(n, _)| *n == r.name).map(|(n, k)| (*n, *k));
+                        if let Some((n, k)) = name {
+                            inner.runners.entry(n).or_insert((0, k)).0 += r.count;
+                        }
+                    }
+                }
+                inner.targets_configured += m.target_metrics.map_or(0, |t| t.targets_configured);
+            }
+            _ => {}
+        }
     }
 
     /// Sends the events describing the invocation, if they weren't sent yet:
@@ -267,6 +452,19 @@ impl Bes {
     /// Writes events to the file and the uploader. Callers hold `inner`, so
     /// that events go out in the stream's order.
     fn send(&self, events: Vec<bep::BuildEvent>) {
+        {
+            let mut relay = self.relay_out.lock().unwrap();
+            if let Some(stream) = relay.as_mut() {
+                for e in &events {
+                    if let Err(err) = crate::nested::write_frame(stream, &e.encode_to_vec()) {
+                        eprintln!("ninja: warning: sending build events to the invocation running this one failed: {err}");
+                        *relay = None;
+                        break;
+                    }
+                }
+                return;
+            }
+        }
         let uploader = self.uploader.lock().unwrap();
         let mut file = self.file.lock().unwrap();
         for e in events {
@@ -283,8 +481,9 @@ impl Bes {
     }
 
     /// Bazel's structured command line: its sections, which UIs show, with
-    /// the options as given and the targets named on the command line as
-    /// the residual.
+    /// the options and the targets named on the command line as the
+    /// residual. The `original` one has the options typed, the `canonical`
+    /// one those of `.ninjars` files and the outer invocation too.
     fn structured_command_line(&self, label: &str) -> cl::CommandLine {
         let chunk = |label: &str, chunk: Vec<String>| cl::CommandLineSection {
             section_label: label.into(),
@@ -294,6 +493,7 @@ impl Bes {
         let given = self
             .given
             .iter()
+            .filter(|g| label != "original" || g.explicit)
             .map(|g| cl::Option { combined_form: g.combined_form.clone(), option_name: g.name.clone(), option_value: g.value.clone(), ..Default::default() })
             .collect();
         cl::CommandLine {
@@ -301,7 +501,7 @@ impl Bes {
             sections: vec![
                 chunk("executable", vec![self.argv.first().cloned().unwrap_or_default()]),
                 cl::CommandLineSection { section_label: "startup options".into(), section_type: Some(options(vec![])) },
-                chunk("command", vec!["build".into()]),
+                chunk("command", vec![self.command.into()]),
                 cl::CommandLineSection { section_label: "command options".into(), section_type: Some(options(given)) },
                 chunk("residual", self.typed.clone()),
             ],
@@ -316,7 +516,7 @@ impl Bes {
             start_time: Some(timestamp(start)),
             build_tool_version: format!("{TOOL_NAME} {}", env!("CARGO_PKG_VERSION")),
             options_description: argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" "),
-            command: "build".into(),
+            command: self.command.into(),
             working_directory: workspace.clone(),
             workspace_directory: workspace.clone(),
             server_pid: i64::from(std::process::id()),
@@ -338,7 +538,8 @@ impl Bes {
         }
         children.push(id::build_finished());
         let command_lines: Vec<_> = ["original", "canonical"].iter().map(|l| (*l, self.structured_command_line(l))).collect();
-        let options: Vec<String> = argv.iter().skip(1).cloned().collect();
+        let explicit: Vec<String> = argv.iter().skip(1).cloned().collect();
+        let options: Vec<String> = self.given.iter().map(|g| g.combined_form.clone()).chain(self.typed.iter().cloned()).collect();
         let status = [("BUILD_HOST", host_name()), ("BUILD_USER", user_name()), ("BUILD_TIMESTAMP", (millis(start) / 1000).to_string())];
         let metadata = self.flags.build_metadata.iter().cloned().collect();
         inner.patterns = Some(patterns);
@@ -352,12 +553,7 @@ impl Bes {
             out.extend(s.post(
                 id::options_parsed(),
                 vec![],
-                Payload::OptionsParsed(bep::OptionsParsed {
-                    cmd_line: options.clone(),
-                    explicit_cmd_line: options,
-                    tool_tag: TOOL_NAME.into(),
-                    ..Default::default()
-                }),
+                Payload::OptionsParsed(bep::OptionsParsed { cmd_line: options, explicit_cmd_line: explicit, tool_tag: TOOL_NAME.into(), ..Default::default() }),
             ));
             out.extend(s.post(
                 id::workspace_status(),
@@ -535,10 +731,10 @@ impl Bes {
             m.first_ms = if m.first_ms == 0 { millis(start) } else { m.first_ms.min(millis(start)) };
             m.last_ms = m.last_ms.max(millis(end));
             let runner = match kind {
-                ExecKind::Remote => ("remote", "Remote"),
-                ExecKind::RemoteCacheHit => ("remote cache hit", "Remote"),
-                ExecKind::DiskCacheHit => ("disk cache hit", "Local"),
-                _ => ("local", "Local"),
+                ExecKind::Remote => RUNNERS[0],
+                ExecKind::RemoteCacheHit => RUNNERS[1],
+                ExecKind::DiskCacheHit => RUNNERS[2],
+                _ => RUNNERS[3],
             };
             inner.runners.entry(runner.0).or_insert((0, runner.1)).0 += 1;
             for c in &info.cas_outputs {
@@ -701,6 +897,23 @@ impl Bes {
         });
         if let Some(mut f) = self.file.lock().unwrap().take() {
             let _ = f.flush();
+        }
+        if let Some(r) = &self.relay_in {
+            crate::nested::Relay::remove(r);
+        }
+        // A nested invocation's stream ends with an empty frame, which the
+        // outer invocation acknowledges once it merged the events before
+        // it: they are in before the command running this one ends (with
+        // `-t exec`, the outer invocation ends with it).
+        let relay = self.relay_out.lock().unwrap().take();
+        if let Some(mut stream) = relay
+            && crate::nested::write_frame(&mut stream, &[]).is_ok()
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(std::io::Read::read_exact(&mut stream, &mut [0u8; 1]));
+            });
+            let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10))).await;
         }
         let uploader = self.uploader.lock().unwrap().take();
         if let Some(u) = uploader {

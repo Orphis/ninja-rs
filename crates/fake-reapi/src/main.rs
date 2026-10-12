@@ -35,5 +35,11 @@ fn main() {
         println!("{}", server.endpoint);
         let _ = tokio::signal::ctrl_c().await;
         eprintln!("{:?}", server.stats());
+        // Which invocations the executions were for.
+        let mut invocations: std::collections::BTreeMap<String, usize> = Default::default();
+        for m in server.state.request_metadata.lock().unwrap().iter() {
+            *invocations.entry(m.tool_invocation_id.clone()).or_default() += 1;
+        }
+        eprintln!("executions per invocation: {invocations:?}");
     });
 }

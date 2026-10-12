@@ -21,6 +21,8 @@ rust_library(
         "//third_party/cargo-rbe/rbe-client",
         "@crates//:prost",
         "@crates//:prost-types",
+        "@crates//:serde",
+        "@crates//:serde_json",
         "@crates//:tokio",
     ] + select({
         "@platforms//os:windows": [],
@@ -55,7 +57,11 @@ rust_test(
 rust_test(
     name = "remote_e2e",
     srcs = ["tests/remote_e2e.rs"],
-    data = ["//crates/fake-reapi:test_certs"],
+    data = [
+        ":ninja-rs",
+        "//crates/fake-reapi:test_certs",
+    ],
+    rustc_env = {"CARGO_BIN_EXE_ninja-rs": "$(rootpath :ninja-rs)"},
     use_libtest_harness = False,
     deps = [
         ":ninja_rs_lib",

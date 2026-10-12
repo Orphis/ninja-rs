@@ -9,7 +9,9 @@ pub mod bes;
 pub mod daemon;
 pub mod exec_runner;
 pub mod jobserver;
+pub mod nested;
 pub mod options;
+pub mod rc;
 pub mod tools;
 
 use std::sync::Arc;
@@ -65,6 +67,9 @@ pub struct Service {
     /// Set by a one-shot CLI process: skip freeing per-build data at the end
     /// of a build. A long-lived service must leave it unset.
     pub skip_teardown: bool,
+    /// Where nested invocations send their build events (the CLI binds it
+    /// before starting threads; see `nested`).
+    pub relay: Option<nested::Relay>,
 }
 
 impl Service {
@@ -82,6 +87,7 @@ impl Service {
             stat_cache: true,
             ids: InvocationIds::default(),
             skip_teardown: false,
+            relay: None,
         }
     }
 
@@ -136,10 +142,10 @@ impl Service {
         self.remote_verbose = opts.remote.verbose;
         self.racing = opts.remote.racing.then(|| exec_runner::Racing { delay: Duration::from_millis(opts.remote.racing_delay_ms), stats: Arc::default() });
         self.ids = InvocationIds::new(&opts.bes);
-        // Build events cover builds, not tools.
-        let bes = if opts.bes.enabled() && opts.tool.is_none() {
+        // Build events cover builds and `-t exec`, not the other tools.
+        let bes = if opts.bes.enabled() && opts.tool.as_deref().is_none_or(|t| t == "exec") {
             let bytestream = opts.remote.endpoint().map(|e| bes::bytestream_prefix(e, &opts.remote.instance_name));
-            Some(Bes::start(opts, &self.ids, bytestream, self.store.clone()).await)
+            Some(Bes::start(opts, &self.ids, bytestream, self.store.clone(), self.relay.take()).await)
         } else {
             None
         };
@@ -170,6 +176,7 @@ impl Service {
         {
             return match t.as_str() {
                 "daemon" => daemon::tool(&opts.tool_args),
+                "exec" => exec(opts, status).await,
                 _ => tools::tool_restat_after_flags(&opts.tool_args),
             };
         }
@@ -199,6 +206,14 @@ impl Service {
                 return EXIT_FAILURE;
             }
 
+            // A nested build without remote execution (CMake's compiler
+            // checks, as a nested configure runs them) has nothing to add
+            // to the outer invocation's events.
+            if let Some(b) = &status.bes
+                && state.lookup_variable(ROOT_SCOPE, "rbe_version").is_empty()
+            {
+                b.leave_relay();
+            }
             let build_dir = state.lookup_variable(ROOT_SCOPE, "builddir");
             let log_path = if build_dir.is_empty() { BUILD_LOG_FILE.to_string() } else { format!("{build_dir}/{BUILD_LOG_FILE}") };
             let deps_path = if build_dir.is_empty() { DEPS_LOG_FILE.to_string() } else { format!("{build_dir}/{DEPS_LOG_FILE}") };
@@ -533,8 +548,16 @@ impl Service {
         } else {
             None
         };
+        // Opened for appending, so that nested invocations' lines (see
+        // `nested`) and this one's don't overwrite each other.
         let execution_log = match &opts.remote.execution_log {
-            Some(f) => Some(Arc::new(std::sync::Mutex::new(std::fs::File::create(f).map_err(|e| format!("creating {f}: {e}"))?))),
+            Some(f) => {
+                if !opts.remote.execution_log_append {
+                    std::fs::File::create(f).map_err(|e| format!("creating {f}: {e}"))?;
+                }
+                let file = std::fs::File::options().create(true).append(true).open(f).map_err(|e| format!("opening {f}: {e}"))?;
+                Some(Arc::new(std::sync::Mutex::new(file)))
+            }
             None => None,
         };
         let backend = ninja_remote::Backend::new(
@@ -787,6 +810,47 @@ impl Service {
 }
 
 /// `file` in the manifest's `builddir` (the current directory if unset).
+/// `-t exec [--] COMMAND [ARGS...]`: runs a command (a configure building
+/// external projects, a script) whose ninja-rs invocations take this one's
+/// options and report under its invocation, as nested invocations do (see
+/// `nested`). Returns the command's exit code.
+async fn exec(opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
+    let args = match opts.tool_args.split_first() {
+        Some((dashes, rest)) if dashes == "--" => rest,
+        _ => &opts.tool_args[..],
+    };
+    let Some((program, rest)) = args.split_first() else {
+        status.error("usage: ninja-rs [options] -t exec [--] COMMAND [ARGS...]");
+        return EXIT_FAILURE;
+    };
+    if let Some(b) = &status.bes {
+        b.announce(&[]);
+    }
+    // The execution log starts here: nested invocations append to it.
+    if let Some(log) = &opts.remote.execution_log
+        && !opts.remote.execution_log_append
+        && let Err(e) = std::fs::File::create(log)
+    {
+        status.warning(&format!("can't write the execution log {log}: {e}"));
+    }
+    match tokio::process::Command::new(program).args(rest).status().await {
+        Ok(s) => match s.code() {
+            Some(code) => code,
+            None => {
+                #[cfg(unix)]
+                if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&s) {
+                    return 128 + signal;
+                }
+                EXIT_FAILURE
+            }
+        },
+        Err(e) => {
+            status.error(&format!("{program}: {e}"));
+            127
+        }
+    }
+}
+
 fn in_build_dir(build_dir: &str, file: &str) -> String {
     if build_dir.is_empty() { file.to_string() } else { format!("{build_dir}/{file}") }
 }

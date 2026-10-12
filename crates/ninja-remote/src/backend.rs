@@ -1234,7 +1234,8 @@ fn log_action(log: &std::sync::Mutex<std::fs::File>, task: &Task, meta: &ActionM
         "input_root": rbe_client::digest_str(&p.input_root_digest),
         "inputs": inputs,
     });
-    let _ = writeln!(log.lock().unwrap(), "{entry}");
+    // One write per line: other invocations append to the same file.
+    let _ = log.lock().unwrap().write_all(format!("{entry}\n").as_bytes());
 }
 
 /// gRPC status codes in `google.rpc.Status`.

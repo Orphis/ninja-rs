@@ -55,6 +55,16 @@ fn fake_clang(args: &[String]) -> i32 {
                 i += 1;
             }
             "--link" => link = true,
+            // A precompiled header (CMake's with Clang) must be there.
+            "-Xclang" if args.get(i).is_some_and(|n| n == "-include-pch") && args.get(i + 1).is_some_and(|n| n == "-Xclang") => {
+                if let Some(pch) = args.get(i + 2)
+                    && !Path::new(pch).exists()
+                {
+                    eprintln!("fake-clang: error: precompiled header {pch} not found");
+                    return 1;
+                }
+                i += 3;
+            }
             "-DFAIL" => {
                 eprintln!("error: FAIL requested");
                 return 1;
@@ -1110,6 +1120,221 @@ int main() {{ return lib(); }}
     Ok(())
 }
 
+/// A file the include scan finds that only exists remotely (a precompiled
+/// header in `-Xclang -include-pch`, as CMake writes with Clang, left
+/// remote by minimal downloads) goes in by digest, as declared inputs do.
+fn test_remote_only_scanned_input() -> Result<(), String> {
+    let f = fixture("pch", true);
+    let mut manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    manifest.push_str(&format!(
+        "build obj/pch.pch: CC {lib}
+  DEP_FILE = obj/pch.pch.d
+  rbe_mnemonic = CCompile
+build obj/user.o: CC {main} | obj/pch.pch
+  DEP_FILE = obj/user.o.d
+  FLAGS = -Xclang -include-pch -Xclang obj/pch.pch
+  rbe_mnemonic = CCompile
+",
+        lib = ninja_escape_path(&f.root.join("src/lib.c").to_string_lossy()),
+        main = ninja_escape_path(&f.root.join("src/main.c").to_string_lossy()),
+    ));
+    write(&f.build.join("build.ninja"), &manifest);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_strict", "obj/user.o"]) == 0, "build failed")?;
+        check(server.stats().executions == 2, &format!("expected 2 remote executions, got {:?}", server.stats()))?;
+        check(!f.build.join("obj/pch.pch").exists(), "the precompiled header was downloaded")?;
+        Ok(())
+    })
+}
+
+/// The ninja-rs binary, found once before the tests change directories.
+static NINJA_EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn ninja_exe() -> PathBuf {
+    NINJA_EXE.get_or_init(find_ninja_exe).clone()
+}
+
+/// The ninja-rs binary (`CARGO_BIN_EXE_ninja-rs`, a runfile under Bazel,
+/// relative to the directory the test starts in).
+fn find_ninja_exe() -> PathBuf {
+    let path = env!("CARGO_BIN_EXE_ninja-rs");
+    if Path::new(path).exists() {
+        return std::path::absolute(path).unwrap();
+    }
+    // Bazel on Windows: no runfiles tree, a manifest of them.
+    let manifest = std::env::var("RUNFILES_MANIFEST_FILE").expect("ninja-rs binary not found");
+    let key = format!("_main/{path} ");
+    let text = std::fs::read_to_string(manifest).unwrap();
+    let line = text.lines().find(|l| l.starts_with(&key)).expect("ninja-rs binary not in the runfiles");
+    PathBuf::from(&line[key.len()..])
+}
+
+/// A build command running ninja-rs again (LLVM's NATIVE tools,
+/// ExternalProject): the nested build runs remotely with the outer one's
+/// settings, under its invocation id, its events join the outer stream
+/// and its actions the outer execution log.
+fn test_nested_invocation() -> Result<(), String> {
+    use rbe_bes::proto::build_event_stream::build_event::Payload;
+    use rbe_bes::proto::build_event_stream::build_event_id::Id;
+    let f = fixture("nested", true);
+    let inner = f.build.join("inner");
+    for file in ["CMakeFiles/rbe_toolchains.json", "CMakeFiles/rbe_targets.json"] {
+        write(&inner.join(file), &std::fs::read_to_string(f.build.join(file)).unwrap());
+    }
+    let (cc, inc) = (f.compiler.to_string_lossy(), f.root.join("include").to_string_lossy().to_string());
+    write(
+        &inner.join("build.ninja"),
+        &format!(
+            "rbe_version = 1
+rbe_toolchains = CMakeFiles/rbe_toolchains.json
+rbe_targets = CMakeFiles/rbe_targets.json
+rule CC
+  command = {cc} -I{inc} -MD -MF $out.d -c $in -o $out
+  depfile = $out.d
+  deps = gcc
+build obj/lib.o: CC {lib}
+  rbe_target = lib
+  rbe_mnemonic = CCompile
+",
+            lib = ninja_escape_path(&f.root.join("src/lib.c").to_string_lossy())
+        ),
+    );
+    let exe = ninja_exe();
+    write(
+        &f.build.join("build.ninja"),
+        &format!(
+            "rule NESTED
+  command = \"{}\" -C inner obj/lib.o
+
+build inner/obj/lib.o: NESTED
+",
+            exe.display()
+        ),
+    );
+    let id = "4a1b2c3d-0000-4000-8000-000000000001";
+    with_server(&f, |server| {
+        let (bep, log) = (f.root.join("events.bep"), f.root.join("exec.jsonl"));
+        let out = std::process::Command::new(&exe)
+            .current_dir(&f.build)
+            .env_remove(ninja_rs::nested::ENV)
+            .args([
+                format!("--remote_executor={}", server.endpoint),
+                format!("--invocation_id={id}"),
+                format!("--build_event_binary_file={}", bep.display()),
+                format!("--execution_log_file={}", log.display()),
+            ])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        check(
+            out.status.success(),
+            &format!(
+                "the build failed:
+{text}"
+            ),
+        )?;
+        check(
+            server.stats().executions == 1,
+            &format!(
+                "expected the nested compile remotely: {:?}
+{text}",
+                server.stats()
+            ),
+        )?;
+        let ids: Vec<String> = server.state.request_metadata.lock().unwrap().iter().map(|m| m.tool_invocation_id.clone()).collect();
+        check(!ids.is_empty() && ids.iter().all(|i| i == id), &format!("executions not under the outer invocation: {ids:?}"))?;
+        let events = ninja_rs::bes::read_binary_file(&bep).map_err(|e| e.to_string())?;
+        rbe_bes::events::validate(&events)?;
+        let nested = events.iter().any(|e| match (e.id.as_ref().and_then(|i| i.id.as_ref()), &e.payload) {
+            (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) => {
+                t.label == "//src:lib" && t.configuration.as_ref().is_some_and(|c| c.id.ends_with("-inner")) && c.success
+            }
+            _ => false,
+        });
+        check(nested, "the nested build's target isn't in the outer stream")?;
+        let lines = std::fs::read_to_string(&log).map_err(|e| e.to_string())?.lines().count();
+        check(lines == 1, &format!("expected the nested action in the execution log, got {lines} lines"))?;
+        Ok(())
+    })
+}
+
+/// `-t exec`: the builds a command runs (a configure building external
+/// projects) are one invocation, with the options of the `.ninjars` file.
+fn test_exec() -> Result<(), String> {
+    use rbe_bes::proto::build_event_stream::build_event::Payload;
+    use rbe_bes::proto::build_event_stream::build_event_id::Id;
+    let f = fixture("exec", true);
+    let inner = f.build.join("inner");
+    for file in ["CMakeFiles/rbe_toolchains.json", "CMakeFiles/rbe_targets.json"] {
+        write(&inner.join(file), &std::fs::read_to_string(f.build.join(file)).unwrap());
+    }
+    let (cc, inc) = (f.compiler.to_string_lossy(), f.root.join("include").to_string_lossy().to_string());
+    write(
+        &inner.join("build.ninja"),
+        &format!(
+            "rbe_version = 1
+rbe_toolchains = CMakeFiles/rbe_toolchains.json
+rbe_targets = CMakeFiles/rbe_targets.json
+rule CC
+  command = {cc} -I{inc} -MD -MF $out.d -c $in -o $out
+  depfile = $out.d
+  deps = gcc
+build obj/lib.o: CC {lib}
+  rbe_target = lib
+  rbe_mnemonic = CCompile
+",
+            lib = ninja_escape_path(&f.root.join("src/lib.c").to_string_lossy())
+        ),
+    );
+    let exe = ninja_exe();
+    let id = "4a1b2c3d-0000-4000-8000-000000000002";
+    with_server(&f, |server| {
+        let (bep, log) = (f.root.join("events.bep"), f.root.join("exec.jsonl"));
+        // The remote settings from the workspace's file, as a project keeps them.
+        write(&f.build.join(".ninjars"), &format!("build --remote_executor={}\nexec --invocation_id={id}\n", server.endpoint));
+        let out = std::process::Command::new(&exe)
+            .current_dir(&f.build)
+            .env_remove(ninja_rs::nested::ENV)
+            .args(["--nosystem_rc", "--nohome_rc"])
+            .arg(format!("--build_event_binary_file={}", bep.display()))
+            .arg(format!("--execution_log_file={}", log.display()))
+            .args(["-t", "exec", "--"])
+            .arg(&exe)
+            .args(["-C", "inner", "obj/lib.o"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        check(out.status.success(), &format!("the command failed:\n{text}"))?;
+        check(server.stats().executions == 1, &format!("expected the build's compile remotely: {:?}\n{text}", server.stats()))?;
+        let ids: Vec<String> = server.state.request_metadata.lock().unwrap().iter().map(|m| m.tool_invocation_id.clone()).collect();
+        check(!ids.is_empty() && ids.iter().all(|i| i == id), &format!("executions not under the exec invocation: {ids:?}"))?;
+        let events = ninja_rs::bes::read_binary_file(&bep).map_err(|e| e.to_string())?;
+        rbe_bes::events::validate(&events)?;
+        let mut started = false;
+        let mut target = false;
+        let mut lines = Vec::new();
+        for e in &events {
+            match (e.id.as_ref().and_then(|i| i.id.as_ref()), &e.payload) {
+                (_, Some(Payload::Started(s))) => started = s.command == "exec" && s.uuid == id,
+                (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) => {
+                    target |= t.label == "//src:lib" && t.configuration.as_ref().is_some_and(|c| c.id.ends_with("-inner")) && c.success
+                }
+                (_, Some(Payload::StructuredCommandLine(c))) => lines.push(c.clone()),
+                _ => {}
+            }
+        }
+        check(started, "no exec BuildStarted with the invocation id")?;
+        check(target, "the build's target isn't in the exec invocation's stream")?;
+        // The file's options are in the canonical command line only.
+        let has = |label: &str| lines.iter().filter(|c| c.command_line_label == label).any(|c| format!("{c:?}").contains("--remote_executor="));
+        check(has("canonical") && !has("original"), "the file's options should be in the canonical command line only")?;
+        let lines = std::fs::read_to_string(&log).map_err(|e| e.to_string())?.lines().count();
+        check(lines == 1, &format!("expected the build's action in the execution log, got {lines} lines"))?;
+        Ok(())
+    })
+}
+
 /// The members of a thin archive recorded as remote-only.
 fn recorded_members(f: &Fixture, archive: &str) -> Vec<String> {
     let text = std::fs::read_to_string(f.build.join(".ninja_remote")).unwrap_or_default();
@@ -1327,6 +1552,7 @@ fn main() -> ExitCode {
     if args.len() >= 3 && args[..3] == ["-t", "daemon", "run"] {
         return ExitCode::from(ninja_rs::daemon::tool(&args[2..]) as u8);
     }
+    ninja_exe();
     let tests: Vec<(&str, fn() -> Result<(), String>)> = vec![
         ("remote_build_and_cache", test_remote_build_and_cache),
         ("local_tool_steps", test_local_tool_steps),
@@ -1343,6 +1569,9 @@ fn main() -> ExitCode {
         ("disk_cache_minimal", test_disk_cache_minimal),
         ("compression", test_compression),
         ("splice_compressed", test_splice_compressed),
+        ("nested_invocation", test_nested_invocation),
+        ("exec", test_exec),
+        ("remote_only_scanned_input", test_remote_only_scanned_input),
         ("thin_archives", test_thin_archives),
         ("mtls", test_mtls),
         ("include_scanner_fallback", test_include_scanner_fallback),

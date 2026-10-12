@@ -34,9 +34,12 @@ pub struct Options {
     /// Certificates for `grpcs://` endpoints: the remote service and the
     /// Build Event Service.
     pub tls: TlsFlags,
+    /// `.ninjars` files (see `rc`).
+    pub rc: RcOptions,
     /// The whole command line (for build events).
     pub argv: Vec<String>,
-    /// The options given, in order (for build events).
+    /// The options given, in order (for build events): from `.ninjars`
+    /// files and the command line.
     pub given: Vec<GivenOption>,
 }
 
@@ -48,6 +51,149 @@ pub struct GivenOption {
     /// Without dashes: `remote_executor`, `j`.
     pub name: String,
     pub value: String,
+    /// Where it is in the arguments parsed.
+    pub index: usize,
+    /// Typed on the command line, not from a `.ninjars` file or the
+    /// invocation running this one.
+    pub explicit: bool,
+}
+
+/// `.ninjars` files and their configs (see `rc`). Which files are read is
+/// decided from the command line alone (`rc::prescan`); the options are
+/// kept here for build events and nested invocations.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RcOptions {
+    /// `--ninjars=FILE`: read after the others (repeatable).
+    pub files: Vec<String>,
+    /// `--[no]system_rc`, `--[no]workspace_rc`, `--[no]home_rc`.
+    pub system: bool,
+    pub workspace: bool,
+    pub home: bool,
+    /// `--ignore_all_rc_files`.
+    pub ignore_all: bool,
+    /// `--config=NAME`, as expanded.
+    pub configs: Vec<String>,
+    /// `--announce_rc`: print the options each file gave.
+    pub announce: bool,
+    /// `--enable_platform_specific_config`: the config named after the
+    /// host's OS (`linux`, `macos`, `windows`...) applies when defined.
+    pub platform_config: bool,
+    /// The files read (not their imports) and the workspace directory, for
+    /// nested invocations expanding their own `--config`.
+    pub read: Vec<String>,
+    pub workspace_dir: Option<String>,
+}
+
+impl Default for RcOptions {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+            system: true,
+            workspace: true,
+            home: true,
+            ignore_all: false,
+            configs: Vec::new(),
+            announce: false,
+            platform_config: false,
+            read: Vec::new(),
+            workspace_dir: None,
+        }
+    }
+}
+
+/// The options that only go on the command line: they decide which
+/// `.ninjars` files are read.
+pub const RC_SELECTION: &[&str] = &["ninjars", "system_rc", "workspace_rc", "home_rc", "ignore_all_rc_files"];
+
+/// A boolean option's value, as Bazel takes them: `--name=true`, `yes`,
+/// `1`, or `false`, `no`, `0`.
+pub fn parse_bool(name: &str, v: &str) -> Result<bool, String> {
+    match v {
+        "true" | "yes" | "1" => Ok(true),
+        "false" | "no" | "0" => Ok(false),
+        _ => Err(format!("invalid --{name} value '{v}' (true or false)")),
+    }
+}
+
+/// The home directory: `HOME`, or `USERPROFILE` on Windows.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    let var = if cfg!(windows) { std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) } else { std::env::var_os("HOME") };
+    var.filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+}
+
+/// A path option's value: `~` expanded (as Bazel does), then absolute,
+/// relative to where ninja-rs was started (not -C).
+fn path_value(name: &str, v: &str) -> Result<String, String> {
+    let expanded = match v.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\') => match home_dir() {
+            Some(h) => format!("{}{rest}", h.to_string_lossy()),
+            None => v.to_string(),
+        },
+        _ => v.to_string(),
+    };
+    std::path::absolute(&expanded).map(|p| p.to_string_lossy().into_owned()).map_err(|e| format!("--{name}={v}: {e}"))
+}
+
+/// The field of a boolean option (`--name`, `--noname`, `--name=false`).
+fn bool_option<'a>(o: &'a mut Options, name: &str) -> Option<&'a mut bool> {
+    Some(match name {
+        "remote_upload_local_results" => &mut o.remote.upload_local_results,
+        "remote_local_fallback" => &mut o.remote.local_fallback,
+        "remote_strict" => &mut o.remote.strict,
+        "remote_racing" => &mut o.remote.racing,
+        "remote_verbose" => &mut o.remote.verbose,
+        "remote_cache_compression" | "experimental_remote_cache_compression" => &mut o.remote.cache_compression,
+        "daemon" => &mut o.remote.daemon,
+        "bes_lifecycle_events" => &mut o.bes.lifecycle_events,
+        "build_event_publish_all_actions" => &mut o.bes.publish_all_actions,
+        "system_rc" => &mut o.rc.system,
+        "workspace_rc" => &mut o.rc.workspace,
+        "home_rc" => &mut o.rc.home,
+        "ignore_all_rc_files" => &mut o.rc.ignore_all,
+        "announce_rc" => &mut o.rc.announce,
+        "enable_platform_specific_config" => &mut o.rc.platform_config,
+        _ => return None,
+    })
+}
+
+/// Whether `name` (without dashes) is a boolean option, or its `no` form.
+pub fn is_bool_option(name: &str) -> bool {
+    let mut o = blank();
+    let base = name.strip_prefix("no").filter(|b| bool_option(&mut o, b).is_some()).unwrap_or(name);
+    bool_option(&mut o, base).is_some()
+}
+
+/// How an option from a `.ninjars` file parses.
+#[derive(Debug, PartialEq)]
+pub enum RcOptionError {
+    /// Not an option of ninja-rs (`common` lines skip these).
+    Unknown(String),
+    Invalid(String),
+}
+
+/// Checks one option of a `.ninjars` file, with its value when it is
+/// separate (`--remote_instance_name main`).
+pub fn check_rc_option(group: &[String]) -> Result<(), RcOptionError> {
+    let only_command_line = || RcOptionError::Invalid(format!("'{}' only goes on the command line", group.join(" ")));
+    match parse_unchecked(group) {
+        Err(e) if e.starts_with("unrecognized option") || e.starts_with("invalid option") => {
+            Err(RcOptionError::Unknown(e.lines().next().unwrap_or_default().to_string()))
+        }
+        Err(e) => Err(RcOptionError::Invalid(e)),
+        Ok(ParseOutcome::Exit(..)) => Err(only_command_line()),
+        Ok(ParseOutcome::Run(o)) => {
+            if let Some(t) = o.targets.first() {
+                Err(RcOptionError::Invalid(format!("'{t}' isn't an option")))
+            } else if o.tool.is_some()
+                || o.working_dir.is_some()
+                || o.given.iter().any(|g| RC_SELECTION.contains(&g.name.strip_prefix("no").unwrap_or(&g.name)))
+            {
+                Err(only_command_line())
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 /// TLS for `grpcs://` endpoints, with Bazel's flag names. Paths are
@@ -133,6 +279,8 @@ pub struct BesFlags {
     pub build_metadata: Vec<(String, String)>,
     pub invocation_id: Option<String>,
     pub build_request_id: Option<String>,
+    /// A nested invocation's events go to the outermost one (see `nested`).
+    pub relay: Option<crate::nested::RelayAddress>,
 }
 
 impl Default for BesFlags {
@@ -150,13 +298,14 @@ impl Default for BesFlags {
             build_metadata: Vec::new(),
             invocation_id: None,
             build_request_id: None,
+            relay: None,
         }
     }
 }
 
 impl BesFlags {
     pub fn enabled(&self) -> bool {
-        self.backend.is_some() || self.binary_file.is_some()
+        self.backend.is_some() || self.binary_file.is_some() || self.relay.is_some()
     }
 }
 
@@ -199,6 +348,8 @@ pub struct RemoteFlags {
     pub download_minimal: bool,
     /// `--execution_log_file`: where to log every remote action (absolute).
     pub execution_log: Option<String>,
+    /// Appended to (a nested invocation's, see `nested`), not replaced.
+    pub execution_log_append: bool,
     /// `--remote_include_scanner`: how compiles' inputs are found.
     pub include_scanner: ninja_remote::action::IncludeScanner,
     /// `--[no]daemon` (`NINJA_RS_DAEMON=1`): use the daemon keeping caches
@@ -272,6 +423,19 @@ options:
            current parallel job configuration. Ignored if -j1 is
            specified explicitly, or if an existing pool is detected
 
+settings files (.ninjars, in the format of Bazel's .bazelrc: /etc/ninjars, the first
+.ninjars from the build directory up, ~/.ninjars, then --ninjars files):
+  --config=NAME              add the options of the NAME config, where it is given
+  --ninjars=FILE             also read FILE, after the others (repeatable; /dev/null
+                             ends them)
+  --[no]system_rc  --[no]workspace_rc  --[no]home_rc
+                             read the system's, the workspace's, the user's file [default=on]
+  --ignore_all_rc_files      read none
+  --announce_rc              print the options each file gives
+  --enable_platform_specific_config
+                             add the config named after the host OS (linux, macos,
+                             windows, freebsd, openbsd) when a file defines it
+
 remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --remote_executor=URL      grpc://host:port or grpcs://host:port
   --remote_cache=URL         remote cache alone: actions remote execution would run
@@ -343,8 +507,9 @@ fn parse_int(flag: &str, v: &str) -> Result<i64, String> {
     v.parse::<i64>().map_err(|_| format!("invalid {flag} parameter"))
 }
 
-pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
-    let mut o = Options {
+/// Options with their defaults.
+fn blank() -> Options {
+    Options {
         working_dir: None,
         input_file: "build.ninja".into(),
         parallelism: guess_parallelism(),
@@ -376,9 +541,40 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
             ..Default::default()
         },
         bes: BesFlags::default(),
-        argv: std::iter::once("ninja-rs".to_string()).chain(args.iter().cloned()).collect(),
+        rc: RcOptions::default(),
+        argv: Vec::new(),
         given: Vec::new(),
-    };
+    }
+}
+
+pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
+    let outcome = parse_unchecked(args)?;
+    if let ParseOutcome::Run(o) = &outcome {
+        validate(o)?;
+    }
+    Ok(outcome)
+}
+
+/// Options that must agree with each other.
+fn validate(o: &Options) -> Result<(), String> {
+    if o.tls.client_certificate.is_some() != o.tls.client_key.is_some() {
+        return Err("--tls_client_certificate and --tls_client_key go together".into());
+    }
+    if o.remote.racing && o.remote.strict {
+        return Err("--remote_racing runs actions locally, which --remote_strict forbids".into());
+    }
+    if let (Some(e), Some(c)) = (&o.remote.executor, &o.remote.cache)
+        && e != c
+    {
+        return Err("--remote_cache and --remote_executor name different services: the executor's cache is used".into());
+    }
+    Ok(())
+}
+
+/// Parses the arguments, without checking that the options agree.
+fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
+    let mut o = blank();
+    o.argv = std::iter::once("ninja-rs".to_string()).chain(args.iter().cloned()).collect();
     let key_value = |flag: &str, v: &str| -> Result<(String, String), String> {
         v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or_else(|| format!("--{flag} expects KEY=VALUE, got '{v}'"))
     };
@@ -405,6 +601,18 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 *i += 1;
                 Ok(v)
             };
+            // Booleans, as Bazel takes them: --name, --noname, --name=false.
+            let negated = name.strip_prefix("no").filter(|base| bool_option(&mut o, base).is_some());
+            if let Some(field) = bool_option(&mut o, negated.unwrap_or(name)) {
+                *field = match (&inline, negated) {
+                    (None, None) => true,
+                    (None, Some(_)) => false,
+                    (Some(_), Some(_)) => return Err(format!("option '--{name}' doesn't take a value")),
+                    (Some(v), None) => parse_bool(name, v)?,
+                };
+                o.given.push(GivenOption { combined_form: a.clone(), name: name.to_string(), value: inline.unwrap_or_default(), index: first, explicit: true });
+                continue;
+            }
             match name {
                 "version" => return Ok(ParseOutcome::Exit(format!("{}\n", ninja_core::parser::NINJA_VERSION), 0)),
                 "verbose" => o.verbosity = Verbosity::Verbose,
@@ -413,9 +621,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "jobserver-pool" => o.jobserver_pool = true,
                 "help" => return Ok(ParseOutcome::Exit(usage(), 1)),
                 "tls_certificate" | "tls_client_certificate" | "tls_client_key" => {
-                    // Relative to where ninja-rs was started, not to -C.
-                    let v = value(&mut i)?;
-                    let abs = std::path::absolute(&v).map_err(|e| format!("--{name}={v}: {e}"))?.to_string_lossy().into_owned();
+                    let abs = path_value(name, &value(&mut i)?)?;
                     match name {
                         "tls_certificate" => o.tls.certificate = Some(abs),
                         "tls_client_certificate" => o.tls.client_certificate = Some(abs),
@@ -425,8 +631,6 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "tls_authority_override" => o.tls.authority_override = Some(value(&mut i)?),
                 "remote_executor" => o.remote.executor = Some(value(&mut i)?),
                 "remote_cache" => o.remote.cache = Some(value(&mut i)?),
-                "remote_upload_local_results" => o.remote.upload_local_results = true,
-                "noremote_upload_local_results" => o.remote.upload_local_results = false,
                 "remote_instance_name" => o.remote.instance_name = value(&mut i)?,
                 "remote_header" => {
                     let v = value(&mut i)?;
@@ -443,10 +647,6 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 }
                 "exec_root" => o.remote.exec_root = Some(value(&mut i)?),
                 "remote_mnemonics" => o.remote.mnemonic_suffixes = value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
-                "remote_local_fallback" => o.remote.local_fallback = true,
-                "noremote_local_fallback" => o.remote.local_fallback = false,
-                "remote_strict" => o.remote.strict = true,
-                "remote_racing" => o.remote.racing = true,
                 "remote_racing_delay" => {
                     let v = value(&mut i)?;
                     let n = parse_int("--remote_racing_delay", &v)?;
@@ -468,7 +668,6 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                     let r: f64 = v.parse().ok().filter(|r| (0.0..=1.0).contains(r)).ok_or("invalid --remote_max_fallback_ratio parameter (0 to 1)")?;
                     o.remote.max_fallback_ratio = Some(r);
                 }
-                "remote_verbose" => o.remote.verbose = true,
                 "remote_download_outputs" => {
                     o.remote.download_minimal = match value(&mut i)?.as_str() {
                         "all" => false,
@@ -479,21 +678,8 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_download_minimal" => o.remote.download_minimal = true,
                 "remote_download_all" => o.remote.download_minimal = false,
                 "remote_include_scanner" => o.remote.include_scanner = value(&mut i)?.parse()?,
-                "remote_cache_compression" | "experimental_remote_cache_compression" => o.remote.cache_compression = true,
-                "noremote_cache_compression" | "noexperimental_remote_cache_compression" => o.remote.cache_compression = false,
-                "daemon" => o.remote.daemon = true,
-                "nodaemon" => o.remote.daemon = false,
-                "execution_log_file" => {
-                    let v = value(&mut i)?;
-                    let abs = std::path::absolute(&v).map_err(|e| format!("--execution_log_file={v}: {e}"))?;
-                    o.remote.execution_log = Some(abs.to_string_lossy().into_owned());
-                }
-                "disk_cache" => {
-                    // Relative to where ninja-rs was started, not to -C.
-                    let v = value(&mut i)?;
-                    let abs = std::path::absolute(&v).map_err(|e| format!("--disk_cache={v}: {e}"))?;
-                    o.remote.disk_cache = Some(abs.to_string_lossy().into_owned());
-                }
+                "execution_log_file" => o.remote.execution_log = Some(path_value(name, &value(&mut i)?)?),
+                "disk_cache" => o.remote.disk_cache = Some(path_value(name, &value(&mut i)?)?),
                 "disk_cache_max_size" => {
                     let v = value(&mut i)?;
                     o.remote.disk_cache_max_size = ninja_remote::disk_cache::parse_size(&v).ok_or_else(|| format!("invalid --disk_cache_max_size '{v}'"))?;
@@ -503,17 +689,16 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 "bes_header" => o.bes.headers.push(key_value(name, &value(&mut i)?)?),
                 "bes_results_url" => o.bes.results_url = Some(value(&mut i)?),
                 "bes_keywords" => o.bes.keywords.extend(value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
-                "bes_lifecycle_events" => o.bes.lifecycle_events = true,
-                "nobes_lifecycle_events" => o.bes.lifecycle_events = false,
                 "bes_timeout" => {
                     let v = value(&mut i)?;
                     o.bes.timeout_secs = parse_int("--bes_timeout", &v)?.max(0) as u64;
                 }
-                "build_event_binary_file" => o.bes.binary_file = Some(value(&mut i)?),
-                "build_event_publish_all_actions" => o.bes.publish_all_actions = true,
+                "build_event_binary_file" => o.bes.binary_file = Some(path_value(name, &value(&mut i)?)?),
                 "build_metadata" => o.bes.build_metadata.push(key_value(name, &value(&mut i)?)?),
                 "invocation_id" => o.bes.invocation_id = Some(value(&mut i)?),
                 "build_request_id" => o.bes.build_request_id = Some(value(&mut i)?),
+                "config" => o.rc.configs.push(value(&mut i)?),
+                "ninjars" => o.rc.files.push(path_value(name, &value(&mut i)?)?),
                 _ => return Err(format!("unrecognized option '--{name}'")),
             }
             let value = match &inline {
@@ -521,7 +706,7 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 None if i > first + 1 => args[i - 1].clone(),
                 None => String::new(),
             };
-            o.given.push(GivenOption { combined_form: args[first..i].join(" "), name: name.to_string(), value });
+            o.given.push(GivenOption { combined_form: args[first..i].join(" "), name: name.to_string(), value, index: first, explicit: true });
             continue;
         }
         if a.len() > 1 && a.starts_with('-') {
@@ -554,6 +739,8 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                     },
                     name: c.to_string(),
                     value: arg.clone().unwrap_or_default(),
+                    index: first,
+                    explicit: true,
                 });
                 match c {
                     'd' => match arg.as_deref().unwrap() {
@@ -622,17 +809,6 @@ pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         positional.push(a.clone());
     }
     o.targets = positional;
-    if o.tls.client_certificate.is_some() != o.tls.client_key.is_some() {
-        return Err("--tls_client_certificate and --tls_client_key go together".into());
-    }
-    if o.remote.racing && o.remote.strict {
-        return Err("--remote_racing runs actions locally, which --remote_strict forbids".into());
-    }
-    if let (Some(e), Some(c)) = (&o.remote.executor, &o.remote.cache)
-        && e != c
-    {
-        return Err("--remote_cache and --remote_executor name different services: the executor's cache is used".into());
-    }
     Ok(ParseOutcome::Run(Box::new(o)))
 }
 

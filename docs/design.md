@@ -279,6 +279,9 @@ endpoints say which certificate was sent and which CAs were trusted
    the `rbe_toolchains` file by `tool` (case-insensitive on Windows). Its
    `inputs` are sent whole as grafted Merkle subtrees, its `platform` becomes
    the REAPI platform. Without a declaration only the executable is sent.
+   The declared inputs are the edge's, with phony inputs replaced by what
+   they depend on (recursively), as ninja orders them: an edge depending on
+   CMake's `all` gets the build's outputs, remote-only ones by digest.
 4. **Include scanning** (`scanner`), see below; a VFS overlay
    (`-ivfsoverlay`, `-vfsoverlay`) is an input. **Links** (`link`): a
    compiler driver that compiles nothing links. Its dry run (`-###`, first
@@ -354,7 +357,8 @@ skipped. CMake doesn't set `restat` on archives.
 
 `parse_compile` understands gcc/clang and cl/clang-cl command lines:
 `-I`, `/I`, `-isystem`, `-iquote`, `-idirafter`, `-isystem-after`, `-imsvc`,
-`/imsvc`, `/external:I`, `-include`, `-imacros`, `/FI`, `--sysroot`,
+`/imsvc`, `/external:I`, `-include`, `-imacros` (also behind `-Xclang`),
+`/FI`, `--sysroot`,
 `-isysroot`, `/winsysroot`, `-nostdinc`, `/X`, `-x`, `/TP`, `/TC`,
 `-fmodule-file=`, `-include-pch`, `-fprofile-use=` and `@file` response
 files (expanded recursively; UTF-16 rsp files are decoded).
@@ -380,9 +384,13 @@ earlier builds) are always sent.
 `--remote_include_scanner=preprocessor` finds a GCC or Clang compile's
 inputs with `crates/cpp-deps`, a preprocessor that evaluates directives
 exactly and skips everything else; when it can't (a `cl`-style command,
-unsupported flags such as `-include-pch` or `-ivfsoverlay`, a compiler it
+unsupported flags such as `-iprefix` or `-ivfsoverlay`, a compiler it
 can't probe, or a result it marks inexact), the conservative scanner above
-runs instead.
+runs instead. Headers compiled alone (`-x c++-header`, as for a precompiled
+header) are scanned as their language, `.S`/`.sx` and
+`-x assembler-with-cpp` as C; `-include` and `-imacros` behind `-Xclang`
+are forced includes, and a precompiled header (`-include-pch`, also behind
+`-Xclang`) is an input that is not scanned.
 
 - **Lexing** (`lex`): each file is reduced once per version to its
   directive lines, tokenized, with `#define`s parsed and include guards
@@ -591,6 +599,101 @@ build are not counted in their target's remaining edges.
 `NINJA_RS_BES_DEBUG=1` traces the upload on stderr (stream, acks,
 lifecycle events).
 
+## Settings files
+
+`rc.rs` reads `.ninjars` files, with the format and features of Bazel's
+`.bazelrc`, so that a project keeps its settings (executor, BES, disk cache,
+mnemonics) in the repository and `cmake --build` or an IDE builds with them.
+
+- **Which files** (`prescan`, `RcFiles::discover`): what the command line
+  says decides, before any file is read (Bazel's startup options): `-C`,
+  `-t`, `--ninjars=FILE`, `--[no]system_rc`, `--[no]workspace_rc`,
+  `--[no]home_rc`, `--ignore_all_rc_files`. These only go on the command
+  line. Then, in order: the system's (`/etc/ninjars`,
+  `%ProgramData%\ninjars`); the workspace's, the first `.ninjars` from the
+  build directory up, short of the home directory, whose directory is the
+  workspace (else the build directory); the user's (`~/.ninjars`); the
+  `--ninjars` files (`/dev/null` ends them; a missing one is an error). A
+  file found twice is read once.
+- **Lines**: `COMMAND[:CONFIG] OPTIONS...`, `import FILE`, `try-import FILE`
+  (relative to the importing file; import loops are errors). `#` at a word's
+  start comments out the rest, a trailing `\` joins the next line, words
+  split like the shell's. `%workspace%` expands in imports and options (an
+  extension: Bazel expands it in imports); `~` expands in path options, as
+  Bazel does.
+- **Commands** (`commands`): levels from least to most specific: `common`
+  and `always`, then `build` (builds and tools), then `exec` (`-t exec`).
+  A level's lines go in the order read, across files and imports; the
+  levels in that order; then the command line. `common` lines skip options
+  ninja-rs doesn't know (Bazel 7's rule), `always` and the others fail on
+  them. Bazel's other commands (`test`, `query`, `startup`...) are skipped,
+  others warned about.
+- **Options**: each is checked alone (`options::check_rc_option`): known,
+  no target or tool, not one of the command-line-only options above. With
+  no targets in files, a word after an option without `=` is its value,
+  unless the option is a boolean. Booleans take Bazel's forms everywhere:
+  `--name`, `--noname`, `--name=true|false|yes|no|1|0`.
+- **Configs**: `--config=NAME` (or `--config NAME`), on the command line or
+  in a file, adds the options of the `COMMAND:NAME` lines of the applicable
+  commands, least specific first, where it is; configs nest, cycles and
+  undefined configs are errors (a config defined for a Bazel command only
+  is defined). `--enable_platform_specific_config` adds the config named
+  after the host OS (`linux`, `macos`, `windows`, `freebsd`, `openbsd`), if
+  defined, between the files' options and the command line's.
+- `--announce_rc` prints each file's options by command, and each config's
+  expansion.
+
+The expanded options are parsed as one command line (`Expanded::args`), and
+each remembers whether it was typed (`GivenOption::explicit`): build events
+show the typed ones in the `original` structured command line and
+`explicit_cmd_line`, all of them in the `canonical` one and `cmd_line`.
+
+## Nested invocations
+
+Builds start builds: a custom command running `cmake --build` (LLVM's
+`NATIVE` tablegen build, ExternalProject's steps) runs ninja-rs again in
+another build directory. They are one invocation:
+
+- **Settings** (`nested.rs`): the outermost invocation exports
+  `NINJA_RS_PARENT`, JSON with its invocation and build request ids, its
+  remote settings as flags (executor, TLS, disk cache, mnemonics, download
+  mode, scanner...; paths made absolute; not the BES and output flags), its
+  execution log, a relay address and the `.ninjars` files it read. A nested
+  invocation puts the flags before its own command line (its own flags
+  win), takes the ids, so that every remote request has the outer
+  `tool_invocation_id`, and appends to the execution log (one `write` per
+  line: the processes share the file). The files' options are among the
+  flags, so it doesn't apply them again; it reads the files for the
+  `--config`s of its own command line only. The environment carries it to
+  grandchildren unchanged.
+- **Build events**: with a BES backend or event file, the outermost
+  invocation listens on a relay (`relay-<pid>`, a Unix socket or named pipe
+  of `ninja-daemon`'s IPC); a nested invocation without its own BES flags
+  connects and sends its events as length-prefixed `BuildEvent`s instead of
+  opening a stream. The outer stream re-posts them (`Bes::relayed`):
+  progress as its own; configurations, targets and actions under a
+  configuration of their own (`<id>-<dir tag>`, mnemonic suffixed with the
+  nested build directory, as Bazel shows a transition), file sets and
+  output paths prefixed with that directory; metrics are added to the
+  outer ones. Started, finished and pattern events stay the outer
+  invocation's. A nested build without `rbe_version` (a `try_compile`)
+  leaves the relay: it reports nothing. A nested stream ends with an empty
+  frame, which the outer invocation acknowledges once it merged what came
+  before: a nested process exits with its events in the outer stream.
+- ExternalProject passes `CMAKE_MAKE_PROGRAM` and `CMAKE_NINJA_RBE` to the
+  projects it configures with Ninja, so their builds run with ninja-rs.
+- **`-t exec [--] COMMAND`** makes any command the outermost invocation:
+  a configure building external projects, a script running several builds.
+  It exports the same context, owns the stream (`BuildStarted` with the
+  command `exec`, the command as the residual), runs the command and ends
+  with its exit code. The `exec` lines of `.ninjars` files apply to it, and
+  the `build` ones.
+
+A nested build runs in a console-pool edge (CMake puts recursive builds
+there). Its local jobs share the outer `-j` only through a jobserver pool
+(`--jobserver-pool`), which it joins as a client; remote actions take no
+token either way.
+
 ## Disk cache
 
 `--disk_cache=DIR` (`ninja-remote/src/disk_cache.rs`) is a local action cache
@@ -740,6 +843,9 @@ the outputs of remote actions in the remote CAS, except:
 - what the command line names, through phony targets, even when it is up
   to date;
 - depfiles, which the build reads;
+- what a remote action reads is never downloaded for it: a file a scanner
+  finds that is a recorded output (a precompiled header) goes in by digest,
+  like a declared one;
 - what a local command reads: before a task runs on the host (a local edge,
   a fallback, `rbe_local`), `RemoteBackend::materialize` downloads its
   inputs that only exist remotely.

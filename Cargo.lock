@@ -700,6 +700,8 @@ dependencies = [
  "prost-types",
  "rbe-bes",
  "rbe-client",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

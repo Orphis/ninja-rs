@@ -52,7 +52,13 @@ ninja-rs [options] [targets...]
   -d explain|keepdepfile|keeprsp|stats|nostatcache  -w phonycycle=err|warn  --version
   -t list|targets|commands|inputs|query|deps|rules|clean|cleandead|recompact|restat
      |compdb|compdb-targets|missingdeps
+  -t exec [--] COMMAND [ARGS...] (run COMMAND: the ninja-rs builds it runs take these
+                                 options and report under this invocation)
   --jobserver-pool               (GNU make jobserver pool for the commands)
+
+settings files (.ninjars, Bazel's .bazelrc format, see below):
+  --config=NAME  --announce_rc  --enable_platform_specific_config
+  --ninjars=FILE  --[no]system_rc  --[no]workspace_rc  --[no]home_rc  --ignore_all_rc_files
 
 remote execution (only for manifests with rbe_version = 1):
   --remote_executor=grpc://host:port | grpcs://host:port
@@ -101,6 +107,50 @@ build events (Bazel's Build Event Protocol, flags named as in Bazel):
   --build_event_publish_all_actions
   --build_metadata=K=V  --invocation_id=UUID  --build_request_id=UUID
 ```
+
+### Settings files
+
+Options can live in `.ninjars` files, which have the format and features of
+Bazel's `.bazelrc`: `COMMAND[:CONFIG] OPTIONS...` lines, `import` and
+`try-import`, `%workspace%`, `--config`, `--announce_rc`,
+`--enable_platform_specific_config`. For example, at the top of a repository:
+
+```
+# Every build.
+build --remote_include_scanner=preprocessor --remote_download_minimal
+build --disk_cache=~/.cache/ninja-rs/disk
+
+# ninja-rs --config=glass
+build:glass --remote_executor=grpcs://glass.cluster.engflow.com
+build:glass --bes_backend=grpcs://glass.cluster.engflow.com
+build:glass --bes_results_url=https://glass.cluster.engflow.com/invocations/default/
+build:glass --remote_mnemonics=Compile,Archive,Link --remote_jobs=200
+
+# Certificates and other personal settings, out of the repository.
+try-import %workspace%/user.ninjars
+```
+
+- **Files**, read in this order, later options winning: `/etc/ninjars`
+  (`%ProgramData%\ninjars` on Windows); the workspace's, the first
+  `.ninjars` found from the build directory (`-C`) up, whose directory is
+  `%workspace%`; `~/.ninjars`; the `--ninjars=FILE` files. Then the command
+  line, where each `--config` adds its options in place.
+- **Commands**: `common` and `always` lines apply to every invocation,
+  `build` lines to builds and tools, `exec` lines to `-t exec` (which takes
+  the `build` ones too); within a file, `common` lines go first. `common`
+  lines skip the options ninja-rs doesn't have, and lines of Bazel's other
+  commands (`test`, `query`, `startup`...) are skipped, so one file can serve
+  both.
+- **Paths**: `~` expands in path options; relative paths are relative to
+  where ninja-rs started, as on the command line: use `%workspace%`.
+- `--announce_rc` prints what each file gave; `--ignore_all_rc_files`,
+  `--nosystem_rc`, `--noworkspace_rc` and `--nohome_rc` leave files out.
+
+Builds that ninja-rs runs (a custom command running `cmake --build`) take
+the outer invocation's options, `.ninjars` ones included, and report under
+its invocation. `-t exec` does the same for builds started outside a build,
+such as a CMake configure building external projects:
+`ninja-rs --config=glass -t exec -- cmake -G Ninja -S . -B build`.
 
 It can be used as CMake's make program:
 `cmake -G Ninja -DCMAKE_MAKE_PROGRAM=/path/to/ninja-rs ...`

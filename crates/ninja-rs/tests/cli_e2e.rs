@@ -39,7 +39,7 @@ struct Run {
 
 fn ninja(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
     let mut c = Command::new(ninja_exe());
-    c.current_dir(dir).args(args).env_remove("MAKEFLAGS").env_remove("NINJA_STATUS");
+    c.current_dir(dir).args(args).env_remove("MAKEFLAGS").env_remove("NINJA_STATUS").env_remove(ninja_rs::nested::ENV);
     for (k, v) in env {
         c.env(k, v);
     }
@@ -59,6 +59,51 @@ fn check_eq(got: &str, want: &str, what: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // fake-job
 // ---------------------------------------------------------------------------
+
+/// `.ninjars` files: the workspace's found from the build directory up,
+/// their options before the command line's, `--config`s expanded; and
+/// `-t exec`, which takes them too.
+fn test_ninjars() -> Result<(), String> {
+    let dir = test_dir("ninjars");
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(
+        dir.join(".ninjars"),
+        "build --build_event_binary_file=%workspace%/a.bep\n\
+         build:other --build_event_binary_file=%workspace%/b.bep\n\
+         build:bad --nope\n\
+         common --some_bazel_flag\n\
+         test --test_output=errors\n",
+    )
+    .unwrap();
+    std::fs::write(out.join("build.ninja"), "build all: phony\ndefault all\n").unwrap();
+    let base = ["-C", "out", "--nosystem_rc", "--nohome_rc"];
+    let with = |more: &[&str]| -> Vec<String> { base.iter().chain(more).map(|s| s.to_string()).collect() };
+    let run = |args: Vec<String>| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        ninja(&dir, &refs, &[])
+    };
+    let r = run(with(&[]));
+    check(r.code == 0 && dir.join("a.bep").is_file(), &format!("the workspace's options: {}{}", r.stdout, r.stderr))?;
+    let r = run(with(&["--config=other", "--announce_rc"]));
+    check(r.code == 0 && dir.join("b.bep").is_file(), &format!("--config: {}{}", r.stdout, r.stderr))?;
+    for want in ["reading rc options for 'build' from", "found applicable config definition build:other"] {
+        check(r.stderr.contains(want), &format!("--announce_rc: no '{want}' in\n{}", r.stderr))?;
+    }
+    let r = run(with(&["--config=bad"]));
+    check(r.code == 2 && r.stderr.contains(".ninjars:3: unrecognized option '--nope'"), &format!("an unknown option: {}", r.stderr))?;
+    let r = run(with(&["--ignore_all_rc_files", "--config=other"]));
+    check(r.code == 2 && r.stderr.contains("config value 'other' is not defined"), &format!("--ignore_all_rc_files: {}", r.stderr))?;
+    // -t exec: the command's exit code.
+    let exe = ninja_exe().to_string_lossy().into_owned();
+    let r = run(with(&["-t", "exec", "--", &exe, "nothing"]));
+    check(r.code == 1 && r.stderr.contains("unknown target 'nothing'"), &format!("-t exec: {}{}", r.stdout, r.stderr))?;
+    let r = run(with(&["-t", "exec", "--", &exe]));
+    check(r.code == 0, &format!("-t exec: {}{}", r.stdout, r.stderr))?;
+    let r = run(with(&["-t", "exec", "no-such-program-here"]));
+    check(r.code == 127, &format!("-t exec of a missing program: {} {}", r.code, r.stderr))?;
+    Ok(())
+}
 
 /// `fake-job OUT`: runs for a while, then writes how many jobs were running
 /// halfway through and its `MAKEFLAGS` to OUT.
@@ -348,6 +393,7 @@ fn main() -> ExitCode {
         ("jobserver_pool", test_jobserver_pool),
         ("jobserver_pool_from_manifest", test_jobserver_pool_from_manifest),
         ("jobserver_client", test_jobserver_client),
+        ("ninjars", test_ninjars),
     ];
     #[cfg(unix)]
     tests.push(("jobserver_pipe", test_jobserver_pipe));
