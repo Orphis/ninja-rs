@@ -185,11 +185,57 @@ fn system_file() -> Option<PathBuf> {
     if cfg!(windows) { std::env::var_os("ProgramData").map(|d| PathBuf::from(d).join("ninjars")) } else { Some(PathBuf::from("/etc/ninjars")) }
 }
 
-/// The workspace's file: the first `.ninjars` from `dir` up, short of the
-/// home directory (whose file is the user's).
+/// Version control directories: a repository's root ends the search for
+/// its `.ninjars`.
+const REPOSITORY_MARKERS: &[&str] = &[".git", ".hg", ".jj", ".sl", ".svn"];
+
+/// The workspace's file: the first `.ninjars` from `dir` up to the
+/// repository's root, short of the home directory (whose file is the
+/// user's). A file someone else could have put there is never read: in a
+/// file system's root (`/`, `D:\`) or a directory others can write to
+/// (`/tmp`), or (on Unix) one another user owns.
 pub fn workspace_file(dir: &Path) -> Option<PathBuf> {
     let home = options::home_dir();
-    dir.ancestors().take_while(|d| home.as_deref() != Some(*d)).map(|d| d.join(FILE_NAME)).find(|f| f.is_file())
+    for d in dir.ancestors() {
+        if home.as_deref() == Some(d) || d.parent().is_none() || writable_by_others(d) {
+            return None;
+        }
+        let f = d.join(FILE_NAME);
+        if f.is_file() && owned_by_user(&f) {
+            return Some(f);
+        }
+        if REPOSITORY_MARKERS.iter().any(|m| d.join(m).exists()) {
+            return None;
+        }
+    }
+    None
+}
+
+/// A directory shared by every user, as `/tmp` is: writable by all, with
+/// the sticky bit. (Writable by all alone is how WSL shows Windows drives,
+/// on a single-user host.)
+#[cfg(unix)]
+fn writable_by_others(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o1002 == 0o1002)
+}
+
+#[cfg(not(unix))]
+fn writable_by_others(_dir: &Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn owned_by_user(file: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    std::fs::metadata(file).is_ok_and(|m| m.uid() == uid || m.uid() == 0)
+}
+
+#[cfg(not(unix))]
+fn owned_by_user(_file: &Path) -> bool {
+    true
 }
 
 fn is_dev_null(f: &str) -> bool {
@@ -473,7 +519,7 @@ pub fn expand(rc: &RcFiles, levels: &[&[&str]], cmdline: &[String], end: usize, 
                 }
                 let first = out.args.len();
                 expand_line(rc, levels, line, &mut stack, &mut out)?;
-                out.announcements.push(format!("  '{}' options: {}", line.command, out.args[first..].join(" ")));
+                out.announcements.push(format!("  '{}' options: {}", line.command, options::redact_args(&out.args[first..]).join(" ")));
             }
         }
     }
@@ -525,7 +571,7 @@ fn expand_config(rc: &RcFiles, levels: &[&[&str]], config: &str, stack: &mut Vec
                 "found applicable config definition {}:{config} in file {}: {}",
                 line.command,
                 line.file.display(),
-                out.args[first..].join(" ")
+                options::redact_args(&out.args[first..]).join(" ")
             ));
         }
     }
@@ -744,6 +790,24 @@ mod tests {
         let e = expand_in(&dir, "", &["--noenable_platform_specific_config", "--announce_rc=false"]).unwrap();
         assert!(!e.args.contains(&"--remote_jobs=3".to_string()));
         assert!(!e.announce);
+    }
+
+    #[test]
+    fn workspace_search_bounds() {
+        // The repository's root ends the search: a file above it isn't the
+        // workspace's.
+        let dir = tree("bounds", &[(".ninjars", "build --remote_jobs=1\n"), ("repo/.git/HEAD", ""), ("repo/build/x", "")]);
+        assert_eq!(workspace_file(&dir.join("repo/build")), None);
+        std::fs::write(dir.join("repo/.ninjars"), "").unwrap();
+        assert_eq!(workspace_file(&dir.join("repo/build")), Some(dir.join("repo").join(FILE_NAME)));
+        // Nor in a directory others can write to.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let shared = tree("shared", &[(".ninjars", ""), ("b/x", "")]);
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            assert_eq!(workspace_file(&shared.join("b")), None);
+        }
     }
 
     #[test]

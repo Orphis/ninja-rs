@@ -22,6 +22,15 @@ use ninja_rs::options::{ParseOutcome, parse_args};
 // ---------------------------------------------------------------------------
 
 fn fake_clang(args: &[String]) -> i32 {
+    // Response files (`@file`, whitespace-separated arguments).
+    let args: Vec<String> = args
+        .iter()
+        .flat_map(|a| match a.strip_prefix('@') {
+            Some(f) => std::fs::read_to_string(f).unwrap_or_default().split_whitespace().map(str::to_string).collect(),
+            None => vec![a.clone()],
+        })
+        .collect();
+    let args = &args;
     let mut include_dirs: Vec<PathBuf> = Vec::new();
     let mut src = None;
     let mut out = None;
@@ -207,6 +216,11 @@ fn fake_cmake(args: &[String]) -> i32 {
             for p in files {
                 std::fs::write(p, "").unwrap();
             }
+            0
+        }
+        // What a build command gets from the invocation running it.
+        [e, env, file] if e == "-E" && env == "environment" => {
+            std::fs::write(file, std::env::var(ninja_rs::nested::ENV).unwrap_or_default()).unwrap();
             0
         }
         _ => {
@@ -481,16 +495,28 @@ fn test_disk_cache_alone() -> Result<(), String> {
     check(disk_cache_entries(&disk) == 2, &format!("expected 2 cached actions, got {}", disk_cache_entries(&disk)))?;
     let main_o = std::fs::read(f.build.join("obj/main.o")).map_err(|e| e.to_string())?;
 
-    // 2. After a clean, the compiles come from the cache. To tell, the
-    //    cached object is altered (same size, which is all a read checks).
+    // 2. After a clean, the compiles come from the cache. To tell, local
+    //    compiles mark their outputs (`race-local-mark`).
+    let mark = f.build.join("race-local-mark");
+    write(&mark, "");
+    check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+    check(run_ninja(&f, None, &[&flag]) == 0, "rebuild from the disk cache failed")?;
+    check(std::fs::read(f.build.join("obj/main.o")).ok().as_ref() == Some(&main_o), "obj/main.o was not restored from the disk cache")?;
+    // A cached blob altered (same size) isn't restored: it's a miss, and
+    // goes.
     let blob = rbe_client::digest_of(&main_o);
     let blob_path = disk.join("cas").join(&blob.hash[..2]).join(&blob.hash);
     let mut altered = main_o.clone();
     altered[0] ^= 0x20;
     std::fs::write(&blob_path, &altered).map_err(|e| e.to_string())?;
     check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
-    check(run_ninja(&f, None, &[&flag]) == 0, "rebuild from the disk cache failed")?;
-    check(std::fs::read(f.build.join("obj/main.o")).ok() == Some(altered), "obj/main.o was not restored from the disk cache")?;
+    check(run_ninja(&f, None, &[&flag]) == 0, "rebuild after a corrupt blob failed")?;
+    let rebuilt = std::fs::read_to_string(f.build.join("obj/main.o")).unwrap_or_default();
+    check(rebuilt.ends_with("RACE-LOCAL\n"), "obj/main.o should have been compiled again")?;
+    check(!blob_path.exists(), "the corrupt blob should be gone")?;
+    std::fs::remove_file(&mark).map_err(|e| e.to_string())?;
+    check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+    check(run_ninja(&f, None, &[&flag]) == 0, "rebuild failed")?;
     check(std::fs::read_to_string(f.build.join("app.bin")).is_ok_and(|s| s.starts_with("LINKED")), "app.bin")?;
     // The depfile was stored with relative paths and mapped back.
     let deep = f.root.join("include/nested/deep.h").to_string_lossy().replace('\\', "/");
@@ -1206,10 +1232,14 @@ build obj/lib.o: CC {lib}
         &format!(
             "rule NESTED
   command = \"{}\" -C inner obj/lib.o
+rule ENV
+  command = \"{}\" -E environment $out
 
 build inner/obj/lib.o: NESTED
+build env.txt: ENV
 ",
-            exe.display()
+            exe.display(),
+            f.root.join("cmake/bin").join(if cfg!(windows) { "fake-cmake.exe" } else { "fake-cmake" }).display()
         ),
     );
     let id = "4a1b2c3d-0000-4000-8000-000000000001";
@@ -1223,6 +1253,7 @@ build inner/obj/lib.o: NESTED
                 format!("--invocation_id={id}"),
                 format!("--build_event_binary_file={}", bep.display()),
                 format!("--execution_log_file={}", log.display()),
+                "--remote_header=x-secret=TOKEN-123".to_string(),
             ])
             .output()
             .map_err(|e| e.to_string())?;
@@ -1234,6 +1265,12 @@ build inner/obj/lib.o: NESTED
 {text}"
             ),
         )?;
+        // The nested build sends the header, which the outer one didn't put
+        // in its commands' environment (nor in its build events, below).
+        let headers = server.state.headers.lock().unwrap().clone();
+        check(headers.contains(&("x-secret".into(), "TOKEN-123".into())), &format!("the nested build's headers: {headers:?}"))?;
+        let env = std::fs::read_to_string(f.build.join("env.txt")).map_err(|e| e.to_string())?;
+        check(env.contains("secret_flags") && !env.contains("TOKEN-123"), &format!("NINJA_RS_PARENT: {env}"))?;
         check(
             server.stats().executions == 1,
             &format!(
@@ -1246,6 +1283,7 @@ build inner/obj/lib.o: NESTED
         check(!ids.is_empty() && ids.iter().all(|i| i == id), &format!("executions not under the outer invocation: {ids:?}"))?;
         let events = ninja_rs::bes::read_binary_file(&bep).map_err(|e| e.to_string())?;
         rbe_bes::events::validate(&events)?;
+        check(!format!("{events:?}").contains("TOKEN-123"), "a header value is in the build events")?;
         let nested = events.iter().any(|e| match (e.id.as_ref().and_then(|i| i.id.as_ref()), &e.payload) {
             (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) => {
                 t.label == "//src:lib" && t.configuration.as_ref().is_some_and(|c| c.id.ends_with("-inner")) && c.success
@@ -1524,6 +1562,87 @@ fn test_daemon() -> Result<(), String> {
     r
 }
 
+/// Results a server (or a poisoned cache) returns that can't be used:
+/// outputs it wasn't asked for, outside the build directory, a declared
+/// output missing or as a symlink, a corrupt blob. Nothing is written from
+/// them; the action runs locally instead, with the right output.
+fn test_untrusted_results() -> Result<(), String> {
+    use rbe_client::proto as re;
+    let f = fixture("untrusted", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let main_o = f.build.join("obj/main.o");
+        check(run_ninja(&f, Some(&ep), &["obj/main.o"]) == 0, "first build failed")?;
+        let good = std::fs::read(&main_o).map_err(|e| e.to_string())?;
+        let planted = server.state.put(b"planted".to_vec());
+        let escape = f.root.join("escape.txt");
+        let absolute = f.root.join("absolute.txt").to_string_lossy().replace('\\', "/");
+        let rebuild = |what: &str| -> Result<(), String> {
+            let _ = std::fs::remove_file(&main_o);
+            check(run_ninja(&f, Some(&ep), &["obj/main.o"]) == 0, &format!("{what}: the build failed"))?;
+            check(std::fs::read(&main_o).ok().as_ref() == Some(&good), &format!("{what}: obj/main.o isn't the compile's"))?;
+            check(!escape.exists() && !f.root.join("absolute.txt").exists(), &format!("{what}: a file was written outside the build"))
+        };
+        let file = |path: &str, d: &re::Digest| re::OutputFile { path: path.into(), digest: Some(d.clone()), ..Default::default() };
+
+        let (p, a) = (planted.clone(), absolute.clone());
+        server.state.set_tamper(Some(Box::new(move |r| {
+            r.output_files.push(file("../escape.txt", &p));
+            r.output_files.push(file(&a, &p));
+        })));
+        rebuild("outputs outside the build directory")?;
+
+        server.state.set_tamper(Some(Box::new(|r| r.output_files.retain(|o| !o.path.ends_with("main.o")))));
+        rebuild("a missing output")?;
+
+        server.state.set_tamper(Some(Box::new(|r| {
+            r.output_files.retain(|o| !o.path.ends_with("main.o"));
+            r.output_symlinks.push(re::OutputSymlink { path: "obj/main.o".into(), target: "../../escape.txt".into(), ..Default::default() });
+        })));
+        rebuild("a symlink output")?;
+        check(std::fs::symlink_metadata(&main_o).is_ok_and(|m| m.is_file()), "obj/main.o should be a file")?;
+
+        server.state.set_tamper(None);
+        server.state.corrupt_blob(&rbe_client::digest_of(&good).hash);
+        rebuild("a corrupt blob")?;
+        Ok(())
+    })
+}
+
+/// Response files of a command run locally from its prepared action (a
+/// disk cache miss): rewritten as the remote action reads them, but a
+/// checked-in one is copied, never modified; ninja's own is rewritten in
+/// place.
+fn test_response_files() -> Result<(), String> {
+    let f = fixture("rsp", true);
+    let inc = f.root.join("include").to_string_lossy().replace('\\', "/");
+    let flags = f.root.join("src/flags.rsp");
+    let original = format!("-I{inc}\n");
+    write(&flags, &original);
+    let cc = f.compiler.to_string_lossy().to_string();
+    let manifest = format!(
+        "rbe_version = 1\nrbe_toolchains = CMakeFiles/rbe_toolchains.json\nrbe_targets = CMakeFiles/rbe_targets.json\n\
+rule CC\n  command = {cc} @{flags} -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
+rule CCRSP\n  command = {cc} @$out.rsp -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n  rspfile = $out.rsp\n  rspfile_content = -I{inc}\n\
+build a.o: CC {main}\n  rbe_mnemonic = CCompile\n\
+build b.o: CCRSP {main}\n  rbe_mnemonic = CCompile\n",
+        flags = ninja_escape_path(&flags.to_string_lossy()),
+        main = ninja_escape_path(&f.root.join("src/main.c").to_string_lossy()),
+    );
+    write(&f.build.join("build.ninja"), &manifest);
+    let disk = format!("--disk_cache={}", f.root.join("disk-cache").to_string_lossy());
+    check(run_ninja(&f, None, &[&disk]) == 0, "the build failed")?;
+    for o in ["a.o", "b.o"] {
+        check(std::fs::read_to_string(f.build.join(o)).is_ok_and(|s| s.contains("#define DEEP 0")), &format!("{o} isn't the compile's"))?;
+    }
+    check(std::fs::read_to_string(&flags).ok().as_deref() == Some(original.as_str()), "the checked-in response file was modified")?;
+    let copies: Vec<String> = std::fs::read_dir(f.build.join(".ninja_rs_rsp"))
+        .map(|d| d.flatten().filter_map(|e| std::fs::read_to_string(e.path()).ok()).collect())
+        .unwrap_or_default();
+    check(copies.len() == 1 && !copies[0].contains(&inc), &format!("expected one relative private copy, got {copies:?}"))?;
+    Ok(())
+}
+
 fn test_without_executor_runs_locally() -> Result<(), String> {
     let f = fixture("noexec", true);
     check(run_ninja(&f, None, &[]) == 0, "local build failed")?;
@@ -1555,6 +1674,8 @@ fn main() -> ExitCode {
     ninja_exe();
     let tests: Vec<(&str, fn() -> Result<(), String>)> = vec![
         ("remote_build_and_cache", test_remote_build_and_cache),
+        ("untrusted_results", test_untrusted_results),
+        ("response_files", test_response_files),
         ("local_tool_steps", test_local_tool_steps),
         ("no_rbe_version_runs_locally", test_no_rbe_version_runs_locally),
         ("build_events", test_build_events),
@@ -1579,6 +1700,9 @@ fn main() -> ExitCode {
         ("split_and_splice_v2_12", || test_split_and_splice(12)),
         ("split_and_splice_v2_13", || test_split_and_splice(13)),
     ];
+    // `cargo test --test remote_e2e -- NAME`: the tests whose name has NAME.
+    let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+    let tests: Vec<_> = tests.into_iter().filter(|(name, _)| filter.is_empty() || filter.iter().any(|f| name.contains(f.as_str()))).collect();
     let count = tests.len();
     let mut failed = 0;
     for (name, t) in tests {

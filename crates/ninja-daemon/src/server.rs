@@ -81,8 +81,10 @@ impl Daemon {
     /// A build starts: its directory is never trusted, entries the watcher
     /// doesn't vouch for are checked again, and roots are brought in sync.
     fn begin(&self, b: Begin) -> Response {
-        self.driver.cache.add_volatile(&b.build_dir);
-        self.files.add_volatile(&b.build_dir);
+        for d in std::iter::once(&b.build_dir).chain(&b.volatile) {
+            self.driver.cache.add_volatile(d);
+            self.files.add_volatile(d);
+        }
         self.watcher.ignore(&b.build_dir);
         self.driver.cache.new_session();
         self.files.new_session();

@@ -61,7 +61,7 @@ fn main() {
     }
 
     // Before any thread starts: what nested invocations get.
-    let relay = ninja_rs::nested::export(&mut opts);
+    let (relay, secret_flags) = ninja_rs::nested::export(&mut opts);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(r) => r,
@@ -81,6 +81,8 @@ fn main() {
     // Don't wait for lingering blocking tasks (e.g. pipes held open by
     // background processes).
     runtime.shutdown_background();
+    // `exit` runs no destructors.
+    drop(secret_flags);
     std::process::exit(code);
 }
 

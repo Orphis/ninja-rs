@@ -131,6 +131,9 @@ pub struct FileDirectives {
     /// nothing outside, so including it again while `G` is defined does
     /// nothing.
     pub guard: Option<Sym>,
+    /// The file is UTF-16 (a byte order mark), which compilers like cl
+    /// read, and this lexer doesn't: its directives are unknown.
+    pub utf16: bool,
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -591,6 +594,12 @@ fn directive_kind(name: &[u8]) -> DirKind {
 
 /// Lexes a file's directives.
 pub fn lex(content: &[u8]) -> FileDirectives {
+    if content.starts_with(&[0xff, 0xfe]) || content.starts_with(&[0xfe, 0xff]) {
+        return FileDirectives { dirs: Vec::new(), guard: None, utf16: true };
+    }
+    // A UTF-8 byte order mark (as editors on Windows write) is not text:
+    // left in, it would hide a directive on the first line.
+    let content = content.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(content);
     let mut lx = Lexer { b: content, pos: 0, line: 0, line_pos: 0 };
     let mut dirs = Vec::new();
     // Whether text (not directives) appeared before the first directive,
@@ -637,7 +646,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
         dirs.push(Directive { kind, toks: toks.into_boxed_slice(), line, mac });
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
-    FileDirectives { dirs, guard }
+    FileDirectives { dirs, guard, utf16: false }
 }
 
 /// The `_Pragma("...")` operators of a line of text, each as the tokens

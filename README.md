@@ -132,9 +132,11 @@ try-import %workspace%/user.ninjars
 
 - **Files**, read in this order, later options winning: `/etc/ninjars`
   (`%ProgramData%\ninjars` on Windows); the workspace's, the first
-  `.ninjars` found from the build directory (`-C`) up, whose directory is
-  `%workspace%`; `~/.ninjars`; the `--ninjars=FILE` files. Then the command
-  line, where each `--config` adds its options in place.
+  `.ninjars` found from the build directory (`-C`) up to the repository's
+  root, whose directory is `%workspace%` (never in a file system's root, in
+  `/tmp` or another directory shared by all users, nor one another user
+  owns); `~/.ninjars`; the `--ninjars=FILE` files. Then the command line,
+  where each `--config` adds its options in place.
 - **Commands**: `common` and `always` lines apply to every invocation,
   `build` lines to builds and tools, `exec` lines to `-t exec` (which takes
   the `build` ones too); within a file, `common` lines go first. `common`

@@ -3,7 +3,8 @@
 //! (with depfile and /showIncludes mapping). With only a disk cache, cache
 //! misses run locally and their results are stored.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +28,8 @@ use crate::toolchains::Toolchains;
 pub struct BackendConfig {
     /// Absolute build directory (where build.ninja is).
     pub build_dir: PathBuf,
+    /// Other directories the build writes to (see `Shared::volatile`).
+    pub volatile: Vec<PathBuf>,
     /// `rbe_toolchains`, relative to the build directory.
     pub toolchains_file: Option<String>,
     /// The `rbe_targets` file's contents: labels and configurations for the
@@ -172,8 +175,15 @@ impl Backend {
             daemon: config.daemon.clone(),
             daemon_error: Default::default(),
             profile_dir: disk.as_ref().map(|d| d.profile_dir()),
+            volatile: std::iter::once(config.build_dir.clone()).chain(config.volatile.iter().cloned()).collect(),
         };
         shared.store.new_build();
+        if shared.include_scanner == crate::action::IncludeScanner::Preprocessor {
+            let p = shared.store.preprocessor(&shared.build_dir, windows);
+            for d in &shared.volatile {
+                p.cache.add_volatile(d);
+            }
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 client,
@@ -308,17 +318,63 @@ enum Failure {
 /// The command a local run of the action uses (see `LocalCommand`): the
 /// remote action's. None for a command with steps on the host, which runs
 /// as the build file has it.
-fn local_command(p: &Prepared, build_dir: &std::path::Path) -> Option<LocalCommand> {
+fn local_command(p: &Prepared, task: &Task, build_dir: &Path, windows: bool) -> Option<LocalCommand> {
     if !p.local_before.is_empty() || !p.local_after.is_empty() {
         return None;
     }
+    let (argv, files) = local_rsp_files(p, task, build_dir, windows);
     Some(LocalCommand {
-        argv: p.command.arguments.clone(),
+        argv,
         dir: PathBuf::from(&p.mapper.build_dir),
         env: p.command.environment_variables.iter().map(|e| (e.name.clone(), e.value.clone())).collect(),
-        files: p.rsp_files.clone(),
+        files,
         map_back: Some(Arc::new(LocalMapBack { mapper: p.mapper.clone(), tree_index: p.tree_index.clone(), build_dir: build_dir.to_path_buf() })),
     })
+}
+
+/// Where a local run of the action reads its response files, rewritten as
+/// the remote action reads them, and the command naming them. The task's
+/// own (ninja's `rspfile`) is rewritten in place: it is the edge's. Any
+/// other (a checked-in `@flags.rsp`, one several commands share) gets a
+/// private copy in `.ninja_rs_rsp`, named by its contents, and the
+/// references to it (in the command, in other response files) point
+/// there: the original is never modified, and a concurrent command never
+/// reads it half written.
+fn local_rsp_files(p: &Prepared, task: &Task, build_dir: &Path, windows: bool) -> (Vec<String>, Vec<(PathBuf, Vec<u8>)>) {
+    let key = |path: &Path| {
+        let s = crate::scanner::normalize(path).to_string_lossy().replace('\\', "/");
+        if windows { s.to_ascii_lowercase() } else { s }
+    };
+    let own = task.rspfile.as_ref().map(|(r, _)| key(&build_dir.join(r)));
+    let private_dir = build_dir.join(".ninja_rs_rsp");
+    let copies: HashMap<String, PathBuf> = p
+        .rsp_files
+        .iter()
+        .filter(|(path, _)| Some(key(path)) != own)
+        .map(|(path, bytes)| (key(path), private_dir.join(format!("{}.rsp", &rbe_client::digest_of(bytes).hash[..32]))))
+        .collect();
+    if copies.is_empty() {
+        return (p.command.arguments.clone(), p.rsp_files.clone());
+    }
+    let work_dir = PathBuf::from(&p.mapper.build_dir);
+    let redirect = |args: &[String]| -> Vec<String> {
+        args.iter()
+            .map(|a| match a.strip_prefix('@').and_then(|f| copies.get(&key(&work_dir.join(f)))) {
+                Some(copy) => format!("@{}", copy.display()),
+                None => a.clone(),
+            })
+            .collect()
+    };
+    let files = p
+        .rsp_files
+        .iter()
+        .map(|(path, bytes)| {
+            let text = String::from_utf8_lossy(bytes);
+            let content = crate::cmdline::join_rsp(&redirect(&crate::cmdline::split_rsp(&text, windows)), windows).into_bytes();
+            (copies.get(&key(path)).cloned().unwrap_or_else(|| path.clone()), content)
+        })
+        .collect();
+    (redirect(&p.command.arguments), files)
 }
 
 /// Maps a local run of the remote command back, as a download does.
@@ -429,7 +485,7 @@ impl Inner {
                 RemoteOutcome::Fallback(reason, None)
             }
             Err(Failure::RunLocally(prepared)) => {
-                let command = local_command(&prepared, &self.shared.build_dir);
+                let command = local_command(&prepared, &task, &self.shared.build_dir, self.shared.windows);
                 RemoteOutcome::RunLocally(Box::new(Capture { inner: self, prepared, task }), command)
             }
             Err(Failure::Infra(e)) => {
@@ -475,7 +531,7 @@ impl Inner {
         let meta = self.action_meta(task);
         // A local run uses the remote action's command, for the same outputs.
         // A command with steps on the host isn't raced (see below).
-        *command = local_command(&prepared, &self.shared.build_dir);
+        *command = local_command(&prepared, task, &self.shared.build_dir, self.shared.windows);
         if let (Some(race), Some(c)) = (race, command.clone()) {
             race.set_command(c);
         }
@@ -484,11 +540,24 @@ impl Inner {
             log_action(log, task, &meta, &prepared);
         }
 
-        // The disk cache first.
+        // The disk cache first. A result this action can't use (see
+        // `check_result`) is removed: a miss.
         let disk_hit = match &self.disk {
             Some(disk) => {
                 let (disk, d) = (disk.clone(), digest.clone());
-                tokio::task::spawn_blocking(move || disk.get_action_result_and_absent(&d)).await.ok().flatten().filter(|(r, _)| r.exit_code == 0)
+                let hit = tokio::task::spawn_blocking(move || disk.get_action_result_and_absent(&d)).await.ok().flatten().filter(|(r, _)| r.exit_code == 0);
+                let unusable = hit.as_ref().and_then(|(r, _)| check_result(&prepared, r).err());
+                if let Some(e) = unusable {
+                    if self.config.verbose {
+                        eprintln!("ninja-rs: disk cache entry {} ignored: {e}", digest.hash);
+                    }
+                    if let Some(disk) = &self.disk {
+                        disk.remove_action_result(&digest);
+                    }
+                    None
+                } else {
+                    hit
+                }
             }
             None => None,
         };
@@ -556,6 +625,16 @@ impl Inner {
         let minimal = self.config.download_minimal;
         let mut cached = client.get_action_result(&digest).await.map_err(Failure::Infra)?.filter(|r| r.exit_code == 0);
         let mut stale = false;
+        // A result this action can't use is a miss, and Execute skips it.
+        if let Some(r) = &cached
+            && let Err(e) = check_result(&prepared, r)
+        {
+            if self.config.verbose {
+                eprintln!("ninja-rs: remote cache entry {} ignored: {e}", digest.hash);
+            }
+            cached = None;
+            stale = true;
+        }
         if minimal
             && let Some(r) = &cached
             && !outputs_in_cas(&client, r).await.map_err(Failure::Infra)?
@@ -635,10 +714,25 @@ impl Inner {
                         return Err(Failure::Infra(anyhow::anyhow!("Execute returned status {}: {}", st.code, st.message)));
                     }
                 }
+                // So does one this action can't use.
+                if resp.cached_result
+                    && let Some(r) = &resp.result
+                    && check_result(&prepared, r).is_err()
+                {
+                    resp = client.execute(&digest, true).await.map_err(Failure::Infra)?;
+                    if let Some(st) = &resp.status
+                        && st.code != 0
+                    {
+                        return Err(Failure::Infra(anyhow::anyhow!("Execute returned status {}: {}", st.code, st.message)));
+                    }
+                }
                 let hit = resp.cached_result;
                 (resp.result.ok_or_else(|| Failure::Infra(anyhow::anyhow!("Execute returned no result")))?, hit)
             }
         };
+        // An execution's result must be usable too: nothing is written
+        // from one that isn't (the action runs locally instead).
+        check_result(&prepared, &result).map_err(|e| Failure::Infra(anyhow::anyhow!("unusable result for {}: {e}", digest.hash)))?;
         // Its outputs are in the remote CAS (checked for a hit in minimal
         // mode, uploaded by an execution).
         if result.exit_code == 0 {
@@ -751,18 +845,24 @@ impl Inner {
             // Disk cache entries hold their output inline.
             None => (result.stdout_raw.clone(), result.stderr_raw.clone()),
         };
+        // Each output goes where the action asked for it (`check_result`
+        // made sure it did), never where the result says.
+        let requested = requested_outputs(p);
+        let local_of = |path: &str| -> Result<PathBuf> {
+            requested.get(path).map(|l| l.to_path_buf()).with_context(|| format!("the result names an output that wasn't requested: {path:?}"))
+        };
         let mut files: Vec<(PathBuf, re::OutputFile)> = Vec::new();
         for f in &result.output_files {
-            let local = self.shared.build_dir.join(&f.path);
-            files.push((local, f.clone()));
+            files.push((local_of(&f.path)?, f.clone()));
         }
         // Output directories (unusual for compiles).
         for d in &result.output_directories {
             let Some(client) = client else { bail!("output directories need a remote cache") };
+            let base = local_of(&d.path)?;
             let tree_digest = d.tree_digest.clone().unwrap_or_default();
             let tree = client.fetch_tree(&tree_digest).await?;
             for (rel, f) in rbe_client::tree::tree_files(&tree)? {
-                let local = self.shared.build_dir.join(&d.path).join(rel);
+                let local = base.join(rel);
                 files.push((
                     local,
                     re::OutputFile { path: String::new(), digest: f.digest, is_executable: f.is_executable, contents: vec![], node_properties: None },
@@ -855,6 +955,9 @@ impl Inner {
                 outputs.forget(&f.path);
             }
             let data: Vec<u8> = if !f.contents.is_empty() {
+                // Inlined contents must be the digest they come with, as
+                // fetched blobs are (rbe-client checks those).
+                rbe_client::verify(&d, &f.contents).with_context(|| format!("inlined contents of {}", local.display()))?;
                 f.contents.clone()
             } else if d.size_bytes == 0 {
                 Vec::new()
@@ -1241,6 +1344,42 @@ fn log_action(log: &std::sync::Mutex<std::fs::File>, task: &Task, meta: &ActionM
 /// gRPC status codes in `google.rpc.Status`.
 mod tonic_code {
     pub const FAILED_PRECONDITION: i32 = 9;
+}
+
+/// The local path of each output an action may return (path relative to
+/// the working directory, as the action asked for it): its outputs, side
+/// outputs and depfile.
+fn requested_outputs(p: &Prepared) -> HashMap<&str, &Path> {
+    p.outputs.iter().chain(&p.side_outputs).chain(&p.depfile).map(|(rel, local)| (rel.as_str(), local.as_path())).collect()
+}
+
+/// Whether a result, from a cache or an execution, is one this action can
+/// use. A result names its outputs: one it wasn't asked for would be
+/// written wherever it says (an absolute path, `..`), by a server or by
+/// whoever can write to a shared cache. Symlinks aren't supported. A
+/// successful result must hold every declared output, or the old local
+/// file would stay and the edge look built (unless a local step after the
+/// remote one may write it).
+fn check_result(p: &Prepared, result: &re::ActionResult) -> Result<(), String> {
+    let requested = requested_outputs(p);
+    for path in result.output_files.iter().map(|f| &f.path).chain(result.output_directories.iter().map(|d| &d.path)) {
+        if !requested.contains_key(path.as_str()) {
+            return Err(format!("it names an output that wasn't requested: {path:?}"));
+        }
+    }
+    #[allow(deprecated)]
+    let symlink = result.output_symlinks.iter().chain(&result.output_file_symlinks).chain(&result.output_directory_symlinks).next();
+    if let Some(l) = symlink {
+        return Err(format!("its output {:?} is a symlink, which isn't supported", l.path));
+    }
+    if result.exit_code == 0 && p.local_after.is_empty() {
+        for (rel, _) in &p.outputs {
+            if !result.output_files.iter().any(|f| f.path == *rel) && !result.output_directories.iter().any(|d| d.path == *rel) {
+                return Err(format!("it lacks the output {rel}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether the CAS still holds all of an action result's outputs.

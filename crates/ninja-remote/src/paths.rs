@@ -268,6 +268,22 @@ impl PathMapper {
         Some(rel)
     }
 
+    /// Rewrites a command's arguments (see `rewrite_arg`), except values
+    /// the program built keeps rather than opens: macro definitions (`-D`,
+    /// `/D`) and run-time library paths (`-rpath`, `-R`, `-install_name`,
+    /// also through `-Wl,` and `-Xlinker`). Their absolute paths name this
+    /// machine's files on purpose (a data directory, where the program finds
+    /// its libraries); made relative, the program would differ from the one
+    /// ninja builds, and break when run from elsewhere.
+    pub fn rewrite_args(&mut self, args: &[String]) -> Vec<String> {
+        let mut out = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            let before = |n: usize| i.checked_sub(n).and_then(|j| args.get(j)).map(String::as_str);
+            out.push(if kept_value(a, before(1), before(2), self.windows) { a.clone() } else { self.rewrite_arg(a) });
+        }
+        out
+    }
+
     /// Rewrites absolute local paths inside one argument to paths relative
     /// to the working directory. Paths outside the exec root, or outside the
     /// input tree when the exec root is a file system's (`/dev/null`), are
@@ -397,6 +413,19 @@ const CL_JOINED_OPTIONS: &[&str] = &[
     "Tp",
     "I",
 ];
+
+/// Whether `arg`, after `prev` (itself after `prev2`), is a value the
+/// program built keeps (see `PathMapper::rewrite_args`).
+fn kept_value(arg: &str, prev: Option<&str>, prev2: Option<&str>, windows: bool) -> bool {
+    let define = arg.len() > 2 && (arg.starts_with("-D") || (windows && arg.starts_with("/D")));
+    let define_flag = |a: &str| a == "-D" || (windows && a == "/D");
+    let runtime_path_flag = |a: &str| matches!(a, "-rpath" | "--rpath" | "-R" | "-install_name");
+    define
+        || prev.is_some_and(define_flag)
+        || prev.is_some_and(runtime_path_flag)
+        || (prev == Some("-Xlinker") && prev2.is_some_and(runtime_path_flag))
+        || ["-Wl,-rpath,", "-Wl,-rpath=", "-Wl,--rpath,", "-Wl,--rpath=", "-Wl,-R", "-Wl,-install_name,"].iter().any(|p| arg.starts_with(p))
+}
 
 /// Finds absolute paths embedded in a command line argument, e.g. in
 /// `-I/x`, `/FoC:\x\y.obj`, `--sysroot=/x`, `-Wl,-rpath,/x`, and clang-cl's
@@ -552,6 +581,32 @@ mod tests {
         // Under the exec root but not in the tree (an include directory
         // no header came from): relative all the same.
         assert_eq!(m.rewrite_arg("/home/u/other/x"), "../../other/x");
+        // Values the program keeps aren't rewritten: definitions and
+        // run-time library paths, however they are spelled.
+        let args: Vec<String> = [
+            "-DDATA_DIR=\"/home/u/proj/data\"",
+            "-D",
+            "X=/home/u/proj/x",
+            "-I/home/u/proj/src",
+            "-Wl,-rpath,/home/u/proj/build/lib",
+            "-Xlinker",
+            "-rpath",
+            "-Xlinker",
+            "/home/u/proj/build/lib",
+            "-rpath",
+            "/home/u/proj/build/lib",
+            "-o",
+            "/home/u/proj/build/a.out",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = m.rewrite_args(&args);
+        for i in [0, 2, 4, 8, 10] {
+            assert_eq!(out[i], args[i], "argument {i}");
+        }
+        assert_eq!(out[3], "-I../src");
+        assert_eq!(out[12], "a.out");
         // Under a file system's root, only what's in the tree.
         let root = ExecRoot::common(&["/build".into(), "/src/a.c".into()], false);
         assert!(root.is_fs_root());

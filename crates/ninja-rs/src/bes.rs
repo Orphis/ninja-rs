@@ -287,8 +287,9 @@ impl Bes {
             inner: Mutex::default(),
             started: Instant::now(),
             start_time: SystemTime::now(),
-            argv: opts.argv.clone(),
-            given: opts.given.clone(),
+            // Header values (tokens) aren't published: their keys are.
+            argv: crate::options::redact_args(&opts.argv),
+            given: opts.given.iter().map(crate::options::GivenOption::redacted).collect(),
             typed: if exec { opts.tool_args.iter().skip_while(|a| *a == "--").cloned().collect() } else { opts.targets.clone() },
             command,
         });

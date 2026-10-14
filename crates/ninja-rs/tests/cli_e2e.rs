@@ -105,6 +105,46 @@ fn test_ninjars() -> Result<(), String> {
     Ok(())
 }
 
+/// `fake-cl gen OUT` writes OUT; `fake-cl cc OUT HEADER` writes OUT and
+/// reports HEADER as `cl /showIncludes` does.
+fn fake_cl(args: &[String]) -> i32 {
+    if let [mode, out, rest @ ..] = args {
+        if let Some(dir) = Path::new(out).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::write(out, "").unwrap();
+        if mode == "cc" {
+            for h in rest {
+                println!("Note: including file: {h}");
+            }
+        }
+        return 0;
+    }
+    2
+}
+
+/// `deps = msvc`: absolute `/showIncludes` paths are recorded relative to
+/// the build directory, as ninja does, so that a generated header is the
+/// node its edge produces (and not a source statted before it is made).
+#[cfg(windows)]
+fn test_msvc_deps_relative() -> Result<(), String> {
+    let dir = test_dir("msvcdeps");
+    let cl = dir.join("fake-cl.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &cl).unwrap();
+    let header = dir.join("gen").join("x.h");
+    let m = format!(
+        "rule gen\n  command = {cl} gen $out\nrule cc\n  command = {cl} cc $out {header}\n  deps = msvc\n\
+         build gen/x.h: gen\nbuild out.obj: cc || gen/x.h\ndefault out.obj\n",
+        cl = cl.display(),
+        header = header.display(),
+    );
+    std::fs::write(dir.join("build.ninja"), m).unwrap();
+    let r = ninja(&dir, &[], &[]);
+    check(r.code == 0, &format!("build failed: {}{}", r.stdout, r.stderr))?;
+    let r = ninja(&dir, &["-t", "deps", "out.obj"], &[]);
+    check(r.stdout.contains("    gen/x.h\n") && !r.stdout.contains(":\\") && !r.stdout.contains(":/"), &format!("deps of out.obj:\n{}", r.stdout))
+}
+
 /// `fake-job OUT`: runs for a while, then writes how many jobs were running
 /// halfway through and its `MAKEFLAGS` to OUT.
 fn fake_job(args: &[String]) -> i32 {
@@ -381,6 +421,10 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ExitCode::from(fake_job(&args) as u8);
     }
+    if stem.starts_with("fake-cl") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ExitCode::from(fake_cl(&args) as u8);
+    }
     type Test = (&'static str, fn() -> Result<(), String>);
     #[allow(unused_mut)]
     let mut tests: Vec<Test> = vec![
@@ -397,6 +441,8 @@ fn main() -> ExitCode {
     ];
     #[cfg(unix)]
     tests.push(("jobserver_pipe", test_jobserver_pipe));
+    #[cfg(windows)]
+    tests.push(("msvc_deps_relative", test_msvc_deps_relative));
     let count = tests.len();
     let mut failed = 0;
     for (name, t) in tests {

@@ -80,32 +80,81 @@ impl BlobSet {
     }
 }
 
-/// A cache of file digests keyed by (path, size, mtime), owned by the
+/// What a file's cached digest is valid for, besides its path: its size,
+/// modification time, and on Unix its change time and inode, which no tool
+/// sets (files extracted in place from an archive with normalized times
+/// can have new contents, the same size and an old modification time; not
+/// an old change time). Windows has its creation time instead, new for a
+/// file extracted into a new directory, but not for one written in place,
+/// or created again under its name within 15 s (NTFS gives it back): its
+/// change time needs a handle per file, too costly here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FileStamp {
+    pub len: u64,
+    /// Nanoseconds since the Unix epoch.
+    pub mtime_ns: u64,
+    /// Unix: change time, in nanoseconds; Windows: creation time, in 100 ns.
+    pub change: u64,
+    pub inode: u64,
+}
+
+impl FileStamp {
+    pub fn of(meta: &fs::Metadata) -> FileStamp {
+        let mtime_ns = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
+        #[cfg(unix)]
+        let (change, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            ((meta.ctime() as u64).wrapping_mul(1_000_000_000).wrapping_add(meta.ctime_nsec() as u64), meta.ino())
+        };
+        #[cfg(windows)]
+        let (change, inode) = {
+            use std::os::windows::fs::MetadataExt;
+            (meta.creation_time(), 0)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let (change, inode) = (0, 0);
+        FileStamp { len: meta.len(), mtime_ns, change, inode }
+    }
+
+    /// Whether the file was modified within its file system's time
+    /// granularity of `now`: changed again since, it could have kept this
+    /// stamp, so its digest isn't kept across builds (git's "racy"
+    /// entries). Whole seconds are 2 s (FAT counts in 2 s, ext3 and HFS+ in
+    /// seconds), finer times 100 ms (kernels stamp files with a clock that
+    /// ticks every few milliseconds).
+    pub fn is_racy(&self, now: SystemTime) -> bool {
+        let now_ns = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let granularity = if self.mtime_ns.is_multiple_of(1_000_000_000) { 2_000_000_000 } else { 100_000_000 };
+        self.mtime_ns.saturating_add(granularity) > now_ns
+    }
+}
+
+/// A cache of file digests keyed by path and `FileStamp`, owned by the
 /// caller (no process-wide state).
 pub trait DigestCache: Send + Sync {
-    fn get(&self, path: &Path, len: u64, mtime: SystemTime) -> Option<re::Digest>;
-    fn put(&self, path: &Path, len: u64, mtime: SystemTime, digest: re::Digest);
+    fn get(&self, path: &Path, stamp: &FileStamp) -> Option<re::Digest>;
+    fn put(&self, path: &Path, stamp: FileStamp, digest: re::Digest);
 }
 
 /// A simple in-memory [`DigestCache`].
 #[derive(Default)]
-pub struct MemDigestCache(Mutex<HashMap<PathBuf, (u64, SystemTime, re::Digest)>>);
+pub struct MemDigestCache(Mutex<HashMap<PathBuf, (FileStamp, re::Digest)>>);
 
 impl MemDigestCache {
     /// All entries, for persisting the cache.
-    pub fn entries(&self) -> Vec<(PathBuf, u64, SystemTime, re::Digest)> {
-        self.0.lock().unwrap().iter().map(|(p, (l, t, d))| (p.clone(), *l, *t, d.clone())).collect()
+    pub fn entries(&self) -> Vec<(PathBuf, FileStamp, re::Digest)> {
+        self.0.lock().unwrap().iter().map(|(p, (s, d))| (p.clone(), *s, d.clone())).collect()
     }
 }
 
 impl DigestCache for MemDigestCache {
-    fn get(&self, path: &Path, len: u64, mtime: SystemTime) -> Option<re::Digest> {
+    fn get(&self, path: &Path, stamp: &FileStamp) -> Option<re::Digest> {
         let map = self.0.lock().unwrap();
-        let (l, t, d) = map.get(path)?;
-        if *l == len && *t == mtime { Some(d.clone()) } else { None }
+        let (s, d) = map.get(path)?;
+        if s == stamp { Some(d.clone()) } else { None }
     }
-    fn put(&self, path: &Path, len: u64, mtime: SystemTime, digest: re::Digest) {
-        self.0.lock().unwrap().insert(path.to_path_buf(), (len, mtime, digest));
+    fn put(&self, path: &Path, stamp: FileStamp, digest: re::Digest) {
+        self.0.lock().unwrap().insert(path.to_path_buf(), (stamp, digest));
     }
 }
 
@@ -131,15 +180,15 @@ pub fn hash_file(path: &Path) -> Result<re::Digest> {
 /// one file (e.g. LLVM's multi-call binary) are hashed once.
 pub fn file_digest(path: &Path, cache: Option<&dyn DigestCache>) -> Result<re::Digest> {
     let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let mtime = meta.modified()?;
+    let stamp = FileStamp::of(&meta);
     let Some(c) = cache else { return hash_file(path) };
     let is_link = fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false);
     let key = if is_link { fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
-    if let Some(d) = c.get(&key, meta.len(), mtime) {
+    if let Some(d) = c.get(&key, &stamp) {
         return Ok(d);
     }
     let d = hash_file(path)?;
-    c.put(&key, meta.len(), mtime, d.clone());
+    c.put(&key, stamp, d.clone());
     Ok(d)
 }
 
@@ -460,6 +509,17 @@ fn build_dir(dir: &DirNode, blobs: &mut BlobSet) -> re::Digest {
     blobs.insert_message(&msg)
 }
 
+/// Whether `name` is a single path component an output may have: not
+/// empty, `.` or `..`, without separators (or, on Windows, a drive or
+/// stream colon). A server's names must not reach outside the output.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', '\0'])
+        && !(cfg!(windows) && name.contains(':'))
+}
+
 /// Lists every file of an output `Tree` with its path relative to the root.
 pub fn tree_files(tree: &re::Tree) -> Result<Vec<(PathBuf, re::FileNode)>> {
     let by_digest: HashMap<String, &re::Directory> = tree
@@ -472,9 +532,18 @@ pub fn tree_files(tree: &re::Tree) -> Result<Vec<(PathBuf, re::FileNode)>> {
     let mut stack = vec![(PathBuf::new(), root)];
     while let Some((rel, dir)) = stack.pop() {
         for f in &dir.files {
+            if !valid_name(&f.name) {
+                bail!("output tree names a file {:?}", f.name);
+            }
             files.push((rel.join(&f.name), f.clone()));
         }
+        if let Some(l) = dir.symlinks.first() {
+            bail!("output tree holds a symlink ({:?}), which isn't supported", l.name);
+        }
         for sub in &dir.directories {
+            if !valid_name(&sub.name) {
+                bail!("output tree names a directory {:?}", sub.name);
+            }
             let h = sub.digest.as_ref().map(|d| d.hash.clone()).unwrap_or_default();
             let child = by_digest.get(&h).with_context(|| format!("tree is missing directory {h}"))?;
             stack.push((rel.join(&sub.name), child));

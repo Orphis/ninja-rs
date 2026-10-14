@@ -70,6 +70,8 @@ pub struct State {
     pub executed: Mutex<Vec<(Vec<String>, String)>>,
     /// The `RequestMetadata` of each `Execute` call.
     pub request_metadata: Mutex<Vec<re::RequestMetadata>>,
+    /// The `x-` headers of each `Execute` call (`--remote_header`).
+    pub headers: Mutex<Vec<(String, String)>>,
     /// Build events received, in order, and the lifecycle events.
     pub build_events: Mutex<Vec<bep::BuildEvent>>,
     pub lifecycle_events: Mutex<Vec<bes::PublishLifecycleEventRequest>>,
@@ -88,11 +90,36 @@ pub struct State {
     fail_executions: std::sync::atomic::AtomicBool,
     /// Milliseconds Execute waits first (a slow remote).
     execute_delay_ms: AtomicU64,
+    /// Rewrites every result returned, cached or executed (a misbehaving
+    /// server, or a poisoned cache).
+    tamper: Mutex<Option<Tamper>>,
     base: PathBuf,
     counter: AtomicU64,
 }
 
+/// See `State::set_tamper`.
+pub type Tamper = Box<dyn Fn(&mut re::ActionResult) + Send + Sync>;
+
 impl State {
+    /// Rewrites every action result the server returns (from the action
+    /// cache or an execution) with `f`; `None` stops.
+    pub fn set_tamper(&self, f: Option<Tamper>) {
+        *self.tamper.lock().unwrap() = f;
+    }
+    fn tampered(&self, mut r: re::ActionResult) -> re::ActionResult {
+        if let Some(f) = self.tamper.lock().unwrap().as_ref() {
+            f(&mut r);
+        }
+        r
+    }
+    /// Replaces a blob's bytes with others of the same size (corruption).
+    pub fn corrupt_blob(&self, hash: &str) {
+        if let Some(data) = self.cas.lock().unwrap().get_mut(hash) {
+            for b in data.iter_mut() {
+                *b = !*b;
+            }
+        }
+    }
     pub fn put(&self, data: Vec<u8>) -> re::Digest {
         let d = digest_of(&data);
         self.cas.lock().unwrap().insert(d.hash.clone(), data);
@@ -296,7 +323,7 @@ impl re::action_cache_server::ActionCache for Svc {
         match self.0.ac.lock().unwrap().get(&d.hash) {
             Some(ar) => {
                 self.0.stats.lock().unwrap().action_cache_hits += 1;
-                Ok(Response::new(ar.clone()))
+                Ok(Response::new(self.0.tampered(ar.clone())))
             }
             None => Err(Status::not_found("not in action cache")),
         }
@@ -519,6 +546,13 @@ impl re::execution_server::Execution for Svc {
         {
             self.0.request_metadata.lock().unwrap().push(meta);
         }
+        for kv in r.metadata().iter() {
+            if let tonic::metadata::KeyAndValueRef::Ascii(k, v) = kv
+                && k.as_str().starts_with("x-")
+            {
+                self.0.headers.lock().unwrap().push((k.as_str().to_string(), v.to_str().unwrap_or_default().to_string()));
+            }
+        }
         if self.0.evict_on_execute.swap(false, Ordering::SeqCst) {
             self.0.clear_cas();
         }
@@ -548,6 +582,7 @@ impl re::execution_server::Execution for Svc {
                 }
             }
         };
+        let resp = re::ExecuteResponse { result: resp.result.map(|r| self.0.tampered(r)), ..resp };
         let op = Operation {
             name: format!("operations/{}", d.hash),
             metadata: None,

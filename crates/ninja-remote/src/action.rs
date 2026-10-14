@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
 
 use ninja_core::runner::Task;
 use rbe_client::proto as re;
@@ -63,6 +62,10 @@ pub struct Shared {
     pub daemon_error: Mutex<Option<String>>,
     /// Where compiler profiles persist (in the disk cache).
     pub profile_dir: Option<PathBuf>,
+    /// Directories the build writes to, the build directory first: their
+    /// contents may change during the build, so the scanners check them
+    /// every time.
+    pub volatile: Vec<PathBuf>,
 }
 
 impl Shared {
@@ -197,10 +200,19 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
                         shared.store.preprocessor(build_dir, windows).scan_in(&argv, build_dir, &shared.scan_env())
                     }
                 };
+                // An include it couldn't find (an error for the compile, a
+                // file only the remote has, or a lookup it got wrong) means
+                // inputs may be missing: the conservative scanner then.
                 match scanned {
-                    Ok(out) if out.exact() => Ok(out.files.into_iter().chain(out.found).collect()),
+                    Ok(out) if out.exact() && out.missing.is_empty() => Ok(out.files.into_iter().chain(out.found).collect()),
                     Ok(out) => {
-                        let why = out.inexact.first().cloned().or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})"))).unwrap_or_default();
+                        let why = out
+                            .inexact
+                            .first()
+                            .cloned()
+                            .or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})")))
+                            .or_else(|| out.missing.first().map(|m| format!("{m} not found")))
+                            .unwrap_or_default();
                         Err(format!("not exact ({why})"))
                     }
                     Err(e) => Err(e),
@@ -228,7 +240,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     }
     if style.is_some() && !driver_link && !scanned {
         let info = parse_compile(&expanded, build_dir);
-        let scanner = Scanner { cache: &shared.store.scan, windows, volatile_roots: vec![build_dir.clone()] };
+        let scanner = Scanner { cache: &shared.store.scan, windows, volatile_roots: shared.volatile.clone() };
         let builtin = match scanner.builtin_dirs(exe, &info) {
             Ok(d) => d,
             Err(e) => {
@@ -446,7 +458,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
             Some(Ok(info)) => {
                 let digest = re::Digest { hash: info.hash.clone(), size_bytes: info.size as i64 };
                 // Saved with the build's digests, for a daemon that restarts.
-                store.digests.put(&f, info.size, UNIX_EPOCH + Duration::from_nanos(info.mtime_ns), digest.clone());
+                store.digests.put(&f, info.stamp(), digest.clone());
                 tree.add_file_with_digest(&rel, &f, digest, info.executable)
             }
             _ => tree.add_file_cached(&rel, &f, Some(&store.digests)),
@@ -473,7 +485,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     let mut rsp_files = Vec::new();
     for (path, content) in rsp_rewritten {
         let rel = mapper.tree_path(&to_s(&path)).ok_or_else(|| format!("{} is outside the exec root", path.display()))?;
-        let args: Vec<String> = split_rsp(&content, windows).iter().map(|a| slashed(mapper.rewrite_arg(a))).collect();
+        let args: Vec<String> = mapper.rewrite_args(&split_rsp(&content, windows)).into_iter().map(slashed).collect();
         let bytes = join_rsp(&args, windows).into_bytes();
         tree.add_bytes(&rel, bytes.clone(), false).map_err(|e| format!("{e:#}"))?;
         rsp_files.push((path, bytes));
@@ -485,7 +497,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     // Command line: one command, or a chain run by the shell.
     let mut remote_steps: Vec<Vec<String>> = Vec::new();
     for (argv, exe) in steps.iter().zip(&exes) {
-        let mut arguments: Vec<String> = argv.iter().map(|a| slashed(mapper.rewrite_arg(a))).collect();
+        let mut arguments: Vec<String> = mapper.rewrite_args(argv).into_iter().map(slashed).collect();
         if let Some(rel) = mapper.tree_path(&to_s(exe)) {
             let mut p = mapper.rel_from_work_dir(&rel);
             if !p.contains('/') {

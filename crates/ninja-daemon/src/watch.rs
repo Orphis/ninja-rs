@@ -184,9 +184,10 @@ impl Watcher {
         std::thread::spawn(move || {
             let Some(w) = me.upgrade() else { return };
             let t = Instant::now();
-            let state = match w.backend() {
-                None => RootState::Failed("file watching is not supported on this system".into()),
-                Some(b) => match b.watch(&dir) {
+            let state = match (w.backend(), local_file_system(&dir)) {
+                (None, _) => RootState::Failed("file watching is not supported on this system".into()),
+                (_, Err(why)) => RootState::Failed(why),
+                (Some(b), Ok(())) => match b.watch(&dir) {
                     Ok(()) => RootState::Unsynced,
                     Err(e) => RootState::Failed(e.to_string()),
                 },
@@ -809,10 +810,68 @@ mod platform {
     }
 }
 
+/// Checks that `dir`'s file system reports every change: a network or
+/// virtual one (NFS, SMB, WSL's view of Windows drives, a VM's shared
+/// folders) only reports this machine's, so the daemon would vouch for
+/// files others changed. Such roots are checked once per build instead.
+#[cfg(target_os = "linux")]
+fn local_file_system(dir: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    // ext2-4, XFS, Btrfs, tmpfs, F2FS, ZFS, bcachefs, overlayfs,
+    // ReiserFS, JFS, NILFS.
+    const LOCAL: &[i64] =
+        &[0xEF53, 0x5846_5342, 0x9123_683E, 0x0102_1994, 0xF2F5_2010, 0x2FC1_2FC1, 0xCA45_1A4E, 0x794C_7630, 0x5265_4973, 0x3153_464A, 0x3434];
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // SAFETY: `statfs` is plain data, filled by the call.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid buffer.
+    if unsafe { libc::statfs(path.as_ptr(), &mut st) } != 0 {
+        return Err(format!("statfs {}: {}", dir.display(), io::Error::last_os_error()));
+    }
+    let kind = st.f_type as i64;
+    if LOCAL.contains(&kind) { Ok(()) } else { Err(format!("{} is on a file system (type {kind:#x}) that may not report every change", dir.display())) }
+}
+
+#[cfg(windows)]
+fn local_file_system(dir: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    const DRIVE_REMOTE: u32 = 4;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumePathNameW(path: *const u16, volume: *mut u16, len: u32) -> i32;
+        fn GetDriveTypeW(root: *const u16) -> u32;
+    }
+    let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let mut volume = vec![0u16; 1024];
+    // SAFETY: a NUL-terminated path and a buffer of the given length.
+    if unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) } == 0 {
+        return Err(format!("the volume of {}: {}", dir.display(), io::Error::last_os_error()));
+    }
+    // SAFETY: a NUL-terminated volume path.
+    if unsafe { GetDriveTypeW(volume.as_ptr()) } == DRIVE_REMOTE {
+        return Err(format!("{} is on a network drive, which may not report every change", dir.display()));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn local_file_system(_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cpp_deps::scan::Watch;
+
+    #[test]
+    fn local_file_systems() {
+        assert_eq!(local_file_system(&std::env::temp_dir()), Ok(()));
+        #[cfg(target_os = "linux")]
+        if std::path::Path::new("/proc/self").exists() {
+            assert!(local_file_system(Path::new("/proc")).is_err());
+        }
+    }
 
     #[derive(Default)]
     struct Recorder(Mutex<Vec<(PathBuf, Change)>>);

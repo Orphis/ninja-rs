@@ -156,6 +156,20 @@ pub fn digest_of_message<M: Message>(m: &M) -> (re::Digest, Vec<u8>) {
     (digest_of(&bytes), bytes)
 }
 
+/// Checks that `data` is the blob `d`: its size and SHA-256. Bytes that
+/// aren't (a server bug, corruption, a truncated stream) must not become
+/// outputs or cache entries.
+pub fn verify(d: &re::Digest, data: &[u8]) -> Result<()> {
+    if data.len() as i64 != d.size_bytes {
+        bail!("blob {}: received {} bytes", digest_str(d), data.len());
+    }
+    let hash = hex::encode(Sha256::digest(data));
+    if hash != d.hash {
+        bail!("blob {}: received data hashing to {hash}", digest_str(d));
+    }
+    Ok(())
+}
+
 pub fn digest_str(d: &re::Digest) -> String {
     format!("{}/{}", d.hash, d.size_bytes)
 }
@@ -585,21 +599,22 @@ impl Client {
         if self.zstd { vec![re::compressor::Value::Zstd as i32] } else { vec![] }
     }
 
-    fn decode(&self, compressor: i32, data: Vec<u8>, size: i64) -> Result<Vec<u8>> {
+    /// The blob `d` as read: decompressed, and checked to be `d`.
+    fn decode(&self, compressor: i32, data: Vec<u8>, d: &re::Digest) -> Result<Vec<u8>> {
+        let size = d.size_bytes;
         self.transfers.wire_read.fetch_add(data.len() as u64, Ordering::Relaxed);
         self.transfers.read.fetch_add(size.max(0) as u64, Ordering::Relaxed);
-        if compressor == re::compressor::Value::Zstd as i32 {
-            let data = zstd::bulk::decompress(&data, size as usize)?;
-            if data.len() as i64 != size {
-                bail!("a compressed blob of {size} bytes decompressed to {}", data.len());
-            }
-            Ok(data)
+        let data = if compressor == re::compressor::Value::Zstd as i32 {
+            zstd::bulk::decompress(&data, size.max(0) as usize).with_context(|| format!("decompressing {}", digest_str(d)))?
         } else {
-            Ok(data)
-        }
+            data
+        };
+        verify(d, &data)?;
+        Ok(data)
     }
 
     async fn batch_read(&self, digests: Vec<re::Digest>) -> Result<Vec<(String, Vec<u8>)>> {
+        let requested: HashSet<(String, i64)> = digests.iter().map(|d| (d.hash.clone(), d.size_bytes)).collect();
         let resp = self
             .cas()
             .batch_read_blobs(self.req(re::BatchReadBlobsRequest {
@@ -618,7 +633,11 @@ impl Client {
             {
                 bail!("read of {} failed: {} {}", digest_str(&d), st.code, st.message);
             }
-            out.push((d.hash.clone(), self.decode(r.compressor, r.data, d.size_bytes)?));
+            // Only what was asked for (whose size bounds what is allocated).
+            if !requested.contains(&(d.hash.clone(), d.size_bytes)) {
+                bail!("BatchReadBlobs returned {}, which wasn't requested", digest_str(&d));
+            }
+            out.push((d.hash.clone(), self.decode(r.compressor, r.data, &d)?));
         }
         Ok(out)
     }
@@ -639,7 +658,7 @@ impl Client {
             wire.extend_from_slice(&chunk.data);
         }
         let compressor = if self.zstd { re::compressor::Value::Zstd as i32 } else { 0 };
-        self.decode(compressor, wire, d.size_bytes)
+        self.decode(compressor, wire, d)
     }
 
     /// Reads `limit` bytes of a blob from `offset` (ByteStream's

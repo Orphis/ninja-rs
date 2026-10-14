@@ -193,13 +193,23 @@ impl DiskCache {
         for c in &chunks {
             data.extend_from_slice(&self.read_whole(c)?);
         }
+        // The layout names the chunks; the whole must still be the blob.
+        rbe_client::verify(d, &data).ok()?;
         Some(data)
     }
 
+    /// A blob stored whole. One whose contents aren't its digest (a torn
+    /// write after a crash, a disk error, a cache shared with another
+    /// writer) is removed: a miss, not an output.
     fn read_whole(&self, d: &re::Digest) -> Option<Vec<u8>> {
         let p = self.blob_path(&d.hash);
         let data = std::fs::read(&p).ok()?;
+        // Another size is another digest (the file is keyed by hash).
         if data.len() as i64 != d.size_bytes {
+            return None;
+        }
+        if rbe_client::verify(d, &data).is_err() {
+            let _ = std::fs::remove_file(&p);
             return None;
         }
         touch(&p);
@@ -441,6 +451,13 @@ mod tests {
         assert!(c.contains_blob(&d));
         // A wrong size is a miss.
         assert!(c.read_blob(&re::Digest { hash: d.hash.clone(), size_bytes: 3 }).is_none());
+        assert_eq!(c.read_blob(&d).unwrap(), data);
+        // Contents that aren't the digest's (a torn write) are a miss, and go.
+        let e = rbe_client::digest_of(b"world");
+        c.put_bytes(&e, b"world").unwrap();
+        std::fs::write(c.blob_path(&e.hash), b"WORLD").unwrap();
+        assert!(c.read_blob(&e).is_none());
+        assert!(!c.blob_path(&e.hash).exists());
 
         let action = rbe_client::digest_of(b"action");
         let result =

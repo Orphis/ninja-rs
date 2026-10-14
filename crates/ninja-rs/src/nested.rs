@@ -38,6 +38,12 @@ pub struct Parent {
     pub rc_files: Vec<String>,
     #[serde(default)]
     pub rc_workspace: Option<String>,
+    /// A file holding the options whose values may be credentials
+    /// (`--remote_header`), in a directory only the user can read: they're
+    /// not in the environment every build command (and its crash dumps, and
+    /// CI logs) sees.
+    #[serde(default)]
+    pub secret_flags: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,9 +58,44 @@ impl RelayAddress {
     }
 }
 
-/// The invocation that ran this one, if any.
+/// The invocation that ran this one, if any, with its secret flags.
 pub fn parent() -> Option<Parent> {
-    serde_json::from_str(&std::env::var(ENV).ok()?).ok()
+    parent_from(&std::env::var(ENV).ok()?)
+}
+
+/// A `NINJA_RS_PARENT` value, with its secret flags.
+fn parent_from(json: &str) -> Option<Parent> {
+    let mut p: Parent = serde_json::from_str(json).ok()?;
+    if let Some(f) = &p.secret_flags {
+        match std::fs::read_to_string(f).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Vec<String>>(&t).map_err(|e| e.to_string())) {
+            Ok(flags) => p.flags.extend(flags),
+            Err(e) => eprintln!("ninja: warning: the options of the invocation running this one: {}: {e}", f.display()),
+        }
+    }
+    Some(p)
+}
+
+/// The secret flags' file of this invocation, removed when dropped.
+pub struct SecretFlags(PathBuf);
+
+impl Drop for SecretFlags {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Writes `flags` to a file only the user can read, in the daemon's private
+/// directory.
+fn write_secret_flags(flags: &[String]) -> io::Result<SecretFlags> {
+    let loc = Location::with_id("flags")?;
+    loc.create_dir()?;
+    let path = loc.dir.join(format!("flags-{}.json", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(&path)?.write_all(serde_json::to_string(flags).map_err(io::Error::other)?.as_bytes())?;
+    Ok(SecretFlags(path))
 }
 
 /// Options not passed on: per invocation (ids, build events, logs written
@@ -121,8 +162,9 @@ pub fn adopt(opts: &mut Options, parent: &Parent) {
 
 /// Sets this invocation's ids (so that nested ones share them), binds the
 /// relay when this is the outermost invocation with build events, and
-/// exports `NINJA_RS_PARENT`. Call before any thread starts.
-pub fn export(opts: &mut Options) -> Option<Relay> {
+/// exports `NINJA_RS_PARENT`. Call before any thread starts. The returned
+/// `SecretFlags` must live as long as the commands that may read it.
+pub fn export(opts: &mut Options) -> (Option<Relay>, Option<SecretFlags>) {
     let invocation_id = opts.bes.invocation_id.get_or_insert_with(crate::bes::new_uuid).clone();
     let build_request_id = opts.bes.build_request_id.get_or_insert_with(crate::bes::new_uuid).clone();
     let relay =
@@ -137,20 +179,34 @@ pub fn export(opts: &mut Options) -> Option<Relay> {
         } else {
             None
         };
+    let is_secret = |f: &String| crate::options::SECRET_OPTIONS.iter().any(|n| f.starts_with(&format!("--{n}=")));
+    let (secret, flags): (Vec<String>, Vec<String>) = exported_flags(opts).into_iter().partition(is_secret);
+    let secrets = if secret.is_empty() {
+        None
+    } else {
+        match write_secret_flags(&secret) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("ninja: warning: nested builds won't get --remote_header: {e}");
+                None
+            }
+        }
+    };
     let parent = Parent {
         invocation_id,
         build_request_id,
-        flags: exported_flags(opts),
+        flags,
         execution_log: opts.remote.execution_log.clone(),
         relay: relay.as_ref().map(|r| r.address.clone()).or_else(|| opts.bes.relay.clone()),
         rc_files: opts.rc.read.clone(),
         rc_workspace: opts.rc.workspace_dir.clone(),
+        secret_flags: secrets.as_ref().map(|s| s.0.clone()),
     };
     if let Ok(json) = serde_json::to_string(&parent) {
         // SAFETY: called before the process starts threads.
         unsafe { std::env::set_var(ENV, json) };
     }
-    relay
+    (relay, secrets)
 }
 
 /// Where nested invocations send their build events: a local socket of the
@@ -210,6 +266,25 @@ pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
 mod tests {
     use super::*;
     use crate::options::{ParseOutcome, parse_args};
+
+    #[test]
+    fn secret_flags_stay_out_of_the_environment() {
+        let flags = vec!["--remote_header=authorization=Bearer t".to_string()];
+        let secrets = write_secret_flags(&flags).unwrap();
+        let path = secrets.0.clone();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let parent = Parent { flags: vec!["--remote_jobs=3".into()], secret_flags: Some(path.clone()), ..Default::default() };
+        let json = serde_json::to_string(&parent).unwrap();
+        assert!(!json.contains("Bearer"));
+        let read = parent_from(&json).unwrap();
+        assert_eq!(read.flags, vec!["--remote_jobs=3".to_string(), flags[0].clone()]);
+        drop(secrets);
+        assert!(!path.exists());
+    }
 
     fn parse(args: &[&str]) -> Options {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();

@@ -336,7 +336,10 @@ impl Service {
                 keep_rsp: opts.keep_rsp,
                 keep_depfile: opts.keep_depfile,
                 task_bindings: RBE_BINDINGS.iter().map(|s| s.to_string()).collect(),
-                cwd: ".".into(),
+                // Absolute: `/showIncludes` paths are made relative to it,
+                // as ninja does, so that a generated header is the node its
+                // edge produces.
+                cwd: std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".into()),
             };
 
             // Attempt to rebuild the manifest before building anything else.
@@ -523,6 +526,7 @@ impl Service {
             return Ok(None);
         }
         let build_dir = std::env::current_dir().map_err(|e| e.to_string())?;
+        let volatile = volatile_dirs(state, &build_dir);
         let file_var = |name: &str| Some(state.lookup_variable(ROOT_SCOPE, name)).filter(|v| !v.is_empty());
         let daemon = if opts.remote.daemon {
             let begin = ninja_daemon::proto::Begin {
@@ -530,6 +534,7 @@ impl Service {
                 env: std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned())).collect(),
                 profile_dir: disk.as_ref().map(|d| d.profile_dir()),
                 digests_file: Some(build_dir.join(in_build_dir(&state.lookup_variable(ROOT_SCOPE, "builddir"), ninja_remote::store::DIGESTS_FILE))),
+                volatile: volatile.clone(),
             };
             let started = tokio::task::spawn_blocking(move || {
                 let client = daemon::connect()?;
@@ -563,6 +568,7 @@ impl Service {
         let backend = ninja_remote::Backend::new(
             ninja_remote::BackendConfig {
                 build_dir,
+                volatile,
                 toolchains_file: file_var("rbe_toolchains"),
                 targets,
                 exec_root: opts.remote.exec_root.clone().map(Into::into),
@@ -851,6 +857,35 @@ async fn exec(opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
     }
 }
 
+/// The directories a build writes to besides the build directory: its
+/// spelling with symlinks resolved, and those of outputs elsewhere (a
+/// generator writing into the source tree). Files there may change during
+/// the build, so the scanners and the daemon check them every time.
+fn volatile_dirs(state: &State, build_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(real) = std::fs::canonicalize(build_dir)
+        && real != build_dir
+    {
+        dirs.push(real);
+    }
+    for (i, e) in state.edges.iter().enumerate() {
+        if state.is_phony(ninja_core::graph::EdgeId(i as u32)) {
+            continue;
+        }
+        for &o in &e.outputs {
+            let path = ninja_remote::scanner::normalize(&build_dir.join(state.path(o)));
+            if let Some(dir) = path.parent()
+                && !dir.starts_with(build_dir)
+                && !dirs.iter().any(|d| dir.starts_with(d))
+            {
+                dirs.retain(|d| !d.starts_with(dir));
+                dirs.push(dir.to_path_buf());
+            }
+        }
+    }
+    dirs
+}
+
 fn in_build_dir(build_dir: &str, file: &str) -> String {
     if build_dir.is_empty() { file.to_string() } else { format!("{build_dir}/{file}") }
 }
@@ -874,4 +909,25 @@ fn requested_paths(state: &State, deps_log: &DepsLog, targets: &[String]) -> Vec
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directories_a_build_writes_to() {
+        let mut state = State::new();
+        let reader = RealFileReader;
+        let build = std::env::temp_dir().join("ninja-rs-volatile").join("build");
+        let generated = build.parent().unwrap().join("src").join("gen");
+        let manifest = format!(
+            "rule r\n  command = x\nbuild obj/a.o: r\nbuild {generated}/a.h {generated}/sub/b.h: r\nbuild all: phony ../elsewhere/x\n",
+            generated = generated.to_string_lossy().replace('\\', "/").replace(':', "$:")
+        );
+        ManifestParser::new(&mut state, &reader, ParserOptions::default()).parse_test(&manifest).unwrap();
+        // Outputs outside the build directory, not the build directory's
+        // own, nor phony ones; a directory under another is covered by it.
+        assert_eq!(volatile_dirs(&state, &build), vec![generated]);
+    }
 }

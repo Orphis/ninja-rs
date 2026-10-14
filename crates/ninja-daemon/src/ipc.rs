@@ -91,12 +91,21 @@ fn short_socket_dir() -> PathBuf {
 /// Creates `dir`, checking that only the user can enter it.
 #[cfg(unix)]
 fn private_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    use std::os::unix::fs::DirBuilderExt;
     match std::fs::DirBuilder::new().mode(0o700).recursive(true).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
+    check_private(dir)
+}
+
+/// Checks that only the user can enter `dir`: its paths are predictable
+/// (in `/tmp` without `XDG_RUNTIME_DIR`), so another user could have made
+/// it first, with a socket of theirs in it.
+#[cfg(unix)]
+fn check_private(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(dir)?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
@@ -133,8 +142,47 @@ mod platform {
 
     pub type Stream = UnixStream;
 
+    /// Connects to the socket, if it's in a directory only the user can
+    /// enter and served by a process of the user's: a daemon's answers go
+    /// into action keys and uploads.
     pub fn connect(loc: &Location) -> io::Result<Stream> {
-        UnixStream::connect(loc.socket())
+        let path = loc.socket();
+        if let Some(dir) = path.parent() {
+            check_private(dir)?;
+        }
+        let s = UnixStream::connect(&path)?;
+        check_peer(&s)?;
+        Ok(s)
+    }
+
+    /// The user of the process at the other end.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `ucred` is plain data, filled by getsockopt.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: the buffer and its length are valid.
+        let r = unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &mut len) };
+        if r != 0 { Err(io::Error::last_os_error()) } else { Ok(cred.uid) }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn peer_uid(s: &UnixStream) -> io::Result<u32> {
+        use std::os::fd::AsRawFd;
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: the out-parameters are valid.
+        let r = unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) };
+        if r != 0 { Err(io::Error::last_os_error()) } else { Ok(uid) }
+    }
+
+    fn check_peer(s: &UnixStream) -> io::Result<()> {
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        match peer_uid(s)? {
+            p if p == uid => Ok(()),
+            p => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("the other end of the socket is user {p}'s"))),
+        }
     }
 
     pub struct Listener(UnixListener);
@@ -148,8 +196,15 @@ mod platform {
             Ok(Listener(UnixListener::bind(&path)?))
         }
 
+        /// The next connection of a process of the user's (others are
+        /// closed).
         pub fn accept(&mut self) -> io::Result<Stream> {
-            self.0.accept().map(|(s, _)| s)
+            loop {
+                let (s, _) = self.0.accept()?;
+                if check_peer(&s).is_ok() {
+                    return Ok(s);
+                }
+            }
         }
     }
 
@@ -179,6 +234,17 @@ mod platform {
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     const ERROR_PIPE_CONNECTED: i32 = 535;
     const ERROR_PIPE_BUSY: i32 = 231;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const TOKEN_QUERY: u32 = 0x8;
+    const TOKEN_USER: i32 = 1;
+    const SDDL_REVISION_1: u32 = 1;
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        length: u32,
+        descriptor: *mut c_void,
+        inherit: i32,
+    }
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -190,10 +256,79 @@ mod platform {
             out_size: u32,
             in_size: u32,
             timeout: u32,
-            security: *const c_void,
+            security: *const SecurityAttributes,
         ) -> Handle;
         fn ConnectNamedPipe(pipe: Handle, overlapped: *mut c_void) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn GetNamedPipeServerProcessId(pipe: Handle, pid: *mut u32) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn GetCurrentProcess() -> Handle;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(token: Handle, class: i32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut c_void, out: *mut *mut u16) -> i32;
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl: *const u16, revision: u32, sd: *mut *mut c_void, size: *mut u32) -> i32;
+    }
+
+    /// The SID of the user `process` runs as, as a string (`S-1-5-21-...`).
+    fn process_user(process: Handle) -> io::Result<String> {
+        let mut token: Handle = std::ptr::null_mut();
+        // SAFETY: valid out-parameter; the token is closed below.
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // TOKEN_USER: a pointer to the SID (in the buffer), then attributes.
+        let mut buf = vec![0u64; 64];
+        let mut len = 0;
+        // SAFETY: the buffer is large enough for a TOKEN_USER and its SID.
+        let ok = unsafe { GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut len) };
+        // SAFETY: opened above.
+        unsafe { CloseHandle(token) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = buf[0] as usize as *mut c_void;
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` points into `buf`, alive here; the string is freed below.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a NUL-terminated string from ConvertSidToStringSidW.
+        let s = unsafe {
+            let n = (0..).take_while(|&i| *text.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(text, n))
+        };
+        // SAFETY: allocated by ConvertSidToStringSidW.
+        unsafe { LocalFree(text.cast()) };
+        Ok(s)
+    }
+
+    /// Checks that the pipe's server runs as this user: the pipe's name is
+    /// predictable, so another user could have created it first.
+    fn check_server(pipe: &File) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        let mut pid = 0;
+        // SAFETY: a pipe handle and a valid out-parameter.
+        if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: closed below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("the pipe's server (process {pid}) isn't this user's")));
+        }
+        let theirs = process_user(process);
+        // SAFETY: opened above.
+        unsafe { CloseHandle(process) };
+        // SAFETY: the pseudo-handle of this process.
+        if theirs? != process_user(unsafe { GetCurrentProcess() })? {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("the pipe's server (process {pid}) isn't this user's")));
+        }
+        Ok(())
     }
 
     pub type Stream = File;
@@ -205,6 +340,10 @@ mod platform {
         loop {
             match std::fs::OpenOptions::new().read(true).write(true).open(loc.pipe()) {
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                Ok(pipe) => {
+                    check_server(&pipe)?;
+                    return Ok(pipe);
+                }
                 r => return r,
             }
         }
@@ -214,24 +353,50 @@ mod platform {
         name: Vec<u16>,
         /// The instance the next client connects to.
         next: Handle,
+        /// Only this user may open the pipe (its default DACL lets
+        /// everyone read).
+        descriptor: *mut c_void,
     }
 
-    // The handle is only used by the thread that accepts.
+    // The handles are only used by the thread that accepts.
     unsafe impl Send for Listener {}
 
-    fn instance(name: &[u16], first: bool) -> io::Result<Handle> {
+    fn instance(name: &[u16], first: bool, descriptor: *mut c_void) -> io::Result<Handle> {
         let mode = PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
-        // SAFETY: `name` is NUL-terminated; no security attributes.
-        let h = unsafe { CreateNamedPipeW(name.as_ptr(), mode, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, std::ptr::null()) };
+        let security = SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor, inherit: 0 };
+        // SAFETY: `name` is NUL-terminated; `security` and its descriptor
+        // are alive during the call.
+        let h = unsafe { CreateNamedPipeW(name.as_ptr(), mode, PIPE_REJECT_REMOTE_CLIENTS, PIPE_UNLIMITED_INSTANCES, 1 << 16, 1 << 16, 0, &security) };
         if h == INVALID_HANDLE_VALUE { Err(io::Error::last_os_error()) } else { Ok(h) }
+    }
+
+    /// A security descriptor giving this user (and the system) access, and
+    /// nobody else.
+    fn this_user_only() -> io::Result<*mut c_void> {
+        // SAFETY: the pseudo-handle of this process.
+        let user = process_user(unsafe { GetCurrentProcess() })?;
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;{user})(A;;GA;;;SY)").encode_utf16().chain([0]).collect();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated SDDL string; freed by the Listener.
+        if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(descriptor)
     }
 
     impl Listener {
         /// Listens; fails when another daemon has the pipe.
         pub fn bind(loc: &Location) -> io::Result<Listener> {
             let name: Vec<u16> = std::ffi::OsStr::new(&loc.pipe()).encode_wide().chain([0]).collect();
-            let next = instance(&name, true)?;
-            Ok(Listener { name, next })
+            let descriptor = this_user_only()?;
+            match instance(&name, true, descriptor) {
+                Ok(next) => Ok(Listener { name, next, descriptor }),
+                Err(e) => {
+                    // SAFETY: allocated by this_user_only.
+                    unsafe { LocalFree(descriptor) };
+                    Err(e)
+                }
+            }
         }
 
         pub fn accept(&mut self) -> io::Result<Stream> {
@@ -243,7 +408,7 @@ mod platform {
                     return Err(e);
                 }
             }
-            let connected = std::mem::replace(&mut self.next, instance(&self.name, false)?);
+            let connected = std::mem::replace(&mut self.next, instance(&self.name, false, self.descriptor)?);
             // SAFETY: the connected instance is handed over to the File.
             Ok(unsafe { File::from_raw_handle(connected) })
         }
@@ -251,8 +416,11 @@ mod platform {
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            // SAFETY: the pending instance is owned here.
-            unsafe { CloseHandle(self.next) };
+            // SAFETY: the pending instance and the descriptor are owned here.
+            unsafe {
+                CloseHandle(self.next);
+                LocalFree(self.descriptor);
+            }
         }
     }
 

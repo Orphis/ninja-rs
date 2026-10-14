@@ -73,10 +73,24 @@ pub struct Config {
     /// The compiler's predefined macros.
     pub predefined: Arc<MacroTable>,
     pub commands: Vec<CommandMacro>,
-    /// `-imacros` and `-include` files, in the order they're processed.
-    pub forced: Vec<PathBuf>,
+    /// `-imacros`, `-include` and `/FI` files, in the order they're
+    /// processed.
+    pub forced: Vec<Forced>,
     /// The `__has_*` operators the compiler has, besides `__has_include`.
     pub operators: Arc<HashSet<Sym>>,
+}
+
+/// A file processed before the main one, and how the compiler finds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Forced {
+    /// A path (absolute, or one the compiler itself reported).
+    Path(PathBuf),
+    /// GCC and Clang (`-include`, `-imacros`): in the working directory,
+    /// then along the `#include "..."` chain.
+    Gcc { cwd: PathBuf, name: String },
+    /// `cl.exe` (`/FI`): as `#include "name"` in the main file, its
+    /// directory first.
+    Msvc(String),
 }
 
 /// Answers the compiler's queries (`__has_builtin(x)` and the like).
@@ -276,6 +290,11 @@ impl Cache {
     /// Starts a new session: files and directories are checked again.
     pub fn new_session(&self) {
         self.session.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current session.
+    pub fn session(&self) -> u64 {
+        self.session.load(Ordering::Relaxed)
     }
 
     fn is_volatile(&self, p: &Path) -> bool {
@@ -572,7 +591,9 @@ impl State<'_> {
             let found = match d {
                 SearchDir::Dir(d) => self.candidate(normalize(&d.join(p)), Some(i)),
                 SearchDir::Framework(d) => {
-                    let (framework, rest) = name.split_once(['/', '\\'])?;
+                    // Only `Framework/Header.h` names are in frameworks: the
+                    // search goes on with the next directory.
+                    let Some((framework, rest)) = name.split_once(['/', '\\']) else { continue };
                     ["Headers", "PrivateHeaders"]
                         .iter()
                         .find_map(|sub| self.candidate(normalize(&d.join(format!("{framework}.framework")).join(sub).join(rest)), Some(i)))
@@ -614,6 +635,10 @@ impl State<'_> {
             return;
         };
         self.record(&real);
+        if fd.utf16 {
+            self.inexact(format!("{}: UTF-16 text isn't scanned", real.display()));
+            return;
+        }
         if let Some(g) = fd.guard
             && self.macros.contains_key(&g)
         {
@@ -852,10 +877,24 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
         st.stack.pop();
     }
     for f in &cfg.forced {
-        let path = normalize(f);
-        match st.locate(&path) {
-            Some(real) => st.include_file(Found { path, real, at: None }, false),
-            None => st.out.missing.push(path.to_string_lossy().into_owned()),
+        let at = |st: &State, path: PathBuf| st.locate(&path).map(|real| Found { path, real, at: None });
+        let found = match f {
+            Forced::Path(p) => at(&st, normalize(p)),
+            Forced::Gcc { cwd, name } => at(&st, normalize(&cwd.join(name))).or_else(|| st.resolve(name, false, false)),
+            Forced::Msvc(name) => {
+                let dir = main.parent().map(Path::to_path_buf).unwrap_or_default();
+                st.stack.push(Frame { path: main.clone(), real: main.clone(), dir, found_at: None, line: 0 });
+                let found = st.resolve(name, false, false);
+                st.stack.pop();
+                found
+            }
+        };
+        match found {
+            Some(found) => st.include_file(found, false),
+            None => st.out.missing.push(match f {
+                Forced::Path(p) => p.to_string_lossy().into_owned(),
+                Forced::Gcc { name, .. } | Forced::Msvc(name) => name.clone(),
+            }),
         }
     }
     let Some(real) = st.locate(&main).filter(|r| cache.directives(r).is_some()) else {
@@ -994,7 +1033,7 @@ mod tests {
         d.file("inc/popped.h", "");
         let mut c = cfg(&d);
         c.commands = vec![CommandMacro::Define("FOO=2".into()), CommandMacro::Define("BAR".into()), CommandMacro::Undef("BAR".into())];
-        c.forced = vec![forced];
+        c.forced = vec![Forced::Path(forced)];
         let cache = Cache::new(vec![], false);
         let out = scan(&cache, &c, &NoOracle, &main);
         assert_eq!(d.rel(&out.files), vec!["forced.h", "main.c", "inc/yes.h", "inc/popped.h"]);
@@ -1019,11 +1058,17 @@ mod tests {
     #[test]
     fn frameworks_and_header_maps() {
         let d = Dir::new("frameworks");
-        let main = d.file("main.m.c", "#include <Foo/Foo.h>\n#include <Foo/Private.h>\n#include \"Mapped/Name.h\"\n#include <Foo/Missing.h>\n");
+        // A name without a framework part goes on past the framework
+        // directory (`-F` comes before `inc` here).
+        let main = d.file(
+            "main.m.c",
+            "#include <Foo/Foo.h>\n#include <Foo/Private.h>\n#include \"Mapped/Name.h\"\n#include <Foo/Missing.h>\n#if __has_include(<plain.h>)\n#include <plain.h>\n#endif\n",
+        );
         d.file("fw/Foo.framework/Headers/Foo.h", "#include <Foo/Other.h>\n");
         d.file("fw/Foo.framework/Headers/Other.h", "");
         d.file("fw/Foo.framework/PrivateHeaders/Private.h", "");
         d.file("real/name.h", "");
+        d.file("inc/plain.h", "");
         let hmap = d.0.join("x.hmap");
         let real = d.0.join("real").to_string_lossy().replace('\\', "/") + "/";
         std::fs::write(&hmap, crate::hmap::build(&[("Mapped/Name.h", &real, "name.h")])).unwrap();
@@ -1034,9 +1079,47 @@ mod tests {
         let out = scan(&cache, &c, &NoOracle, &main);
         assert_eq!(
             d.rel(&out.files),
-            vec!["main.m.c", "fw/Foo.framework/Headers/Foo.h", "fw/Foo.framework/Headers/Other.h", "fw/Foo.framework/PrivateHeaders/Private.h", "real/name.h"]
+            vec![
+                "main.m.c",
+                "fw/Foo.framework/Headers/Foo.h",
+                "fw/Foo.framework/Headers/Other.h",
+                "fw/Foo.framework/PrivateHeaders/Private.h",
+                "real/name.h",
+                "inc/plain.h"
+            ]
         );
         assert_eq!(out.missing, vec!["Foo/Missing.h"]);
+    }
+
+    #[test]
+    fn byte_order_marks_and_forced_lookup() {
+        let d = Dir::new("bom");
+        // A UTF-8 byte order mark doesn't hide the first line's directive.
+        let main = d.0.join("main.c");
+        std::fs::write(&main, b"\xEF\xBB\xBF#include \"a.h\"\n").unwrap();
+        d.file("a.h", "");
+        let cache = Cache::new(vec![], false);
+        let out = scan(&cache, &cfg(&d), &NoOracle, &main);
+        assert_eq!(d.rel(&out.files), vec!["main.c", "a.h"]);
+        // UTF-16 isn't scanned: inexact.
+        let wide = d.0.join("wide.c");
+        std::fs::write(&wide, [0xff, 0xfe, b'#', 0]).unwrap();
+        let w = scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &wide);
+        assert!(!w.exact(), "{w:?}");
+        // Forced includes are found as the compilers find them: GCC's in the
+        // working directory, then along the quote chain; cl's next to the
+        // source first.
+        d.file("inc/config.h", "");
+        d.file("src/pre.h", "");
+        d.file("inc/pre.h", "");
+        let src = d.file("src/x.c", "");
+        let cache = Cache::new(vec![], false);
+        let mut c = cfg(&d);
+        c.forced = vec![Forced::Gcc { cwd: d.0.join("build"), name: "config.h".into() }];
+        assert_eq!(d.rel(&scan(&cache, &c, &NoOracle, &src).files), vec!["inc/config.h", "src/x.c"]);
+        c.forced = vec![Forced::Msvc("pre.h".into())];
+        c.msvc_lookup = true;
+        assert_eq!(d.rel(&scan(&cache, &c, &NoOracle, &src).files), vec!["src/pre.h", "src/x.c"]);
     }
 
     #[test]

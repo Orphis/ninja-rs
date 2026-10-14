@@ -187,7 +187,11 @@ Every local run of an action the backend prepared (a cache miss of
 `--remote_cache` or `--disk_cache`, a fallback after a remote failure, a
 raced local run) runs the remote action's command (`LocalCommand`): its
 argv, with paths relative to the working directory (locally, the build
-directory), and its rewritten response files. It writes the bytes remote
+directory), and its rewritten response files: the task's own (ninja's
+`rspfile`) rewritten in place, any other a private copy in
+`.ninja_rs_rsp/`, named by its contents, which the command then names (a
+checked-in `@flags.rsp` is never modified, nor read half written by a
+concurrent command). It writes the bytes remote
 execution would, rather than ones with the checkout's absolute paths (in
 debug info, say): stored results, and the inputs of later actions, don't
 depend on the checkout. Its depfile and `/showIncludes` lines are mapped
@@ -226,9 +230,17 @@ and the first branch to finish wins (`run_raced` in `exec_runner.rs`):
 `Service` holds the remote connection and an `Arc<Store>` across builds; the
 CLI runs one build in-process. `Store` contains:
 
-- file digests keyed by (symlink-resolved path, size, mtime), persisted to
-  `$builddir/.ninja_rs_digests` after remote builds (this matters: hashing
-  a 150 MB toolchain takes seconds in release builds and minutes in debug);
+- file digests keyed by the symlink-resolved path and a `FileStamp`:
+  size, modification time, and on Unix change time and inode (which no tool
+  sets: an archive extracted in place can give new contents an old
+  modification time), on Windows creation time (new for a file extracted
+  into a new directory; not for one rewritten in place, nor created again
+  under its name within 15 s, which NTFS gives the old one's). Persisted to
+  `$builddir/.ninja_rs_digests` after remote builds, but for files modified
+  within the time granularity before (a change since could go unseen: 2 s
+  for whole-second times, else 100 ms).
+  This matters: hashing a 150 MB toolchain takes seconds in release builds
+  and minutes in debug;
 - include scanner caches: parsed directives per (path, size, mtime);
   resolved includes per (file version, search path); directory listings
   (never for directories under the build dir); built-in include dirs per
@@ -311,8 +323,18 @@ endpoints say which certificate was sent and which CAs were trusted
    (ByteStream for large blobs, via `rbe-client`) and `Execute`. When the
    server splices blobs, a large one is uploaded as its chunks instead
    (see "Split and spliced blobs").
-8. **Download**: outputs are written atomically; files whose content is
-   already identical are left untouched so `restat` keeps working. The
+8. **Download**: a result is checked first (`check_result`), whichever
+   cache or execution it comes from: an output it names that the action
+   didn't request (an absolute path, `..`: a server, or whoever can write to
+   a shared cache, would write anywhere), a declared output missing (the old
+   local file would stay, the edge look built), or a symlink make a cached
+   result a miss, and an executed one a failure (run locally). Outputs go
+   where the action asked for them, never where the result says. Every blob
+   read is checked against its digest (size and SHA-256, as Bazel's
+   `--remote_verify_downloads` does), and so are inlined contents and the
+   disk cache's blobs (a corrupt one is removed: a miss). Outputs are written
+   atomically; files whose content is already identical aren't rewritten,
+   but made newer than the inputs. The
    depfile is rewritten to local paths before the builder reads it
    (`deps = gcc`); `/showIncludes` lines in stdout are rewritten for
    `deps = msvc`. stdout and stderr are concatenated like a local run, with
@@ -383,14 +405,25 @@ earlier builds) are always sent.
 
 `--remote_include_scanner=preprocessor` finds a GCC or Clang compile's
 inputs with `crates/cpp-deps`, a preprocessor that evaluates directives
-exactly and skips everything else; when it can't (a `cl`-style command,
-unsupported flags such as `-iprefix` or `-ivfsoverlay`, a compiler it
-can't probe, or a result it marks inexact), the conservative scanner above
-runs instead. Headers compiled alone (`-x c++-header`, as for a precompiled
-header) are scanned as their language, `.S`/`.sx` and
-`-x assembler-with-cpp` as C; `-include` and `-imacros` behind `-Xclang`
-are forced includes, and a precompiled header (`-include-pch`, also behind
-`-Xclang`) is an input that is not scanned.
+exactly and skips everything else; when it can't (unsupported flags such
+as `-iprefix`, a compiler it can't probe, a result it marks inexact, or an
+active `#include` it can't find: a lookup it may have got wrong drops
+inputs otherwise), the conservative scanner above runs instead. Headers
+compiled alone (`-x c++-header`, as for a precompiled header) are scanned
+as their language, `.S`/`.sx` as `assembler-with-cpp`; `-include` and
+`-imacros` behind `-Xclang` are forced includes, and a precompiled header
+(`-include-pch`, also behind `-Xclang`) is an input that is not scanned,
+when the header it was made from is forced too (otherwise its macros are
+unknown: the scan falls back).
+
+Lookups follow the compilers': forced includes in the working directory
+then along the `#include "..."` chain (GCC, Clang, clang-cl's `/FI`), or as
+`#include "..."` in the source (`cl`'s `/FI`); GCC's and Clang's search
+lists without duplicates, a `-I` that is also a system directory searched
+only there; a framework directory passes over names without a framework
+part. A UTF-8 byte order mark is skipped; a UTF-16 file makes the scan
+inexact. Queries `cl` only evaluates in `#if` get their value one bit at a
+time (`__has_cpp_attribute(nodiscard) >= 201907L` needs the value).
 
 - **Lexing** (`lex`): each file is reduced once per version to its
   directive lines, tokenized, with `#define`s parsed and include guards
@@ -483,8 +516,7 @@ header and common Windows headers alone in C++17, C++20 and C++latest with
 27,979 files, none missing or extra. Warm scans take 1 to 14 ms; probing a
 profile takes 0.3 to 0.7 s on Windows (process starts).
 
-Not handled yet: `-include-pch` (the precompiled header's macros are
-unknown; `/Yu` is fine, its header is scanned), Apple sub-frameworks and
+Not handled yet: Apple sub-frameworks and
 header-map lookups relative to a framework, `_Pragma` produced by macros
 in text (text isn't expanded), MSVC's traditional preprocessor's own
 expansion rules (only `#if` and `#include` operands are expanded, where they
@@ -611,8 +643,12 @@ mnemonics) in the repository and `cmake --build` or an IDE builds with them.
   `--[no]home_rc`, `--ignore_all_rc_files`. These only go on the command
   line. Then, in order: the system's (`/etc/ninjars`,
   `%ProgramData%\ninjars`); the workspace's, the first `.ninjars` from the
-  build directory up, short of the home directory, whose directory is the
-  workspace (else the build directory); the user's (`~/.ninjars`); the
+  build directory up to the repository's root (a `.git`, `.hg`, `.jj`,
+  `.sl` or `.svn`), short of the home directory, whose directory is the
+  workspace (else the build directory); never one someone else could have
+  put there: in a file system's root, a directory shared by all users
+  (`/tmp`: writable by all and sticky), or (on Unix) a file another user
+  owns; the user's (`~/.ninjars`); the
   `--ninjars` files (`/dev/null` ends them; a missing one is an error). A
   file found twice is read once.
 - **Lines**: `COMMAND[:CONFIG] OPTIONS...`, `import FILE`, `try-import FILE`
@@ -662,7 +698,12 @@ another build directory. They are one invocation:
   invocation puts the flags before its own command line (its own flags
   win), takes the ids, so that every remote request has the outer
   `tool_invocation_id`, and appends to the execution log (one `write` per
-  line: the processes share the file). The files' options are among the
+  line: the processes share the file). Header values (`--remote_header`, often tokens) aren't in the
+  environment every build command sees: they go in a file only the user
+  can read (`flags-<pid>.json` in the daemon's private directory), which
+  the variable names and the invocation removes when it ends. Build events
+  and `--announce_rc` show headers' names, not their values. The files'
+  options are among the
   flags, so it doesn't apply them again; it reads the files for the
   `--config`s of its own command line only. The environment carries it to
   grandchildren unchanged.
@@ -926,8 +967,14 @@ every header and toolchain file.
   `-t daemon [status|start|stop]`.
 - **Talking:** length-prefixed JSON over a Unix socket in a directory only
   the user can enter (`$XDG_RUNTIME_DIR/ninja-rs`, else
-  `/tmp/ninja-rs-<uid>`), or a Windows named pipe (which other users can't
-  write to, nor remote clients open). A pool of connections lets
+  `/tmp/ninja-rs-<uid>`), or a Windows named pipe that only the user (and
+  the system) may open, nor remote clients. Both ends check the other: a
+  client only connects to a socket in a directory the user owns and no one
+  else can enter, served by a process of the user's (`SO_PEERCRED`,
+  `getpeereid`), or to a pipe whose server runs as the user; a daemon only
+  accepts the user's processes. (A predictable path or name could
+  otherwise be another user's first, answering with chosen digests.) A pool
+  of connections lets
   concurrent actions ask in parallel. A build begins with the build
   directory, its environment (compilers are probed in the build's, and
   `INCLUDE`, `CPATH` and the like are part of a profile's key), the
@@ -941,9 +988,17 @@ every header and toolchain file.
   created, removed or renamed, and everything under a directory that
   was. Build directories are never trusted (their files change during
   builds; on Linux they aren't even watched, so that compiles writing
-  objects don't flood the queue), nor are paths through symbolic links
-  (events come for real paths). Files outside every root (system headers)
-  are checked once per build, as without the daemon.
+  objects don't flood the queue), nor the other directories a build writes
+  to (outputs outside the build directory, as an in-source generator
+  writes them; the build directory with symlinks resolved): their files
+  are checked every time, even within a build, as a generator can rewrite a
+  header between two actions. Nor are paths through symbolic links (events
+  come for real paths). Roots on a file system that may not report every
+  change are never watched: on Linux, any but an allow-list of local ones
+  (ext4, XFS, Btrfs, tmpfs, ZFS...: not NFS, SMB, FUSE, nor WSL's view of
+  Windows drives, 9p); on Windows, network drives. Files outside every
+  watched root (system headers) are checked once per build, as without the
+  daemon.
 - **Trust:** an entry checked while its root is in sync, with no event
   meanwhile, stays valid until an event says otherwise (`WATCHED` in
   `cpp_deps::scan::Cache` and `ninja_daemon::files`); other entries are
@@ -965,8 +1020,15 @@ every header and toolchain file.
   buffers on Windows. Elsewhere nothing is watched yet: every entry is
   checked once per build, which still saves lexing, probing and hashing.
 - **Profiles persist** in the disk cache (`cpp-deps/`), with or without
-  the daemon: a file per profile, its whole key checked when loading;
-  profiles unused for a month are removed when another is saved.
+  the daemon: a file per profile, its whole key checked when loading. The
+  key has the compiler's path, size and modification time, its banner
+  (`--version`, or `cl`'s: a wrapper's or a shim's file doesn't change with
+  the compiler behind it), the flags, the working directory and the
+  variables that change answers (`INCLUDE`, `CPATH`, `SDKROOT`,
+  `DEVELOPER_DIR`, `VCToolsInstallDir`...). What it doesn't see (a clang
+  configuration file's contents) is stale for a day at most: profiles are
+  probed again after a day, however often used. Those unused for a month
+  are removed when another is saved.
 
 Measured on 256 compiles (36 standard headers each, a chain of project
 headers), from the disk cache, 32 threads; median of five builds:

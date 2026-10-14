@@ -187,10 +187,24 @@ fn map_back(task: &Task, command: Option<&LocalCommand>, result: &mut TaskResult
     }
 }
 
-/// Writes the files a prepared command reads (rewritten response files).
+/// Writes the files a prepared command reads (rewritten response files),
+/// unless they already hold that: through a temporary file renamed into
+/// place, so that a command reading one never sees it half written.
 fn write_files(cmd: &LocalCommand) {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for (path, data) in &cmd.files {
-        let _ = std::fs::write(path, data);
+        if std::fs::read(path).is_ok_and(|old| old == *data) {
+            continue;
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+        if std::fs::write(&tmp, data).is_err() || std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::write(path, data);
+        }
     }
 }
 

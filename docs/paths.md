@@ -43,6 +43,14 @@ cl-style compilers) is scanned for embedded absolute paths:
 A path ends at `;`, `,`, a quote or `=` (and `:` on POSIX): both sides of a
 prefix map (`-ffile-prefix-map=OLD=NEW`, `/pathmap:`) are rewritten.
 
+Values the program built keeps, rather than files the command opens, are
+left as they are: macro definitions (`-D`, `/D`) and run-time library
+paths (`-rpath`, `-R`, `-install_name`, also through `-Wl,` and
+`-Xlinker`). Rewritten, `-DDATA_DIR="/home/u/proj/data"` would become
+`"../data"` and the program would differ from the one ninja builds (and
+break when run from elsewhere). An action with such a value names the
+checkout, so two checkouts don't share it.
+
 A path is rewritten to a path **relative to the working directory** when it
 lies under the exec root, in the input tree or not: an include directory
 no header came from (`-isystem <src>/Utilities` in a compile reading none

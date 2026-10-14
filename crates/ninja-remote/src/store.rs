@@ -164,11 +164,11 @@ impl Store {
         }
     }
 
-    /// Loads persisted file digests (`path\tsize\tmtime_ns\thash`). Entries
-    /// are only used when size and mtime still match.
+    /// Loads persisted file digests (see `read_digests`). Entries are only
+    /// used when the file's `FileStamp` still matches.
     pub fn load_digests(&self, file: &Path) {
-        for (p, size, mtime, hash) in read_digests(file) {
-            self.digests.put(&p, size, mtime, re::Digest { hash, size_bytes: size as i64 });
+        for (p, stamp, hash) in read_digests(file) {
+            self.digests.put(&p, stamp, re::Digest { hash, size_bytes: stamp.len as i64 });
         }
     }
 
@@ -178,13 +178,15 @@ impl Store {
         out.push('\n');
         let mut entries = self.digests.entries();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (p, size, mtime, d) in entries {
-            let ns = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let now = std::time::SystemTime::now();
+        for (p, s, d) in entries {
             let ps = p.to_string_lossy();
-            if ps.contains(['\t', '\n']) {
+            // A file modified within the time granularity of now could
+            // change again unseen: hashed again next time.
+            if ps.contains(['\t', '\n']) || s.is_racy(now) {
                 continue;
             }
-            out.push_str(&format!("{ps}\t{size}\t{ns}\t{}\n", d.hash));
+            out.push_str(&format!("{ps}\t{}\t{}\t{}\t{}\t{}\n", s.len, s.mtime_ns, s.change, s.inode, d.hash));
         }
         let tmp = file.with_extension("tmp");
         std::fs::File::create(&tmp)?.write_all(out.as_bytes())?;
@@ -205,13 +207,53 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.txt");
         std::fs::write(&f, "hello").unwrap();
+        // Modified a while ago: a recent file's digest isn't saved.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
         let s = Store::default();
         let d = rbe_client::tree::file_digest(&f, Some(&s.digests)).unwrap();
         s.save_digests(&dir.join("digests")).unwrap();
         let s2 = Store::default();
         s2.load_digests(&dir.join("digests"));
-        let m = std::fs::metadata(&f).unwrap();
-        assert_eq!(s2.digests.get(&f, m.len(), m.modified().unwrap()), Some(d));
+        let stamp = |f: &Path| rbe_client::tree::FileStamp::of(&std::fs::metadata(f).unwrap());
+        assert_eq!(s2.digests.get(&f, &stamp(&f)), Some(d.clone()));
+        // New contents with the same size and modification time (as an
+        // archive extracted in place gives): not the cached digest. (On
+        // Windows the creation time stands in, which NTFS gives back to a
+        // file created again under the same name within 15 s.)
+        #[cfg(unix)]
+        {
+            std::fs::write(&f, "jello").unwrap();
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
+            assert_ne!(rbe_client::tree::file_digest(&f, Some(&s2.digests)).unwrap(), d);
+        }
+        // Modified within the time granularity: not saved. A second ago is
+        // only too recent for a file system counting in seconds.
+        let now = std::time::SystemTime::now();
+        let whole = |t: std::time::SystemTime| {
+            let s = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(s)
+        };
+        let set = |name: &str, t: std::time::SystemTime| {
+            let g = dir.join(name);
+            std::fs::write(&g, name).unwrap();
+            std::fs::File::options().write(true).open(&g).unwrap().set_modified(t).unwrap();
+            rbe_client::tree::file_digest(&g, Some(&s2.digests)).unwrap();
+            g
+        };
+        let fresh = set("fresh.txt", now);
+        let second = set("second.txt", whole(now));
+        let fine = set("fine.txt", whole(now) - std::time::Duration::from_secs(1) + std::time::Duration::from_millis(1));
+        s2.save_digests(&dir.join("digests")).unwrap();
+        let s3 = Store::default();
+        s3.load_digests(&dir.join("digests"));
+        assert!(s3.digests.get(&fresh, &stamp(&fresh)).is_none());
+        assert!(s3.digests.get(&second, &stamp(&second)).is_none());
+        assert!(s3.digests.get(&f, &stamp(&f)).is_some());
+        // Unless the file system keeps whole seconds only (FAT, ext3).
+        if !stamp(&fine).mtime_ns.is_multiple_of(1_000_000_000) {
+            assert!(s3.digests.get(&fine, &stamp(&fine)).is_some());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -226,7 +268,7 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(*a.files, vec!["bin/cc".to_string()]);
         // The same tree from a listing.
-        let info = ninja_daemon::proto::FileInfo { hash: rbe_client::digest_of(b"x").hash, size: 1, executable: false, mtime_ns: 0 };
+        let info = ninja_daemon::proto::FileInfo { hash: rbe_client::digest_of(b"x").hash, size: 1, executable: false, mtime_ns: 0, change: 0, inode: 0 };
         let listed = TreeInfo { dirs: vec!["bin".into()], files: vec![("bin/cc".into(), info)] };
         let c = Store::default().toolchain_tree(&dir, &|_| Some(Ok(listed.clone()))).unwrap();
         assert_eq!(c.digest, a.digest);

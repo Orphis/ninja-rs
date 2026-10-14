@@ -27,3 +27,8 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 zstd = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "sync", "signal", "time", "fs", "io-util"] }
+
+# Debug builds hash toolchains (hundreds of MB, the tests' too) in seconds
+# rather than minutes.
+[profile.dev.package.sha2]
+opt-level = 3

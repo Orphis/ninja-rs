@@ -5,12 +5,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cpp_deps::scan::Watch;
 use rbe_client::DigestCache;
 use rbe_client::proto as re;
-use rbe_client::tree::MemDigestCache;
+use rbe_client::tree::{FileStamp, MemDigestCache};
 
 use crate::proto::{FileInfo, TreeInfo};
 use crate::watch::{Change, Listener, Watcher, key};
@@ -39,10 +38,6 @@ pub struct Files {
     /// Digests by real path, size and modification time: links to a file
     /// (LLVM's tools) are hashed once, and digests saved by builds reused.
     hashes: MemDigestCache,
-}
-
-fn mtime_ns(t: SystemTime) -> u64 {
-    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
 }
 
 #[cfg(unix)]
@@ -90,11 +85,11 @@ impl Files {
         self.len() == (0, 0)
     }
 
-    /// Digests a build saved: used for files whose size and modification
-    /// time still match.
-    pub fn seed(&self, entries: impl IntoIterator<Item = (PathBuf, u64, SystemTime, String)>) {
-        for (p, size, mtime, hash) in entries {
-            self.hashes.put(&p, size, mtime, re::Digest { hash, size_bytes: size as i64 });
+    /// Digests a build saved: used for files whose `FileStamp` still
+    /// matches.
+    pub fn seed(&self, entries: impl IntoIterator<Item = (PathBuf, FileStamp, String)>) {
+        for (p, stamp, hash) in entries {
+            self.hashes.put(&p, stamp, re::Digest { hash, size_bytes: stamp.len as i64 });
         }
     }
 
@@ -110,16 +105,23 @@ impl Files {
         }
     }
 
+    fn is_volatile(&self, k: &Path) -> bool {
+        self.volatile.read().unwrap().iter().any(|v| k.starts_with(v))
+    }
+
     fn token(&self, k: &Path, p: &Path) -> Option<u64> {
-        if self.volatile.read().unwrap().iter().any(|v| k.starts_with(v)) { None } else { self.watcher.token(p) }
+        if self.is_volatile(k) { None } else { self.watcher.token(p) }
     }
 
     /// A file's digest (symlinks followed).
     pub fn get(&self, p: &Path) -> Result<FileInfo, String> {
         let k = key(p, self.case_insensitive);
         let known = self.files.read().unwrap().get(&k).cloned();
+        // A file the build may write is checked every time: a generator
+        // can rewrite it between two actions of a session.
         if let Some(e) = &known
             && self.current(e.session.load(Ordering::Relaxed))
+            && !self.is_volatile(&k)
         {
             return Ok(e.info.clone());
         }
@@ -128,16 +130,22 @@ impl Files {
         if !meta.is_file() {
             return Err(format!("{} is not a file", p.display()));
         }
-        let mtime = meta.modified().map(mtime_ns).unwrap_or(0);
+        let stamp = FileStamp::of(&meta);
         if let Some(e) = known
-            && e.info.size == meta.len()
-            && e.info.mtime_ns == mtime
+            && e.info.stamp() == stamp
         {
             e.session.store(self.checked(token), Ordering::Relaxed);
             return Ok(e.info.clone());
         }
         let d = rbe_client::tree::file_digest(p, Some(&self.hashes)).map_err(|e| format!("{e:#}"))?;
-        let info = FileInfo { hash: d.hash, size: d.size_bytes as u64, executable: is_executable(&meta), mtime_ns: mtime };
+        let info = FileInfo {
+            hash: d.hash,
+            size: d.size_bytes as u64,
+            executable: is_executable(&meta),
+            mtime_ns: stamp.mtime_ns,
+            change: stamp.change,
+            inode: stamp.inode,
+        };
         let entry = FileEntry { info: info.clone(), session: AtomicU64::new(self.checked(token)) };
         self.files.write().unwrap().insert(k, Arc::new(entry));
         Ok(info)
@@ -210,11 +218,11 @@ impl Listener for Files {
 }
 
 /// The first line of `.ninja_rs_digests` files.
-pub const DIGESTS_SIGNATURE: &str = "# ninja-rs digests v1";
+pub const DIGESTS_SIGNATURE: &str = "# ninja-rs digests v2";
 
-/// The entries of a `.ninja_rs_digests` file (`path\tsize\tmtime_ns\thash`
-/// lines): (path, size, modification time, hash).
-pub fn read_digests(file: &Path) -> Vec<(PathBuf, u64, SystemTime, String)> {
+/// The entries of a `.ninja_rs_digests` file
+/// (`path\tsize\tmtime_ns\tchange\tinode\thash` lines): (path, stamp, hash).
+pub fn read_digests(file: &Path) -> Vec<(PathBuf, FileStamp, String)> {
     let Ok(text) = std::fs::read_to_string(file) else { return Vec::new() };
     let mut lines = text.lines();
     if lines.next() != Some(DIGESTS_SIGNATURE) {
@@ -223,11 +231,11 @@ pub fn read_digests(file: &Path) -> Vec<(PathBuf, u64, SystemTime, String)> {
     lines
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 4 {
+            if f.len() != 6 {
                 return None;
             }
-            let (Ok(size), Ok(ns)) = (f[1].parse::<u64>(), f[2].parse::<u128>()) else { return None };
-            Some((PathBuf::from(f[0]), size, UNIX_EPOCH + Duration::from_nanos(ns as u64), f[3].to_string()))
+            let (Ok(len), Ok(mtime_ns), Ok(change), Ok(inode)) = (f[1].parse(), f[2].parse(), f[3].parse(), f[4].parse()) else { return None };
+            Some((PathBuf::from(f[0]), FileStamp { len, mtime_ns, change, inode }, f[5].to_string()))
         })
         .collect()
 }
@@ -261,7 +269,7 @@ mod tests {
         let b = dir.join("b.txt");
         std::fs::write(&b, "bbb").unwrap();
         let m = std::fs::metadata(&b).unwrap();
-        files.seed([(b.clone(), 3, m.modified().unwrap(), "made-up".to_string())]);
+        files.seed([(b.clone(), FileStamp::of(&m), "made-up".to_string())]);
         assert_eq!(files.get(&b).unwrap().hash, "made-up");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -269,9 +277,9 @@ mod tests {
     #[test]
     fn digest_files() {
         let f = std::env::temp_dir().join(format!("ninja_daemon_digests_{}", std::process::id()));
-        std::fs::write(&f, format!("{DIGESTS_SIGNATURE}\n/a/b\t3\t1000\tabc\nbad line\n")).unwrap();
+        std::fs::write(&f, format!("{DIGESTS_SIGNATURE}\n/a/b\t3\t1000\t7\t9\tabc\nbad line\n")).unwrap();
         let d = read_digests(&f);
-        assert_eq!(d, vec![(PathBuf::from("/a/b"), 3, UNIX_EPOCH + Duration::from_nanos(1000), "abc".to_string())]);
+        assert_eq!(d, vec![(PathBuf::from("/a/b"), FileStamp { len: 3, mtime_ns: 1000, change: 7, inode: 9 }, "abc".to_string())]);
         let _ = std::fs::remove_file(&f);
     }
 }

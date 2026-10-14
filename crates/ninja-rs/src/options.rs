@@ -105,6 +105,47 @@ impl Default for RcOptions {
 /// `.ninjars` files are read.
 pub const RC_SELECTION: &[&str] = &["ninjars", "system_rc", "workspace_rc", "home_rc", "ignore_all_rc_files"];
 
+/// Options whose values may be credentials (`Authorization=Bearer ...`):
+/// shown with their key only, wherever options are reported.
+pub const SECRET_OPTIONS: &[&str] = &["remote_header", "bes_header"];
+
+const REDACTED: &str = "<redacted>";
+
+/// `KEY=VALUE` with the value hidden.
+fn redact_header(kv: &str) -> String {
+    match kv.split_once('=') {
+        Some((k, _)) => format!("{k}={REDACTED}"),
+        None => REDACTED.to_string(),
+    }
+}
+
+/// Arguments as they may be reported (build events, `--announce_rc`): the
+/// values of `SECRET_OPTIONS` hidden, in `--name=K=V` and `--name K=V`.
+pub fn redact_args(args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    for a in args {
+        let after_name = out.last().and_then(|p| p.strip_prefix("--")).is_some_and(|n| SECRET_OPTIONS.contains(&n));
+        let inline = a.strip_prefix("--").and_then(|r| r.split_once('=')).filter(|(n, _)| SECRET_OPTIONS.contains(n));
+        out.push(match inline {
+            Some((name, kv)) => format!("--{name}={}", redact_header(kv)),
+            None if after_name => redact_header(a),
+            None => a.clone(),
+        });
+    }
+    out
+}
+
+impl GivenOption {
+    /// As it may be reported (see `redact_args`).
+    pub fn redacted(&self) -> GivenOption {
+        if !SECRET_OPTIONS.contains(&self.name.as_str()) {
+            return self.clone();
+        }
+        let value = redact_header(&self.value);
+        GivenOption { combined_form: format!("--{}={value}", self.name), value, ..self.clone() }
+    }
+}
+
 /// A boolean option's value, as Bazel takes them: `--name=true`, `yes`,
 /// `1`, or `false`, `no`, `0`.
 pub fn parse_bool(name: &str, v: &str) -> Result<bool, String> {
@@ -815,6 +856,21 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redaction() {
+        let args: Vec<String> = ["ninja-rs", "--remote_header=authorization=Bearer t", "--bes_header", "x-key=k", "--remote_jobs=5", "--remote_header=bare"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            redact_args(&args),
+            vec!["ninja-rs", "--remote_header=authorization=<redacted>", "--bes_header", "x-key=<redacted>", "--remote_jobs=5", "--remote_header=<redacted>"]
+        );
+        let o = p(&["--remote_header", "authorization=Bearer t"]);
+        let g = o.given[0].redacted();
+        assert_eq!((g.combined_form.as_str(), g.value.as_str()), ("--remote_header=authorization=<redacted>", "authorization=<redacted>"));
+    }
 
     fn p(args: &[&str]) -> Options {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();

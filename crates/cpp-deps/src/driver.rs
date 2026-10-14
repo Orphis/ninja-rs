@@ -19,7 +19,7 @@ use crate::external::is_cl_style;
 use crate::hmap::HeaderMap;
 use crate::intern;
 use crate::probe::{self, Style};
-use crate::scan::{self, Cache, CommandMacro, Config, MacroTable, Oracle, Output, SearchDir};
+use crate::scan::{self, Cache, CommandMacro, Config, Forced, MacroTable, Oracle, Output, SearchDir};
 use crate::vfs::Overlay;
 
 /// A directory of the command line.
@@ -48,7 +48,7 @@ pub struct Invocation {
     pub embed_dirs: Vec<PathBuf>,
     pub overlays: Vec<PathBuf>,
     pub commands: Vec<CommandMacro>,
-    pub forced: Vec<PathBuf>,
+    pub forced: Vec<Forced>,
     /// `cl.exe`: its built-in directories are `INCLUDE`'s, unless `/X`.
     pub no_include_env: bool,
     /// `cl.exe`: the conforming preprocessor (`/Zc:preprocessor`), whose
@@ -110,6 +110,15 @@ const PROFILE_VARS: &[&str] = &[
     "GCC_EXEC_PREFIX",
     "COMPILER_PATH",
     "CCC_OVERRIDE_OPTIONS",
+    // Which Xcode an xcrun shim runs.
+    "DEVELOPER_DIR",
+    // Where clang-cl finds the MSVC headers without INCLUDE.
+    "VCToolsInstallDir",
+    "VCINSTALLDIR",
+    "WindowsSdkDir",
+    "WindowsSDKVersion",
+    "UniversalCRTSdkDir",
+    "UCRTVersion",
 ];
 
 /// Parses a compile command (response files expanded).
@@ -140,6 +149,42 @@ fn new_invocation(argv: &[String], style: Style) -> Result<Invocation, String> {
         conforming: false,
         probe_args: Vec::new(),
     })
+}
+
+/// Whether two search directories are the same: the same kind, and the
+/// same directory once symlinks are resolved (GCC compares inodes).
+fn same_dir(a: &Dir, b: &Dir) -> bool {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    match (a, b) {
+        (Dir::Path(x), Dir::Path(y)) | (Dir::Framework(x), Dir::Framework(y)) => x == y || real(x) == real(y),
+        _ => false,
+    }
+}
+
+/// GCC's and Clang's `-iquote` and `-I` lists as they search them: a
+/// directory given twice is searched at its first place only, one that is
+/// also a system directory (`-isystem`, built in, `-idirafter`) only at its
+/// place among those, and the last `-iquote` one not if it's the first
+/// `-I` one (GCC's `merge_include_chains`).
+fn gcc_search_lists(quote: &[Dir], user: &[Dir], system: [&[Dir]; 3]) -> (Vec<Dir>, Vec<Dir>) {
+    let is_system = |d: &Dir| system.iter().any(|s| s.iter().any(|x| same_dir(x, d)));
+    let dedup = |dirs: &[Dir]| {
+        let mut out: Vec<Dir> = Vec::new();
+        for d in dirs {
+            if !is_system(d) && !out.iter().any(|o| same_dir(o, d)) {
+                out.push(d.clone());
+            }
+        }
+        out
+    };
+    let user = dedup(user);
+    let mut quote = dedup(quote);
+    if let (Some(last), Some(first)) = (quote.last(), user.first())
+        && same_dir(last, first)
+    {
+        quote.pop();
+    }
+    (quote, user)
 }
 
 fn finish(mut inv: Invocation, lang: Option<String>) -> Result<Invocation, String> {
@@ -191,8 +236,12 @@ const WITH_ARG: &[(&str, bool)] = &[
 
 fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
     let abs = |p: &str| -> PathBuf { scan::normalize(&cwd.join(p)) };
+    let forced = |p: &str| if Path::new(p).is_absolute() { Forced::Path(abs(p)) } else { Forced::Gcc { cwd: cwd.to_path_buf(), name: p.to_string() } };
     let mut inv = new_invocation(argv, Style::Gcc)?;
     let mut lang: Option<String> = None;
+    // A precompiled header stands for the header it was made of, which
+    // must be forced too: its macros and files are unknown otherwise.
+    let mut include_pch = false;
     let mut i = 1;
     while i < argv.len() {
         let a = &argv[i];
@@ -217,10 +266,13 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
             let operand = (argv.get(i + 1).map(String::as_str) == Some("-Xclang")).then(|| argv.get(i + 2)).flatten();
             match (v.as_str(), operand) {
                 ("-include" | "-imacros", Some(f)) => {
-                    inv.forced.push(abs(f));
+                    inv.forced.push(forced(f));
                     i += 3;
                 }
-                ("-include-pch", Some(_)) => i += 3,
+                ("-include-pch", Some(_)) => {
+                    include_pch = true;
+                    i += 3;
+                }
                 ("-emit-pch" | "-fno-pch-timestamp" | "-fno-validate-pch", _) => i += 1,
                 _ => {
                     inv.probe_args.push(a.clone());
@@ -231,6 +283,7 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
             continue;
         }
         if a == "-include-pch" {
+            include_pch = true;
             i += 1;
             continue;
         }
@@ -254,7 +307,7 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
                 "--embed-dir" => inv.embed_dirs.push(abs(&v)),
                 "-D" => inv.commands.push(CommandMacro::Define(v)),
                 "-U" => inv.commands.push(CommandMacro::Undef(v)),
-                "-include" | "-imacros" => inv.forced.push(abs(&v)),
+                "-include" | "-imacros" => inv.forced.push(forced(&v)),
                 "-x" => lang = Some(v),
                 _ if keep => {
                     inv.probe_args.push(a.clone());
@@ -305,6 +358,9 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
             }
             inv.source = abs(a);
         }
+    }
+    if include_pch && inv.forced.is_empty() {
+        return Err("a precompiled header without the header it was made from".into());
     }
     finish(inv, lang)
 }
@@ -419,7 +475,15 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
         } else if let Some(v) = f.strip_prefix("vfsoverlay:") {
             inv.overlays.push(abs(v));
         } else if let Some(v) = value(f, "FI", &mut i)? {
-            inv.forced.push(abs(&v));
+            // cl searches it as `#include "..."` in the source; clang-cl
+            // takes it as `-include`.
+            inv.forced.push(if Path::new(&v).is_absolute() {
+                Forced::Path(abs(&v))
+            } else if inv.style == Style::Msvc {
+                Forced::Msvc(v)
+            } else {
+                Forced::Gcc { cwd: cwd.to_path_buf(), name: v }
+            });
         } else if let Some(v) = value(f, "Tp", &mut i)? {
             inv.source = abs(&v);
             lang = Some("c++".into());
@@ -486,12 +550,23 @@ pub struct Profile {
     /// Held while the compiler answers queries, so that concurrent scans
     /// don't ask the same ones.
     asking: Mutex<()>,
+    /// When the compiler was probed, in seconds since the Unix epoch.
+    probed: u64,
 }
 
-const PROFILE_SIGNATURE: &str = "cpp-deps profile 1";
+const PROFILE_SIGNATURE: &str = "cpp-deps profile 2";
 
 /// Profiles unused for this long are removed when another is saved.
 const PROFILE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Profiles are probed again after this long, however often used: what the
+/// key doesn't see (a clang configuration file's contents, an SDK installed
+/// behind a shim) is then stale for a day at most.
+const PROFILE_LIFETIME: Duration = Duration::from_secs(24 * 3600);
+
+fn unix_secs(t: SystemTime) -> u64 {
+    t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
 
 impl Profile {
     fn new(predefines: String, operators: Vec<String>, dialect: crate::expr::Dialect, builtin_dirs: Vec<Dir>, implicit: Vec<PathBuf>) -> Profile {
@@ -504,6 +579,7 @@ impl Profile {
             implicit,
             answers: Mutex::default(),
             asking: Mutex::default(),
+            probed: unix_secs(SystemTime::now()),
         }
     }
 
@@ -525,7 +601,10 @@ impl Profile {
         if bad(key) {
             return Ok(());
         }
-        let mut out = format!("{PROFILE_SIGNATURE}\nkey\t{key}\ndialect\t{}\t{}\n", self.dialect.true_false as u8, self.dialect.alt_operators as u8);
+        let mut out = format!(
+            "{PROFILE_SIGNATURE}\nkey\t{key}\nprobed\t{}\ndialect\t{}\t{}\n",
+            self.probed, self.dialect.true_false as u8, self.dialect.alt_operators as u8
+        );
         let mut operators: Vec<&str> = self.operators.iter().map(|o| o.as_str()).collect();
         operators.sort();
         for o in operators {
@@ -576,10 +655,11 @@ impl Profile {
         if lines.next() != Some(PROFILE_SIGNATURE) || lines.next()?.strip_prefix("key\t") != Some(key) {
             return None;
         }
-        let (mut dialect, mut operators, mut dirs, mut implicit, mut answers) = (None, Vec::new(), Vec::new(), Vec::new(), HashMap::new());
+        let (mut probed, mut dialect, mut operators, mut dirs, mut implicit, mut answers) = (None, None, Vec::new(), Vec::new(), Vec::new(), HashMap::new());
         for line in lines {
             let f: Vec<&str> = line.split('\t').collect();
             match f.as_slice() {
+                ["probed", t] => probed = Some(t.parse::<u64>().ok()?),
                 ["dialect", t, a] => dialect = Some(crate::expr::Dialect { true_false: *t == "1", alt_operators: *a == "1" }),
                 ["operator", o] => operators.push(o.to_string()),
                 ["dir", p] => dirs.push(Dir::Path(PathBuf::from(p))),
@@ -592,7 +672,12 @@ impl Profile {
                 _ => return None,
             }
         }
-        let profile = Profile::new(predefines.to_string(), operators, dialect?, dirs, implicit);
+        let probed = probed?;
+        if unix_secs(SystemTime::now()).saturating_sub(probed) > PROFILE_LIFETIME.as_secs() {
+            return None;
+        }
+        let mut profile = Profile::new(predefines.to_string(), operators, dialect?, dirs, implicit);
+        profile.probed = probed;
         *profile.answers.lock().unwrap() = answers;
         // Used: kept by the clean-up of `save`.
         if let Ok(f) = std::fs::File::options().append(true).open(&file) {
@@ -623,23 +708,41 @@ fn load_once<K: std::hash::Hash + Eq, T>(map: &Mutex<HashMap<K, Loaded<T>>>, key
 pub struct Driver {
     pub cache: Cache,
     profiles: Mutex<HashMap<String, Loaded<Profile>>>,
+    /// Compilers' fingerprints (`probe::fingerprint`), by path, taken once
+    /// per session (build).
+    fingerprints: Mutex<HashMap<PathBuf, (u64, String)>>,
     overlays: Mutex<HashMap<PathBuf, Loaded<Overlay>>>,
     header_maps: Mutex<HashMap<PathBuf, Loaded<HeaderMap>>>,
 }
 
 impl Driver {
     pub fn new(cache: Cache) -> Self {
-        Driver { cache, profiles: Mutex::default(), overlays: Mutex::default(), header_maps: Mutex::default() }
+        Driver { cache, profiles: Mutex::default(), fingerprints: Mutex::default(), overlays: Mutex::default(), header_maps: Mutex::default() }
+    }
+
+    /// A compiler's fingerprint, taken once per session.
+    fn fingerprint(&self, inv: &Invocation, cwd: &Path, env: &Environment) -> String {
+        let session = self.cache.session();
+        if let Some((s, f)) = self.fingerprints.lock().unwrap().get(&inv.compiler)
+            && *s == session
+        {
+            return f.clone();
+        }
+        let f = probe::fingerprint(&env.compiler(inv, cwd));
+        self.fingerprints.lock().unwrap().insert(inv.compiler.clone(), (session, f.clone()));
+        f
     }
 
     /// The key of a compiler's profile for an invocation's flags: what
-    /// may change its answers, the compiler's version included.
-    fn profile_key(inv: &Invocation, cwd: &Path, env: &Environment) -> String {
+    /// may change its answers, the compiler's version included (its file,
+    /// and its banner: a wrapper's file doesn't change with the compiler).
+    fn profile_key(&self, inv: &Invocation, cwd: &Path, env: &Environment) -> String {
+        let fingerprint = self.fingerprint(inv, cwd, env);
         let meta = std::fs::metadata(&inv.compiler).ok();
         let mtime = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
         let vars: Vec<String> = PROFILE_VARS.iter().filter_map(|v| env.var(v).map(|val| format!("{v}={val}"))).collect();
         format!(
-            "{}\u{1}{}\u{1}{mtime}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            "{}\u{1}{}\u{1}{mtime}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:016x}",
             inv.compiler.display(),
             meta.map_or(0, |m| m.len()),
             inv.style,
@@ -648,14 +751,20 @@ impl Driver {
             inv.conforming,
             inv.no_include_env,
             vars.join("\u{1}"),
-            inv.probe_args.join("\u{1}")
+            inv.probe_args.join("\u{1}"),
+            {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::hash::DefaultHasher::new();
+                fingerprint.hash(&mut h);
+                h.finish()
+            }
         )
     }
 
     /// The profile of a compiler for an invocation's flags: probed once,
     /// or loaded from the profile directory.
     pub fn profile(&self, inv: &Invocation, cwd: &Path, env: &Environment) -> Result<Arc<Profile>, String> {
-        let key = Driver::profile_key(inv, cwd, env);
+        let key = self.profile_key(inv, cwd, env);
         load_once(&self.profiles, key.clone(), || {
             if let Some(p) = env.profile_dir.as_deref().and_then(|d| Profile::load(d, &key)) {
                 return Ok(Arc::new(p));
@@ -716,20 +825,29 @@ impl Driver {
         let inv = parse_in(argv, cwd, env)?;
         let profile = self.profile(&inv, cwd, env)?;
         let dirs = |ds: &[Dir]| ds.iter().map(|d| self.search_dir(d, cwd)).collect::<Result<Vec<_>, _>>();
-        let mut angled = dirs(&inv.user_dirs)?;
-        angled.extend(dirs(&inv.system_dirs)?);
-        angled.extend(dirs(&profile.builtin_dirs)?);
-        angled.extend(dirs(&inv.after_dirs)?);
+        let (quote, user) = if inv.style == Style::Gcc {
+            gcc_search_lists(&inv.quote_dirs, &inv.user_dirs, [&inv.system_dirs[..], &profile.builtin_dirs, &inv.after_dirs])
+        } else {
+            (inv.quote_dirs.clone(), inv.user_dirs.clone())
+        };
+        let mut system: Vec<Dir> = Vec::new();
+        for d in inv.system_dirs.iter().chain(&profile.builtin_dirs).chain(&inv.after_dirs) {
+            if inv.style != Style::Gcc || !system.iter().any(|s| same_dir(s, d)) {
+                system.push(d.clone());
+            }
+        }
+        let mut angled = dirs(&user)?;
+        angled.extend(dirs(&system)?);
         let cfg = Config {
             dialect: profile.dialect,
-            quote_dirs: dirs(&inv.quote_dirs)?,
+            quote_dirs: dirs(&quote)?,
             angled_dirs: angled,
             embed_dirs: inv.embed_dirs.clone(),
             overlays: inv.overlays.iter().map(|o| self.overlay(o, cwd)).collect::<Result<_, _>>()?,
             msvc_lookup: inv.style != Style::Gcc,
             predefined: profile.predefined.clone(),
             commands: inv.commands.clone(),
-            forced: profile.implicit.iter().chain(&inv.forced).cloned().collect(),
+            forced: profile.implicit.iter().cloned().map(Forced::Path).chain(inv.forced.iter().cloned()).collect(),
             operators: profile.operators.clone(),
         };
         // Each answer may reveal more queries; a few rounds of asking settle
@@ -775,7 +893,7 @@ impl Driver {
             }
             drop(answers);
             if let Some(d) = &env.profile_dir {
-                let _ = profile.save(d, &Driver::profile_key(&inv, cwd, env));
+                let _ = profile.save(d, &self.profile_key(&inv, cwd, env));
             }
         }
     }
@@ -791,6 +909,24 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn gcc_search_list_rules() {
+        let d = |s: &str| Dir::Path(p(s));
+        // Duplicates searched at their first place; user directories that
+        // are system ones (`-I/usr/include`) only at the system place; the
+        // last -iquote one not when it's the first -I one.
+        let (quote, user) = gcc_search_lists(
+            &[d("/q"), d("/q"), d("/sys"), d("/u")],
+            &[d("/u"), d("/builtin"), d("/u"), d("/v"), d("/after")],
+            [&[d("/sys")], &[d("/builtin")], &[d("/after")]],
+        );
+        assert_eq!(quote, vec![d("/q")]);
+        assert_eq!(user, vec![d("/u"), d("/v")]);
+        // A framework directory isn't the directory of the same path.
+        let (_, user) = gcc_search_lists(&[], &[Dir::Framework(p("/f"))], [&[d("/f")], &[], &[]]);
+        assert_eq!(user, vec![Dir::Framework(p("/f"))]);
     }
 
     #[test]
@@ -847,7 +983,7 @@ mod tests {
         assert_eq!(inv.overlays, vec![p("/b/o.yaml")]);
         assert_eq!(inv.embed_dirs, vec![p("/b/data")]);
         assert_eq!(inv.commands, vec![CommandMacro::Define("A=1".into()), CommandMacro::Define("B".into()), CommandMacro::Undef("C".into())]);
-        assert_eq!(inv.forced, vec![p("/b/pre.h")]);
+        assert_eq!(inv.forced, vec![Forced::Gcc { cwd: cwd.to_path_buf(), name: "pre.h".into() }]);
         assert_eq!(inv.probe_args, s(&["--target=x86_64-linux-gnu", "-O2", "-std=c++17"]));
         assert!(parse(&s(&["cc", "-iprefix", "p/", "-c", "a.c"]), cwd).is_err());
         assert!(parse(&s(&["cc", "-c", "a.f90"]), cwd).is_err());
@@ -873,7 +1009,15 @@ mod tests {
             cwd,
         )
         .unwrap();
-        assert_eq!((pch.lang.as_str(), pch.forced.clone(), pch.probe_args.clone()), ("c++", vec![p("/b/pch.hxx")], Vec::<String>::new()));
+        // An absolute path (only on Unix hosts without a drive).
+        let header = || {
+            if Path::new("/b/pch.hxx").is_absolute() {
+                Forced::Path(p("/b/pch.hxx"))
+            } else {
+                Forced::Gcc { cwd: cwd.to_path_buf(), name: "/b/pch.hxx".into() }
+            }
+        };
+        assert_eq!((pch.lang.as_str(), pch.forced.clone(), pch.probe_args.clone()), ("c++", vec![header()], Vec::<String>::new()));
         let user = parse(
             &s(&[
                 "clang++",
@@ -893,7 +1037,10 @@ mod tests {
             cwd,
         )
         .unwrap();
-        assert_eq!((user.forced.clone(), user.probe_args.clone()), (vec![p("/b/pch.hxx")], s(&["-Xclang", "-fno-x"])));
+        assert_eq!((user.forced.clone(), user.probe_args.clone()), (vec![header()], s(&["-Xclang", "-fno-x"])));
+        // Without the header it was made from, its macros are unknown.
+        assert!(parse(&s(&["clang++", "-include-pch", "/b/pch.hxx.pch", "-c", "a.cpp"]), cwd).is_err());
+        assert!(parse(&s(&["clang++", "-Xclang", "-include-pch", "-Xclang", "/b/pch.hxx.pch", "-c", "a.cpp"]), cwd).is_err());
         assert_eq!(parse(&s(&["cc", "-c", "blake3.S"]), cwd).unwrap().lang, "assembler-with-cpp");
     }
 
@@ -946,7 +1093,7 @@ mod tests {
             inv.commands,
             vec![CommandMacro::Define("A=1".into()), CommandMacro::Define("B=2".into()), CommandMacro::Define("C".into()), CommandMacro::Undef("D".into())]
         );
-        assert_eq!(inv.forced, vec![p("C:/b/pre.h")]);
+        assert_eq!(inv.forced, vec![Forced::Msvc("pre.h".into())]);
         assert!(inv.no_include_env && inv.conforming);
         // The probe passes the language itself.
         assert_eq!(inv.probe_args, s(&["/std:c++20", "/EHsc", "/MDd", "/Zc:preprocessor"]));
@@ -1008,6 +1155,12 @@ mod tests {
         assert_eq!(q.implicit, p.implicit);
         assert_eq!(*q.answers.lock().unwrap(), *p.answers.lock().unwrap());
         assert!(q.predefined.contains_key(&intern::intern("__GNUC__")));
+        assert_eq!(q.probed, p.probed);
+        // Probed over a day ago: probed again, used or not.
+        let mut old = q;
+        old.probed -= PROFILE_LIFETIME.as_secs() + 60;
+        old.save(&dir, "k\u{1}1").unwrap();
+        assert!(Profile::load(&dir, "k\u{1}1").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

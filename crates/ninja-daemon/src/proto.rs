@@ -48,6 +48,10 @@ pub struct Begin {
     pub profile_dir: Option<PathBuf>,
     /// File digests the build saved (`.ninja_rs_digests`), to start from.
     pub digests_file: Option<PathBuf>,
+    /// Other directories the build writes to (outputs outside the build
+    /// directory, its spelling with symlinks resolved): always checked too.
+    #[serde(default)]
+    pub volatile: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +97,18 @@ pub struct FileInfo {
     pub executable: bool,
     /// Nanoseconds since the Unix epoch.
     pub mtime_ns: u64,
+    /// The rest of its `FileStamp`: change (or creation) time and inode.
+    #[serde(default)]
+    pub change: u64,
+    #[serde(default)]
+    pub inode: u64,
+}
+
+impl FileInfo {
+    /// What the digest is valid for.
+    pub fn stamp(&self) -> rbe_client::tree::FileStamp {
+        rbe_client::tree::FileStamp { len: self.size, mtime_ns: self.mtime_ns, change: self.change, inode: self.inode }
+    }
 }
 
 /// A directory's contents, as `InputTree::add_dir` adds them (symlinks

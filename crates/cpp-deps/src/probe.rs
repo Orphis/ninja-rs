@@ -133,6 +133,25 @@ pub struct Ran {
     pub stderr: String,
 }
 
+/// What identifies the compiler behind its path: its version banner
+/// (`--version`, or `cl`'s), which a wrapper passes through (ccache's
+/// masquerade directory, an xcrun shim), unlike the metadata of the file
+/// the path names. Empty when it can't run.
+pub fn fingerprint(c: &Compiler) -> String {
+    let mut cmd = Command::new(c.path);
+    if let Some(env) = c.env {
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
+    }
+    cmd.env("LC_ALL", "C").current_dir(c.cwd).stdin(Stdio::null());
+    if c.style != Style::Msvc {
+        cmd.arg("--version");
+    }
+    match cmd.output() {
+        Ok(out) => format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+        Err(_) => String::new(),
+    }
+}
+
 /// Runs the compiler on `input` with its flags and the `extra` flags of the
 /// operation; Err when it fails.
 pub fn run(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, String> {
@@ -278,7 +297,11 @@ fn answers_of(text: &str, n: usize) -> Vec<Option<i64>> {
         if let (Some(Ok(i)), Some(v)) = (parts.next().map(str::parse::<usize>), parts.next())
             && i < n
         {
-            answers[i] = integer(v);
+            // `+N`: a part of the value (a bit, see `answer`).
+            answers[i] = match v.strip_prefix('+') {
+                Some(part) => integer(part).map(|p| answers[i].unwrap_or(0) + p),
+                None => integer(v),
+            };
         }
     }
     answers
@@ -286,8 +309,10 @@ fn answers_of(text: &str, n: usize) -> Vec<Option<i64>> {
 
 /// The answers to queries (operator, argument), with the same flags as
 /// `probe`: their values as the compiler expands them in text, or, for
-/// those it doesn't (MSVC, some GCC operators), whether `#if` finds them
-/// true. None for those the compiler can't evaluate.
+/// those it doesn't (MSVC, some GCC operators), as `#if` evaluates them,
+/// one bit at a time (`__has_cpp_attribute(nodiscard) >= 201907L` needs
+/// the value, not whether it's true). None for those the compiler can't
+/// evaluate.
 pub fn answer(c: &Compiler, queries: &[(String, String)]) -> Result<Vec<Option<i64>>, String> {
     let all: Vec<usize> = (0..queries.len()).collect();
     let text = |i: usize| {
@@ -301,7 +326,12 @@ pub fn answer(c: &Compiler, queries: &[(String, String)]) -> Result<Vec<Option<i
     let missing: Vec<usize> = all.into_iter().filter(|&i| answers[i].is_none()).collect();
     let as_if = |i: usize| {
         let (op, arg) = &queries[i];
-        format!("#if {op}({arg})\n{QUERY_MARK} {i} 1\n#else\n{QUERY_MARK} {i} 0\n#endif\n")
+        let mut lines = format!("#if {op}({arg})\n");
+        for bit in 0..32 {
+            lines.push_str(&format!("#if (({op}({arg})) >> {bit}) & 1\n{QUERY_MARK} {i} +{}\n#endif\n", 1i64 << bit));
+        }
+        lines.push_str(&format!("#else\n{QUERY_MARK} {i} 0\n#endif\n"));
+        lines
     };
     let _ = ask(c, &missing, &as_if, &mut answers);
     Ok(answers)
@@ -352,6 +382,8 @@ mod tests {
         assert_eq!(integer(" 1"), Some(1));
         assert_eq!(integer("__has_feature(x)"), None);
         assert_eq!(answers_of("NINJA_RS_QUERY 1 7\n  NINJA_RS_QUERY 0 2L\nother\n", 3), vec![Some(2), Some(7), None]);
+        // A value from `#if`, bit by bit.
+        assert_eq!(answers_of("NINJA_RS_QUERY 0 +1\nNINJA_RS_QUERY 0 +4\nNINJA_RS_QUERY 1 0\n", 2), vec![Some(5), Some(0)]);
     }
 
     /// Against a real compiler, when `CPP_DEPS_TEST_CXX` names one.
@@ -363,6 +395,7 @@ mod tests {
         let std = [if style == Style::Gcc { "-std=c++17" } else { "/std:c++17" }.to_string()];
         let c = Compiler { path: Path::new(&cxx), args: &std, style, lang: "c++", cwd: &cwd, env: None };
         let p = probe(&c).unwrap();
+        assert!(fingerprint(&c).contains("version"), "{}", fingerprint(&c));
         assert!(p.predefines.contains("#define __cplusplus 201703L"), "{}", p.predefines);
         assert!(p.operators.iter().any(|o| o == "__has_include"));
         assert!(p.operators.iter().any(|o| o == "__has_builtin"));
@@ -394,6 +427,7 @@ mod tests {
         let args = ["/std:c++20".to_string(), "/EHsc".to_string()];
         let c = Compiler { path: Path::new(&cl), args: &args, style: Style::Msvc, lang: "c++", cwd: &cwd, env: None };
         let p = probe(&c).unwrap();
+        assert!(fingerprint(&c).contains("Version"), "{}", fingerprint(&c));
         assert!(p.predefines.contains("#define _MSC_VER "), "{}", p.predefines);
         assert!(p.predefines.contains("#define _MSVC_LANG 202002L"), "{}", p.predefines);
         assert!(p.predefines.contains("#define _CPPUNWIND 1"));
@@ -401,6 +435,7 @@ mod tests {
         // C++20 implies /permissive-: `and` is an operator.
         assert!(p.dialect.true_false && p.dialect.alt_operators, "{:?}", p.dialect);
         let a = answer(&c, &[("__has_cpp_attribute".into(), "nodiscard".into())]).unwrap();
-        assert!(a[0].is_some_and(|v| v > 0), "{a:?}");
+        // cl doesn't expand it in text: its value comes from `#if`.
+        assert!(a[0].is_some_and(|v| v >= 201907), "{a:?}");
     }
 }
