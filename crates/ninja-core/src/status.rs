@@ -39,8 +39,10 @@ impl EdgeInfo {
 }
 
 pub trait Status {
-    fn edge_added_to_plan(&mut self);
-    fn edge_removed_from_plan(&mut self);
+    /// An edge with a command is added to the plan, or removed from it (a
+    /// `restat` found its inputs unchanged).
+    fn edge_added_to_plan(&mut self, edge: EdgeId);
+    fn edge_removed_from_plan(&mut self, edge: EdgeId);
     fn build_edge_started(&mut self, info: &EdgeInfo, start_ms: i64);
     fn build_edge_finished(&mut self, info: &EdgeInfo, end_ms: i64, exit_code: Option<i32>, kind: &ExecKind, output: &[u8]);
     /// A started edge goes back to waiting: inputs it needed were lost from
@@ -507,10 +509,10 @@ impl StatusPrinter {
 }
 
 impl Status for StatusPrinter {
-    fn edge_added_to_plan(&mut self) {
+    fn edge_added_to_plan(&mut self, _edge: EdgeId) {
         self.total_edges += 1;
     }
-    fn edge_removed_from_plan(&mut self) {
+    fn edge_removed_from_plan(&mut self, _edge: EdgeId) {
         self.total_edges = self.total_edges.saturating_sub(1);
     }
     fn build_edge_rewound(&mut self, info: &EdgeInfo, lost: &[String]) {
@@ -635,8 +637,8 @@ pub struct NullStatus {
 }
 
 impl Status for NullStatus {
-    fn edge_added_to_plan(&mut self) {}
-    fn edge_removed_from_plan(&mut self) {}
+    fn edge_added_to_plan(&mut self, _edge: EdgeId) {}
+    fn edge_removed_from_plan(&mut self, _edge: EdgeId) {}
     fn build_edge_started(&mut self, info: &EdgeInfo, _start_ms: i64) {
         self.started.push(info.command.clone());
     }

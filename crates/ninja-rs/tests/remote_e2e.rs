@@ -847,6 +847,51 @@ fn test_build_events() -> Result<(), String> {
             matches!(&given, Some(SectionType::OptionList(o)) if o.option.iter().any(|o| o.option_name == "j" && o.option_value == "2" && o.combined_form == "-j 2")),
             &format!("short options: {given:?}"),
         )?;
+
+        // 5. Up to date: every target the requested ones need still
+        //    completes, with its outputs, as Bazel reports them.
+        let target_outcomes = |file: &std::path::Path| -> Result<Vec<(String, bool, usize)>, String> {
+            let events = ninja_rs::bes::read_binary_file(file).map_err(|e| e.to_string())?;
+            rbe_bes::events::validate(&events)?;
+            Ok(events
+                .iter()
+                .filter_map(|e| match (id_of(e), &e.payload) {
+                    (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) => {
+                        Some((t.label, c.success, c.output_group.iter().map(|g| g.file_sets.len()).sum()))
+                    }
+                    (Some(Id::TargetCompleted(t)), _) => Some((t.label, false, 0)),
+                    _ => None,
+                })
+                .collect())
+        };
+        let file4 = f.root.join("events4.bin");
+        let flag = format!("--build_event_binary_file={}", file4.to_string_lossy());
+        check(run_ninja(&f, Some(&ep), &[&flag, "app.bin", "lib.a"]) == 0, "the no-op build failed")?;
+        let outcomes = target_outcomes(&file4)?;
+        for label in ["//src:app", "//src:lib"] {
+            check(outcomes.contains(&(label.to_string(), true, 1)), &format!("{label} up to date: {outcomes:?}"))?;
+        }
+
+        // 6. A restat leaving its output unchanged takes the edges after it
+        //    out of the plan: their target completes, it isn't aborted.
+        let cmake = f.root.join("cmake/bin").join(if cfg!(windows) { "fake-cmake.exe" } else { "fake-cmake" });
+        write(&f.build.join("src.txt"), "source");
+        write(&f.build.join("gen.txt"), "generated");
+        let mut manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+        manifest.push_str(&format!(
+            "rule KEEP\n  command = {} -E touch keep.flag\n  restat = 1\nbuild gen.txt: KEEP src.txt\n\
+             build gen.bin: LINK gen.txt\n  rbe_target = gen\n  rbe_mnemonic = CLink\n  rbe_artifact = 1\n",
+            cmake.display()
+        ));
+        write(&f.build.join("build.ninja"), &manifest);
+        check(run_ninja(&f, Some(&ep), &["gen.bin"]) == 0, "building gen.bin failed")?;
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(f.build.join("src.txt")).unwrap().set_modified(later).unwrap();
+        let file5 = f.root.join("events5.bin");
+        let flag = format!("--build_event_binary_file={}", file5.to_string_lossy());
+        check(run_ninja(&f, Some(&ep), &[&flag, "gen.bin"]) == 0, "the restat build failed")?;
+        let outcomes = target_outcomes(&file5)?;
+        check(outcomes == [("//:gen".to_string(), true, 1)], &format!("//:gen after the restat: {outcomes:?}"))?;
         Ok(())
     })
 }
@@ -1002,6 +1047,27 @@ fn test_minimal_downloads() -> Result<(), String> {
         check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
         check(!f.build.join(".ninja_remote").exists(), ".ninja_remote survived the clean")?;
         Ok(())
+    })
+}
+
+/// Local commands needing different remote-only inputs download them at
+/// once, not one after the other.
+fn test_parallel_materialization() -> Result<(), String> {
+    let f = fixture("materialize", true);
+    let mut manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    manifest.push_str("build copy_main.o: COPY obj/main.o\n");
+    write(&f.build.join("build.ninja"), &manifest);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let flags = ["--remote_download_minimal", "--remote_mnemonics=Compile,Link"];
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "first build failed")?;
+        check(remote_only(&f) == ["obj/lib.o", "obj/main.o"], &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        server.state.set_read_delay(std::time::Duration::from_millis(500));
+        check(run_ninja(&f, Some(&ep), &[flags[0], flags[1], "-j4", "copy.o", "copy_main.o"]) == 0, "the copies failed")?;
+        check(server.stats().max_concurrent_reads >= 2, &format!("the inputs were downloaded one after the other: {:?}", server.stats()))?;
+        check(remote_only(&f).is_empty(), &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        let main_o = std::fs::read(f.build.join("obj/main.o")).map_err(|e| format!("obj/main.o: {e}"))?;
+        check(std::fs::read(f.build.join("copy_main.o")).ok() == Some(main_o), "copy_main.o content")
     })
 }
 
@@ -1222,8 +1288,14 @@ rule CC
 build obj/lib.o: CC {lib}
   rbe_target = lib
   rbe_mnemonic = CCompile
+  rbe_artifact = 1
+build obj/main.o: CC {main}
+  rbe_target = app
+  rbe_mnemonic = CCompile
+  rbe_artifact = 1
 ",
-            lib = ninja_escape_path(&f.root.join("src/lib.c").to_string_lossy())
+            lib = ninja_escape_path(&f.root.join("src/lib.c").to_string_lossy()),
+            main = ninja_escape_path(&f.root.join("src/main.c").to_string_lossy())
         ),
     );
     let exe = ninja_exe();
@@ -1231,11 +1303,14 @@ build obj/lib.o: CC {lib}
         &f.build.join("build.ninja"),
         &format!(
             "rule NESTED
-  command = \"{}\" -C inner obj/lib.o
+  command = \"{}\" -C inner $target
 rule ENV
   command = \"{}\" -E environment $out
 
 build inner/obj/lib.o: NESTED
+  target = obj/lib.o
+build inner/obj/main.o: NESTED || inner/obj/lib.o
+  target = obj/main.o
 build env.txt: ENV
 ",
             exe.display(),
@@ -1272,9 +1347,9 @@ build env.txt: ENV
         let env = std::fs::read_to_string(f.build.join("env.txt")).map_err(|e| e.to_string())?;
         check(env.contains("secret_flags") && !env.contains("TOKEN-123"), &format!("NINJA_RS_PARENT: {env}"))?;
         check(
-            server.stats().executions == 1,
+            server.stats().executions == 2,
             &format!(
-                "expected the nested compile remotely: {:?}
+                "expected the nested compiles remotely: {:?}
 {text}",
                 server.stats()
             ),
@@ -1291,8 +1366,27 @@ build env.txt: ENV
             _ => false,
         });
         check(nested, "the nested build's target isn't in the outer stream")?;
+        // Two nested builds in one directory each number their file sets
+        // from 0: each target still gets its own files.
+        let mut sets: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        let mut completed: Vec<(String, Vec<String>)> = Vec::new();
+        for e in &events {
+            match (e.id.as_ref().and_then(|i| i.id.as_ref()), &e.payload) {
+                (Some(Id::NamedSet(s)), Some(Payload::NamedSetOfFiles(files))) => {
+                    sets.insert(s.id.clone(), files.files.iter().map(|f| format!("{}/{}", f.path_prefix.join("/"), f.name)).collect());
+                }
+                (Some(Id::TargetCompleted(t)), Some(Payload::Completed(c))) => {
+                    completed.push((t.label.clone(), c.output_group.iter().flat_map(|g| g.file_sets.iter().map(|s| s.id.clone())).collect()));
+                }
+                _ => {}
+            }
+        }
+        for (label, file) in [("//src:lib", "inner/obj/lib.o"), ("//src:app", "inner/obj/main.o")] {
+            let files: Vec<&String> = completed.iter().filter(|(l, _)| l == label).flat_map(|(_, s)| s.iter()).filter_map(|s| sets.get(s)).flatten().collect();
+            check(files.len() == 1 && files[0].ends_with(file), &format!("{label}'s files: {files:?} (sets {sets:?}, completed {completed:?})"))?;
+        }
         let lines = std::fs::read_to_string(&log).map_err(|e| e.to_string())?.lines().count();
-        check(lines == 1, &format!("expected the nested action in the execution log, got {lines} lines"))?;
+        check(lines == 2, &format!("expected the nested actions in the execution log, got {lines} lines"))?;
         Ok(())
     })
 }
@@ -1566,6 +1660,44 @@ fn test_daemon() -> Result<(), String> {
 /// outputs it wasn't asked for, outside the build directory, a declared
 /// output missing or as a symlink, a corrupt blob. Nothing is written from
 /// them; the action runs locally instead, with the right output.
+/// Calls failing for a transient reason (UNAVAILABLE) are made again, up
+/// to --remote_retries times; a broken Execute stream is followed again
+/// (WaitExecution). With --remote_strict, a failure that stands fails.
+fn test_transient_failures() -> Result<(), String> {
+    let f = fixture("transient", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let s = &server.state;
+        for (method, times) in [("GetCapabilities", 1), ("FindMissingBlobs", 2), ("BatchUpdateBlobs", 1), ("Write", 1), ("GetActionResult", 1), ("Execute", 1)]
+        {
+            s.fail_next(method, times);
+        }
+        s.break_next_executions(1);
+        check(run_ninja(&f, Some(&ep), &["--remote_strict", "obj/main.o", "obj/lib.o"]) == 0, "the build failed")?;
+        let stats = server.stats();
+        check(stats.injected_failures == 7 && stats.wait_executions == 1 && stats.executions == 2, &format!("{stats:?}"))?;
+        // Without retries, the failure stands.
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        s.clear_action_cache();
+        s.fail_next("Execute", 1);
+        check(run_ninja(&f, Some(&ep), &["--remote_strict", "--remote_retries=0", "obj/main.o"]) == 1, "the build should fail without retries")?;
+        Ok(())
+    })
+}
+
+/// Concurrent actions needing the same blob (the toolchain, on a cold
+/// CAS) upload it once: the others wait for that upload.
+fn test_shared_uploads() -> Result<(), String> {
+    let f = fixture("shared_uploads", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        server.state.set_write_delay(std::time::Duration::from_millis(500));
+        check(run_ninja(&f, Some(&ep), &["-j8", "obj/main.o", "obj/lib.o", "obj/big.o"]) == 0, "the build failed")?;
+        let stats = server.stats();
+        check(stats.bytestream_writes == 1 && stats.executions == 3, &format!("the toolchain wasn't uploaded once: {stats:?}"))
+    })
+}
+
 fn test_untrusted_results() -> Result<(), String> {
     use rbe_client::proto as re;
     let f = fixture("untrusted", true);
@@ -1675,6 +1807,9 @@ fn main() -> ExitCode {
     let tests: Vec<(&str, fn() -> Result<(), String>)> = vec![
         ("remote_build_and_cache", test_remote_build_and_cache),
         ("untrusted_results", test_untrusted_results),
+        ("transient_failures", test_transient_failures),
+        ("shared_uploads", test_shared_uploads),
+        ("parallel_materialization", test_parallel_materialization),
         ("response_files", test_response_files),
         ("local_tool_steps", test_local_tool_steps),
         ("no_rbe_version_runs_locally", test_no_rbe_version_runs_locally),
@@ -1715,5 +1850,17 @@ fn main() -> ExitCode {
         }
     }
     println!("test result: {} passed; {failed} failed", count - failed);
-    if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if failed > 0 {
+        return ExitCode::FAILURE;
+    }
+    // The fixtures (copies of this binary, hundreds of MB each), kept
+    // after a failure to look into.
+    let base = std::env::var_os("TEST_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let prefix = format!("ninja-rs-e2e-{}-", std::process::id());
+    for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+    ExitCode::SUCCESS
 }

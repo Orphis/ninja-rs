@@ -135,6 +135,9 @@ pub struct Status {
     pub listings: usize,
     pub digests: usize,
     pub trees: usize,
+    /// Directories watched one by one (inotify).
+    #[serde(default)]
+    pub watched_dirs: usize,
     /// Files the preprocessor lexed, and found lexed already.
     pub files_lexed: u64,
     pub files_reused: u64,

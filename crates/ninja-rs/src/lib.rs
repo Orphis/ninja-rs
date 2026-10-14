@@ -177,6 +177,7 @@ impl Service {
             return match t.as_str() {
                 "daemon" => daemon::tool(&opts.tool_args),
                 "exec" => exec(opts, status).await,
+                "wincodepage" => tools::tool_wincodepage(&opts.tool_args),
                 _ => tools::tool_restat_after_flags(&opts.tool_args),
             };
         }
@@ -517,7 +518,8 @@ impl Service {
                             correlated_invocations_id: self.ids.build_request_id.clone(),
                             ..Default::default()
                         })
-                        .with_compression(opts.remote.cache_compression),
+                        .with_compression(opts.remote.cache_compression)
+                        .with_retries(opts.remote.retries, opts.remote.timeout),
                 )
             }
             None => None,
@@ -773,7 +775,7 @@ impl Service {
         // Like ninja: cache stats while scanning, but not while building, so
         // restat and later edges see the outputs' new timestamps.
         disk.allow_stat_cache(self.stat_cache);
-        for n in nodes {
+        for &n in &nodes {
             if let Err(e) = builder.add_target(n) {
                 disk.allow_stat_cache(false);
                 builder.status.error(&e);
@@ -783,7 +785,7 @@ impl Service {
         disk.allow_stat_cache(false);
         if let Some(b) = &bes {
             let patterns = bes::patterns(builder.state, targets, &targets_file);
-            b.plan(builder.state, &builder.plan, targets_file, &patterns);
+            b.plan(builder.state, &builder.plan, &nodes, targets_file, &patterns, remote_outputs.as_deref());
         }
         let code = if builder.already_up_to_date() {
             if config.verbosity != Verbosity::NoStatusUpdate {

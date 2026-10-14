@@ -41,7 +41,21 @@ pub const TOOLS: &[ToolInfo] = &[
     ToolInfo { name: "restat", desc: "restats all outputs in the build log", when: When::AfterFlags },
     ToolInfo { name: "rules", desc: "list all rules", when: When::AfterLoad },
     ToolInfo { name: "targets", desc: "list targets by their rule or depth in the DAG", when: When::AfterLoad },
+    ToolInfo { name: "wincodepage", desc: "print the Windows code page used by ninja-rs", when: When::AfterFlags },
 ];
+
+/// `-t wincodepage`: the encoding build files are read in, which CMake asks
+/// on Windows before writing them (ANSI otherwise, mangling non-ASCII
+/// paths). ninja-rs reads them as UTF-8 and passes commands and paths to
+/// Windows as UTF-16, on every code page.
+pub fn tool_wincodepage(args: &[String]) -> i32 {
+    if !args.is_empty() {
+        println!("usage: ninja -t wincodepage");
+        return 1;
+    }
+    println!("Build file encoding: UTF-8");
+    0
+}
 
 pub fn find_tool(name: &str) -> Option<&'static ToolInfo> {
     TOOLS.iter().find(|t| t.name == name)

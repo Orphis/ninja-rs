@@ -85,9 +85,11 @@ struct Inner {
     disk: Option<Arc<DiskCache>>,
     shared: Shared,
     config: BackendConfig,
-    /// Held while downloading remote-only inputs, so that two tasks
-    /// reading the same file don't both write it.
-    materializing: tokio::sync::Mutex<()>,
+    /// Remote-only outputs being downloaded, by path: a task needing one
+    /// another task is downloading waits for it (`true` once written)
+    /// rather than writing it too; tasks needing others download theirs
+    /// meanwhile.
+    materializing: std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<bool>>>>,
     fallbacks: Fallbacks,
     /// Hashes of blobs found gone from the remote CAS during this build: a
     /// disk cache result referencing one is stale (see `try_execute`).
@@ -446,6 +448,42 @@ fn map_show_includes(
         }
     }
     out.into_bytes()
+}
+
+/// Runs file system work (writing outputs, hashing, the disk cache) off
+/// the async workers, which then go on serving transfers (HTTP/2 flow
+/// control) and build events. Inline on a single-threaded runtime.
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// Paths a task downloads for every task needing them (see
+/// `Inner::materializing`); those it didn't write are released as failed.
+struct PathClaims<'a> {
+    map: &'a std::sync::Mutex<std::collections::HashMap<String, tokio::sync::watch::Receiver<Option<bool>>>>,
+    senders: std::collections::HashMap<String, tokio::sync::watch::Sender<Option<bool>>>,
+}
+
+impl PathClaims<'_> {
+    fn done(&mut self, path: &str) {
+        if let Some(tx) = self.senders.remove(path) {
+            self.map.lock().unwrap().remove(path);
+            let _ = tx.send(Some(true));
+        }
+    }
+}
+
+impl Drop for PathClaims<'_> {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap();
+        for (path, tx) in self.senders.drain() {
+            map.remove(&path);
+            let _ = tx.send(Some(false));
+        }
+    }
 }
 
 /// Racing: claims the task's outputs for the remote branch, before it
@@ -886,7 +924,7 @@ impl Inner {
             for (local, f) in &files {
                 let d = f.digest.clone().unwrap_or_default();
                 let named_like_archive = [".a", ".lib"].iter().any(|ext| f.path.to_ascii_lowercase().ends_with(ext));
-                if !may_stay_remote(local, f) || !(thin_command || named_like_archive) || same_content(local, &d, &self.shared.store) {
+                if !may_stay_remote(local, f) || !(thin_command || named_like_archive) || blocking(|| same_content(local, &d, &self.shared.store)) {
                     continue;
                 }
                 match self.remote_thin_members(c, &d).await {
@@ -904,22 +942,74 @@ impl Inner {
             }
         }
         let stays_remote = |local: &PathBuf, f: &re::OutputFile| may_stay_remote(local, f) && !download_anyway.contains(&f.path);
-        let mut needed = Vec::new();
-        for (local, f) in &files {
-            let d = f.digest.clone().unwrap_or_default();
-            if Some(local) != depfile_local.as_ref() && same_content(local, &d, &self.shared.store) {
-                continue;
+        let needed = blocking(|| {
+            let mut needed = Vec::new();
+            for (local, f) in &files {
+                let d = f.digest.clone().unwrap_or_default();
+                if Some(local) != depfile_local.as_ref() && same_content(local, &d, &self.shared.store) {
+                    continue;
+                }
+                if stays_remote(local, f) {
+                    continue;
+                }
+                if f.contents.is_empty() || d.size_bytes == 0 {
+                    needed.push(d);
+                }
             }
-            if stays_remote(local, f) {
-                continue;
-            }
-            if f.contents.is_empty() || d.size_bytes == 0 {
-                needed.push(d);
-            }
-        }
+            needed
+        });
         let blobs = self.fetch_blobs(client, &needed).await?;
         let mut left_remote: std::collections::HashSet<&str> = Default::default();
-        for (local, f) in &files {
+        blocking(|| self.write_outputs(p, &files, &blobs, &stays_remote, &thin, &mut left_remote))?;
+        // The disk cache keeps the result with the outputs it can hold;
+        // those left remote stay in the remote CAS (see `try_execute`).
+        if keep
+            && result.output_directories.is_empty()
+            && let Some(disk) = &self.disk
+        {
+            blocking(|| -> Result<()> {
+                // Fetched blobs are stored already; the others are the local
+                // files they matched, or inline.
+                for (local, f) in &files {
+                    let d = f.digest.clone().unwrap_or_default();
+                    if left_remote.contains(f.path.as_str()) {
+                        continue;
+                    }
+                    if !f.contents.is_empty() {
+                        disk.put_bytes(&d, &f.contents)?;
+                    } else if !disk.contains_blob(&d) {
+                        disk.put_file(local, Some(&self.shared.store.digests))?;
+                    }
+                }
+                let mut stored = result.clone();
+                stored.stdout_raw = stdout.clone();
+                stored.stderr_raw = stderr.clone();
+                stored.stdout_digest = None;
+                stored.stderr_digest = None;
+                Ok(disk.put_action_result(&p.action_digest, &stored)?)
+            })?;
+        }
+        let mut out = stdout;
+        if task.deps.as_deref() == Some("msvc") {
+            out = self.map_show_includes(&out, task, p);
+        }
+        out.extend_from_slice(&stderr);
+        Ok(out)
+    }
+
+    /// Writes the outputs of a result that aren't up to date already, and
+    /// records those left remote (in `left_remote` too).
+    fn write_outputs<'f>(
+        &self,
+        p: &Prepared,
+        files: &'f [(PathBuf, re::OutputFile)],
+        blobs: &std::collections::HashMap<String, Vec<u8>>,
+        stays_remote: &dyn Fn(&PathBuf, &re::OutputFile) -> bool,
+        thin: &std::collections::HashMap<String, Arc<Vec<String>>>,
+        left_remote: &mut std::collections::HashSet<&'f str>,
+    ) -> Result<()> {
+        let depfile_local = p.depfile.as_ref().map(|(_, l)| l.clone());
+        for (local, f) in files {
             let d = f.digest.clone().unwrap_or_default();
             let is_depfile = Some(local) == depfile_local.as_ref();
             if !is_depfile && same_content(local, &d, &self.shared.store) {
@@ -967,38 +1057,7 @@ impl Inner {
             let data = if is_depfile { self.map_depfile(&data, p) } else { data };
             write_output(local, &data, f.is_executable)?;
         }
-        // The disk cache keeps the result with the outputs it can hold;
-        // those left remote stay in the remote CAS (see `try_execute`).
-        if keep
-            && result.output_directories.is_empty()
-            && let Some(disk) = &self.disk
-        {
-            // Fetched blobs are stored already; the others are the local
-            // files they matched, or inline.
-            for (local, f) in &files {
-                let d = f.digest.clone().unwrap_or_default();
-                if left_remote.contains(f.path.as_str()) {
-                    continue;
-                }
-                if !f.contents.is_empty() {
-                    disk.put_bytes(&d, &f.contents)?;
-                } else if !disk.contains_blob(&d) {
-                    disk.put_file(local, Some(&self.shared.store.digests))?;
-                }
-            }
-            let mut stored = result.clone();
-            stored.stdout_raw = stdout.clone();
-            stored.stderr_raw = stderr.clone();
-            stored.stdout_digest = None;
-            stored.stderr_digest = None;
-            disk.put_action_result(&p.action_digest, &stored)?;
-        }
-        let mut out = stdout;
-        if task.deps.as_deref() == Some("msvc") {
-            out = self.map_show_includes(&out, task, p);
-        }
-        out.extend_from_slice(&stderr);
-        Ok(out)
+        Ok(())
     }
 
     async fn materialize_paths(&self, paths: &[String]) -> Result<(), MaterializeError> {
@@ -1006,19 +1065,66 @@ impl Inner {
         if outputs.is_empty() {
             return Ok(());
         }
-        let _guard = self.materializing.lock().await;
         // A local command reading a thin archive reads its members too.
-        let members = crate::archive::expand(paths, &self.shared.build_dir, Some(outputs), &self.shared.store).map_err(MaterializeError::from)?;
-        let mut wanted: Vec<(PathBuf, Entry, &String)> = Vec::new();
-        for p in paths.iter().chain(&members) {
-            let local = self.shared.build_dir.join(p);
-            if local.exists() {
-                continue;
+        let wanted = blocking(|| -> Result<Vec<(PathBuf, Entry, String)>, MaterializeError> {
+            let members = crate::archive::expand(paths, &self.shared.build_dir, Some(outputs), &self.shared.store).map_err(MaterializeError::from)?;
+            let mut wanted = Vec::new();
+            for p in paths.iter().chain(&members) {
+                let local = self.shared.build_dir.join(p);
+                if local.exists() {
+                    continue;
+                }
+                if let Some(e) = outputs.get(p) {
+                    wanted.push((local, e, p.clone()));
+                }
             }
-            if let Some(e) = outputs.get(p) {
-                wanted.push((local, e, p));
-            }
+            Ok(wanted)
+        })?;
+        if wanted.is_empty() {
+            return Ok(());
         }
+        // This task downloads the files no other task is downloading.
+        let (mut claims, waits) = {
+            let mut map = self.materializing.lock().unwrap();
+            let (mut senders, mut waits) = (std::collections::HashMap::new(), Vec::new());
+            for (_, e, _) in &wanted {
+                match map.get(&e.path) {
+                    Some(rx) => waits.push(rx.clone()),
+                    None if !senders.contains_key(&e.path) => {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        map.insert(e.path.clone(), rx);
+                        senders.insert(e.path.clone(), tx);
+                    }
+                    None => {}
+                }
+            }
+            (PathClaims { map: &self.materializing, senders }, waits)
+        };
+        let mine: Vec<&(PathBuf, Entry, String)> = wanted.iter().filter(|(_, e, _)| claims.senders.contains_key(&e.path)).collect();
+        self.download_remote_outputs(&mine, outputs, &mut claims).await?;
+        drop(claims);
+        // Those another task downloaded; should that have failed, this task
+        // downloads what is still missing.
+        let mut failed = false;
+        for mut rx in waits {
+            failed |= !matches!(rx.wait_for(|v| v.is_some()).await.map(|v| *v), Ok(Some(true)));
+        }
+        if failed {
+            let left: Vec<&(PathBuf, Entry, String)> = blocking(|| wanted.iter().filter(|(local, _, _)| !local.exists()).collect());
+            let mut none = PathClaims { map: &self.materializing, senders: Default::default() };
+            self.download_remote_outputs(&left, outputs, &mut none).await?;
+        }
+        Ok(())
+    }
+
+    /// Downloads and writes remote-only outputs (local path, record, task
+    /// input), marking each claimed one done.
+    async fn download_remote_outputs(
+        &self,
+        wanted: &[&(PathBuf, Entry, String)],
+        outputs: &RemoteOutputs,
+        claims: &mut PathClaims<'_>,
+    ) -> Result<(), MaterializeError> {
         if wanted.is_empty() {
             return Ok(());
         }
@@ -1031,20 +1137,21 @@ impl Inner {
                 return Err(MaterializeError { message: format!("downloading outputs of remote actions: {e:#}"), lost });
             }
         };
-        let write = |local: &PathBuf, e: &Entry| -> Result<()> {
-            let data = if e.digest.size_bytes == 0 {
-                Vec::new()
-            } else {
-                blobs.get(&e.digest.hash).cloned().with_context(|| format!("missing blob for {}", local.display()))?
-            };
-            write_output(local, &data, e.executable)?;
-            crate::remote_outputs::set_mtime(local, e.mtime).with_context(|| format!("setting the time of {}", local.display()))
-        };
-        for (local, e, _) in &wanted {
-            write(local, e).map_err(|err| MaterializeError::from(format!("{err:#}")))?;
-            outputs.forget(&e.path);
-        }
-        Ok(())
+        blocking(|| -> Result<(), MaterializeError> {
+            for (local, e, _) in wanted {
+                let data = if e.digest.size_bytes == 0 {
+                    Vec::new()
+                } else {
+                    blobs.get(&e.digest.hash).cloned().ok_or_else(|| MaterializeError::from(format!("missing blob for {}", local.display())))?
+                };
+                write_output(local, &data, e.executable).map_err(|err| MaterializeError::from(format!("{err:#}")))?;
+                crate::remote_outputs::set_mtime(local, e.mtime)
+                    .map_err(|err| MaterializeError::from(format!("setting the time of {}: {err}", local.display())))?;
+                outputs.forget(&e.path);
+                claims.done(&e.path);
+            }
+            Ok(())
+        })
     }
 
     /// The members of a blob if it's a thin archive: from the disk cache
@@ -1094,16 +1201,18 @@ impl Inner {
     /// then). A large blob is fetched as its chunks when the remote splits
     /// blobs, downloading only those the disk cache lacks.
     async fn fetch_blobs(&self, client: Option<&Client>, needed: &[re::Digest]) -> Result<std::collections::HashMap<String, Vec<u8>>> {
-        let mut blobs = std::collections::HashMap::new();
-        let mut missing = Vec::new();
-        for d in needed {
-            match self.disk.as_ref().and_then(|disk| disk.read_blob(d)) {
-                Some(data) => {
-                    blobs.insert(d.hash.clone(), data);
+        let (mut blobs, mut missing) = blocking(|| {
+            let (mut blobs, mut missing) = (std::collections::HashMap::new(), Vec::new());
+            for d in needed {
+                match self.disk.as_ref().and_then(|disk| disk.read_blob(d)) {
+                    Some(data) => {
+                        blobs.insert(d.hash.clone(), data);
+                    }
+                    None => missing.push(d.clone()),
                 }
-                None => missing.push(d.clone()),
             }
-        }
+            (blobs, missing)
+        });
         if missing.is_empty() {
             return Ok(blobs);
         }
@@ -1133,12 +1242,16 @@ impl Inner {
             }
             missing = whole;
         }
-        for (hash, data) in client.read_blobs(&missing).await? {
-            if let Some(disk) = &self.disk {
-                disk.put_bytes(&re::Digest { hash: hash.clone(), size_bytes: data.len() as i64 }, &data)?;
-            }
-            blobs.insert(hash, data);
+        let fetched = client.read_blobs(&missing).await?;
+        if let Some(disk) = &self.disk {
+            blocking(|| -> Result<()> {
+                for (hash, data) in &fetched {
+                    disk.put_bytes(&re::Digest { hash: hash.clone(), size_bytes: data.len() as i64 }, data)?;
+                }
+                Ok(())
+            })?;
         }
+        blobs.extend(fetched);
         Ok(blobs)
     }
 
@@ -1418,6 +1531,11 @@ async fn fetch_chunked(client: &Client, disk: &DiskCache, d: &re::Digest) -> Res
     let Some(split) = client.split_blob(d).await? else { return Ok(None) };
     let lacking: Vec<re::Digest> = split.chunk_digests.iter().filter(|c| !disk.contains_chunk(c)).cloned().collect();
     let fetched = client.read_blobs(&lacking).await?;
+    blocking(|| assemble_chunks(disk, d, split, &fetched)).map(Some)
+}
+
+/// A blob from its chunks, those fetched stored in the disk cache.
+fn assemble_chunks(disk: &DiskCache, d: &re::Digest, split: re::SplitBlobResponse, fetched: &std::collections::HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
     let mut data = Vec::with_capacity(d.size_bytes as usize);
     for c in &split.chunk_digests {
         match fetched.get(&c.hash) {
@@ -1437,7 +1555,7 @@ async fn fetch_chunked(client: &Client, disk: &DiskCache, d: &re::Digest) -> Res
         bail!("the chunks don't make up the blob");
     }
     disk.put_chunked(d, split)?;
-    Ok(Some(data))
+    Ok(data)
 }
 
 fn prepared_blobs(p: &Prepared) -> rbe_client::BlobSet {

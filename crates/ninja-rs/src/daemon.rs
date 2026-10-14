@@ -19,7 +19,9 @@ pub fn connect() -> io::Result<Client> {
     let loc = location()?;
     Client::connect_or_start(&loc, || {
         loc.create_dir()?;
-        ipc::spawn_detached(&program(&loc)?, &["-t", "daemon", "run", "--id", &loc.id], &loc.dir)
+        // It exits once this binary is rebuilt (see `server::serve`).
+        let exe = std::env::current_exe()?;
+        ipc::spawn_detached(&program(&loc)?, &["-t", "daemon", "run", "--id", &loc.id, "--exe", &exe.to_string_lossy()], &loc.dir)
     })
 }
 
@@ -73,10 +75,15 @@ fn duration(secs: u64) -> String {
 
 /// `-t daemon`.
 pub fn tool(args: &[String]) -> i32 {
-    // A daemon running a copy is told its name.
+    // A daemon running a copy is told its name, and the binary it comes
+    // from.
     let id = match args {
         [run, flag, id, ..] if run == "run" && flag == "--id" => Some(id),
         _ => None,
+    };
+    let exe = match args {
+        [_, _, _, flag, exe, ..] if flag == "--exe" => Some(std::path::PathBuf::from(exe)),
+        _ => std::env::current_exe().ok(),
     };
     let loc = match id.map_or_else(location, |id| Location::with_id(id)) {
         Ok(l) => l,
@@ -88,7 +95,7 @@ pub fn tool(args: &[String]) -> i32 {
     match args.first().map(String::as_str).unwrap_or("status") {
         "run" => {
             let idle = std::env::var("NINJA_RS_DAEMON_IDLE").ok().and_then(|v| v.parse().ok()).map(Duration::from_secs).unwrap_or(DEFAULT_IDLE);
-            match ninja_daemon::server::serve(&loc, idle) {
+            match ninja_daemon::server::serve(&loc, idle, exe) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("ninja-rs: error: the daemon: {e}");
@@ -130,7 +137,7 @@ pub fn tool(args: &[String]) -> i32 {
                     "  preprocessor: {} files and {} directory listings kept ({} files lexed, {} reused)",
                     s.lexed, s.listings, s.files_lexed, s.files_reused
                 );
-                println!("  {} file digests, {} toolchain trees", s.digests, s.trees);
+                println!("  {} file digests, {} toolchain trees, {} directories watched", s.digests, s.trees, s.watched_dirs);
                 if !s.roots.is_empty() {
                     println!("  roots:");
                     for (p, state) in &s.roots {

@@ -59,6 +59,12 @@ pub struct Stats {
     /// Blobs read and written compressed (batches and ByteStream).
     pub compressed_reads: u64,
     pub compressed_writes: u64,
+    /// Calls failed on purpose (`State::fail_next`), and operations
+    /// followed again (`WaitExecution`).
+    pub injected_failures: u64,
+    pub wait_executions: u64,
+    /// Most reads (batches and ByteStream) served at once.
+    pub max_concurrent_reads: u64,
 }
 
 #[derive(Default)]
@@ -90,6 +96,17 @@ pub struct State {
     fail_executions: std::sync::atomic::AtomicBool,
     /// Milliseconds Execute waits first (a slow remote).
     execute_delay_ms: AtomicU64,
+    /// Milliseconds a ByteStream write waits before it reads the blob,
+    /// and a read before it answers.
+    write_delay_ms: AtomicU64,
+    read_delay_ms: AtomicU64,
+    reads_in_flight: AtomicU64,
+    /// Calls to fail with UNAVAILABLE, by method (see `fail_next`).
+    failures: Mutex<HashMap<&'static str, u32>>,
+    /// Executions whose stream breaks once the operation is named (see
+    /// `break_next_executions`), and the operations they leave to follow.
+    break_executions: Mutex<u64>,
+    operations: Mutex<HashMap<String, Operation>>,
     /// Rewrites every result returned, cached or executed (a misbehaving
     /// server, or a poisoned cache).
     tamper: Mutex<Option<Tamper>>,
@@ -142,6 +159,51 @@ impl State {
     /// Makes every Execute wait first, as a slow or busy remote would.
     pub fn set_execute_delay(&self, delay: std::time::Duration) {
         self.execute_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+    /// Makes the next `times` calls of `method` (`FindMissingBlobs`,
+    /// `BatchUpdateBlobs`, `BatchReadBlobs`, `GetActionResult`,
+    /// `UpdateActionResult`, `GetCapabilities`, `Read`, `Write`, `Execute`)
+    /// fail with UNAVAILABLE, as a transient failure would.
+    pub fn fail_next(&self, method: &'static str, times: u32) {
+        *self.failures.lock().unwrap().entry(method).or_default() += times;
+    }
+    fn injected(&self, method: &'static str) -> Result<(), Status> {
+        let mut failures = self.failures.lock().unwrap();
+        match failures.get_mut(method) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                self.stats.lock().unwrap().injected_failures += 1;
+                Err(Status::unavailable(format!("injected failure of {method}")))
+            }
+            _ => Ok(()),
+        }
+    }
+    /// The next `times` executions run, but their stream breaks after the
+    /// operation's name: the client must follow it (`WaitExecution`).
+    pub fn break_next_executions(&self, times: u64) {
+        *self.break_executions.lock().unwrap() += times;
+    }
+    /// Makes every ByteStream write wait first, so that uploads overlap.
+    pub fn set_write_delay(&self, delay: std::time::Duration) {
+        self.write_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+    /// Makes every read (batches and ByteStream) wait first, so that
+    /// concurrent ones overlap (see `Stats::max_concurrent_reads`).
+    pub fn set_read_delay(&self, delay: std::time::Duration) {
+        self.read_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+    /// A read being served, until it's dropped.
+    async fn reading(self: &Arc<Self>) -> Reading {
+        let now = self.reads_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.max_concurrent_reads = stats.max_concurrent_reads.max(now);
+        }
+        let delay = self.read_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        Reading(self.clone())
     }
     /// Makes every Execute fail, as a broken remote service would.
     pub fn set_fail_executions(&self, on: bool) {
@@ -201,6 +263,14 @@ impl State {
     }
 }
 
+struct Reading(Arc<State>);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        self.0.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub fn digest_of(data: &[u8]) -> re::Digest {
     re::Digest { hash: hex::encode(Sha256::digest(data)), size_bytes: data.len() as i64 }
 }
@@ -215,12 +285,14 @@ struct Svc(Arc<State>);
 #[tonic::async_trait]
 impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
     async fn find_missing_blobs(&self, r: Request<re::FindMissingBlobsRequest>) -> Result<Response<re::FindMissingBlobsResponse>, Status> {
+        self.0.injected("FindMissingBlobs")?;
         let cas = self.0.cas.lock().unwrap();
         let missing = r.into_inner().blob_digests.into_iter().filter(|d| d.size_bytes != 0 && !cas.contains_key(&d.hash)).collect();
         Ok(Response::new(re::FindMissingBlobsResponse { missing_blob_digests: missing }))
     }
 
     async fn batch_update_blobs(&self, r: Request<re::BatchUpdateBlobsRequest>) -> Result<Response<re::BatchUpdateBlobsResponse>, Status> {
+        self.0.injected("BatchUpdateBlobs")?;
         let mut responses = Vec::new();
         let zstd = re::compressor::Value::Zstd as i32;
         for req in r.into_inner().requests {
@@ -249,6 +321,8 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
     }
 
     async fn batch_read_blobs(&self, r: Request<re::BatchReadBlobsRequest>) -> Result<Response<re::BatchReadBlobsResponse>, Status> {
+        self.0.injected("BatchReadBlobs")?;
+        let _reading = self.0.reading().await;
         let mut responses = Vec::new();
         let r = r.into_inner();
         let zstd = re::compressor::Value::Zstd as i32;
@@ -319,6 +393,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
 #[tonic::async_trait]
 impl re::action_cache_server::ActionCache for Svc {
     async fn get_action_result(&self, r: Request<re::GetActionResultRequest>) -> Result<Response<re::ActionResult>, Status> {
+        self.0.injected("GetActionResult")?;
         let d = r.into_inner().action_digest.unwrap_or_default();
         match self.0.ac.lock().unwrap().get(&d.hash) {
             Some(ar) => {
@@ -329,6 +404,7 @@ impl re::action_cache_server::ActionCache for Svc {
         }
     }
     async fn update_action_result(&self, r: Request<re::UpdateActionResultRequest>) -> Result<Response<re::ActionResult>, Status> {
+        self.0.injected("UpdateActionResult")?;
         let r = r.into_inner();
         let ar = r.action_result.unwrap_or_default();
         self.0.ac.lock().unwrap().insert(r.action_digest.unwrap_or_default().hash, ar.clone());
@@ -340,6 +416,7 @@ impl re::action_cache_server::ActionCache for Svc {
 #[tonic::async_trait]
 impl re::capabilities_server::Capabilities for Svc {
     async fn get_capabilities(&self, _r: Request<re::GetCapabilitiesRequest>) -> Result<Response<re::ServerCapabilities>, Status> {
+        self.0.injected("GetCapabilities")?;
         let sha = re::digest_function::Value::Sha256 as i32;
         let chunking = *self.0.chunking.lock().unwrap();
         Ok(Response::new(re::ServerCapabilities {
@@ -384,6 +461,8 @@ fn parse_resource(name: &str) -> Option<(re::Digest, bool)> {
 impl bs::byte_stream_server::ByteStream for Svc {
     type ReadStream = BoxStream<bs::ReadResponse>;
     async fn read(&self, r: Request<bs::ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
+        self.0.injected("Read")?;
+        let _reading = self.0.reading().await;
         let r = r.into_inner();
         let (d, compressed) = parse_resource(&r.resource_name).ok_or_else(|| Status::invalid_argument("bad resource name"))?;
         let data = self.0.get(&d).ok_or_else(|| Status::not_found("blob not found"))?;
@@ -415,6 +494,11 @@ impl bs::byte_stream_server::ByteStream for Svc {
     }
 
     async fn write(&self, r: Request<Streaming<bs::WriteRequest>>) -> Result<Response<bs::WriteResponse>, Status> {
+        self.0.injected("Write")?;
+        let delay = self.0.write_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         let mut stream = r.into_inner();
         let mut resource = String::new();
         let mut data = Vec::new();
@@ -559,6 +643,7 @@ impl re::execution_server::Execution for Svc {
         if self.0.fail_executions.load(Ordering::SeqCst) {
             return Err(Status::internal("injected failure"));
         }
+        self.0.injected("Execute")?;
         let delay = self.0.execute_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -583,8 +668,9 @@ impl re::execution_server::Execution for Svc {
             }
         };
         let resp = re::ExecuteResponse { result: resp.result.map(|r| self.0.tampered(r)), ..resp };
+        let name = format!("operations/{}-{}", d.hash, self.0.counter.fetch_add(1, Ordering::SeqCst));
         let op = Operation {
-            name: format!("operations/{}", d.hash),
+            name: name.clone(),
             metadata: None,
             done: true,
             result: Some(operation::Result::Response(Any {
@@ -592,12 +678,28 @@ impl re::execution_server::Execution for Svc {
                 value: resp.encode_to_vec(),
             })),
         };
+        // A broken stream: the operation named, then an error; it is done
+        // for whoever follows it.
+        let broken = {
+            let mut left = self.0.break_executions.lock().unwrap();
+            let broken = *left > 0;
+            *left = left.saturating_sub(1);
+            broken
+        };
+        if broken {
+            self.0.operations.lock().unwrap().insert(name.clone(), op);
+            let named = Operation { name, metadata: None, done: false, result: None };
+            return Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(named), Err(Status::unavailable("injected: the stream broke"))]))));
+        }
         Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(op)]))))
     }
 
     type WaitExecutionStream = BoxStream<Operation>;
-    async fn wait_execution(&self, _r: Request<re::WaitExecutionRequest>) -> Result<Response<Self::WaitExecutionStream>, Status> {
-        Err(Status::unimplemented("WaitExecution"))
+    async fn wait_execution(&self, r: Request<re::WaitExecutionRequest>) -> Result<Response<Self::WaitExecutionStream>, Status> {
+        let name = r.into_inner().name;
+        let op = self.0.operations.lock().unwrap().remove(&name).ok_or_else(|| Status::not_found(format!("no operation {name}")))?;
+        self.0.stats.lock().unwrap().wait_executions += 1;
+        Ok(Response::new(Box::pin(tokio_stream::iter(vec![Ok(op)]))))
     }
 }
 
@@ -676,8 +778,16 @@ impl FakeServer {
         let addr = listener.local_addr()?;
         let svc = Svc(state.clone());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-        let mut builder = tonic::transport::Server::builder();
+        // Without TCP_NODELAY (tonic doesn't set it for an incoming stream),
+        // window updates wait behind Nagle's algorithm and delayed ACKs:
+        // one large upload crawls at a few MB/s. Adaptive windows, as the
+        // client's.
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener).map(|s| {
+            s.inspect(|s| {
+                let _ = s.set_nodelay(true);
+            })
+        });
+        let mut builder = tonic::transport::Server::builder().http2_adaptive_window(Some(true));
         let endpoint = match &tls {
             Some(t) => {
                 use tonic::transport::{Certificate, Identity, ServerTlsConfig};

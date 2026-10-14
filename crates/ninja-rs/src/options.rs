@@ -156,10 +156,39 @@ pub fn parse_bool(name: &str, v: &str) -> Result<bool, String> {
     }
 }
 
+/// A duration, as Bazel writes them: a number and a unit (`d`, `h`, `m`,
+/// `s`, `ms`), or a number alone, in `unit`.
+pub fn parse_duration(name: &str, v: &str, unit: std::time::Duration) -> Result<std::time::Duration, String> {
+    use std::time::Duration;
+    let bad = || format!("invalid --{name} value '{v}' (a duration: 30s, 5m, 500ms...)");
+    let digits = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    let n: u64 = v[..digits].parse().map_err(|_| bad())?;
+    Ok(match &v[digits..] {
+        "" => unit * u32::try_from(n).map_err(|_| bad())?,
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n.checked_mul(60).ok_or_else(bad)?),
+        "h" => Duration::from_secs(n.checked_mul(3600).ok_or_else(bad)?),
+        "d" => Duration::from_secs(n.checked_mul(86400).ok_or_else(bad)?),
+        _ => return Err(bad()),
+    })
+}
+
+/// An optional value: empty unsets it, as in Bazel (`--disk_cache=` turns
+/// off a cache a settings file sets).
+fn unless_empty(v: String) -> Option<String> {
+    (!v.is_empty()).then_some(v)
+}
+
 /// The home directory: `HOME`, or `USERPROFILE` on Windows.
 pub fn home_dir() -> Option<std::path::PathBuf> {
     let var = if cfg!(windows) { std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) } else { std::env::var_os("HOME") };
     var.filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+}
+
+/// An optional path option's value (see `path_value`): empty unsets it.
+fn optional_path(name: &str, v: &str) -> Result<Option<String>, String> {
+    if v.is_empty() { Ok(None) } else { path_value(name, v).map(Some) }
 }
 
 /// A path option's value: `~` expanded (as Bazel does), then absolute,
@@ -315,8 +344,9 @@ pub struct BesFlags {
     pub lifecycle_events: bool,
     /// Report every action, not only failed ones.
     pub publish_all_actions: bool,
-    /// How long to wait for the upload at the end of the build.
-    pub timeout_secs: u64,
+    /// How long to wait for the upload at the end of the build; zero
+    /// waits as long as it takes (Bazel's `0`).
+    pub timeout: std::time::Duration,
     pub build_metadata: Vec<(String, String)>,
     pub invocation_id: Option<String>,
     pub build_request_id: Option<String>,
@@ -335,7 +365,7 @@ impl Default for BesFlags {
             keywords: Vec::new(),
             lifecycle_events: true,
             publish_all_actions: false,
-            timeout_secs: 60,
+            timeout: std::time::Duration::from_secs(60),
             build_metadata: Vec::new(),
             invocation_id: None,
             build_request_id: None,
@@ -399,6 +429,12 @@ pub struct RemoteFlags {
     /// `--[no]remote_cache_compression`: blobs travel compressed with zstd
     /// when the remote supports it.
     pub cache_compression: bool,
+    /// `--remote_retries`: calls failing for a transient reason are made
+    /// again this many times.
+    pub retries: u32,
+    /// `--remote_timeout`: how long a call may take, or a transfer go
+    /// without moving (executions aren't bounded).
+    pub timeout: std::time::Duration,
 }
 
 impl RemoteFlags {
@@ -478,7 +514,8 @@ settings files (.ninjars, in the format of Bazel's .bazelrc: /etc/ninjars, the f
                              windows, freebsd, openbsd) when a file defines it
 
 remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
-  --remote_executor=URL      grpc://host:port or grpcs://host:port
+  --remote_executor=URL      grpc://host:port or grpcs://host:port (an empty value, as
+                             for every optional value, unsets it)
   --remote_cache=URL         remote cache alone: actions remote execution would run
                              are looked up there, and run locally on a miss
   --[no]remote_upload_local_results  with --remote_cache, store the results of
@@ -497,12 +534,20 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
                              (checked from 20 actions on)
   --remote_racing            also run actions sent remotely locally, when a local
                              slot is free; the first to finish wins
-  --remote_racing_delay=MS   wait this long before a local run starts [default=250]
+  --remote_racing_delay=DURATION  wait this long before a local run starts
+                             (milliseconds without a unit) [default=250ms]
   --remote_verbose           log remote decisions and cache hits
+  --remote_retries=N         make calls failing for a transient reason (UNAVAILABLE,
+                             RESOURCE_EXHAUSTED...) again, up to N times [default=5]
+  --remote_timeout=DURATION  how long a remote call may take, or a transfer go without
+                             moving (30s, 2m; seconds without a unit). Executions
+                             aren't bounded: a broken one is followed again
+                             (WaitExecution) [default=60s]
   --disk_cache=DIR           local action cache and CAS (also without --remote_executor)
-  --remote_download_outputs=all|minimal
+  --remote_download_outputs=all|minimal|toplevel
                              outputs of remote actions to download: all, or only
-                             deliverables, named targets and local inputs [default=all]
+                             deliverables, named targets and local inputs (minimal,
+                             and Bazel's toplevel) [default=all]
   --remote_download_minimal  same as --remote_download_outputs=minimal
   --execution_log_file=FILE  log every remote action (key, command, inputs) as JSON lines
   --remote_include_scanner=conservative|preprocessor|clang-scan-deps|compiler
@@ -532,7 +577,9 @@ build events (Bazel's Build Event Protocol):
   --bes_results_url=URL      printed with the invocation id appended
   --bes_keywords=A,B         notification keywords
   --[no]bes_lifecycle_events send lifecycle events [default=on]
-  --bes_timeout=SECONDS      wait at most this long for the upload at the end [default=60]
+  --bes_timeout=DURATION     wait at most this long for the upload at the end (60s,
+                             5m; seconds without a unit; 0 waits as long as it
+                             takes) [default=60s]
   --build_event_binary_file=PATH  also write the events to PATH (length-delimited)
   --build_event_publish_all_actions  report every action, not only failed ones
   --build_metadata=K=V       extra build metadata (repeatable)
@@ -579,6 +626,8 @@ fn blank() -> Options {
             disk_cache_max_size: DEFAULT_DISK_CACHE_MAX_SIZE,
             daemon: std::env::var("NINJA_RS_DAEMON").is_ok_and(|v| v == "1"),
             cache_compression: true,
+            retries: rbe_client::DEFAULT_RETRIES,
+            timeout: rbe_client::DEFAULT_TIMEOUT,
             ..Default::default()
         },
         bes: BesFlags::default(),
@@ -662,16 +711,16 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                 "jobserver-pool" => o.jobserver_pool = true,
                 "help" => return Ok(ParseOutcome::Exit(usage(), 1)),
                 "tls_certificate" | "tls_client_certificate" | "tls_client_key" => {
-                    let abs = path_value(name, &value(&mut i)?)?;
+                    let abs = optional_path(name, &value(&mut i)?)?;
                     match name {
-                        "tls_certificate" => o.tls.certificate = Some(abs),
-                        "tls_client_certificate" => o.tls.client_certificate = Some(abs),
-                        _ => o.tls.client_key = Some(abs),
+                        "tls_certificate" => o.tls.certificate = abs,
+                        "tls_client_certificate" => o.tls.client_certificate = abs,
+                        _ => o.tls.client_key = abs,
                     }
                 }
-                "tls_authority_override" => o.tls.authority_override = Some(value(&mut i)?),
-                "remote_executor" => o.remote.executor = Some(value(&mut i)?),
-                "remote_cache" => o.remote.cache = Some(value(&mut i)?),
+                "tls_authority_override" => o.tls.authority_override = unless_empty(value(&mut i)?),
+                "remote_executor" => o.remote.executor = unless_empty(value(&mut i)?),
+                "remote_cache" => o.remote.cache = unless_empty(value(&mut i)?),
                 "remote_instance_name" => o.remote.instance_name = value(&mut i)?,
                 "remote_header" => {
                     let v = value(&mut i)?;
@@ -686,15 +735,11 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                     }
                     o.remote.jobs = n as usize;
                 }
-                "exec_root" => o.remote.exec_root = Some(value(&mut i)?),
+                "exec_root" => o.remote.exec_root = unless_empty(value(&mut i)?),
                 "remote_mnemonics" => o.remote.mnemonic_suffixes = value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
                 "remote_racing_delay" => {
-                    let v = value(&mut i)?;
-                    let n = parse_int("--remote_racing_delay", &v)?;
-                    if n < 0 {
-                        return Err("invalid --remote_racing_delay parameter".into());
-                    }
-                    o.remote.racing_delay_ms = n as u64;
+                    let d = parse_duration(name, &value(&mut i)?, std::time::Duration::from_millis(1))?;
+                    o.remote.racing_delay_ms = d.as_millis().try_into().unwrap_or(u64::MAX);
                 }
                 "remote_max_fallbacks" => {
                     let v = value(&mut i)?;
@@ -704,6 +749,16 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                     }
                     o.remote.max_fallbacks = Some(n as usize);
                 }
+                "remote_retries" => {
+                    let v = value(&mut i)?;
+                    o.remote.retries = v.parse().map_err(|_| format!("invalid --remote_retries value '{v}'"))?;
+                }
+                "remote_timeout" => {
+                    o.remote.timeout = parse_duration(name, &value(&mut i)?, std::time::Duration::from_secs(1))?;
+                    if o.remote.timeout.is_zero() {
+                        return Err("invalid --remote_timeout value '0'".into());
+                    }
+                }
                 "remote_max_fallback_ratio" => {
                     let v = value(&mut i)?;
                     let r: f64 = v.parse().ok().filter(|r| (0.0..=1.0).contains(r)).ok_or("invalid --remote_max_fallback_ratio parameter (0 to 1)")?;
@@ -712,32 +767,31 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_download_outputs" => {
                     o.remote.download_minimal = match value(&mut i)?.as_str() {
                         "all" => false,
-                        "minimal" => true,
-                        v => return Err(format!("invalid --remote_download_outputs '{v}' (all or minimal)")),
+                        // Bazel's toplevel: what the build asks for and what
+                        // local actions read, which is ninja-rs's minimal.
+                        "minimal" | "toplevel" => true,
+                        v => return Err(format!("invalid --remote_download_outputs '{v}' (all, minimal or toplevel)")),
                     }
                 }
                 "remote_download_minimal" => o.remote.download_minimal = true,
                 "remote_download_all" => o.remote.download_minimal = false,
                 "remote_include_scanner" => o.remote.include_scanner = value(&mut i)?.parse()?,
-                "execution_log_file" => o.remote.execution_log = Some(path_value(name, &value(&mut i)?)?),
-                "disk_cache" => o.remote.disk_cache = Some(path_value(name, &value(&mut i)?)?),
+                "execution_log_file" => o.remote.execution_log = optional_path(name, &value(&mut i)?)?,
+                "disk_cache" => o.remote.disk_cache = optional_path(name, &value(&mut i)?)?,
                 "disk_cache_max_size" => {
                     let v = value(&mut i)?;
                     o.remote.disk_cache_max_size = ninja_remote::disk_cache::parse_size(&v).ok_or_else(|| format!("invalid --disk_cache_max_size '{v}'"))?;
                 }
-                "bes_backend" => o.bes.backend = Some(value(&mut i)?),
+                "bes_backend" => o.bes.backend = unless_empty(value(&mut i)?),
                 "bes_instance_name" => o.bes.instance_name = value(&mut i)?,
                 "bes_header" => o.bes.headers.push(key_value(name, &value(&mut i)?)?),
-                "bes_results_url" => o.bes.results_url = Some(value(&mut i)?),
+                "bes_results_url" => o.bes.results_url = unless_empty(value(&mut i)?),
                 "bes_keywords" => o.bes.keywords.extend(value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
-                "bes_timeout" => {
-                    let v = value(&mut i)?;
-                    o.bes.timeout_secs = parse_int("--bes_timeout", &v)?.max(0) as u64;
-                }
-                "build_event_binary_file" => o.bes.binary_file = Some(path_value(name, &value(&mut i)?)?),
+                "bes_timeout" => o.bes.timeout = parse_duration(name, &value(&mut i)?, std::time::Duration::from_secs(1))?,
+                "build_event_binary_file" => o.bes.binary_file = optional_path(name, &value(&mut i)?)?,
                 "build_metadata" => o.bes.build_metadata.push(key_value(name, &value(&mut i)?)?),
-                "invocation_id" => o.bes.invocation_id = Some(value(&mut i)?),
-                "build_request_id" => o.bes.build_request_id = Some(value(&mut i)?),
+                "invocation_id" => o.bes.invocation_id = unless_empty(value(&mut i)?),
+                "build_request_id" => o.bes.build_request_id = unless_empty(value(&mut i)?),
                 "config" => o.rc.configs.push(value(&mut i)?),
                 "ninjars" => o.rc.files.push(path_value(name, &value(&mut i)?)?),
                 _ => return Err(format!("unrecognized option '--{name}'")),
@@ -958,6 +1012,28 @@ mod tests {
         assert!(tls_hint("invalid peer certificate: UnknownIssuer", "h:1", &TlsFlags::default()).contains("--tls_certificate adds a CA"));
         assert!(tls_hint("transport error: broken pipe", "grpc://h:1", &tls).is_empty());
         assert!(tls_hint("not found", "grpcs://h:1", &tls).is_empty());
+    }
+
+    /// Bazel's values: empty unsets, durations with units.
+    #[test]
+    fn bazel_values() {
+        use std::time::Duration;
+        let o = p(&["--remote_executor=grpc://e:1", "--disk_cache=/c", "--bes_backend=grpc://b:1", "--remote_executor=", "--disk_cache=", "--bes_backend", ""]);
+        assert_eq!((o.remote.executor, o.remote.disk_cache, o.bes.backend), (None, None, None));
+        assert_eq!(p(&["--execution_log_file=", "--exec_root="]).remote.execution_log, None);
+        assert_eq!(p(&["--bes_timeout=90s"]).bes.timeout, Duration::from_secs(90));
+        assert_eq!(p(&["--bes_timeout=2m"]).bes.timeout, Duration::from_secs(120));
+        assert_eq!(p(&["--bes_timeout=45"]).bes.timeout, Duration::from_secs(45));
+        assert_eq!(p(&["--bes_timeout=0"]).bes.timeout, Duration::ZERO);
+        assert_eq!(p(&["--remote_racing_delay=1s"]).remote.racing_delay_ms, 1000);
+        assert_eq!(p(&["--remote_racing_delay=40"]).remote.racing_delay_ms, 40);
+        assert!(p(&["--remote_download_outputs=toplevel"]).remote.download_minimal);
+        let o = p(&["--remote_retries=2", "--remote_timeout=5m"]);
+        assert_eq!((o.remote.retries, o.remote.timeout), (2, Duration::from_secs(300)));
+        for bad in ["--bes_timeout=60x", "--bes_timeout=s", "--bes_timeout=-1s", "--remote_download_outputs=some", "--remote_retries=-1", "--remote_timeout=0"]
+        {
+            assert!(parse_args(&[bad.to_string()]).is_err(), "{bad}");
+        }
     }
 
     #[test]

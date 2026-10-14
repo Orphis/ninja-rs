@@ -2,9 +2,10 @@
 //! Minimal REAPI v2 client: mTLS connection, CAS upload/download, Execute.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
@@ -19,6 +20,7 @@ use re::{
     execution_client::ExecutionClient,
 };
 use sha2::{Digest as _, Sha256};
+use tokio::sync::watch;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// gRPC header carrying [`re::RequestMetadata`] on every REAPI call, as Bazel
@@ -69,6 +71,109 @@ pub struct Client {
     metadata: Option<Arc<re::RequestMetadata>>,
     /// Extra headers sent with every call.
     headers: Arc<Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>>,
+    /// Calls failing for a transient reason are made again this many times
+    /// (`--remote_retries`), after exponential backoff.
+    retries: u32,
+    /// How long a call may take (`--remote_timeout`), and a stream go
+    /// without moving. Executions aren't bounded: a broken one is followed
+    /// again (`WaitExecution`).
+    timeout: Duration,
+    /// Blobs being uploaded, by hash: a call needing one another call is
+    /// uploading waits for it (`true` once there, `false` if that upload
+    /// failed), instead of uploading it too. Shared by clones.
+    inflight: Arc<Mutex<HashMap<String, watch::Receiver<Option<bool>>>>>,
+}
+
+/// `--remote_retries` and `--remote_timeout` defaults, Bazel's.
+pub const DEFAULT_RETRIES: u32 = 5;
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The gRPC status an error is, or wraps.
+pub fn status_of(e: &anyhow::Error) -> Option<&tonic::Status> {
+    e.chain().find_map(|c| c.downcast_ref::<tonic::Status>())
+}
+
+/// Codes worth another call, as Bazel's `RemoteRetrier` retries them.
+fn transient(code: tonic::Code) -> bool {
+    use tonic::Code::*;
+    matches!(code, Unavailable | Unknown | DeadlineExceeded | Aborted | Internal | ResourceExhausted | Cancelled)
+}
+
+/// How long to wait before attempt `attempt + 1`: 100 ms doubling up to
+/// 5 s (Bazel's), give or take 10%.
+fn backoff(attempt: u32) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    let base = Duration::from_millis(100).saturating_mul(1 << attempt.min(16)).min(Duration::from_secs(5));
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(attempt);
+    base.mul_f64(0.9 + 0.2 * (h.finish() % 1000) as f64 / 1000.0)
+}
+
+/// Reads until `buf` is full or the end: fewer bytes only at the end.
+fn read_full(r: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+/// A ByteStream write's requests, `BYTESTREAM_CHUNK` of the blob at a time,
+/// compressed as they go (see `size`): a large file is never in memory
+/// whole. Stops when the call has ended (`tx` closed). `wire`: bytes sent.
+fn produce_writes(
+    mut reader: Box<dyn Read + Send>,
+    size: Option<u64>,
+    resource: String,
+    tx: tokio::sync::mpsc::Sender<WriteRequest>,
+    wire: Arc<AtomicU64>,
+) -> Result<()> {
+    // Compressed when `size` is given: the frame says it (and the encoder
+    // fails should the file have changed size since it was hashed).
+    let mut encoder = match size {
+        Some(size) => {
+            let mut e = zstd::stream::write::Encoder::new(Vec::new(), 3)?;
+            e.set_pledged_src_size(Some(size))?;
+            Some(e)
+        }
+        None => None,
+    };
+    let mut buf = vec![0u8; BYTESTREAM_CHUNK];
+    let mut offset = 0usize;
+    loop {
+        let n = read_full(&mut reader, &mut buf)?;
+        let end = n < buf.len();
+        let mut data = match encoder.as_mut() {
+            Some(e) => {
+                e.write_all(&buf[..n])?;
+                std::mem::take(e.get_mut())
+            }
+            None => buf[..n].to_vec(),
+        };
+        if end && let Some(e) = encoder.take() {
+            data.extend(e.finish()?);
+        }
+        // The compressor holds data back: nothing to send yet.
+        if data.is_empty() && !end {
+            continue;
+        }
+        let request = WriteRequest {
+            resource_name: if offset == 0 { resource.clone() } else { String::new() },
+            write_offset: offset as i64,
+            finish_write: end,
+            data,
+        };
+        offset += request.data.len();
+        wire.fetch_add(request.data.len() as u64, Ordering::Relaxed);
+        if tx.blocking_send(request).is_err() || end {
+            return Ok(());
+        }
+    }
 }
 
 /// Blobs smaller than this travel uncompressed: too little to gain.
@@ -124,10 +229,15 @@ pub async fn connect_channel(opts: &ConnectOptions) -> Result<Channel> {
         "grpc" | "http" => (format!("http://{rest}"), false),
         other => bail!("unsupported endpoint scheme `{other}`"),
     };
+    // Flow-control windows sized to the connection's bandwidth-delay
+    // product (as grpc-java tunes them), not 64 KiB: one large download
+    // isn't held back by them.
     let mut endpoint = Endpoint::from_shared(url)?
         .connect_timeout(Duration::from_secs(20))
         .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_while_idle(true);
+        .keep_alive_while_idle(true)
+        .tcp_nodelay(true)
+        .http2_adaptive_window(true);
     if tls {
         let domain = opts.authority_override.clone().unwrap_or(host);
         let mut cfg = ClientTlsConfig::new().domain_name(domain).with_webpki_roots();
@@ -206,6 +316,55 @@ impl Client {
             transfers: Default::default(),
             metadata: None,
             headers: Arc::new(Vec::new()),
+            retries: DEFAULT_RETRIES,
+            timeout: DEFAULT_TIMEOUT,
+            inflight: Default::default(),
+        }
+    }
+
+    /// Calls failing for a transient reason are made again `retries` times;
+    /// each may take `timeout` (a stream, go that long without moving).
+    pub fn with_retries(mut self, retries: u32, timeout: Duration) -> Self {
+        self.retries = retries;
+        self.timeout = timeout;
+        self
+    }
+
+    /// Runs `call` until it succeeds, fails for good, or has failed for a
+    /// transient reason `retries` times, waiting longer each time.
+    async fn retrying<T, F, Fut>(&self, mut call: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut attempt = 0;
+        loop {
+            match call().await {
+                Err(e) if attempt < self.retries && status_of(&e).is_some_and(|s| transient(s.code())) => {
+                    tokio::time::sleep(backoff(attempt)).await;
+                    attempt += 1;
+                }
+                r => return r,
+            }
+        }
+    }
+
+    /// `call`, failing with DEADLINE_EXCEEDED after `--remote_timeout`.
+    async fn timed<T>(&self, call: impl std::future::Future<Output = Result<T, tonic::Status>>) -> Result<T, tonic::Status> {
+        match tokio::time::timeout(self.timeout, call).await {
+            Ok(r) => r,
+            Err(_) => Err(tonic::Status::deadline_exceeded(format!("no answer within {:?} (--remote_timeout)", self.timeout))),
+        }
+    }
+
+    /// Resolves when `progress` (milliseconds after `start`) is older than
+    /// `--remote_timeout`: a stream that stopped moving.
+    async fn stalled(&self, progress: &AtomicU64, start: Instant) {
+        loop {
+            tokio::time::sleep(self.timeout / 4).await;
+            if start.elapsed().saturating_sub(Duration::from_millis(progress.load(Ordering::Relaxed))) > self.timeout {
+                return;
+            }
         }
     }
 
@@ -280,12 +439,13 @@ impl Client {
     }
 
     pub async fn capabilities(&mut self) -> Result<re::ServerCapabilities> {
-        let caps = CapabilitiesClient::new(self.channel.clone())
-            .get_capabilities(self.req(re::GetCapabilitiesRequest {
-                instance_name: self.instance.clone(),
-            }))
-            .await?
-            .into_inner();
+        let this = &*self;
+        let caps = this
+            .retrying(|| async {
+                let request = this.req(re::GetCapabilitiesRequest { instance_name: this.instance.clone() });
+                Ok(this.timed(CapabilitiesClient::new(this.channel.clone()).get_capabilities(request)).await?.into_inner())
+            })
+            .await?;
         if let Some(cache) = &caps.cache_capabilities
             && cache.max_batch_total_size_bytes > 0
         {
@@ -313,14 +473,15 @@ impl Client {
         let mut missing = Vec::new();
         for chunk in digests.chunks(10_000) {
             let resp = self
-                .cas()
-                .find_missing_blobs(self.req(re::FindMissingBlobsRequest {
-                    instance_name: self.instance.clone(),
-                    blob_digests: chunk.to_vec(),
-                    digest_function: re::digest_function::Value::Sha256 as i32,
-                }))
-                .await?
-                .into_inner();
+                .retrying(|| async {
+                    let request = self.req(re::FindMissingBlobsRequest {
+                        instance_name: self.instance.clone(),
+                        blob_digests: chunk.to_vec(),
+                        digest_function: re::digest_function::Value::Sha256 as i32,
+                    });
+                    Ok(self.timed(self.cas().find_missing_blobs(request)).await?.into_inner())
+                })
+                .await?;
             missing.extend(resp.missing_blob_digests);
         }
         Ok(missing)
@@ -331,7 +492,9 @@ impl Client {
     /// splices blobs, as their chunks (only those it lacks), then spliced.
     /// Chunks are batched too, unless the server compresses ByteStream
     /// writes and not batches: then each goes through ByteStream,
-    /// compressed, several at once, as Bazel uploads them.
+    /// compressed, several at once, as Bazel uploads them. Large files are
+    /// read as they are sent. A blob another call is uploading (concurrent
+    /// actions sharing a toolchain) is waited for, not sent again.
     /// Returns the number of blobs uploaded and the bytes sent.
     pub async fn upload_blobs(&self, blobs: &BlobSet) -> Result<(usize, u64)> {
         let digests = blobs.0.values().map(|(d, _)| d.clone()).collect();
@@ -347,12 +510,30 @@ impl Client {
         if !lost.is_empty() {
             return Err(MissingRemoteBlobs(lost).into());
         }
-        let mut up = Uploader::new(self);
+        // This call uploads the blobs no other call is uploading.
+        let (mut up, waits) = {
+            let mut inflight = self.inflight.lock().unwrap();
+            let (mut claims, mut waits) = (HashMap::new(), Vec::new());
+            for d in &missing {
+                match inflight.get(&d.hash) {
+                    Some(rx) => waits.push((d.clone(), rx.clone())),
+                    None => {
+                        let (tx, rx) = watch::channel(None);
+                        inflight.insert(d.hash.clone(), rx);
+                        claims.insert(d.hash.clone(), tx);
+                    }
+                }
+            }
+            (Uploader::new(self, claims), waits)
+        };
         let mut spliced = Vec::new();
         for d in &missing {
+            if !up.claims.contains_key(&d.hash) {
+                continue;
+            }
             let (_, src) = &blobs.0[&d.hash];
-            let data = src.load()?;
             if let Some(cdc) = self.chunking.splice_chunker(d) {
+                let data = src.load()?;
                 let chunks: Vec<(re::Digest, &[u8])> = cdc.chunks(&data).map(|c| (digest_of(c), c)).collect();
                 let mut lacking: HashSet<String> =
                     self.find_missing(chunks.iter().map(|(cd, _)| cd.clone()).collect()).await?.into_iter().map(|cd| cd.hash).collect();
@@ -366,7 +547,7 @@ impl Client {
                             streams.join_next().await.expect("uploads in flight")??;
                         }
                         up.sent += c.len() as u64;
-                        let (client, cd, c) = (self.clone(), cd.clone(), c.to_vec());
+                        let (client, cd, c) = (self.clone(), cd.clone(), BlobSource::Bytes(c.to_vec()));
                         streams.spawn(async move { client.bytestream_write(&cd, &c).await });
                     }
                     while let Some(r) = streams.join_next().await {
@@ -375,25 +556,40 @@ impl Client {
                 } else {
                     for (cd, c) in &chunks {
                         if lacking.remove(&cd.hash) {
-                            up.add(cd, c.to_vec()).await?;
+                            up.add_bytes(cd, c.to_vec()).await?;
                         }
                     }
                 }
                 spliced.push((d.clone(), chunks.into_iter().map(|(cd, _)| cd).collect::<Vec<_>>()));
                 continue;
             }
-            up.add(d, data).await?;
+            up.add(d, src).await?;
         }
         up.flush().await?;
         // Once all the chunks are in the CAS. A server refusing the splice
         // gets the whole blob.
         for (d, chunks) in spliced {
             if self.splice_blob(&d, &chunks).await.is_err() {
-                up.add(&d, blobs.0[&d.hash].1.load()?).await?;
+                up.add(&d, &blobs.0[&d.hash].1).await?;
+            } else {
+                up.done(&d.hash);
             }
         }
         up.flush().await?;
-        Ok((missing.len(), up.sent))
+        let mut sent = up.sent;
+        drop(up);
+        // What other calls upload: a blob whose upload failed (or stopped)
+        // is uploaded by this call.
+        let mut again = Uploader::new(self, HashMap::new());
+        for (d, mut rx) in waits {
+            let uploaded = matches!(rx.wait_for(|v| v.is_some()).await.map(|v| *v), Ok(Some(true)));
+            if !uploaded {
+                again.add(&d, &blobs.0[&d.hash].1).await?;
+            }
+        }
+        again.flush().await?;
+        sent += again.sent;
+        Ok((missing.len(), sent))
     }
 
     /// The chunks a blob is made of, from the server (`GetChunkMapping`, or
@@ -403,6 +599,16 @@ impl Client {
         if !self.chunking.split {
             return Ok(None);
         }
+        self.retrying(|| async {
+            match tokio::time::timeout(self.timeout, self.split_blob_once(d)).await {
+                Ok(r) => r,
+                Err(_) => Err(tonic::Status::deadline_exceeded(format!("splitting {}: no answer within {:?}", digest_str(d), self.timeout)).into()),
+            }
+        })
+        .await
+    }
+
+    async fn split_blob_once(&self, d: &re::Digest) -> Result<Option<re::SplitBlobResponse>> {
         let not_found = |s: &tonic::Status| s.code() == tonic::Code::NotFound;
         let split = if self.chunking.v2_13 {
             let request = re::GetChunkMappingRequest {
@@ -455,6 +661,16 @@ impl Client {
     /// Tells the server that a blob is the concatenation of chunks it holds
     /// (`RegisterChunkMapping`, or `SpliceBlob` before RE API v2.13).
     pub async fn splice_blob(&self, d: &re::Digest, chunks: &[re::Digest]) -> Result<()> {
+        self.retrying(|| async {
+            match tokio::time::timeout(self.timeout, self.splice_blob_once(d, chunks)).await {
+                Ok(r) => r,
+                Err(_) => Err(tonic::Status::deadline_exceeded(format!("splicing {}: no answer within {:?}", digest_str(d), self.timeout)).into()),
+            }
+        })
+        .await
+    }
+
+    async fn splice_blob_once(&self, d: &re::Digest, chunks: &[re::Digest]) -> Result<()> {
         let context = || format!("splicing {}", digest_str(d));
         if self.chunking.v2_13 {
             // The list may be long: spread it over messages, the first one
@@ -493,59 +709,67 @@ impl Client {
         if requests.is_empty() {
             return Ok(());
         }
-        let resp = self
-            .cas()
-            .batch_update_blobs(self.req(re::BatchUpdateBlobsRequest {
+        self.retrying(|| async {
+            let request = self.req(re::BatchUpdateBlobsRequest {
                 instance_name: self.instance.clone(),
-                requests,
+                requests: requests.clone(),
                 digest_function: re::digest_function::Value::Sha256 as i32,
-            }))
-            .await?
-            .into_inner();
-        for r in resp.responses {
-            if let Some(st) = r.status
-                && st.code != 0
-            {
-                bail!("upload of {:?} failed: {} {}", r.digest, st.code, st.message);
+            });
+            let resp = self.timed(self.cas().batch_update_blobs(request)).await?.into_inner();
+            for r in resp.responses {
+                if let Some(st) = r.status
+                    && st.code != 0
+                {
+                    let what = r.digest.as_ref().map(digest_str).unwrap_or_default();
+                    return Err(tonic::Status::new(tonic::Code::from(st.code), format!("upload of {what} failed: {}", st.message)).into());
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
-    async fn bytestream_write(&self, d: &re::Digest, data: &[u8]) -> Result<()> {
-        let packed = if self.zstd { compressed(data) } else { None };
-        let (kind, data) = match &packed {
-            Some(c) => ("compressed-blobs/zstd", c.as_slice()),
-            None => ("blobs", data),
+    /// Uploads a blob through ByteStream, read from `src` as it is sent.
+    async fn bytestream_write(&self, d: &re::Digest, src: &BlobSource) -> Result<()> {
+        self.retrying(|| self.bytestream_write_once(d, src)).await
+    }
+
+    async fn bytestream_write_once(&self, d: &re::Digest, src: &BlobSource) -> Result<()> {
+        let reader: Box<dyn Read + Send> = match src {
+            BlobSource::Bytes(b) => Box::new(std::io::Cursor::new(b.clone())),
+            BlobSource::File(p) => Box::new(std::fs::File::open(p).with_context(|| format!("reading {}", p.display()))?),
+            BlobSource::Remote(_) => return src.load().map(|_| ()),
         };
-        let resource = format!(
-            "{}uploads/{}/{kind}/{}/{}",
-            self.prefix(),
-            upload_id(),
-            d.hash,
-            d.size_bytes
-        );
-        let mut reqs = Vec::new();
-        let mut offset = 0usize;
-        loop {
-            let end = (offset + BYTESTREAM_CHUNK).min(data.len());
-            reqs.push(WriteRequest {
-                resource_name: if offset == 0 { resource.clone() } else { String::new() },
-                write_offset: offset as i64,
-                finish_write: end == data.len(),
-                data: data[offset..end].to_vec(),
-            });
-            offset = end;
-            if offset >= data.len() {
-                break;
-            }
-        }
-        ByteStreamClient::new(self.channel.clone())
-            .write(self.req(tokio_stream::iter(reqs)))
-            .await
-            .with_context(|| format!("ByteStream write {}", digest_str(d)))?;
+        let compress = self.zstd && d.size_bytes as usize >= MIN_COMPRESSED;
+        let kind = if compress { "compressed-blobs/zstd" } else { "blobs" };
+        let resource = format!("{}uploads/{}/{kind}/{}/{}", self.prefix(), upload_id(), d.hash, d.size_bytes);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let wire = Arc::new(AtomicU64::new(0));
+        let producer = {
+            let wire = wire.clone();
+            let size = compress.then_some(d.size_bytes as u64);
+            tokio::task::spawn_blocking(move || produce_writes(reader, size, resource, tx, wire))
+        };
+        // The stream moves when the transport takes the next request.
+        let (progress, start) = (Arc::new(AtomicU64::new(0)), Instant::now());
+        let requests = {
+            let progress = progress.clone();
+            tokio_stream::StreamExt::map(tokio_stream::wrappers::ReceiverStream::new(rx), move |r| {
+                progress.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                r
+            })
+        };
+        let mut bytestream = ByteStreamClient::new(self.channel.clone());
+        let call = bytestream.write(self.req(requests));
+        let result: Result<()> = tokio::select! {
+            r = call => r.map(|_| ()).map_err(anyhow::Error::from),
+            _ = self.stalled(&progress, start) => Err(tonic::Status::deadline_exceeded(format!("stalled for {:?} (--remote_timeout)", self.timeout)).into()),
+        };
+        // Reading the file failing explains a broken stream best.
+        producer.await.context("ByteStream write")??;
+        result.with_context(|| format!("ByteStream write {}", digest_str(d)))?;
         self.transfers.sent.fetch_add(d.size_bytes as u64, Ordering::Relaxed);
-        self.transfers.wire_sent.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.transfers.wire_sent.fetch_add(wire.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(())
     }
 
@@ -616,22 +840,23 @@ impl Client {
     async fn batch_read(&self, digests: Vec<re::Digest>) -> Result<Vec<(String, Vec<u8>)>> {
         let requested: HashSet<(String, i64)> = digests.iter().map(|d| (d.hash.clone(), d.size_bytes)).collect();
         let resp = self
-            .cas()
-            .batch_read_blobs(self.req(re::BatchReadBlobsRequest {
-                instance_name: self.instance.clone(),
-                digests,
-                acceptable_compressors: self.compressors(),
-                digest_function: re::digest_function::Value::Sha256 as i32,
-            }))
-            .await?
-            .into_inner();
+            .retrying(|| async {
+                let request = self.req(re::BatchReadBlobsRequest {
+                    instance_name: self.instance.clone(),
+                    digests: digests.clone(),
+                    acceptable_compressors: self.compressors(),
+                    digest_function: re::digest_function::Value::Sha256 as i32,
+                });
+                Ok(self.timed(self.cas().batch_read_blobs(request)).await?.into_inner())
+            })
+            .await?;
         let mut out = Vec::with_capacity(resp.responses.len());
         for r in resp.responses {
             let d = r.digest.clone().unwrap_or_default();
             if let Some(st) = &r.status
                 && st.code != 0
             {
-                bail!("read of {} failed: {} {}", digest_str(&d), st.code, st.message);
+                return Err(tonic::Status::new(tonic::Code::from(st.code), format!("read of {} failed: {}", digest_str(&d), st.message)).into());
             }
             // Only what was asked for (whose size bounds what is allocated).
             if !requested.contains(&(d.hash.clone(), d.size_bytes)) {
@@ -644,40 +869,32 @@ impl Client {
 
     async fn bytestream_read(&self, d: &re::Digest) -> Result<Vec<u8>> {
         let kind = if self.zstd { "compressed-blobs/zstd" } else { "blobs" };
-        let mut stream = ByteStreamClient::new(self.channel.clone())
-            .read(self.req(ReadRequest {
-                resource_name: format!("{}{kind}/{}/{}", self.prefix(), d.hash, d.size_bytes),
-                read_offset: 0,
-                read_limit: 0,
-            }))
-            .await
-            .with_context(|| format!("ByteStream read {}", digest_str(d)))?
-            .into_inner();
-        let mut wire = Vec::new();
-        while let Some(chunk) = stream.message().await? {
-            wire.extend_from_slice(&chunk.data);
-        }
+        let resource = format!("{}{kind}/{}/{}", self.prefix(), d.hash, d.size_bytes);
+        let wire = self.retrying(|| self.read_stream(&resource, 0, 0)).await.with_context(|| format!("ByteStream read {}", digest_str(d)))?;
         let compressor = if self.zstd { re::compressor::Value::Zstd as i32 } else { 0 };
         self.decode(compressor, wire, d)
+    }
+
+    /// A ByteStream read, each message within `--remote_timeout`.
+    async fn read_stream(&self, resource: &str, offset: i64, limit: i64) -> Result<Vec<u8>> {
+        let request = self.req(ReadRequest { resource_name: resource.to_string(), read_offset: offset, read_limit: limit });
+        let mut stream = self.timed(ByteStreamClient::new(self.channel.clone()).read(request)).await?.into_inner();
+        let mut data = Vec::new();
+        while let Some(chunk) = self.timed(stream.message()).await? {
+            data.extend_from_slice(&chunk.data);
+        }
+        Ok(data)
     }
 
     /// Reads `limit` bytes of a blob from `offset` (ByteStream's
     /// `read_offset` and `read_limit`), uncompressed: a part of a large blob
     /// without fetching all of it.
     pub async fn read_range(&self, d: &re::Digest, offset: i64, limit: i64) -> Result<Vec<u8>> {
-        let mut stream = ByteStreamClient::new(self.channel.clone())
-            .read(self.req(ReadRequest {
-                resource_name: format!("{}blobs/{}/{}", self.prefix(), d.hash, d.size_bytes),
-                read_offset: offset,
-                read_limit: limit,
-            }))
+        let resource = format!("{}blobs/{}/{}", self.prefix(), d.hash, d.size_bytes);
+        let mut data = self
+            .retrying(|| self.read_stream(&resource, offset, limit))
             .await
-            .with_context(|| format!("ByteStream read {} at {offset}", digest_str(d)))?
-            .into_inner();
-        let mut data = Vec::new();
-        while let Some(chunk) = stream.message().await? {
-            data.extend_from_slice(&chunk.data);
-        }
+            .with_context(|| format!("ByteStream read {} at {offset}", digest_str(d)))?;
         self.transfers.wire_read.fetch_add(data.len() as u64, Ordering::Relaxed);
         self.transfers.read.fetch_add(data.len() as u64, Ordering::Relaxed);
         if limit > 0 && data.len() as i64 > limit {
@@ -687,21 +904,22 @@ impl Client {
     }
 
     pub async fn get_action_result(&self, action: &re::Digest) -> Result<Option<re::ActionResult>> {
-        let res = ActionCacheClient::new(self.channel.clone())
-            .get_action_result(self.req(re::GetActionResultRequest {
+        self.retrying(|| async {
+            let request = self.req(re::GetActionResultRequest {
                 instance_name: self.instance.clone(),
                 action_digest: Some(action.clone()),
                 inline_stdout: true,
                 inline_stderr: true,
                 inline_output_files: vec![],
                 digest_function: re::digest_function::Value::Sha256 as i32,
-            }))
-            .await;
-        match res {
-            Ok(r) => Ok(Some(r.into_inner())),
-            Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
-            Err(s) => Err(s.into()),
-        }
+            });
+            match self.timed(ActionCacheClient::new(self.channel.clone()).get_action_result(request)).await {
+                Ok(r) => Ok(Some(r.into_inner())),
+                Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
+                Err(s) => Err(s.into()),
+            }
+        })
+        .await
     }
 
     /// Publishes `result` under `action` in the action cache (needs the
@@ -714,49 +932,105 @@ impl Client {
         if result.stderr_digest.is_some() {
             result.stderr_raw.clear();
         }
-        ActionCacheClient::new(self.channel.clone())
-            .update_action_result(self.req(re::UpdateActionResultRequest {
+        self.retrying(|| async {
+            let request = self.req(re::UpdateActionResultRequest {
                 instance_name: self.instance.clone(),
                 action_digest: Some(action.clone()),
-                action_result: Some(result),
+                action_result: Some(result.clone()),
                 results_cache_policy: None,
                 digest_function: re::digest_function::Value::Sha256 as i32,
-            }))
-            .await?;
-        Ok(())
+            });
+            self.timed(ActionCacheClient::new(self.channel.clone()).update_action_result(request)).await?;
+            Ok(())
+        })
+        .await
     }
 
-    /// Runs `Execute` and waits for the operation to finish.
+    /// Runs `Execute` and waits for the operation to finish, as Bazel does:
+    /// a stream broken once the operation is named is followed again
+    /// (`WaitExecution`); an operation the server lost, or that failed for a
+    /// transient reason, executes again (up to `--remote_retries` times).
+    /// FAILED_PRECONDITION comes back as the response's status, however the
+    /// server reports it.
     pub async fn execute(&self, action: &re::Digest, skip_cache_lookup: bool) -> Result<re::ExecuteResponse> {
-        let mut stream = ExecutionClient::new(self.channel.clone())
-            .execute(self.req(re::ExecuteRequest {
-                instance_name: self.instance.clone(),
-                skip_cache_lookup,
-                action_digest: Some(action.clone()),
-                execution_policy: None,
-                results_cache_policy: None,
-                digest_function: re::digest_function::Value::Sha256 as i32,
-                inline_stdout: true,
-                inline_stderr: true,
-                inline_output_files: vec![],
-            }))
-            .await?
-            .into_inner();
-        while let Some(op) = stream.message().await? {
+        let request = re::ExecuteRequest {
+            instance_name: self.instance.clone(),
+            skip_cache_lookup,
+            action_digest: Some(action.clone()),
+            execution_policy: None,
+            results_cache_policy: None,
+            digest_function: re::digest_function::Value::Sha256 as i32,
+            inline_stdout: true,
+            inline_stderr: true,
+            inline_output_files: vec![],
+        };
+        let mut operation: Option<String> = None;
+        let mut attempt = 0;
+        loop {
+            let executions = ExecutionClient::new(self.channel.clone());
+            let outcome = match &operation {
+                None => self.follow(executions.clone().execute(self.req(request.clone())).await, &mut operation).await,
+                Some(name) => self.follow(executions.clone().wait_execution(self.req(re::WaitExecutionRequest { name: name.clone() })).await, &mut operation).await,
+            };
+            let status = match outcome {
+                // Not DEADLINE_EXCEEDED: the action timed out.
+                Ok(resp)
+                    if resp.status.as_ref().is_some_and(|s| s.code != tonic::Code::DeadlineExceeded as i32 && transient(tonic::Code::from(s.code))) =>
+                {
+                    let st = resp.status.unwrap_or_default();
+                    operation = None;
+                    tonic::Status::new(tonic::Code::from(st.code), format!("execution failed: {}", st.message))
+                }
+                Ok(resp) => return Ok(resp),
+                Err(Ended::Operation(s)) => {
+                    operation = None;
+                    s
+                }
+                Err(Ended::Stream(s)) => s,
+            };
+            // Followed again, the operation is gone (or can't be followed):
+            // executed again.
+            let lost = operation.is_some() && matches!(status.code(), tonic::Code::NotFound | tonic::Code::Unimplemented);
+            if lost {
+                operation = None;
+            }
+            if attempt >= self.retries || !(lost || transient(status.code())) {
+                return Err(anyhow::Error::from(status).context(format!("executing {}", digest_str(action))));
+            }
+            tokio::time::sleep(backoff(attempt)).await;
+            attempt += 1;
+        }
+    }
+
+    /// Follows an operation's updates until it is done: its response, or
+    /// what ended it. Its name, once known, goes in `name`.
+    async fn follow(
+        &self,
+        call: Result<tonic::Response<tonic::Streaming<bazel_remote_apis::google::longrunning::Operation>>, tonic::Status>,
+        name: &mut Option<String>,
+    ) -> std::result::Result<re::ExecuteResponse, Ended> {
+        let mut stream = call.map_err(Ended::Stream)?.into_inner();
+        while let Some(op) = stream.message().await.map_err(Ended::Stream)? {
+            if !op.name.is_empty() {
+                *name = Some(op.name.clone());
+            }
             if !op.done {
                 continue;
             }
             return match op.result {
-                Some(operation::Result::Response(any)) => {
-                    Ok(re::ExecuteResponse::decode(any.value.as_slice())?)
+                Some(operation::Result::Response(any)) => re::ExecuteResponse::decode(any.value.as_slice())
+                    .map_err(|e| Ended::Operation(tonic::Status::internal(format!("decoding the ExecuteResponse: {e}")))),
+                // Missing inputs, as the response would say it.
+                Some(operation::Result::Error(st)) if st.code == tonic::Code::FailedPrecondition as i32 => {
+                    Ok(re::ExecuteResponse { status: Some(st), ..Default::default() })
                 }
                 Some(operation::Result::Error(st)) => {
-                    bail!("execution failed: code {} {}", st.code, st.message)
+                    Err(Ended::Operation(tonic::Status::new(tonic::Code::from(st.code), format!("execution failed: {}", st.message))))
                 }
-                None => bail!("operation done without result"),
+                None => Err(Ended::Operation(tonic::Status::internal("operation done without result"))),
             };
         }
-        bail!("Execute stream ended before the operation completed")
+        Err(Ended::Stream(tonic::Status::unavailable("the stream ended before the operation completed")))
     }
 
     /// stdout/stderr may be inlined or only referenced by digest.
@@ -806,6 +1080,14 @@ impl std::fmt::Display for MissingRemoteBlobs {
 
 impl std::error::Error for MissingRemoteBlobs {}
 
+/// How an operation followed ended without a response.
+enum Ended {
+    /// Its stream broke: it may still run.
+    Stream(tonic::Status),
+    /// It is done, failed.
+    Operation(tonic::Status),
+}
+
 /// Uploads blobs: small ones batched, large ones through ByteStream.
 struct Uploader<'a> {
     client: &'a Client,
@@ -813,18 +1095,42 @@ struct Uploader<'a> {
     batch_bytes: i64,
     /// Bytes uploaded.
     sent: u64,
+    /// The blobs it uploads for every call needing them (see
+    /// `Client::inflight`), until they are in the CAS.
+    claims: HashMap<String, watch::Sender<Option<bool>>>,
 }
 
 impl<'a> Uploader<'a> {
-    fn new(client: &'a Client) -> Self {
-        Self { client, batch: Vec::new(), batch_bytes: 0, sent: 0 }
+    fn new(client: &'a Client, claims: HashMap<String, watch::Sender<Option<bool>>>) -> Self {
+        Self { client, batch: Vec::new(), batch_bytes: 0, sent: 0, claims }
     }
 
-    async fn add(&mut self, d: &re::Digest, data: Vec<u8>) -> Result<()> {
+    /// A claimed blob is in the CAS.
+    fn done(&mut self, hash: &str) {
+        if let Some(tx) = self.claims.remove(hash) {
+            self.client.inflight.lock().unwrap().remove(hash);
+            let _ = tx.send(Some(true));
+        }
+    }
+
+    /// Uploads a blob: a large one read as it is sent, a small one batched.
+    async fn add(&mut self, d: &re::Digest, src: &BlobSource) -> Result<()> {
+        if d.size_bytes > self.client.max_batch_bytes - 1024 {
+            self.sent += d.size_bytes as u64;
+            self.client.bytestream_write(d, src).await?;
+            self.done(&d.hash);
+            return Ok(());
+        }
+        self.add_bytes(d, src.load()?).await
+    }
+
+    async fn add_bytes(&mut self, d: &re::Digest, data: Vec<u8>) -> Result<()> {
         self.sent += data.len() as u64;
         let limit = self.client.max_batch_bytes - 1024;
         if d.size_bytes > limit {
-            return self.client.bytestream_write(d, &data).await;
+            self.client.bytestream_write(d, &BlobSource::Bytes(data)).await?;
+            self.done(&d.hash);
+            return Ok(());
         }
         let (data, compressor) = match self.client.batch_zstd.then(|| compressed(&data)).flatten() {
             Some(c) => (c, re::compressor::Value::Zstd as i32),
@@ -844,7 +1150,28 @@ impl<'a> Uploader<'a> {
 
     async fn flush(&mut self) -> Result<()> {
         self.batch_bytes = 0;
-        self.client.flush_batch(std::mem::take(&mut self.batch)).await
+        let batch = std::mem::take(&mut self.batch);
+        let hashes: Vec<String> = batch.iter().filter_map(|r| r.digest.as_ref().map(|d| d.hash.clone())).collect();
+        self.client.flush_batch(batch).await?;
+        for h in hashes {
+            self.done(&h);
+        }
+        Ok(())
+    }
+}
+
+/// Blobs it claimed and didn't upload (a failure, a cancelled call): the
+/// calls waiting for them upload them.
+impl Drop for Uploader<'_> {
+    fn drop(&mut self) {
+        if self.claims.is_empty() {
+            return;
+        }
+        let mut inflight = self.client.inflight.lock().unwrap();
+        for (hash, tx) in self.claims.drain() {
+            inflight.remove(&hash);
+            let _ = tx.send(Some(false));
+        }
     }
 }
 

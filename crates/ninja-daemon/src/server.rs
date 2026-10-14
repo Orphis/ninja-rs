@@ -3,7 +3,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -132,6 +132,7 @@ impl Daemon {
                 .collect(),
             lexed,
             listings,
+            watched_dirs: self.watcher.watched_dirs(),
             digests,
             trees,
             files_lexed: stats.files_lexed,
@@ -155,9 +156,19 @@ fn logger(loc: &Location) -> Box<dyn Fn(&str) + Send + Sync> {
     })
 }
 
-/// Runs the daemon until it has been idle for `idle` or is asked to stop.
-/// Returns at once when another one is running.
-pub fn serve(loc: &Location, idle: Duration) -> std::io::Result<()> {
+/// Whether the daemon of `exe` is no longer the one at `loc`: the binary
+/// was rebuilt (or removed), and builds start another daemon.
+pub fn superseded(exe: &Path, loc: &Location) -> bool {
+    Location::for_exe(exe).map_or(true, |l| l.id != loc.id)
+}
+
+/// How long a superseded daemon waits for builds still using it.
+const SUPERSEDED_GRACE: Duration = Duration::from_secs(10);
+
+/// Runs the daemon until it has been idle for `idle`, is asked to stop, or
+/// the binary it comes from (`exe`) is rebuilt: its watches go then rather
+/// than hours later. Returns at once when another one is running.
+pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::Result<()> {
     loc.create_dir()?;
     let lock = std::fs::File::options().create(true).truncate(false).write(true).open(loc.lock_file())?;
     match lock.try_lock() {
@@ -171,12 +182,19 @@ pub fn serve(loc: &Location, idle: Duration) -> std::io::Result<()> {
     let mut listener = ipc::Listener::bind(loc)?;
     log(&format!("started (ninja-rs {}), exiting after {idle:?} idle", env!("CARGO_PKG_VERSION")));
     {
-        let (daemon, log) = (daemon.clone(), log.clone());
+        let (daemon, log, loc) = (daemon.clone(), log.clone(), loc.clone());
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(5).min(idle));
                 if daemon.idle() >= idle {
                     log("idle: exiting");
+                    std::process::exit(0);
+                }
+                if let Some(exe) = &exe
+                    && daemon.idle() >= SUPERSEDED_GRACE
+                    && superseded(exe, &loc)
+                {
+                    log(&format!("{} was rebuilt or removed: exiting", exe.display()));
                     std::process::exit(0);
                 }
             }
@@ -208,5 +226,23 @@ fn connection(daemon: &Daemon, mut stream: ipc::Stream, log: &(dyn Fn(&str) + Se
             log("asked to stop: exiting");
             std::process::exit(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rebuilt (or removed) binary supersedes its daemon.
+    #[test]
+    fn superseded_by_a_rebuilt_binary() {
+        let exe = std::env::temp_dir().join(format!("ninja_daemon_exe_{}", std::process::id()));
+        std::fs::write(&exe, "version 1").unwrap();
+        let loc = Location::for_exe(&exe).unwrap();
+        assert!(!superseded(&exe, &loc));
+        std::fs::write(&exe, "version 2, longer").unwrap();
+        assert!(superseded(&exe, &loc));
+        std::fs::remove_file(&exe).unwrap();
+        assert!(superseded(&exe, &loc));
     }
 }

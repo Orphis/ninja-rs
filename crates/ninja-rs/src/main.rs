@@ -105,6 +105,9 @@ fn settings(cmdline: &[String], parent: Option<&ninja_rs::nested::Parent>) -> Re
         for w in &files.warnings {
             eprintln!("ninja: warning: {w}");
         }
+        for n in &expanded.notes {
+            eprintln!("ninja: note: {n}");
+        }
     }
     if expanded.announce {
         for line in &expanded.announcements {

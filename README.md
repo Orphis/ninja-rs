@@ -51,7 +51,7 @@ ninja-rs [options] [targets...]
   -C DIR  -f FILE  -j N  -k N  -l N (ignored)  -n  -v/--verbose  --quiet  --status FMT
   -d explain|keepdepfile|keeprsp|stats|nostatcache  -w phonycycle=err|warn  --version
   -t list|targets|commands|inputs|query|deps|rules|clean|cleandead|recompact|restat
-     |compdb|compdb-targets|missingdeps
+     |compdb|compdb-targets|missingdeps|wincodepage
   -t exec [--] COMMAND [ARGS...] (run COMMAND: the ninja-rs builds it runs take these
                                  options and report under this invocation)
   --jobserver-pool               (GNU make jobserver pool for the commands)
@@ -73,13 +73,17 @@ remote execution (only for manifests with rbe_version = 1):
   --remote_strict                (actions sent remotely run there or fail)
   --remote_max_fallbacks=N  --remote_max_fallback_ratio=R
                                  (cap local runs after remote failures)
-  --remote_racing  --remote_racing_delay=MS
+  --remote_racing  --remote_racing_delay=DURATION
                                  (also run actions sent remotely locally, on free
                                  local slots; the first to finish wins)
   --remote_verbose               (log cache hits and local fallbacks)
+  --remote_retries=N             (calls failing for a transient reason, made again; 5)
+  --remote_timeout=DURATION      (a call, or a transfer without progress; 60s;
+                                 executions aren't bounded: followed with WaitExecution)
   --remote_mnemonics=Compile,Link,Archive  (also links and archives)
-  --remote_download_outputs=all|minimal    (minimal: deliverables, named targets,
-                                            local inputs; alias --remote_download_minimal)
+  --remote_download_outputs=all|minimal|toplevel
+                                 (minimal, as Bazel's toplevel: deliverables, named
+                                 targets, local inputs; alias --remote_download_minimal)
   --execution_log_file=FILE      (JSON line per remote action: key, command, inputs)
   --remote_include_scanner=conservative|preprocessor|clang-scan-deps|compiler
                                  (preprocessor: exact inputs for GCC/Clang compiles,
@@ -102,7 +106,7 @@ TLS for grpcs:// endpoints (remote service and BES; flags named as in Bazel):
 build events (Bazel's Build Event Protocol, flags named as in Bazel):
   --bes_backend=grpc://host:port | grpcs://host:port
   --bes_instance_name=NAME  --bes_header=K=V  --bes_results_url=URL
-  --bes_keywords=A,B  --[no]bes_lifecycle_events  --bes_timeout=SECONDS
+  --bes_keywords=A,B  --[no]bes_lifecycle_events  --bes_timeout=DURATION (0: no limit)
   --build_event_binary_file=PATH
   --build_event_publish_all_actions
   --build_metadata=K=V  --invocation_id=UUID  --build_request_id=UUID
@@ -140,9 +144,13 @@ try-import %workspace%/user.ninjars
 - **Commands**: `common` and `always` lines apply to every invocation,
   `build` lines to builds and tools, `exec` lines to `-t exec` (which takes
   the `build` ones too); within a file, `common` lines go first. `common`
-  lines skip the options ninja-rs doesn't have, and lines of Bazel's other
-  commands (`test`, `query`, `startup`...) are skipped, so one file can serve
-  both.
+  lines skip the options ninja-rs doesn't have, and with a note values it
+  can't take; lines of Bazel's other commands (`test`, `query`,
+  `startup`...) are skipped, so one file can serve both. A Bazel file
+  imported (named `*bazelrc`) is read like `common` lines throughout:
+  `import %workspace%/.bazelrc` takes its remote settings.
+- **Values** as in Bazel: an empty one unsets an option (`--disk_cache=`),
+  durations take units (`--bes_timeout=60s`).
 - **Paths**: `~` expands in path options; relative paths are relative to
   where ninja-rs started, as on the command line: use `%workspace%`.
 - `--announce_rc` prints what each file gave; `--ignore_all_rc_files`,

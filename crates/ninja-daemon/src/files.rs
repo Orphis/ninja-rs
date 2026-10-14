@@ -160,9 +160,9 @@ impl Files {
         {
             return Ok(e.info.clone());
         }
-        // A tree is a whole root's business: watched from now on.
-        self.watcher.add_root(dir);
-        let token = self.token(&k, dir);
+        // Watched whole from now on.
+        self.watcher.watch_tree(dir);
+        let token = if self.is_volatile(&k) { None } else { self.watcher.tree_token(dir) };
         let mut info = TreeInfo::default();
         let mut outside = false;
         let real = std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;

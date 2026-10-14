@@ -222,6 +222,16 @@ fn test_rules() -> Result<(), String> {
     check_eq(&ninja(&dir, &["-t", "rules", "-d"], &[]).stdout, "cc: CC ${out}\ngen\nlink\nphony\n", "-t rules -d")
 }
 
+/// `-t wincodepage` says build files are UTF-8 (CMake writes them in the
+/// ANSI code page otherwise), and they are read so.
+fn test_wincodepage() -> Result<(), String> {
+    let dir = test_dir("wincodepage");
+    check_eq(&ninja(&dir, &["-t", "wincodepage"], &[]).stdout, "Build file encoding: UTF-8\n", "-t wincodepage")?;
+    check(ninja(&dir, &["-t", "wincodepage", "x"], &[]).code == 1, "-t wincodepage x prints the usage")?;
+    std::fs::write(dir.join("build.ninja"), "build caf\u{e9}/\u{65e5}\u{672c}.o: phony\n").unwrap();
+    check_eq(&ninja(&dir, &["-t", "targets", "all"], &[]).stdout, "caf\u{e9}/\u{65e5}\u{672c}.o: phony\n", "-t targets")
+}
+
 fn test_inputs() -> Result<(), String> {
     let dir = tools_fixture("inputs");
     check_eq(&ninja(&dir, &["-t", "inputs", "app"], &[]).stdout, "a.c\na.o\nb.c\nb.o\ngen.h\n", "-t inputs")?;
@@ -429,6 +439,7 @@ fn main() -> ExitCode {
     #[allow(unused_mut)]
     let mut tests: Vec<Test> = vec![
         ("rules", test_rules),
+        ("wincodepage", test_wincodepage),
         ("inputs", test_inputs),
         ("compdb", test_compdb),
         ("missingdeps", test_missingdeps),
@@ -455,5 +466,17 @@ fn main() -> ExitCode {
         }
     }
     println!("test result: {} passed; {failed} failed", count - failed);
-    if failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+    if failed > 0 {
+        return ExitCode::FAILURE;
+    }
+    // The fixtures (copies of this binary, hundreds of MB each), kept
+    // after a failure to look into.
+    let base = std::env::var_os("TEST_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let prefix = format!("ninja-rs-cli-{}-", std::process::id());
+    for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+    ExitCode::SUCCESS
 }

@@ -889,7 +889,7 @@ impl<'a> Builder<'a> {
         self.plan.wanted_edges += 1;
         if !self.state.is_phony(edge) {
             self.plan.command_edges += 1;
-            self.status.edge_added_to_plan();
+            self.status.edge_added_to_plan(edge);
         }
     }
 
@@ -1091,7 +1091,7 @@ impl<'a> Builder<'a> {
                 self.plan.wanted_edges -= 1;
                 if !self.state.is_phony(oe) {
                     self.plan.command_edges -= 1;
-                    self.status.edge_removed_from_plan();
+                    self.status.edge_removed_from_plan(oe);
                 }
             }
         }

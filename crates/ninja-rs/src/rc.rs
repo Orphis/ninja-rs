@@ -10,9 +10,11 @@
 //! The commands: `common` and `always` lines apply to every invocation,
 //! `build` lines to builds and tools, `exec` lines to `-t exec` (which
 //! takes the `build` ones too). `common` skips the options ninja-rs doesn't
-//! have, so that one file can serve Bazel and ninja-rs; Bazel's other
-//! commands (`test`, `query`, `startup`...) are skipped. Lines with a
-//! config apply when `--config=CONFIG` is given, where it is given.
+//! have, and with a note those whose values it can't take, so that one
+//! file can serve Bazel and ninja-rs; so do all the lines of Bazel's own
+//! files (named `*bazelrc`, imported). Bazel's other commands (`test`,
+//! `query`, `startup`...) are skipped. Lines with a config apply when
+//! `--config=CONFIG` is given, where it is given.
 //!
 //! The files, read in this order, later options winning:
 //! 1. the system's: `/etc/ninjars` (`%ProgramData%\ninjars` on Windows);
@@ -446,6 +448,8 @@ pub struct Expanded {
     pub explicit: Vec<bool>,
     /// What `--announce_rc` prints.
     pub announcements: Vec<String>,
+    /// Options skipped because ninja-rs can't take their values: printed.
+    pub notes: Vec<String>,
     /// `--announce_rc` was given (last value).
     pub announce: bool,
 }
@@ -546,6 +550,7 @@ pub fn expand(rc: &RcFiles, levels: &[&[&str]], cmdline: &[String], end: usize, 
         let mut platform = Expanded::default();
         expand_config(rc, levels, platform_config(), &mut stack, &mut platform)?;
         out.announcements.extend(platform.announcements);
+        out.notes.extend(platform.notes);
         out.args.splice(files_end..files_end, platform.args);
         out.explicit.splice(files_end..files_end, platform.explicit);
     }
@@ -600,14 +605,22 @@ fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<St
         let takes_next = !a.contains('=') && args.get(i + 1).is_some_and(|n| !n.starts_with('-'));
         let n = if takes_next && !(a.starts_with("--") && options::is_bool_option(&a[2..])) { 2 } else { 1 };
         let group = &args[i..i + n];
+        // `common` lines, and Bazel's own files, are shared with Bazel: its
+        // options are skipped, and values only Bazel takes.
+        let shared = line.command == "common" || line.file.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("bazelrc"));
         match options::check_rc_option(group) {
             Ok(()) => {
                 for a in group {
                     out.push(a, false);
                 }
             }
-            // `common` lines are shared with Bazel: its options are skipped.
-            Err(RcOptionError::Unknown(_)) if line.command == "common" => {}
+            Err(RcOptionError::Unknown(_)) if shared => {}
+            Err(RcOptionError::Invalid(e)) if shared => {
+                let note = format!("{}: '{}' skipped: {e}", line.origin, options::redact_args(group).join(" "));
+                if !out.notes.contains(&note) {
+                    out.notes.push(note);
+                }
+            }
             Err(RcOptionError::Unknown(e) | RcOptionError::Invalid(e)) => return Err(format!("{}: {e}", line.origin)),
         }
         i += n;
@@ -709,6 +722,42 @@ mod tests {
         // After -t, the tool's arguments.
         let e = expand_in(&dir, "build", &["-t", "exec", "--", "x", "--config=nope"]).unwrap();
         assert_eq!(e.args[2..], strings(&["-t", "exec", "--", "x", "--config=nope"]));
+    }
+
+    /// A `.bazelrc` imported: its lines take what ninja-rs knows, skip the
+    /// rest, and note values only Bazel takes; `common` lines do too.
+    #[test]
+    fn shared_with_bazel() {
+        let dir = tree(
+            "shared",
+            &[
+                (".ninjars", "import %workspace%/.bazelrc\ncommon --remote_jobs=many\nbuild --disk_cache=\n"),
+                (
+                    ".bazelrc",
+                    "build --remote_executor=grpcs://e:1 --compilation_mode opt --disk_cache=/c\n\
+                     build --remote_download_outputs=toplevel --bes_timeout=60s --remote_jobs=fifty\n\
+                     common --remote_header=x-token=SECRET\n",
+                ),
+            ],
+        );
+        let e = expand_in(&dir, "build", &[]).unwrap();
+        assert_eq!(
+            e.args,
+            strings(&[
+                "--remote_header=x-token=SECRET",
+                "--remote_executor=grpcs://e:1",
+                "--disk_cache=/c",
+                "--remote_download_outputs=toplevel",
+                "--bes_timeout=60s",
+                "--disk_cache="
+            ])
+        );
+        assert_eq!(e.notes.len(), 2, "{:?}", e.notes);
+        assert!(e.notes[0].contains(".ninjars:2: '--remote_jobs=many' skipped: invalid --remote_jobs"), "{:?}", e.notes);
+        assert!(e.notes[1].contains(".bazelrc:2: '--remote_jobs=fifty' skipped"), "{:?}", e.notes);
+        // A .ninjars file's build lines stay strict.
+        let dir = tree("strict", &[(".ninjars", "build --compilation_mode opt\n")]);
+        assert!(expand_in(&dir, "build", &[]).unwrap_err().contains("unrecognized option '--compilation_mode'"));
     }
 
     #[test]

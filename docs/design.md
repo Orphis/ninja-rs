@@ -56,7 +56,12 @@ deps), 26 depfile parser tests, plus dyndep, lexer, canonicalization and
   `-t inputs` flags and shell escaping, `-t rules -d`, `-t compdb` listing
   every input, `-t compdb-targets` and the jobserver (below).
 - Not implemented: `-l` (accepted, ignored),
-  `-t browse/graph/msvc/wincodepage/multi-inputs/urtle`.
+  `-t browse/graph/msvc/multi-inputs/urtle`.
+- `-t wincodepage` says `Build file encoding: UTF-8`, on every system:
+  ninja-rs reads build files as UTF-8 and gives Windows commands and paths
+  in UTF-16, whatever the code page. Without the tool, CMake on Windows
+  writes build files in the ANSI code page, and non-ASCII paths come out
+  mangled.
 - Tools write `\n` line endings on Windows too (ninja writes `\r\n`).
 - Failed commands summary (ninja issue 2378): with many jobs, a `FAILED:`
   block scrolls away behind the output of the commands still running.
@@ -268,6 +273,29 @@ endpoints say which certificate was sent and which CAs were trusted
 (`options::tls_hint`). The fake server can require client certificates
 (`ServerTls`; test certificates in `crates/fake-reapi/testdata/tls`).
 
+Calls failing for a transient reason (UNAVAILABLE, RESOURCE_EXHAUSTED,
+ABORTED, INTERNAL, UNKNOWN, CANCELLED, DEADLINE_EXCEEDED: Bazel's
+`RemoteRetrier` list; a batch's per-blob statuses too) are made again, up
+to `--remote_retries` times (5), after 100 ms doubling up to 5 s, give or
+take 10%. `--remote_timeout` (60 s, Bazel's units) bounds each call, and
+for a transfer how long it may go without moving (ByteStream reads and
+writes, which take as long as their size). Executions aren't bounded, as
+in Bazel: an `Execute` stream broken once the operation is named is
+followed again (`WaitExecution`); an operation the server lost (NOT_FOUND,
+or UNIMPLEMENTED for `WaitExecution`) or that failed for a transient
+reason (in the operation, or the response's status but DEADLINE_EXCEEDED:
+the action timed out) executes again. FAILED_PRECONDITION (missing inputs)
+comes back as the response's status, however the server reports it. What
+still fails is a remote failure: run locally, or with `--remote_strict`
+the action's failure. The fake server injects these (`State::fail_next`,
+`break_next_executions`).
+
+Connections set `TCP_NODELAY` and size their HTTP/2 flow-control windows
+to the bandwidth-delay product (as grpc-java does), not 64 KiB: a lone
+large transfer isn't throttled by window updates waiting behind delayed
+ACKs. (The fake server needs the same: without it, one 190 MB upload took
+8 s instead of under one, which concurrent duplicate uploads had hidden.)
+
 ## Remote execution flow
 
 1. **Policy** (`backend::policy_wants`): remote only if the manifest has
@@ -322,7 +350,12 @@ endpoints say which certificate was sent and which CAs were trusted
    results are reused); otherwise `FindMissingBlobs` + `BatchUpdateBlobs`
    (ByteStream for large blobs, via `rbe-client`) and `Execute`. When the
    server splices blobs, a large one is uploaded as its chunks instead
-   (see "Split and spliced blobs").
+   (see "Split and spliced blobs"). A large file is read as it is sent, a
+   megabyte at a time (compressed as it goes, the frame stating its size),
+   never whole in memory. A blob another action is uploading (the
+   toolchain, for every action of a cold build) isn't uploaded again: the
+   action waits for that upload (`Client::inflight`, shared by the
+   client's clones), and uploads it itself should that one fail.
 8. **Download**: a result is checked first (`check_result`), whichever
    cache or execution it comes from: an output it names that the action
    didn't request (an absolute path, `..`: a server, or whoever can write to
@@ -334,7 +367,10 @@ endpoints say which certificate was sent and which CAs were trusted
    `--remote_verify_downloads` does), and so are inlined contents and the
    disk cache's blobs (a corrupt one is removed: a miss). Outputs are written
    atomically; files whose content is already identical aren't rewritten,
-   but made newer than the inputs. The
+   but made newer than the inputs. File work (writing outputs, hashing the
+   local copies, the disk cache) runs off the async workers
+   (`block_in_place`), which go on serving transfers (HTTP/2 flow control)
+   and build events meanwhile. The
    depfile is rewritten to local paths before the builder reads it
    (`deps = gcc`); `/showIncludes` lines in stdout are rewritten for
    `deps = msvc`. stdout and stderr are concatenated like a local run, with
@@ -606,13 +642,18 @@ events) and/or to a file (`--build_event_binary_file`):
   when it ran remotely, the digests of its outputs (`TaskResult::cas_outputs`,
   filled by the backend from the `ActionResult`).
 - `Bes::plan` runs once the requested targets are in the builder's plan
-  (before `already_up_to_date`, so no-op builds report too): the edges in
-  `Plan::want` give the targets (`rbe_target`, `rbe_config`), their
-  artifacts, and how many edges each still has to run (`Want::ToStart`).
-  It posts the configurations, the pattern's expansion and one
-  `TargetConfigured` per label; targets with nothing to run complete at once.
-- A target completes when its last edge finishes, or fails with its first
-  failed edge. Its outputs are CAS references (`bytestream://` from
+  (before `already_up_to_date`): the edges they need (through every input
+  and validation, whether the plan has them or not, and those the plan
+  has besides) give the targets (`rbe_target`, `rbe_config`) and their
+  artifacts; the plan, how many edges each still has to run
+  (`Want::ToStart`). It posts the configurations, the pattern's expansion
+  and one `TargetConfigured` per label; targets with nothing to run (up to
+  date) complete at once, with their artifacts (CAS references when they
+  were left remote): a no-op build reports every target, as Bazel does.
+- A target completes when its last edge finishes or leaves the plan (a
+  `restat` found its inputs unchanged: `Status::edge_removed_from_plan`
+  says which edge, and so does `edge_added_to_plan` for one added since),
+  or fails with its first failed edge. Its outputs are CAS references (`bytestream://` from
   `--remote_executor`) when built remotely, `file://` with a digest (cached
   in `Store`) otherwise. At the end, targets that never completed are
   `Aborted` (`SKIPPED` after a failure, `USER_INTERRUPTED`), then come
@@ -625,8 +666,8 @@ events) and/or to a file (`--build_event_binary_file`):
   `tool_invocation_id` of every remote request, whose `target_id` is the
   label and `configuration_id` the configuration's id.
 
-Build events never fail the build. Edges a dyndep file adds during the
-build are not counted in their target's remaining edges.
+Build events never fail the build. Edges only a dyndep file's inputs
+lead to are not counted in their target's remaining edges.
 
 `NINJA_RS_BES_DEBUG=1` traces the upload on stderr (stream, acks,
 lifecycle events).
@@ -661,14 +702,22 @@ mnemonics) in the repository and `cmake --build` or an IDE builds with them.
   and `always`, then `build` (builds and tools), then `exec` (`-t exec`).
   A level's lines go in the order read, across files and imports; the
   levels in that order; then the command line. `common` lines skip options
-  ninja-rs doesn't know (Bazel 7's rule), `always` and the others fail on
-  them. Bazel's other commands (`test`, `query`, `startup`...) are skipped,
-  others warned about.
+  ninja-rs doesn't know (Bazel 7's rule), and with a note those whose
+  values it can't take (a value only Bazel has); `always` and the others
+  fail on them. So do all the lines of Bazel's own files (named
+  `*bazelrc`): `import %workspace%/.bazelrc` shares the executor, cache
+  and BES settings, and skips the rest. Bazel's other commands (`test`,
+  `query`, `startup`...) are skipped, others warned about.
 - **Options**: each is checked alone (`options::check_rc_option`): known,
   no target or tool, not one of the command-line-only options above. With
   no targets in files, a word after an option without `=` is its value,
-  unless the option is a boolean. Booleans take Bazel's forms everywhere:
-  `--name`, `--noname`, `--name=true|false|yes|no|1|0`.
+  unless the option is a boolean. Values take Bazel's forms everywhere:
+  booleans `--name`, `--noname`, `--name=true|false|yes|no|1|0`; an empty
+  value unsets an option (`--disk_cache=` turns off a cache a file sets,
+  `--remote_executor=` remote execution); durations a number and a unit
+  (`60s`, `5m`, `500ms`; a number alone is the flag's old unit), and
+  `--bes_timeout=0` waits as long as it takes; `--remote_download_outputs`
+  takes Bazel's `toplevel` (ninja-rs's `minimal`).
 - **Configs**: `--config=NAME` (or `--config NAME`), on the command line or
   in a file, adds the options of the `COMMAND:NAME` lines of the applicable
   commands, least specific first, where it is; configs nest, cycles and
@@ -714,9 +763,11 @@ another build directory. They are one invocation:
   opening a stream. The outer stream re-posts them (`Bes::relayed`):
   progress as its own; configurations, targets and actions under a
   configuration of their own (`<id>-<dir tag>`, mnemonic suffixed with the
-  nested build directory, as Bazel shows a transition), file sets and
-  output paths prefixed with that directory; metrics are added to the
-  outer ones. Started, finished and pattern events stay the outer
+  nested build directory, as Bazel shows a transition), output paths
+  prefixed with that directory, file sets with the directory and the
+  connection (each invocation numbers its own from 0, and LLVM runs a
+  nested build per tool in `NATIVE`); metrics are added to the outer
+  ones. Started, finished and pattern events stay the outer
   invocation's. A nested build without `rbe_version` (a `try_compile`)
   leaves the relay: it reports nothing. A nested stream ends with an empty
   frame, which the outer invocation acknowledges once it merged what came
@@ -889,7 +940,9 @@ the outputs of remote actions in the remote CAS, except:
   like a declared one;
 - what a local command reads: before a task runs on the host (a local edge,
   a fallback, `rbe_local`), `RemoteBackend::materialize` downloads its
-  inputs that only exist remotely.
+  inputs that only exist remotely. Tasks download theirs at the same time;
+  a file another task is downloading is waited for, not written twice
+  (`Inner::materializing`, by path).
 
 `remote_outputs::RemoteOutputs` records the others in `.ninja_remote` in the
 build directory: path, digest, executable bit, a time, and the members of a
@@ -962,9 +1015,11 @@ every header and toolchain file.
   time name it), serving every build: started by the first build that
   wants it, detached (out of the terminal's process group, or the
   console), exiting after `NINJA_RS_DAEMON_IDLE` seconds without builds
-  (3 hours). A lock file keeps it single. On Windows it runs a copy of
-  the binary, so that ninja-rs can be rebuilt or upgraded meanwhile.
-  `-t daemon [status|start|stop]`.
+  (3 hours), or once the binary it comes from is rebuilt or removed (it
+  checks every few seconds, idle for ten), so that a rebuilt ninja-rs's
+  daemon doesn't run beside the old one's watches. A lock file keeps it
+  single. On Windows it runs a copy of the binary, so that ninja-rs can be
+  rebuilt or upgraded meanwhile. `-t daemon [status|start|stop]`.
 - **Talking:** length-prefixed JSON over a Unix socket in a directory only
   the user can enter (`$XDG_RUNTIME_DIR/ninja-rs`, else
   `/tmp/ninja-rs-<uid>`), or a Windows named pipe that only the user (and
@@ -981,9 +1036,19 @@ every header and toolchain file.
   profile directory and its digests file (`.ninja_rs_digests`, to start
   from after a restart). A build that can't reach the daemon, or whose
   daemon fails, does the work itself, and says so once.
-- **Watching:** roots are watched recursively: the repository a checked
-  file is in (the nearest directory with `.git`, `.hg`, `.jj`, `.sl` or
-  `.svn`), and toolchain directories listed whole. Events drop the
+- **Watching:** the roots are the repository a checked file is in (the
+  nearest directory with `.git`, `.hg`, `.jj`, `.sl` or `.svn`) and the
+  toolchain directories listed whole. With inotify (a watch per
+  directory), a repository is watched lazily: its root (and its `.git`, for
+  cookies) at first, then the directory of each file checked, with those
+  above it (their renaming moves the file), each vouched for once a sync
+  followed its watch (`Watcher::epoch`); a toolchain directory, in the
+  checkout or not, with everything under it, directories created there
+  since included. A dotfiles repository in the home directory doesn't
+  watch the home directory, nor do other build trees in a checkout get
+  watched. Out of watches (ENOSPC), a root gives back all of its own (IDEs
+  need them too) and is checked once per build for ten minutes.
+  `ReadDirectoryChangesW` watches a root whole with one handle. Events drop the
   entries they concern: a file's, its directory's names when it's
   created, removed or renamed, and everything under a directory that
   was. Build directories are never trusted (their files change during
@@ -1011,9 +1076,8 @@ every header and toolchain file.
   sync and drop everything under it; a cookie that doesn't come back
   within two seconds restarts the watch. Roots the daemon can't write to
   are trusted without a cookie.
-- **Backends:** inotify on Linux (a watch per directory, added as they
-  appear; `IN_OPEN` isn't watched, so compilers reading headers aren't
-  events), `ReadDirectoryChangesW` per root on Windows (synchronous reads
+- **Backends:** inotify on Linux (a watch per directory, lazily;
+  `IN_OPEN` isn't watched, so compilers reading headers aren't events), `ReadDirectoryChangesW` per root on Windows (synchronous reads
   in a thread each; directories' own "modified" events, which follow
   their files', are ignored; short names are expanded). Not the `notify`
   crate: it watches opens on Linux and, in 8.x, misreads overflowed

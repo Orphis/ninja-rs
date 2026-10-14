@@ -11,9 +11,10 @@
 //! - **Configurations** come from the `rbe_targets` file (`rbe_config` on
 //!   edges picks one), or a single default one.
 //! - A target **completes** when the last of its edges this build runs
-//!   finishes (at once if it has none to run), or fails with its first failed
-//!   edge. Its outputs are those of its `rbe_artifact` (or
-//!   `rbe_deliverable`) edges: CAS
+//!   finishes or leaves the plan (a `restat`), at once if it has none to run
+//!   (it is up to date: every target the requested ones need is reported,
+//!   as Bazel does), or fails with its first failed edge. Its outputs are
+//!   those of its `rbe_artifact` (or `rbe_deliverable`) edges: CAS
 //!   references (`bytestream://`) for outputs built remotely, `file://`
 //!   otherwise. Targets that never complete (after a failure, or an
 //!   interruption) are `Aborted`.
@@ -32,10 +33,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bep::build_event::Payload;
 use ninja_core::build::{Plan, Want};
-use ninja_core::graph::{EdgeId, State};
+use ninja_core::graph::{EdgeId, NodeId, State};
 use ninja_core::runner::ExecKind;
 use ninja_core::status::{EdgeInfo, Status, StatusPrinter};
 use ninja_remote::Store;
+use ninja_remote::remote_outputs::RemoteOutputs;
 use ninja_remote::targets::{Configuration, Targets};
 use prost::Message;
 use rbe_bes::events::{EventStream, id};
@@ -128,18 +130,22 @@ struct RelaySource {
     rel: String,
     /// `rel` as path components, for its files.
     prefix: Vec<String>,
-    /// Tells its configurations and file sets apart.
+    /// Tells its configurations apart: its build directory's.
     tag: String,
+    /// Tells its file sets apart, which each invocation numbers from 0:
+    /// this connection's (LLVM runs a nested build per tool in `NATIVE`).
+    sets_tag: String,
 }
 
 impl RelaySource {
-    fn new(build_dir: &Path, nested: &str) -> RelaySource {
+    /// The `connection`th nested invocation, building in `nested`.
+    fn new(build_dir: &Path, nested: &str, connection: usize) -> RelaySource {
         let nested = Path::new(nested);
         let rel = nested.strip_prefix(build_dir).unwrap_or(nested);
         let prefix: Vec<String> =
             rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).filter(|c| !c.is_empty() && c != "/" && c != "\\").collect();
         let rel = prefix.join("/");
-        RelaySource { tag: rel.clone(), rel, prefix }
+        RelaySource { tag: rel.clone(), sets_tag: format!("{rel}#{connection}"), rel, prefix }
     }
 
     fn config(&self, id: &str) -> String {
@@ -181,6 +187,11 @@ struct MnemonicStats {
 struct Inner {
     stream: EventStream,
     targets: BTreeMap<TargetKey, TargetState>,
+    /// The target of every edge the requested targets need.
+    edge_targets: HashMap<EdgeId, TargetKey>,
+    /// The targets were planned (`plan`): edges added to or removed from
+    /// the plan since change what they wait for.
+    planned: bool,
     targets_file: Arc<Targets>,
     starts: HashMap<EdgeId, SystemTime>,
     /// Output path → (hash, size), for outputs built remotely.
@@ -310,11 +321,14 @@ impl Bes {
     fn serve_relay(self: &Arc<Self>, mut listener: ninja_daemon::ipc::Listener) {
         let me = Arc::downgrade(self);
         std::thread::spawn(move || {
+            let mut connections = 0;
             while let Ok(mut stream) = listener.accept() {
                 let me = me.clone();
+                connections += 1;
+                let connection = connections;
                 std::thread::spawn(move || {
                     let Ok(Some(dir)) = crate::nested::read_frame(&mut stream) else { return };
-                    let source = RelaySource::new(&me.upgrade().map(|b| b.build_dir.clone()).unwrap_or_default(), &String::from_utf8_lossy(&dir));
+                    let source = RelaySource::new(&me.upgrade().map(|b| b.build_dir.clone()).unwrap_or_default(), &String::from_utf8_lossy(&dir), connection);
                     while let Ok(Some(frame)) = crate::nested::read_frame(&mut stream) {
                         // The end: everything before it is merged.
                         if frame.is_empty() {
@@ -337,7 +351,7 @@ impl Bes {
         use bep::build_event_id::Id;
         let (Some(id), Some(payload)) = (event.id.and_then(|i| i.id), event.payload) else { return };
         let config = |c: &str| source.config(c);
-        let set = |s: &str| format!("{}:{s}", source.tag);
+        let set = |s: &str| format!("{}:{s}", source.sets_tag);
         let sets = |sets: Vec<bep::build_event_id::NamedSetOfFilesId>| -> Vec<bep::build_event_id::NamedSetOfFilesId> {
             sets.into_iter().map(|s| bep::build_event_id::NamedSetOfFilesId { id: set(&s.id) }).collect()
         };
@@ -569,36 +583,65 @@ impl Bes {
         }
     }
 
-    /// The build's targets, once the requested targets are in `plan`:
-    /// configurations, the pattern's expansion and `TargetConfigured`
-    /// events; targets with nothing to build complete at once. `patterns`
-    /// are the targets built (see `announce`).
-    pub fn plan(&self, state: &State, plan: &Plan, targets_file: Arc<Targets>, patterns: &[String]) {
+    /// The build's targets, once the requested ones (`roots`) are in
+    /// `plan`: configurations, the pattern's expansion and
+    /// `TargetConfigured` events. Every target the requested ones need is
+    /// reported, those with nothing to build (up to date) completing at
+    /// once. `patterns` are the targets built (see `announce`);
+    /// `remote_outputs`, outputs left in the remote CAS.
+    pub fn plan(&self, state: &State, plan: &Plan, roots: &[NodeId], targets_file: Arc<Targets>, patterns: &[String], remote_outputs: Option<&RemoteOutputs>) {
         self.announce(patterns);
+        // The edges the requested targets need, through every input and
+        // validation, and those the plan has besides.
+        let mut edges: BTreeSet<EdgeId> = plan.want.keys().copied().collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = roots.to_vec();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            let Some(e) = state.node(n).in_edge else { continue };
+            edges.insert(e);
+            let edge = state.edge(e);
+            stack.extend(edge.inputs.iter().chain(&edge.validations).copied());
+        }
         let mut targets: BTreeMap<TargetKey, TargetState> = BTreeMap::new();
+        let mut edge_targets: HashMap<EdgeId, TargetKey> = HashMap::new();
         let mut configs: BTreeMap<Option<String>, Configuration> = BTreeMap::new();
-        for (&edge, &want) in &plan.want {
+        let mut cas: HashMap<String, (String, i64)> = HashMap::new();
+        for edge in edges {
             if state.is_phony(edge) {
                 continue;
             }
+            let want = plan.want.get(&edge).copied().unwrap_or(Want::Nothing);
             let binding = |k: &str| state.edge_binding(edge, k).ok().filter(|v| !v.is_empty());
             let Some(name) = binding("rbe_target") else { continue };
             let config_name = binding("rbe_config");
             let config = configs
                 .entry(config_name.clone())
                 .or_insert_with(|| targets_file.configuration(config_name.as_deref()).cloned().unwrap_or_else(default_configuration));
-            let t = targets.entry((name.clone(), config_name)).or_insert_with(|| TargetState {
+            let key = (name.clone(), config_name);
+            let t = targets.entry(key.clone()).or_insert_with(|| TargetState {
                 label: targets_file.label(&name),
                 config_id: config.id(),
                 remaining: 0,
                 artifacts: Vec::new(),
                 done: false,
             });
+            edge_targets.insert(edge, key);
             if want != Want::Nothing {
                 t.remaining += 1;
             }
             if binding("rbe_artifact").as_deref() == Some("1") || binding("rbe_deliverable").as_deref() == Some("1") {
-                t.artifacts.extend(state.edge(edge).outputs.iter().map(|&o| state.path(o).to_string()));
+                for &o in &state.edge(edge).outputs {
+                    let path = state.path(o).to_string();
+                    // Up to date and left remote (minimal downloads): its
+                    // CAS reference.
+                    if let Some(e) = remote_outputs.and_then(|r| r.get(&path)) {
+                        cas.insert(path.clone(), (e.digest.hash.clone(), e.digest.size_bytes));
+                    }
+                    t.artifacts.push(path);
+                }
             }
         }
         // One TargetConfigured per label, announcing a completion per
@@ -612,6 +655,11 @@ impl Bes {
         let ready: Vec<TargetKey> = targets.iter().filter(|(_, t)| t.remaining == 0).map(|(k, _)| k.clone()).collect();
         self.emit(|i| {
             i.targets = targets;
+            i.edge_targets = edge_targets;
+            i.planned = true;
+            for (path, digest) in cas {
+                i.cas.entry(path).or_insert(digest);
+            }
             i.targets_file = targets_file;
             i.targets_configured = labels.len() as i64;
             let s = &mut i.stream;
@@ -649,6 +697,30 @@ impl Bes {
             out
         });
         for key in ready {
+            self.complete(&key, true);
+        }
+    }
+
+    /// An edge was added to the plan (`added`) or removed from it after
+    /// the targets were planned: its target waits for one more edge, or one
+    /// fewer (and completes when none is left).
+    pub fn plan_changed(&self, edge: EdgeId, added: bool) {
+        let complete = {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.planned {
+                return;
+            }
+            let Some(key) = inner.edge_targets.get(&edge).cloned() else { return };
+            let Some(t) = inner.targets.get_mut(&key).filter(|t| !t.done) else { return };
+            if added {
+                t.remaining += 1;
+                None
+            } else {
+                t.remaining = t.remaining.saturating_sub(1);
+                (t.remaining == 0).then_some(key)
+            }
+        };
+        if let Some(key) = complete {
             self.complete(&key, true);
         }
     }
@@ -919,7 +991,8 @@ impl Bes {
         let uploader = self.uploader.lock().unwrap().take();
         if let Some(u) = uploader {
             let outcome = BuildOutcome { success: exit_code == 0, exit_code };
-            let timeout = Duration::from_secs(self.flags.timeout_secs);
+            // Zero waits as long as it takes, as Bazel's --bes_timeout=0.
+            let timeout = Some(self.flags.timeout).filter(|t| !t.is_zero()).unwrap_or(Duration::MAX);
             match tokio::time::timeout(timeout, u.finish(outcome)).await {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => eprintln!("ninja: warning: build event upload failed: {e:#}"),
@@ -939,11 +1012,17 @@ pub struct ReportingStatus<'a> {
 }
 
 impl Status for ReportingStatus<'_> {
-    fn edge_added_to_plan(&mut self) {
-        self.printer.edge_added_to_plan();
+    fn edge_added_to_plan(&mut self, edge: EdgeId) {
+        self.printer.edge_added_to_plan(edge);
+        if let Some(b) = &self.bes {
+            b.plan_changed(edge, true);
+        }
     }
-    fn edge_removed_from_plan(&mut self) {
-        self.printer.edge_removed_from_plan();
+    fn edge_removed_from_plan(&mut self, edge: EdgeId) {
+        self.printer.edge_removed_from_plan(edge);
+        if let Some(b) = &self.bes {
+            b.plan_changed(edge, false);
+        }
     }
     fn build_edge_started(&mut self, info: &EdgeInfo, start_ms: i64) {
         self.printer.build_edge_started(info, start_ms);
