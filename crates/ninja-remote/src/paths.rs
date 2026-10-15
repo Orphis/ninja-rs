@@ -417,7 +417,7 @@ const CL_JOINED_OPTIONS: &[&str] = &[
 /// Whether `arg`, after `prev` (itself after `prev2`), is a value the
 /// program built keeps (see `PathMapper::rewrite_args`).
 fn kept_value(arg: &str, prev: Option<&str>, prev2: Option<&str>, windows: bool) -> bool {
-    let define = arg.len() > 2 && (arg.starts_with("-D") || (windows && arg.starts_with("/D")));
+    let define = is_define(arg, windows);
     let define_flag = |a: &str| a == "-D" || (windows && a == "/D");
     let runtime_path_flag = |a: &str| matches!(a, "-rpath" | "--rpath" | "-R" | "-install_name");
     define
@@ -425,6 +425,18 @@ fn kept_value(arg: &str, prev: Option<&str>, prev2: Option<&str>, windows: bool)
         || prev.is_some_and(runtime_path_flag)
         || (prev == Some("-Xlinker") && prev2.is_some_and(runtime_path_flag))
         || ["-Wl,-rpath,", "-Wl,-rpath=", "-Wl,--rpath,", "-Wl,--rpath=", "-Wl,-R", "-Wl,-install_name,"].iter().any(|p| arg.starts_with(p))
+}
+
+/// Whether `arg` defines a macro: `-D` (or `/D` on Windows), a name, then
+/// its end, the value's `=` (`#` for cl), or a function-like macro's
+/// parameters. Linker options spelled alike (`/DEF:x.def`,
+/// `/DEFAULTLIB:x.lib`, `-DELAYLOAD:x.dll`) aren't: their paths are
+/// opened, and rewritten.
+fn is_define(arg: &str, windows: bool) -> bool {
+    let Some(rest) = arg.strip_prefix("-D").or_else(|| arg.strip_prefix("/D").filter(|_| windows)) else { return false };
+    let b = rest.as_bytes();
+    let end = b.iter().position(|&c| !(c.is_ascii_alphanumeric() || c == b'_')).unwrap_or(b.len());
+    end > 0 && !b[0].is_ascii_digit() && matches!(b.get(end), None | Some(b'=' | b'#' | b'('))
 }
 
 /// Finds absolute paths embedded in a command line argument, e.g. in
@@ -627,6 +639,31 @@ mod tests {
         assert_eq!(m.tree_path("C:/Users/x/proj/src/B.h").as_deref(), Some("SRC/B.h"));
         assert_eq!(m.rewrite_arg("/FoC:\\Users\\x\\proj\\build\\obj\\a.obj"), "/Foobj\\a.obj");
         assert_eq!(m.rewrite_arg("-IC:/users/x/proj/src"), "-I../SRC");
+        // Definitions keep their paths; linker options starting with D
+        // name files, rewritten.
+        let args: Vec<String> = [
+            r#"/DDATA_DIR="C:\Users\x\proj\data""#,
+            "/D",
+            r"X=C:\Users\x\proj\x",
+            "-DY#C:/Users/x/proj/y",
+            r"/DEF:C:\Users\x\proj\src\exports.def",
+            "-DEF:C:/Users/x/proj/src/exports.def",
+            r"/DEFAULTLIB:C:\Users\x\proj\build\x.lib",
+            "/DEBUG",
+            "/DLL",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = m.rewrite_args(&args);
+        for i in [0, 2, 3, 7, 8] {
+            assert_eq!(out[i], args[i], "argument {i}");
+        }
+        assert_eq!(out[4], r"/DEF:..\SRC\exports.def");
+        assert_eq!(out[5], "-DEF:../SRC/exports.def");
+        assert_eq!(out[6], "/DEFAULTLIB:x.lib");
+        assert!(!is_define("-D", false) && !is_define("-D1X", false) && !is_define("/DX", false));
+        assert!(is_define("-DF(a)=a", false) && is_define("-DX", false));
     }
 
     #[test]

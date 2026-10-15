@@ -9,7 +9,10 @@
 //! command runs, the backend downloads the recorded inputs it reads
 //! (setting their recorded time, so nothing downstream looks stale); remote
 //! actions get them by digest. A local write of a recorded path drops its
-//! record, as does a remote action producing it again.
+//! record (ninja's own writes, and outputs of commands run on the host),
+//! as does a remote action producing it again. A build without the remote
+//! service drops them all: they can't be fetched, and local runs replace
+//! them.
 //!
 //! File format (`.ninja_remote`): a version line, then one line per output:
 //! `<mtime ns> <hash> <size> <x|-> <path>`, followed for a thin archive by
@@ -86,6 +89,10 @@ impl RemoteOutputs {
                     continue;
                 };
                 let (Ok(mtime), Ok(size)) = (mtime.parse(), size.parse()) else { continue };
+                // A digest names a disk cache file: a malformed one is dropped.
+                if !rbe_client::valid_hash(hash) {
+                    continue;
+                }
                 let e = Entry {
                     path: path.to_string(),
                     digest: re::Digest { hash: hash.to_string(), size_bytes: size },
@@ -204,6 +211,15 @@ impl Disk for RemoteDisk<'_> {
     fn write_file(&self, path: &str, contents: &[u8]) -> Result<(), String> {
         self.outputs.forget(path);
         self.inner.write_file(path, contents)
+    }
+
+    /// A local run (a local edge, a fallback, a raced run that won) wrote
+    /// them: the records are stale, and would bring the old outputs back
+    /// should the files be removed.
+    fn outputs_written(&self, paths: &[&str]) {
+        for p in paths {
+            self.outputs.forget(p);
+        }
     }
 
     fn make_dirs(&self, path: &str) -> Result<(), String> {

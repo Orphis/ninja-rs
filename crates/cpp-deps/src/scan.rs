@@ -16,7 +16,7 @@ use crate::expr;
 use crate::hmap::HeaderMap;
 use crate::intern::{self, Sym};
 use crate::lex::{self, DirKind, Directive, FileDirectives, Kind, P, Token};
-use crate::macros::{self, Context, Expander, Macro, XTok};
+use crate::macros::{self, Context, Expander, Macro, Pragmas, XTok};
 use crate::vfs::{Overlay, Redirect};
 
 pub type MacroTable = HashMap<Sym, Arc<Macro>>;
@@ -51,11 +51,29 @@ impl From<PathBuf> for SearchDir {
     }
 }
 
+/// The compiler, for what its preprocessors do differently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Family {
+    /// `#include_next` from a file found next to its includer starts at
+    /// the head of the `#include "..."` chain.
+    #[default]
+    Gcc,
+    /// `#include_next` from a file not found along the chains searches as
+    /// `#include` does.
+    Clang,
+    /// cl: a lone carriage return doesn't end a line.
+    Msvc,
+}
+
 /// What a compile's preprocessor is set up with.
 #[derive(Clone, Debug, Default)]
 pub struct Config {
+    pub family: Family,
     /// `true`/`false` and the alternative operators (`and`, `or`, ...).
     pub dialect: expr::Dialect,
+    /// Trigraphs are replaced (which the lexer doesn't do: files with any
+    /// make the result inexact).
+    pub trigraphs: bool,
     /// `-iquote`: searched by `#include "..."` only.
     pub quote_dirs: Vec<SearchDir>,
     /// `-I`/`-F`, `-isystem`/`-iframework`, the built-in directories,
@@ -67,14 +85,15 @@ pub struct Config {
     /// VFS overlays (`-ivfsoverlay`), in the order given: later ones are
     /// consulted first.
     pub overlays: Vec<Arc<Overlay>>,
-    /// MSVC: `#include "..."` searches the directories of every includer,
-    /// innermost first, not only the current file's.
+    /// MSVC (cl, and Clang's MSVC compatibility): `#include "..."` searches
+    /// the directories of every includer, innermost first, not only the
+    /// current file's; forced includes count the main file as one.
     pub msvc_lookup: bool,
     /// The compiler's predefined macros.
     pub predefined: Arc<MacroTable>,
     pub commands: Vec<CommandMacro>,
     /// `-imacros`, `-include` and `/FI` files, in the order they're
-    /// processed.
+    /// processed (every `-imacros` first).
     pub forced: Vec<Forced>,
     /// The `__has_*` operators the compiler has, besides `__has_include`.
     pub operators: Arc<HashSet<Sym>>,
@@ -191,8 +210,10 @@ pub struct Cache {
     lexing: Mutex<HashMap<Version, Lexing>>,
     dirs: RwLock<HashMap<PathBuf, Listing>>,
     session: AtomicU64,
-    /// As keys (see `key`).
-    volatile: RwLock<Vec<PathBuf>>,
+    /// As keys (see `key`), with when a build last named each: looked up
+    /// by ancestor, however many there are (CMake's `try_compile` names
+    /// hundreds a day).
+    volatile: RwLock<HashMap<PathBuf, std::time::Instant>>,
     case_insensitive: bool,
     watch: OnceLock<Arc<dyn Watch>>,
     files_lexed: AtomicU64,
@@ -220,13 +241,16 @@ impl Cache {
         cache
     }
 
-    /// Another directory whose contents may change during a session.
+    /// Another directory whose contents may change during a session, or
+    /// one named again.
     pub fn add_volatile(&self, dir: &Path) {
         let key = self.key(dir).into_owned();
-        let mut volatile = self.volatile.write().unwrap();
-        if !volatile.contains(&key) {
-            volatile.push(key);
-        }
+        self.volatile.write().unwrap().insert(key, std::time::Instant::now());
+    }
+
+    /// Forgets the volatile directories not named since `before`.
+    pub fn expire_volatile(&self, before: std::time::Instant) {
+        self.volatile.write().unwrap().retain(|_, named| *named >= before);
     }
 
     /// Lets `watch` vouch for files (once).
@@ -299,7 +323,8 @@ impl Cache {
 
     fn is_volatile(&self, p: &Path) -> bool {
         let key = self.key(p);
-        self.volatile.read().unwrap().iter().any(|v| key.starts_with(v))
+        let volatile = self.volatile.read().unwrap();
+        !volatile.is_empty() && key.ancestors().any(|a| volatile.contains_key(a))
     }
 
     fn name_key(&self, name: &str) -> String {
@@ -410,15 +435,20 @@ struct Frame {
     dir: PathBuf,
     /// Where the file was found in the search chain (for `#include_next`).
     found_at: Option<usize>,
+    /// Found next to an includer (or in the working directory).
+    relative: bool,
     line: u32,
+    /// A `#line` changed `__LINE__` and `__FILE__`.
+    line_set: bool,
 }
 
 /// A file found by a lookup: its path as the preprocessor knows it, its
-/// real path, and where in the search chain.
+/// real path, and where: in the search chain, or next to an includer.
 struct Found {
     path: PathBuf,
     real: PathBuf,
     at: Option<usize>,
+    relative: bool,
 }
 
 struct Cond {
@@ -434,10 +464,14 @@ struct State<'a> {
     oracle: &'a dyn Oracle,
     macros: MacroTable,
     pushed: HashMap<Sym, Vec<Option<Arc<Macro>>>>,
+    /// The macros that macros defined so far push or pop, in text.
+    pushed_in_text: HashSet<Sym>,
     once: HashSet<String>,
     seen: HashSet<String>,
     stack: Vec<Frame>,
-    counter: i64,
+    /// The main file's directory while forced includes are processed, an
+    /// includer's for the MSVC lookup.
+    base: Option<PathBuf>,
     main: PathBuf,
     out: Output,
 }
@@ -469,14 +503,24 @@ impl Context for State<'_> {
     }
 
     fn dynamic(&mut self, name: Sym) -> Option<Token> {
+        // `__COUNTER__` counts its uses in text too, which isn't expanded;
+        // `#line` changes `__LINE__` and `__FILE__`.
+        let line_set = self.stack.last()?.line_set;
+        let unknown = if name == intern::COUNTER {
+            Some("__COUNTER__")
+        } else if line_set && [intern::LINE, intern::FILE, intern::FILE_NAME].contains(&name) {
+            Some("__LINE__ or __FILE__ after #line")
+        } else {
+            None
+        };
+        if let Some(what) = unknown {
+            self.inexact(format!("{}: {what} in a condition or #include", self.here()));
+            return Some(Token { kind: Kind::Unknown, sym: intern::EMPTY, space: true });
+        }
         let frame = self.stack.last()?;
         Some(match name {
             intern::LINE => number(frame.line as i64),
             intern::FILE => string(&frame.path.to_string_lossy()),
-            intern::COUNTER => {
-                self.counter += 1;
-                number(self.counter - 1)
-            }
             intern::INCLUDE_LEVEL => number(self.stack.len() as i64 - 1),
             intern::BASE_FILE => string(&self.main.to_string_lossy()),
             intern::FILE_NAME => string(&frame.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
@@ -525,6 +569,14 @@ impl Context for State<'_> {
         }
         v
     }
+
+    fn redefined(&self, name: Sym) -> bool {
+        match (self.macros.get(&name), self.cfg.predefined.get(&name)) {
+            (None, None) => false,
+            (Some(m), Some(p)) => !Arc::ptr_eq(m, p),
+            _ => true,
+        }
+    }
 }
 
 impl State<'_> {
@@ -563,7 +615,7 @@ impl State<'_> {
 
     fn candidate(&self, path: PathBuf, at: Option<usize>) -> Option<Found> {
         let real = self.locate(&path)?;
-        Some(Found { path, real, at })
+        Some(Found { path, real, at, relative: false })
     }
 
     /// Finds an included file.
@@ -572,20 +624,32 @@ impl State<'_> {
         if p.is_absolute() {
             return self.candidate(normalize(p), None);
         }
-        if !angled && !next {
-            let dirs: Vec<&PathBuf> =
-                if self.cfg.msvc_lookup { self.stack.iter().rev().map(|f| &f.dir).collect() } else { self.stack.last().map(|f| &f.dir).into_iter().collect() };
+        // `#include_next` goes on after the directory the current file was
+        // found in, `<...>` or not. From a file found otherwise, GCC starts
+        // at the head of the chain when it was found next to its includer,
+        // and searches as `#include` does when it's the main file or was
+        // found by its absolute path; Clang always searches as `#include`.
+        let after = match self.stack.last() {
+            Some(f) if next => match f.found_at {
+                Some(i) => Some(i + 1),
+                None if f.relative && self.cfg.family == Family::Gcc => Some(0),
+                None => None,
+            },
+            _ => None,
+        };
+        if !angled && after.is_none() {
+            let dirs: Vec<&PathBuf> = if self.cfg.msvc_lookup {
+                self.stack.iter().rev().map(|f| &f.dir).chain(&self.base).collect()
+            } else {
+                self.stack.last().map(|f| &f.dir).into_iter().collect()
+            };
             for d in dirs {
                 if let Some(f) = self.candidate(normalize(&d.join(p)), None) {
-                    return Some(f);
+                    return Some(Found { relative: true, ..f });
                 }
             }
         }
-        let quotes = self.cfg.quote_dirs.len();
-        let mut start = if angled { quotes } else { 0 };
-        if next && let Some(Some(i)) = self.stack.last().map(|f| f.found_at) {
-            start = start.max(i + 1);
-        }
+        let start = after.unwrap_or(if angled { self.cfg.quote_dirs.len() } else { 0 });
         let chain = self.cfg.quote_dirs.iter().chain(&self.cfg.angled_dirs).enumerate().skip(start);
         for (i, d) in chain {
             let found = match d {
@@ -625,7 +689,7 @@ impl State<'_> {
     }
 
     fn include_file(&mut self, f: Found, import: bool) {
-        let Found { path, real, at: found_at } = f;
+        let Found { path, real, at: found_at, relative } = f;
         let key = self.key(&real);
         if self.once.contains(&key) {
             return;
@@ -638,6 +702,12 @@ impl State<'_> {
         if fd.utf16 {
             self.inexact(format!("{}: UTF-16 text isn't scanned", real.display()));
             return;
+        }
+        if fd.trigraphs && self.cfg.trigraphs {
+            self.inexact(format!("{}: trigraphs aren't replaced", real.display()));
+        }
+        if fd.lone_cr && self.cfg.family == Family::Msvc {
+            self.inexact(format!("{}: cl doesn't end lines at a lone carriage return", real.display()));
         }
         if let Some(g) = fd.guard
             && self.macros.contains_key(&g)
@@ -652,7 +722,7 @@ impl State<'_> {
             return;
         }
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        self.stack.push(Frame { path, real, dir, found_at, line: 0 });
+        self.stack.push(Frame { path, real, dir, found_at, relative, line: 0, line_set: false });
         self.run(&fd);
         self.stack.pop();
     }
@@ -729,6 +799,14 @@ impl State<'_> {
 
     fn pragma(&mut self, d: &Directive) {
         let Some(first) = d.toks.first() else { return };
+        if first.sym == intern::PRAGMA_OPERATOR {
+            self.inexact(format!("{}: a pragma from a macro in text", self.here()));
+            return;
+        }
+        if first.sym == intern::INCLUDE_ALIAS {
+            self.inexact(format!("{}: #pragma include_alias", self.here()));
+            return;
+        }
         if first.sym == intern::ONCE {
             let key = self.stack.last().map(|f| self.key(&f.real));
             if let Some(k) = key {
@@ -748,6 +826,7 @@ impl State<'_> {
             let cur = self.macros.get(&name).cloned();
             self.pushed.entry(name).or_default().push(cur);
         } else if let Some(prev) = self.pushed.get_mut(&name).and_then(Vec::pop) {
+            self.changing(name);
             match prev {
                 Some(m) => {
                     self.macros.insert(name, m);
@@ -756,6 +835,14 @@ impl State<'_> {
                     self.macros.remove(&name);
                 }
             }
+        }
+    }
+
+    /// Before a macro's definition changes: a macro that text may push or
+    /// pop (see `Pragmas::Macros`) then has an unknown definition.
+    fn changing(&mut self, name: Sym) {
+        if self.pushed_in_text.contains(&name) {
+            self.inexact(format!("{}: {} changes while macros in text may push or pop it", self.here(), name.as_str()));
         }
     }
 
@@ -803,17 +890,32 @@ impl State<'_> {
                 _ if !active => {}
                 DirKind::Define => {
                     if let Some(m) = &d.mac {
+                        match &m.pragmas {
+                            Pragmas::None => {}
+                            // Pushing and popping macros never changed in
+                            // between does nothing.
+                            Pragmas::Macros(names) => self.pushed_in_text.extend(names.iter().copied()),
+                            Pragmas::Other => self.inexact(format!("{}: {} may run a pragma in text", self.here(), m.name.as_str())),
+                        }
+                        self.changing(m.name);
                         self.macros.insert(m.name, m.clone());
                     }
                 }
                 DirKind::Undef => {
-                    if let Some(n) = d.toks.first().and_then(Token::ident) {
-                        self.macros.remove(&n);
+                    if let Some(n) = d.toks.first().and_then(Token::ident)
+                        && self.macros.remove(&n).is_some()
+                    {
+                        self.changing(n);
                     }
                 }
                 DirKind::Include | DirKind::IncludeNext | DirKind::Import => self.include(d),
                 DirKind::Embed => self.embed(d),
                 DirKind::Pragma => self.pragma(d),
+                DirKind::Line => {
+                    if let Some(f) = self.stack.last_mut() {
+                        f.line_set = true;
+                    }
+                }
                 DirKind::Other => {}
             }
         }
@@ -839,13 +941,19 @@ fn header_name(toks: &[Token]) -> Option<(String, bool)> {
     }
 }
 
-/// `-D`/`-U` as `#define`/`#undef` lines.
+/// `-D`/`-U` as `#define`/`#undef` lines. A value ends at a line's end,
+/// and a backslash ending it is kept (as GCC and Clang do), not a splice
+/// joining the next line.
 fn command_text(commands: &[CommandMacro]) -> String {
     let mut text = String::new();
     for c in commands {
         match c {
             CommandMacro::Define(d) => match d.split_once('=') {
-                Some((name, value)) => text.push_str(&format!("#define {name} {value}\n")),
+                Some((name, value)) => {
+                    let value = value.split(['\n', '\r']).next().unwrap_or_default();
+                    let splice = if value.trim_end().ends_with('\\') { "\\\n" } else { "" };
+                    text.push_str(&format!("#define {name} {value}{splice}\n"));
+                }
                 None => text.push_str(&format!("#define {d} 1\n")),
             },
             CommandMacro::Undef(u) => text.push_str(&format!("#undef {u}\n")),
@@ -863,31 +971,41 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
         oracle,
         macros: (*cfg.predefined).clone(),
         pushed: HashMap::new(),
+        pushed_in_text: HashSet::new(),
         once: HashSet::new(),
         seen: HashSet::new(),
         stack: Vec::new(),
-        counter: 0,
+        base: None,
         main: main.clone(),
         out: Output::default(),
     };
     if !cfg.commands.is_empty() {
         let fd = lex::lex(command_text(&cfg.commands).as_bytes());
-        st.stack.push(Frame { path: PathBuf::from("<command line>"), real: PathBuf::new(), dir: PathBuf::new(), found_at: None, line: 0 });
+        let frame = Frame {
+            path: PathBuf::from("<command line>"),
+            real: PathBuf::new(),
+            dir: PathBuf::new(),
+            found_at: None,
+            relative: false,
+            line: 0,
+            line_set: false,
+        };
+        st.stack.push(frame);
         st.run(&fd);
         st.stack.pop();
     }
+    // The MSVC lookup searches the main file's directory for forced
+    // includes and what they include, as an includer's (cl's `/FI`
+    // first, Clang's `-include` after the working directory).
+    if cfg.msvc_lookup {
+        st.base = main.parent().map(Path::to_path_buf);
+    }
     for f in &cfg.forced {
-        let at = |st: &State, path: PathBuf| st.locate(&path).map(|real| Found { path, real, at: None });
+        let at = |st: &State, path: PathBuf, relative| st.locate(&path).map(|real| Found { path, real, at: None, relative });
         let found = match f {
-            Forced::Path(p) => at(&st, normalize(p)),
-            Forced::Gcc { cwd, name } => at(&st, normalize(&cwd.join(name))).or_else(|| st.resolve(name, false, false)),
-            Forced::Msvc(name) => {
-                let dir = main.parent().map(Path::to_path_buf).unwrap_or_default();
-                st.stack.push(Frame { path: main.clone(), real: main.clone(), dir, found_at: None, line: 0 });
-                let found = st.resolve(name, false, false);
-                st.stack.pop();
-                found
-            }
+            Forced::Path(p) => at(&st, normalize(p), false),
+            Forced::Gcc { cwd, name } => at(&st, normalize(&cwd.join(name)), true).or_else(|| st.resolve(name, false, false)),
+            Forced::Msvc(name) => st.resolve(name, false, false),
         };
         match found {
             Some(found) => st.include_file(found, false),
@@ -897,11 +1015,12 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
             }),
         }
     }
+    st.base = None;
     let Some(real) = st.locate(&main).filter(|r| cache.directives(r).is_some()) else {
         st.out.missing.push(main.to_string_lossy().into_owned());
         return st.out;
     };
-    st.include_file(Found { path: main, real, at: None }, false);
+    st.include_file(Found { path: main, real, at: None, relative: false }, false);
     // The main file first.
     st.out
 }
@@ -909,6 +1028,24 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn many_volatile_dirs() {
+        let cache = Cache::new(Vec::new(), false);
+        for i in 0..5000 {
+            cache.add_volatile(&PathBuf::from(format!("/b/try_compile/{i}")));
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert!(!cache.is_volatile(Path::new("/src/include/a.h")));
+        }
+        assert!(start.elapsed() < std::time::Duration::from_millis(500), "{:?}", start.elapsed());
+        assert!(cache.is_volatile(Path::new("/b/try_compile/4321/x.h")));
+        assert!(!cache.is_volatile(Path::new("/b/try_compile/43210/x.h")));
+        // Not named since: forgotten.
+        cache.expire_volatile(std::time::Instant::now() + std::time::Duration::from_millis(1));
+        assert!(!cache.is_volatile(Path::new("/b/try_compile/4321/x.h")));
+    }
 
     struct Dir(PathBuf);
 
@@ -995,6 +1132,180 @@ mod tests {
         let before = cache.stats().files_lexed;
         scan(&cache, &cfg(&d), &NoOracle, &main);
         assert_eq!(cache.stats().files_lexed, before);
+    }
+
+    #[test]
+    fn include_next_rules() {
+        let d = Dir::new("next");
+        let mut c = cfg(&d);
+        c.quote_dirs = vec![d.0.join("q1").into(), d.0.join("q2").into()];
+        let main = d.file("main.c", "#include \"x.h\"\n");
+        d.file("q1/x.h", "#include_next <x.h>\n");
+        d.file("q2/x.h", "");
+        d.file("inc/x.h", "");
+        let rel = d.file("rel/main.c", "#include \"y.h\"\n");
+        d.file("rel/y.h", "#include_next <y.h>\n");
+        d.file("q1/y.h", "");
+        d.file("inc/y.h", "");
+        let rel2 = d.file("rel/main2.c", "#include_next \"y2.h\"\n");
+        d.file("rel/y2.h", "");
+        d.file("q1/y2.h", "");
+        let cache = Cache::new(vec![], false);
+        let files = |c: &Config, main: &Path| d.rel(&scan(&cache, c, &NoOracle, main).files);
+        // From an -iquote directory: on with the next one, <...> or not.
+        assert_eq!(files(&c, &main), vec!["main.c", "q1/x.h", "q2/x.h"]);
+        // From a file found next to its includer: GCC starts at the head
+        // of the chain, Clang searches as #include does.
+        assert_eq!(files(&c, &rel), vec!["rel/main.c", "rel/y.h", "q1/y.h"]);
+        c.family = Family::Clang;
+        assert_eq!(files(&c, &rel), vec!["rel/main.c", "rel/y.h", "inc/y.h"]);
+        // In the main file: as #include, its directory first.
+        for family in [Family::Gcc, Family::Clang] {
+            c.family = family;
+            assert_eq!(files(&c, &rel2), vec!["rel/main2.c", "rel/y2.h"]);
+        }
+    }
+
+    #[test]
+    fn msvc_forced_lookup() {
+        let d = Dir::new("msvc_forced");
+        let src = d.file("src/main.cc", "");
+        d.file("inc/pre.h", "#include \"x.h\"\n");
+        d.file("src/x.h", "");
+        d.file("other/x.h", "");
+        d.file("src/pre2.h", "");
+        let mut c = cfg(&d);
+        c.angled_dirs = vec![d.0.join("inc").into(), d.0.join("other").into()];
+        c.msvc_lookup = true;
+        let cache = Cache::new(vec![], false);
+        // cl's /FI: the source's directory is an includer's for what the
+        // forced file includes.
+        c.forced = vec![Forced::Msvc("pre.h".into())];
+        assert_eq!(d.rel(&scan(&cache, &c, &NoOracle, &src).files), vec!["inc/pre.h", "src/x.h", "src/main.cc"]);
+        // Clang's -include with MSVC compatibility: the working directory,
+        // then the source's.
+        let gcc = |name: &str| Forced::Gcc { cwd: d.0.join("build"), name: name.into() };
+        c.forced = vec![gcc("pre.h"), gcc("pre2.h")];
+        assert_eq!(d.rel(&scan(&cache, &c, &NoOracle, &src).files), vec!["inc/pre.h", "src/x.h", "src/pre2.h", "src/main.cc"]);
+        // Neither without it.
+        c.msvc_lookup = false;
+        let out = scan(&cache, &c, &NoOracle, &src);
+        assert_eq!(d.rel(&out.files), vec!["inc/pre.h", "other/x.h", "src/main.cc"]);
+        assert_eq!(out.missing, vec!["pre2.h"]);
+    }
+
+    #[test]
+    fn trigraphs_and_line_endings() {
+        let d = Dir::new("lexing");
+        let main = d.file("main.c", "??=include \"t.h\"\n#include \"a.h\"\r#include \"b.h\"\rint x;\r");
+        for f in ["t.h", "a.h", "b.h"] {
+            d.file(f, "");
+        }
+        let mut c = cfg(&d);
+        let cache = Cache::new(vec![], false);
+        // A lone carriage return ends a line; trigraphs are text when off.
+        let out = scan(&cache, &c, &NoOracle, &main);
+        assert_eq!(d.rel(&out.files), vec!["main.c", "a.h", "b.h"]);
+        assert!(out.exact(), "{:?}", out.inexact);
+        // When on, the file's directives are unknown.
+        c.trigraphs = true;
+        assert!(!scan(&cache, &c, &NoOracle, &main).exact());
+        // cl doesn't end lines at a lone carriage return.
+        c.trigraphs = false;
+        c.family = Family::Msvc;
+        assert!(!scan(&cache, &c, &NoOracle, &main).exact());
+    }
+
+    #[test]
+    fn counter_and_line() {
+        let d = Dir::new("counter");
+        d.file("a.h", "");
+        d.file("b.h", "");
+        let scanned = |name: &str, text: &str| {
+            let out = scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &d.file(name, text));
+            assert!(out.missing.is_empty(), "{:?}", out.missing);
+            out
+        };
+        // __COUNTER__ counts its uses in text, which isn't expanded: both
+        // branches, inexact.
+        let out = scanned("counter.c", "int x = __COUNTER__;\n#if __COUNTER__ == 1\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n");
+        assert_eq!(d.rel(&out.files), vec!["counter.c", "a.h", "b.h"]);
+        assert!(!out.exact());
+        assert!(scanned("text.c", "int x = __COUNTER__;\n#include \"a.h\"\n").exact());
+        // #line changes __LINE__ and __FILE__, not lookups.
+        assert!(!scanned("line.c", "#line 100\n#if __LINE__ == 101\n#include \"a.h\"\n#endif\n").exact());
+        assert!(!scanned("marker.c", "# 100 \"x.c\"\n#if __LINE__ == 101\n#include \"a.h\"\n#endif\n").exact());
+        let out = scanned("line2.c", "#line 10 \"sub/x.c\"\n#include \"a.h\"\n#if __LINE__ == 3\n#endif\n");
+        assert!(!out.exact());
+        let out = scanned("line3.c", "#line 10 \"sub/x.c\"\n#include \"a.h\"\n");
+        assert_eq!(d.rel(&out.files), vec!["line3.c", "a.h"]);
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert!(scanned("line4.c", "#if __LINE__ == 1\n#include \"a.h\"\n#endif\n").exact());
+    }
+
+    #[test]
+    fn pragmas_the_scan_cant_see() {
+        let d = Dir::new("pragmas");
+        d.file("a.h", "");
+        d.file("real.h", "");
+        let exact = |name: &str, text: &str| {
+            let out = scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &d.file(name, text));
+            assert!(out.missing.is_empty(), "{:?}", out.missing);
+            out.exact()
+        };
+        assert!(!exact("alias.c", "#pragma include_alias(\"a.h\", \"real.h\")\n#include \"a.h\"\n"));
+        assert!(!exact("alias2.c", "_Pragma(\"include_alias(\\\"a.h\\\", \\\"real.h\\\")\")\n#include \"a.h\"\n"));
+        // From macros expanded in text: unknown, but for pushing and popping
+        // macros that don't change meanwhile (libc++'s _LIBCPP_PUSH_MACROS).
+        let push = "#define PUSH _Pragma(\"push_macro(\\\"M\\\")\") _Pragma(\"push_macro(\\\"N\\\")\")\n#define POP _Pragma(\"pop_macro(\\\"M\\\")\")\n";
+        assert!(exact("push.c", &format!("{push}PUSH\n#include \"a.h\"\nPOP\n")));
+        assert!(!exact("push2.c", &format!("{push}PUSH\n#define M 2\nPOP\n#if M == 2\n#endif\n")));
+        assert!(!exact("push3.c", &format!("#define N 1\n{push}PUSH\n#undef N\nPOP\n")));
+        assert!(!exact("once.c", "#define ONCE _Pragma(\"once\")\nONCE\n"));
+        assert!(!exact("ms.c", "#define ONCE __pragma(once)\nONCE\n"));
+        assert!(!exact("generic.c", "#define DO_PRAGMA(x) _Pragma(#x)\nDO_PRAGMA(push_macro(\"M\"))\n"));
+        assert!(!exact("generic2.c", "#define PRAGMA(x) _Pragma(x)\nPRAGMA(\"once\")\n"));
+        assert!(exact("diagnostic.c", "#define DO_PRAGMA(x) _Pragma(#x)\n#define PUSH _Pragma(\"GCC diagnostic push\")\nDO_PRAGMA(GCC diagnostic pop)\n"));
+    }
+
+    #[test]
+    fn query_operands() {
+        let d = Dir::new("operands");
+        d.file("yes.h", "");
+        let mut c = cfg(&d);
+        c.predefined = Arc::new(macro_table("#define __GNUC__ 4\n#define P __builtin_expect\n"));
+        let oracle = Answers(
+            [(("__has_builtin".to_string(), "__builtin_expect".to_string()), 1), (("__has_builtin".to_string(), "P".to_string()), 1)].into_iter().collect(),
+        );
+        let scanned = |name: &str, text: &str| {
+            let out = scan(&Cache::new(vec![], false), &c, &oracle, &d.file(name, text));
+            assert!(out.missing.is_empty(), "{:?}", out.missing);
+            out
+        };
+        // GCC expands a query's operand, Clang mostly doesn't: a macro of
+        // the source makes the answer unknown.
+        let query = "#if __has_builtin(B)\n#include \"yes.h\"\n#endif\n";
+        assert!(!scanned("macro.c", &format!("#define B __builtin_expect\n{query}")).exact());
+        assert!(scanned("plain.c", "#if __has_builtin(__builtin_expect)\n#include \"yes.h\"\n#endif\n").exact());
+        // A predefined one is the compiler's: it answered for it.
+        let out = scanned("predefined.c", "#if __has_builtin(P)\n#include \"yes.h\"\n#endif\n");
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert!(!scanned("redefined.c", "#undef P\n#define P x\n#if __has_builtin(P)\n#endif\n").exact());
+    }
+
+    #[test]
+    fn command_line_values() {
+        let d = Dir::new("values");
+        let main = d.file("main.c", "#if defined(Y) && !defined(W) && Z == 1\n#include \"yes.h\"\n#endif\n");
+        d.file("yes.h", "");
+        let mut c = cfg(&d);
+        // A value ending with a backslash doesn't take the next -D; one
+        // ends at a newline.
+        c.commands = vec![CommandMacro::Define("X=a\\".into()), CommandMacro::Define("Y".into()), CommandMacro::Define("Z=1\n#define W".into())];
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &main);
+        assert_eq!(d.rel(&out.files), vec!["main.c", "yes.h"]);
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert_eq!(command_text(&c.commands[..1]), "#define X a\\\\\n\n");
     }
 
     #[test]

@@ -71,6 +71,7 @@ rust_test(
         "//crates/ninja-remote",
         "//third_party/cargo-rbe/rbe-bes",
         "//third_party/cargo-rbe/rbe-client",
+        "@crates//:prost",
         "@crates//:tokio",
     ],
 )

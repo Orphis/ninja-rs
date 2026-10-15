@@ -17,6 +17,57 @@ use ninja_core::subprocess::Interrupt;
 use ninja_rs::Service;
 use ninja_rs::options::{ParseOutcome, parse_args};
 
+/// Counts the bytes allocated, for the tests bounding a build's memory.
+struct Counting;
+
+static ALLOCATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Counting {
+    fn grew(by: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        PEAK.fetch_max(ALLOCATED.fetch_add(by, Relaxed) + by, Relaxed);
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            Self::grew(layout.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, layout) };
+        ALLOCATED.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let q = unsafe { std::alloc::System.realloc(p, layout, new_size) };
+        if !q.is_null() {
+            if new_size > layout.size() {
+                Self::grew(new_size - layout.size());
+            } else {
+                ALLOCATED.fetch_sub(layout.size() - new_size, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+/// What `f` returns, and the most bytes allocated at once while it ran
+/// beyond those allocated before.
+fn peak_during<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = ALLOCATED.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let r = f();
+    (r, PEAK.load(Relaxed).saturating_sub(base))
+}
+
 // ---------------------------------------------------------------------------
 // fake-clang
 // ---------------------------------------------------------------------------
@@ -36,6 +87,8 @@ fn fake_clang(args: &[String]) -> i32 {
     let mut out = None;
     let mut depfile = None;
     let mut link = false;
+    let mut split_dwarf = false;
+    let mut repeat = 1;
     let mut inputs = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -64,6 +117,9 @@ fn fake_clang(args: &[String]) -> i32 {
                 i += 1;
             }
             "--link" => link = true,
+            "-gsplit-dwarf" => split_dwarf = true,
+            // A large output from a small source.
+            _ if a.starts_with("-DREPEAT=") => repeat = a["-DREPEAT=".len()..].parse().unwrap_or(1),
             // A precompiled header (CMake's with Clang) must be there.
             "-Xclang" if args.get(i).is_some_and(|n| n == "-include-pch") && args.get(i + 1).is_some_and(|n| n == "-Xclang") => {
                 if let Some(pch) = args.get(i + 2)
@@ -142,6 +198,11 @@ fn fake_clang(args: &[String]) -> i32 {
         eprintln!("fake-clang: error: {e}");
         return 1;
     }
+    // A file only local runs read, which no include names.
+    if let Ok(extra) = std::fs::read_to_string("local-extra-dep") {
+        text.push_str(&std::fs::read_to_string(&extra).unwrap_or_default());
+        deps.push(extra.replace('\\', "/"));
+    }
     if let Some(d) = depfile {
         let body: Vec<String> = deps.iter().map(|d| d.replace(' ', "\\ ")).collect();
         std::fs::write(&d, format!("{out}: {}\n", body.join(" "))).unwrap();
@@ -149,7 +210,10 @@ fn fake_clang(args: &[String]) -> i32 {
     if Path::new("race-local-mark").exists() {
         text.push_str("RACE-LOCAL\n");
     }
-    std::fs::write(&out, text).unwrap();
+    std::fs::write(&out, text.repeat(repeat)).unwrap();
+    if split_dwarf {
+        std::fs::write(Path::new(&out).with_extension("dwo"), "DWO\n").unwrap();
+    }
     println!("fake-clang: compiled {src}");
     0
 }
@@ -533,6 +597,63 @@ fn test_disk_cache_alone() -> Result<(), String> {
     std::fs::write(&header, "#define DEEP 0\n").unwrap();
     check(run_ninja(&f, None, &[&flag]) == 0, "build after LF failed")?;
     check(mtime(&f.build.join("obj/main.o")) >= mtime(&header), "obj/main.o is older than deep.h after a disk cache hit")?;
+    Ok(())
+}
+
+/// Files a compile writes besides its object (split DWARF here) come back
+/// from remote executions and from cache hits.
+fn test_compile_side_outputs() -> Result<(), String> {
+    let f = fixture("sideoutputs", true);
+    let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    let changed = manifest.replacen("DEP_FILE = obj/main.o.d\n", "DEP_FILE = obj/main.o.d\n  FLAGS = -gsplit-dwarf\n", 1);
+    check(changed != manifest, "the manifest didn't change")?;
+    write(&f.build.join("build.ninja"), &changed);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let dwo = f.build.join("obj/main.dwo");
+        check(run_ninja(&f, Some(&ep), &["obj/main.o"]) == 0, "remote build failed")?;
+        check(server.stats().executions == 1, &format!("expected a remote execution, got {:?}", server.stats()))?;
+        check(std::fs::read_to_string(&dwo).is_ok_and(|s| s == "DWO\n"), "obj/main.dwo wasn't returned")?;
+        std::fs::remove_file(&dwo).map_err(|e| e.to_string())?;
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        check(run_ninja(&f, Some(&ep), &["obj/main.o"]) == 0, "rebuild failed")?;
+        let st = server.stats();
+        check(st.executions == 1 && st.action_cache_hits == 1, &format!("expected a cache hit, got {st:?}"))?;
+        check(dwo.exists(), "obj/main.dwo wasn't restored from the cache")?;
+        Ok(())
+    })
+}
+
+/// Local results the action's key doesn't describe aren't cached: when
+/// the command read a file the action's inputs lack, ran with a variable
+/// compilers read set, or ran steps on the host.
+fn test_capture_guards() -> Result<(), String> {
+    let f = fixture("captureguards", true);
+    let disk = f.root.join("disk-cache");
+    let flag = format!("--disk_cache={}", disk.to_string_lossy());
+    let objs = ["obj/main.o", "obj/lib.o"];
+    let clean = || check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed");
+    let entries = || disk_cache_entries(&disk);
+    // 1. A file the scan didn't find.
+    let secret = f.root.join("secret.h");
+    write(&secret, "SECRET\n");
+    write(&f.build.join("local-extra-dep"), &secret.to_string_lossy());
+    check(run_ninja(&f, None, &[&flag, objs[0], objs[1]]) == 0, "build reading an undeclared file failed")?;
+    check(entries() == 0, &format!("results reading an undeclared file were cached: {}", entries()))?;
+    std::fs::remove_file(f.build.join("local-extra-dep")).map_err(|e| e.to_string())?;
+    clean()?;
+    // 2. A variable compilers read. Tests run one at a time.
+    unsafe { std::env::set_var("CPATH", f.root.join("include")) };
+    let code = run_ninja(&f, None, &[&flag, objs[0], objs[1]]);
+    unsafe { std::env::remove_var("CPATH") };
+    check(code == 0, "build with CPATH set failed")?;
+    check(entries() == 0, &format!("results with CPATH set were cached: {}", entries()))?;
+    clean()?;
+    // 3. Steps on the host (removing the archive before, a stamp after):
+    //    only the compiles are cached.
+    check(run_ninja(&f, None, &[&flag, "--remote_mnemonics=Compile,Archive", "lib.a"]) == 0, "lib.a failed")?;
+    check(f.build.join("ar.stamp").exists(), "the archive's host step didn't run")?;
+    check(entries() == 2, &format!("expected the 2 compiles cached, got {}", entries()))?;
     Ok(())
 }
 
@@ -997,6 +1118,37 @@ fn test_splice_compressed() -> Result<(), String> {
 fn remote_only(f: &Fixture) -> Vec<String> {
     let text = std::fs::read_to_string(f.build.join(".ninja_remote")).unwrap_or_default();
     text.lines().skip(1).filter_map(|l| l.splitn(5, ' ').nth(4)).map(str::to_string).collect()
+}
+
+/// A local run of an action whose outputs were left remote (here a local
+/// mnemonic after a command change) drops their records: its outputs
+/// removed are missing, not the old remote ones again. A build without the
+/// remote service drops every record.
+fn test_local_run_drops_records() -> Result<(), String> {
+    let f = fixture("localrecords", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let minimal = "--remote_download_minimal";
+        check(run_ninja(&f, Some(&ep), &[minimal, "--remote_mnemonics=Compile,Link"]) == 0, "first build failed")?;
+        check(remote_only(&f).contains(&"obj/main.o".to_string()), &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        // Another command for obj/main.o, run locally (only links go
+        // remotely now); local runs mark their outputs.
+        let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+        let changed = manifest.replacen("DEP_FILE = obj/main.o.d\n", "DEP_FILE = obj/main.o.d\n  FLAGS = -DCHANGED\n", 1);
+        check(changed != manifest, "the manifest wasn't changed")?;
+        write(&f.build.join("build.ninja"), &changed);
+        write(&f.build.join("race-local-mark"), "");
+        let local = [minimal, "--remote_mnemonics=Link", "obj/main.o"];
+        check(run_ninja(&f, Some(&ep), &local) == 0, "the local compile failed")?;
+        check(!remote_only(&f).contains(&"obj/main.o".to_string()), &format!("obj/main.o still recorded: {:?}", remote_only(&f)))?;
+        std::fs::remove_file(f.build.join("obj/main.o")).map_err(|e| e.to_string())?;
+        check(run_ninja(&f, Some(&ep), &local) == 0, "the rebuild failed")?;
+        let main_o = std::fs::read_to_string(f.build.join("obj/main.o")).map_err(|e| e.to_string())?;
+        check(main_o.contains("RACE-LOCAL"), "obj/main.o came back from the old remote record")?;
+        let _ = std::fs::remove_file(f.build.join("race-local-mark"));
+        check(run_ninja(&f, None, &["obj/main.o"]) == 0, "the local build failed")?;
+        check(!f.build.join(".ninja_remote").exists(), "records survived a build without the remote service")
+    })
 }
 
 /// `--remote_download_minimal`: objects stay remote, deliverables come down,
@@ -1685,6 +1837,98 @@ fn test_transient_failures() -> Result<(), String> {
     })
 }
 
+/// Large blobs one call uploads go through ByteStream several at once.
+fn test_parallel_uploads() -> Result<(), String> {
+    let f = fixture("parallel_uploads", true);
+    with_server(&f, |server| {
+        server.state.set_write_delay(std::time::Duration::from_millis(300));
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let opts = rbe_client::ConnectOptions {
+                endpoint: server.endpoint.clone(),
+                instance_name: String::new(),
+                client_cert_pem: None,
+                client_key_pem: None,
+                ca_pem: None,
+                authority_override: None,
+                headers: Vec::new(),
+            };
+            let mut client = rbe_client::Client::connect(opts).await.map_err(|e| format!("{e:#}"))?;
+            client.capabilities().await.map_err(|e| format!("{e:#}"))?;
+            let mut blobs = rbe_client::BlobSet::default();
+            for i in 0..8u8 {
+                let data = vec![i; 4 << 20];
+                blobs.insert(rbe_client::digest_of(&data), rbe_client::BlobSource::Bytes(data));
+            }
+            client.upload_blobs(&blobs).await.map_err(|e| format!("{e:#}"))?;
+            let st = server.stats();
+            check(st.bytestream_writes == 8 && st.max_concurrent_writes >= 4, &format!("the blobs went one at a time: {st:?}"))
+        })
+    })
+}
+
+/// Large outputs are written as they arrive, never whole in memory: from a
+/// remote execution (compressed), from the remote cache, and from the disk
+/// cache; a damaged copy in the disk cache isn't restored.
+fn test_large_outputs() -> Result<(), String> {
+    let f = fixture("largeoutputs", true);
+    with_server(&f, |server| {
+        server.state.set_compression(true);
+        let ep = server.endpoint.clone();
+        let disk = f.root.join("disk-cache");
+        let flag = format!("--disk_cache={}", disk.to_string_lossy());
+        // A small source, a large object: the memory the build uses is
+        // the download's.
+        let lines = noise_lines(2_000, 11);
+        write(&f.root.join("src/big.c"), &format!("{}\n", lines.join("\n")));
+        let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+        let changed = manifest.replacen("DEP_FILE = obj/big.o.d\n", "DEP_FILE = obj/big.o.d\n  FLAGS = -DREPEAT=100\n", 1);
+        check(changed != manifest, "the manifest didn't change")?;
+        write(&f.build.join("build.ninja"), &changed);
+        let big_o = f.build.join("obj/big.o");
+        let expected = || -> Result<(), String> {
+            let data = std::fs::read_to_string(&big_o).map_err(|e| format!("obj/big.o: {e}"))?;
+            check(data.len() > 4 << 20 && data.ends_with(&format!("{}\n", lines.last().unwrap())), "obj/big.o content")?;
+            // Nothing left behind next to the outputs.
+            let left: Vec<_> =
+                std::fs::read_dir(f.build.join("obj")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().contains("ninja-rs-tmp")).collect();
+            check(left.is_empty(), &format!("temporary files left: {left:?}"))
+        };
+        let clean = || check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed");
+
+        // 1. A remote execution, downloaded compressed, kept in the disk cache.
+        check(run_ninja(&f, Some(&ep), &[&flag, "obj/big.o"]) == 0, "first build failed")?;
+        check(server.stats().executions == 1 && server.stats().compressed_reads >= 1, &format!("{:?}", server.stats()))?;
+        expected()?;
+        // 2. From the remote cache.
+        clean()?;
+        check(run_ninja(&f, Some(&ep), &["obj/big.o"]) == 0, "rebuild from the remote cache failed")?;
+        check(server.stats().action_cache_hits == 1, &format!("expected a remote cache hit: {:?}", server.stats()))?;
+        expected()?;
+        // 3. From the disk cache alone, a chunk at a time.
+        let size = std::fs::metadata(&big_o).map_or(0, |m| m.len()) as usize;
+        clean()?;
+        let (code, peak) = peak_during(|| run_ninja(&f, None, &[&flag, "obj/big.o"]));
+        check(code == 0, "rebuild from the disk cache failed")?;
+        eprintln!("large_outputs: {size} bytes restored, peak {peak} bytes allocated");
+        check(peak < size / 2, &format!("obj/big.o ({size} bytes) was held in memory: {peak} bytes allocated at once"))?;
+        expected()?;
+        // 4. A chunk damaged in the disk cache (same size): not restored,
+        //    and the object built again.
+        let hash = rbe_client::digest_of(&std::fs::read(&big_o).unwrap()).hash;
+        let layout = std::fs::read(disk.join("chunked").join(&hash[..2]).join(&hash)).map_err(|e| format!("no layout for obj/big.o: {e}"))?;
+        let layout = <rbe_client::proto::SplitBlobResponse as prost::Message>::decode(layout.as_slice()).map_err(|e| e.to_string())?;
+        let chunk = &layout.chunk_digests[layout.chunk_digests.len() / 2].hash;
+        let chunk_path = disk.join("cas").join(&chunk[..2]).join(chunk);
+        let mut damaged = std::fs::read(&chunk_path).map_err(|e| e.to_string())?;
+        damaged[0] ^= 0x20;
+        std::fs::write(&chunk_path, damaged).map_err(|e| e.to_string())?;
+        clean()?;
+        check(run_ninja(&f, None, &[&flag, "obj/big.o"]) == 0, "rebuild after damage failed")?;
+        expected()
+    })
+}
+
 /// Concurrent actions needing the same blob (the toolchain, on a cold
 /// CAS) upload it once: the others wait for that upload.
 fn test_shared_uploads() -> Result<(), String> {
@@ -1737,6 +1981,25 @@ fn test_untrusted_results() -> Result<(), String> {
         server.state.set_tamper(None);
         server.state.corrupt_blob(&rbe_client::digest_of(&good).hash);
         rebuild("a corrupt blob")?;
+
+        // A digest that is a path, with a disk cache (where a blob is read,
+        // then removed for not matching its digest), and an output named
+        // twice: refused, and the file named is left alone.
+        let victim = f.root.join("victim.txt");
+        write(&victim, "precious");
+        let target = re::Digest { hash: victim.to_string_lossy().into_owned(), size_bytes: 8 };
+        let disk = format!("--disk_cache={}", f.root.join("disk").to_string_lossy());
+        for tamper in [
+            Box::new(move |r: &mut re::ActionResult| r.output_files.iter_mut().for_each(|o| o.digest = Some(target.clone()))) as fake_reapi::Tamper,
+            Box::new(|r: &mut re::ActionResult| r.output_files.extend(r.output_files.clone())),
+        ] {
+            server.state.set_tamper(Some(tamper));
+            server.state.clear_action_cache();
+            let _ = std::fs::remove_file(&main_o);
+            check(run_ninja(&f, Some(&ep), &[&disk, "obj/main.o"]) == 0, "a malformed result: the build failed")?;
+            check(std::fs::read(&main_o).ok().as_ref() == Some(&good), "a malformed result: obj/main.o isn't the compile's")?;
+            check(std::fs::read_to_string(&victim).is_ok_and(|v| v == "precious"), "a malformed result: the file its digest names was touched")?;
+        }
         Ok(())
     })
 }
@@ -1809,18 +2072,23 @@ fn main() -> ExitCode {
         ("untrusted_results", test_untrusted_results),
         ("transient_failures", test_transient_failures),
         ("shared_uploads", test_shared_uploads),
+        ("parallel_uploads", test_parallel_uploads),
+        ("large_outputs", test_large_outputs),
         ("parallel_materialization", test_parallel_materialization),
         ("response_files", test_response_files),
         ("local_tool_steps", test_local_tool_steps),
         ("no_rbe_version_runs_locally", test_no_rbe_version_runs_locally),
         ("build_events", test_build_events),
         ("disk_cache_alone", test_disk_cache_alone),
+        ("capture_guards", test_capture_guards),
+        ("compile_side_outputs", test_compile_side_outputs),
         ("disk_cache_with_remote", test_disk_cache_with_remote),
         ("remote_cache_only", test_remote_cache_only),
         ("fallback_guards", test_fallback_guards),
         ("racing", test_racing),
         ("without_executor_runs_locally", test_without_executor_runs_locally),
         ("minimal_downloads", test_minimal_downloads),
+        ("local_run_drops_records", test_local_run_drops_records),
         ("action_rewinding", test_action_rewinding),
         ("disk_cache_minimal", test_disk_cache_minimal),
         ("compression", test_compression),

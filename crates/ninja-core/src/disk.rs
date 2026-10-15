@@ -22,6 +22,9 @@ pub trait Disk: Send + Sync {
     /// `AllowStatCache`: callers enable it only while scanning for dirty
     /// nodes, so that restat never sees stale timestamps.
     fn allow_stat_cache(&self, _allow: bool) {}
+    /// A command run on the host wrote these outputs: anything recording
+    /// them elsewhere (outputs left in a remote cache) is stale.
+    fn outputs_written(&self, _paths: &[&str]) {}
 }
 
 pub fn system_time_to_ns(t: SystemTime) -> TimeStamp {

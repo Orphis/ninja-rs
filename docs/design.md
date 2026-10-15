@@ -45,7 +45,32 @@ deps), 26 depfile parser tests, plus dyndep, lexer, canonicalization and
   FNV-1a and is discarded on load), so they equal ninja 1.13's. The deps log
   (v2) stores each path once and deps as path ids, like ninja's binary log;
   v1 repeated every path in every record (44.7 MB vs 1.75 MB for CMake's own
-  build) and is discarded on load.
+  build) and is discarded on load. Only complete lines count in both: a
+  torn last line (a crash, a kill, a full disk) is ignored and cut off
+  before the next build appends, so it can't load as a shorter record or
+  merge with the next one; the deps log warns `premature end of file;
+  recovering`, as ninja does.
+- **Interruption.** SIGINT, SIGTERM and SIGHUP (Ctrl-C and Ctrl-Break on
+  Windows) interrupt a build, as in ninja. Every command but `console` ones
+  runs in a process group of its own (on Windows, a job object it joins
+  before it runs, in a console process group of its own), so the
+  terminal's Ctrl-C only reaches ninja-rs. ninja-rs sends the signal it got
+  to each group (terminates the jobs), waits until the commands' processes
+  have exited, deletes the outputs they were writing, ends the build events
+  (`USER_INTERRUPTED`) and exits with 130 (`build stopped: interrupted by
+  user.`). `console` commands stay in the foreground: they get the
+  terminal's signals and are waited for. Unlike ninja, which waits for each
+  command's first process only, ninja-rs also waits for the processes a
+  command leaves behind, killing those still there 2 s after it exited; a
+  second interrupt kills every command still running, and a third makes
+  ninja-rs exit at once, whatever it waits for. A build stopping on an
+  error of its own (a depfile it can't parse, a log it can't write) sends
+  SIGTERM to its running commands, where ninja waits for them to finish.
+  Interrupts outside the build loop (loading the manifest, connecting,
+  `-t exec`) take effect when the build starts; ninja dies at once there.
+  A job allows its processes to leave it (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`),
+  as a server started with `CREATE_BREAKAWAY_FROM_JOB` asks; such a
+  process isn't stopped, like one leaving its process group on POSIX.
 - `--version` prints `1.13.1` (the manifest language level implemented,
   including `$^`, validations and dyndep), which also satisfies CMake's
   feature checks.
@@ -241,7 +266,8 @@ CLI runs one build in-process. `Store` contains:
   modification time), on Windows creation time (new for a file extracted
   into a new directory; not for one rewritten in place, nor created again
   under its name within 15 s, which NTFS gives the old one's). Persisted to
-  `$builddir/.ninja_rs_digests` after remote builds, but for files modified
+  `$builddir/.ninja_rs_digests` after remote builds and builds reporting
+  events (their artifacts' digests), but for files modified
   within the time granularity before (a change since could go unseen: 2 s
   for whole-second times, else 100 ms).
   This matters: hashing a 150 MB toolchain takes seconds in release builds
@@ -250,8 +276,10 @@ CLI runs one build in-process. `Store` contains:
   resolved includes per (file version, search path); directory listings
   (never for directories under the build dir); built-in include dirs per
   (compiler, relevant flags, language);
-- toolchain input trees (built once per directory, concurrent requests wait
-  on a `OnceLock`);
+- toolchain input trees (built once per directory, concurrent requests
+  waiting for the first; one that couldn't be built isn't kept, so the next
+  action tries again, and one the daemon couldn't list is read in the
+  build; a daemon's sync files are left out);
 - hashes known to be in the CAS (skips `FindMissingBlobs` for them).
 
 All keys are plain data (paths, sizes, mtimes, digests) so the store can be
@@ -273,6 +301,17 @@ endpoints say which certificate was sent and which CAs were trusted
 (`options::tls_hint`). The fake server can require client certificates
 (`ServerTls`; test certificates in `crates/fake-reapi/testdata/tls`).
 
+Connecting is bounded (`rbe_client::CONNECT_TIMEOUT`, 20 s): resolving the
+name, the TCP connection, the TLS handshake (tonic's connect timeout covers
+the TCP connection only; `ClientTlsConfig::timeout` bounds the handshake,
+on every reconnection too) and HTTP/2's. A server that never answered
+anything (one accepting connections and saying nothing, as a hung process
+does: the kernel still accepts them) isn't called again: a call it leaves
+unanswered fails after one `--remote_timeout` (or the HTTP/2 keep-alive's
+50 s), not `--remote_retries` + 1 of them. The server's own statuses
+(UNAVAILABLE included) are answers; one standing for a broken connection,
+which carries the transport's error as its source, isn't.
+
 Calls failing for a transient reason (UNAVAILABLE, RESOURCE_EXHAUSTED,
 ABORTED, INTERNAL, UNKNOWN, CANCELLED, DEADLINE_EXCEEDED: Bazel's
 `RemoteRetrier` list; a batch's per-blob statuses too) are made again, up
@@ -281,7 +320,11 @@ take 10%. `--remote_timeout` (60 s, Bazel's units) bounds each call, and
 for a transfer how long it may go without moving (ByteStream reads and
 writes, which take as long as their size). Executions aren't bounded, as
 in Bazel: an `Execute` stream broken once the operation is named is
-followed again (`WaitExecution`); an operation the server lost (NOT_FOUND,
+followed again (`WaitExecution`); a stream that brought an update of the
+operation before breaking starts the count over, so a long execution whose
+streams a proxy keeps resetting is followed to its end (an operation named
+anew doesn't count: executions the server keeps losing still fail after
+`--remote_retries`); an operation the server lost (NOT_FOUND,
 or UNIMPLEMENTED for `WaitExecution`) or that failed for a transient
 reason (in the operation, or the response's status but DEADLINE_EXCEEDED:
 the action timed out) executes again. FAILED_PRECONDITION (missing inputs)
@@ -339,7 +382,17 @@ ACKs. (The fake server needs the same: without it, one 190 MB upload took
    input by a relative path are sent with forward slashes, so that an
    archive's member names don't depend on the host. **Thin archives**
    among the inputs of any action but a compile bring their members, see
-   below.
+   below. **A compile's other files** (`compile_outputs`): what it writes
+   besides its object and depfile is requested as optional outputs, named
+   as the compiler names them: `-gsplit-dwarf`'s `.dwo`, `--coverage`'s
+   `.gcno` (or `-fprofile-note=`), `-ftime-trace`'s JSON, `-MJ`,
+   `--serialize-diagnostics`, `-fstack-usage`, optimization records, a
+   depfile other than ninja's, clang-cl's `/sourceDependencies`, and
+   these through `/clang:`. Flags writing files that can't be named that
+   way run the compile locally: `-save-temps`, `-fdump-*`, cl's listings
+   and `/P`, `-ftime-trace=` naming a directory, and cl.exe's `/Zi` (a PDB
+   several compiles share; clang-cl puts the debug information in the
+   object).
 5. **Exec root and path rewriting** (`paths`), see [paths.md](paths.md).
 6. **Action**: `Command` (rewritten argv, `output_paths` and legacy
    `output_files` relative to the working directory, working directory,
@@ -352,7 +405,8 @@ ACKs. (The fake server needs the same: without it, one 190 MB upload took
    server splices blobs, a large one is uploaded as its chunks instead
    (see "Split and spliced blobs"). A large file is read as it is sent, a
    megabyte at a time (compressed as it goes, the frame stating its size),
-   never whole in memory. A blob another action is uploading (the
+   never whole in memory. A call sends up to 16 batches and streams at
+   once. A blob another action is uploading (the
    toolchain, for every action of a cold build) isn't uploaded again: the
    action waits for that upload (`Client::inflight`, shared by the
    client's clones), and uploads it itself should that one fail.
@@ -361,13 +415,26 @@ ACKs. (The fake server needs the same: without it, one 190 MB upload took
    didn't request (an absolute path, `..`: a server, or whoever can write to
    a shared cache, would write anywhere), a declared output missing (the old
    local file would stay, the edge look built), or a symlink make a cached
-   result a miss, and an executed one a failure (run locally). Outputs go
+   result a miss, and an executed one a failure (run locally), and so do
+   an output named twice and a malformed digest: every digest a result
+   gives (outputs, the files of output directories, stdout and stderr), a
+   server splits a blob into, or a cache or `.ninja_remote` holds, must be
+   64 lowercase hex digits with a size of at least 0 before it's used
+   (`rbe_client::valid_digest`), since a hash becomes a file name in the
+   disk cache and `../../x` would name another file. Outputs go
    where the action asked for them, never where the result says. Every blob
    read is checked against its digest (size and SHA-256, as Bazel's
    `--remote_verify_downloads` does), and so are inlined contents and the
    disk cache's blobs (a corrupt one is removed: a miss). Outputs are written
-   atomically; files whose content is already identical aren't rewritten,
-   but made newer than the inputs. File work (writing outputs, hashing the
+   atomically, each writer through a temporary file of its own (two tasks
+   writing one output each rename a whole file, and none removes the
+   other's); files whose content is already identical aren't rewritten,
+   but made newer than the inputs. Blobs up to 4 MiB are read into memory,
+   batched; a larger one, or one the disk cache keeps as chunks, goes to a
+   file next to its output as it arrives (from the remote, decompressed and
+   hashed on a blocking thread; from the disk cache, a chunk at a time),
+   then is renamed into place: a large output is never whole in memory.
+   Reads are bounded: 32 batches and streams in flight for the build. File work (writing outputs, hashing the
    local copies, the disk cache) runs off the async workers
    (`block_in_place`), which go on serving transfers (HTTP/2 flow control)
    and build events meanwhile. The
@@ -390,7 +457,10 @@ other inputs, by digest when they only exist remotely; `materialize`
 downloads them with the archive for a local command. Compiles read no
 archives and skip this. Member paths survive the input root's layout (tree
 paths are relative to the exec root); a member named by an absolute path
-wouldn't, and makes the action run locally. The action's key includes the
+wouldn't, and makes the action run locally, as does one outside the build
+directory once resolved (`../`): an archive from a remote or a cache would
+otherwise make a local command read, or a download write, any file the
+build can reach. The action's key includes the
 members' digests: a thin archive's bytes only depend on its members'
 names, sizes and symbols.
 
@@ -441,8 +511,8 @@ earlier builds) are always sent.
 
 `--remote_include_scanner=preprocessor` finds a GCC or Clang compile's
 inputs with `crates/cpp-deps`, a preprocessor that evaluates directives
-exactly and skips everything else; when it can't (unsupported flags such
-as `-iprefix`, a compiler it can't probe, a result it marks inexact, or an
+exactly and skips everything else; when it can't (a flag it doesn't
+model, a compiler it can't probe, a result it marks inexact, or an
 active `#include` it can't find: a lookup it may have got wrong drops
 inputs otherwise), the conservative scanner above runs instead. Headers
 compiled alone (`-x c++-header`, as for a precompiled header) are scanned
@@ -450,14 +520,41 @@ as their language, `.S`/`.sx` as `assembler-with-cpp`; `-include` and
 `-imacros` behind `-Xclang` are forced includes, and a precompiled header
 (`-include-pch`, also behind `-Xclang`) is an input that is not scanned,
 when the header it was made from is forced too (otherwise its macros are
-unknown: the scan falls back).
+unknown: the scan falls back). Every flag is taken by the scan
+(directories, macros, forced includes, the language), given to the probe
+(what may change predefined macros, built-in directories or query
+answers: `-std`, `-m…`, `-O`, `-f…`, targets, sysroots, toolchains),
+dropped (outputs, dependency files including `-Wp,-MD,file`, diagnostics,
+debug information, linking, per-object flags such as `-frandom-seed=`:
+they stay out of the profile's key), or unsupported: `-traditional-cpp`,
+`-finput-charset=` other than UTF-8, `-fno-dollars-in-identifiers`, Clang
+modules and header units, `-fmodule-file=` without a module name, other
+`-Wp,` and `-Xpreprocessor` options, `-A`, `-iprefix`, offloading, and any
+flag no list names, make the compile fall back. `cl`-style flags go to the
+probe unless dropped or unsupported (`/clr`, `/ZW`, header units,
+`/source-charset:` other than UTF-8, `-fno-ms-compatibility`); `CL` or
+`_CL_` setting what the scan reads from the command line (`/I`, `/FI`,
+`/D`, `/X`…) falls back too. The language is the driver's: `-x` applies to
+the inputs after it; `g++`, `clang++`, `c++` and `--driver-mode=g++`
+compile `.c` as C++.
 
 Lookups follow the compilers': forced includes in the working directory
 then along the `#include "..."` chain (GCC, Clang, clang-cl's `/FI`), or as
-`#include "..."` in the source (`cl`'s `/FI`); GCC's and Clang's search
-lists without duplicates, a `-I` that is also a system directory searched
-only there; a framework directory passes over names without a framework
-part. A UTF-8 byte order mark is skipped; a UTF-16 file makes the scan
+`#include "..."` in the source (`cl`'s `/FI`), every `-imacros` before any
+`-include`. `#include_next` goes on after the directory the current file
+was found in (an `-iquote` one too, `<...>` or not); from a file found
+next to its includer GCC starts at the head of the chain, Clang searches
+as `#include`. `cl`, `clang-cl` and Clang for the MSVC ABI (`__clang__`
+with `_MSC_VER`, Clang's default on Windows) search every includer's
+directory, the source's included for forced includes and what they
+include; flags turning Clang's MSVC compatibility on or off must agree
+with the predefined macros. Search lists merge as each compiler does,
+chosen from the predefined macros: GCC drops an `-I` or `-iquote`
+directory that is also a system one, and the last `-iquote` one when it's
+the first `-I` one; Clang and clang-cl only the `-I` one; `cl` an `/I`
+that is also `/external:I` (not `INCLUDE`'s). Directories compare by real
+path, taken once per build. A framework directory passes over names
+without a framework part. A UTF-8 byte order mark is skipped; a UTF-16 file makes the scan
 inexact. Queries `cl` only evaluates in `#if` get their value one bit at a
 time (`__has_cpp_attribute(nodiscard) >= 201907L` needs the value).
 
@@ -467,11 +564,26 @@ time (`__has_cpp_attribute(nodiscard) >= 201907L` needs the value).
   string and raw string literals, digit separators, line splices). The
   lexed files and directory listings are shared by every compile, and
   trusted for a build outside the build directory (`Cache` sessions).
+  Lines end at a newline, a carriage return and newline, or a lone
+  carriage return (GCC, Clang; `cl` reads those files otherwise:
+  inexact). Trigraphs aren't replaced: when the compiler replaces them
+  (the probe asks: GCC's ISO modes, Clang's outside GNU modes and
+  Windows, `/Zc:trigraphs`), a file with any makes the scan inexact.
 - **Macros** (`macros`): expansion with hide sets (Prosser's algorithm),
   `#`, `##` with placemarkers, `__VA_ARGS__`, `__VA_OPT__`, GNU's
   `, ## __VA_ARGS__`, `push_macro`/`pop_macro`. Only `#if`/`#elif` and
   `#include` operands are expanded; in `#if`, `defined`, `__has_include`
-  and the compiler's queries are evaluated as they appear.
+  and the compiler's queries are evaluated as they appear. What only
+  text could tell makes the result inexact: `__COUNTER__` in a condition
+  or `#include`, `__LINE__`/`__FILE__` after `#line`, `#pragma
+  include_alias`, a macro whose expansion runs `once`, `include_alias` or
+  a pragma the scan can't read, and pragmas given to macros in text
+  (`DO_PRAGMA(push_macro("M"))`, `__pragma(once)`, `PRAGMA("once")`).
+  Macros pushing and popping macros by name (libc++'s
+  `_LIBCPP_PUSH_MACROS`) stay exact unless those macros change meanwhile.
+  A query naming a macro the source defined is unknown (GCC expands
+  queries' operands). `-D` values end at a newline; a trailing backslash
+  is kept.
 - **`#if`** (`expr`): C's 64-bit integer arithmetic; `true`/`false` and
   the alternative operators (`and`, `or`, `not`, `bitand`...) by dialect
   (C++; `<iso646.h>` macros in C). A value may be unknown: `&&`, `||` and
@@ -502,7 +614,8 @@ time (`__has_cpp_attribute(nodiscard) >= 201907L` needs the value).
   to 1 for compiles without it), operators from `#ifdef` lines through
   `/EP`, built-in directories from `INCLUDE` (unless `/X`). The `#if`
   dialect is probed too: `true` (C++, C23) and the alternative operators
-  (`and`, `or`...: C++, or MSVC's conforming mode). Queries
+  (`and`, `or`...: C++, or MSVC's conforming mode), and whether trigraphs
+  are replaced. Queries
   (`__has_builtin(x)`, `__has_cpp_attribute(x)`...) are answered by running
   the compiler on generated lines, in batches (as `#if` tests for those it
   doesn't expand in text), then the compile is scanned again; answers are
@@ -553,8 +666,8 @@ header and common Windows headers alone in C++17, C++20 and C++latest with
 profile takes 0.3 to 0.7 s on Windows (process starts).
 
 Not handled yet: Apple sub-frameworks and
-header-map lookups relative to a framework, `_Pragma` produced by macros
-in text (text isn't expanded), MSVC's traditional preprocessor's own
+header-map lookups relative to a framework, `_Pragma` from macros in text
+beyond the cases detected above, MSVC's traditional preprocessor's own
 expansion rules (only `#if` and `#include` operands are expanded, where they
 rarely differ), raw string literals spanning a line splice.
 
@@ -614,7 +727,9 @@ machine, Linux in WSL and Windows:
 - The compiler is 10 to 50 times slower than the preprocessor warm.
 
 Making the preprocessor scale needed: read locks only on cached files and
-directory listings, atomic counters, one probe per profile (concurrent
+directory listings, directories' real paths and header-map checks taken
+once per build (comparing every pair per compile cost 110 ms with 30 `-I`
+on Windows, 3.6 s on /mnt/c), atomic counters, one probe per profile (concurrent
 scans wait for it), one scan at a time asking the compiler queries, and
 scans whose unknown queries another scan answered scanning again. A batch
 of queries the compiler rejects is split in halves, so that one bad query
@@ -654,11 +769,29 @@ events) and/or to a file (`--build_event_binary_file`):
   `restat` found its inputs unchanged: `Status::edge_removed_from_plan`
   says which edge, and so does `edge_added_to_plan` for one added since),
   or fails with its first failed edge. Its outputs are CAS references (`bytestream://` from
-  `--remote_executor`) when built remotely, `file://` with a digest (cached
-  in `Store`) otherwise. At the end, targets that never completed are
-  `Aborted` (`SKIPPED` after a failure, `USER_INTERRUPTED`), then come
-  `BuildFinished`, `BuildMetrics` (per mnemonic and runner) and
-  `BuildToolLogs`.
+  `--remote_executor`) when built remotely, `file://` with a digest (from
+  the file digest cache, persisted) otherwise. At the end, targets that
+  never completed are `Aborted` (`SKIPPED` after a failure,
+  `USER_INTERRUPTED`), then come `BuildFinished`, `BuildMetrics` (per
+  mnemonic and runner) and `BuildToolLogs`.
+- Artifacts are hashed off the build loop and outside the stream's lock,
+  in completion order (`report_targets`): `TargetCompleted` waits for its
+  files' digests, and `finish` and the digest cache's save wait for every
+  target completed (`Bes::settle`). Builds reporting events load and save
+  `.ninja_rs_digests` too: a no-op build doesn't hash its artifacts again.
+  Nothing is hashed when events go nowhere (no file, no outer invocation,
+  the upload failed).
+- The upload connects in the background (`BesUploader::connecting`): the
+  build doesn't wait for the backend, events queue meanwhile, and a failed
+  connection is reported at the end. `BuildEnqueued` and
+  `InvocationAttemptStarted` go alongside the stream, which doesn't wait
+  for them (`check_preceding_lifecycle_events_present` is false, Bazel's
+  default); `InvocationAttemptFinished` and `BuildFinished` after it.
+  Every call has a deadline (`BesConfig::rpc_timeout`, 15 s): a lifecycle
+  event, and the stream's next ack while events wait for one (the stream
+  is then opened again, resending what wasn't acked). A backend that never
+  answered anything isn't called again: a silent one costs one deadline
+  (20 s for a `grpcs://` handshake), whatever `--bes_timeout` says.
 - Failed edges are `ActionExecuted` events (all of them with
   `--build_event_publish_all_actions`); the status lines and command output
   are `Progress`.
@@ -686,12 +819,27 @@ mnemonics) in the repository and `cmake --build` or an IDE builds with them.
   `%ProgramData%\ninjars`); the workspace's, the first `.ninjars` from the
   build directory up to the repository's root (a `.git`, `.hg`, `.jj`,
   `.sl` or `.svn`), short of the home directory, whose directory is the
-  workspace (else the build directory); never one someone else could have
-  put there: in a file system's root, a directory shared by all users
-  (`/tmp`: writable by all and sticky), or (on Unix) a file another user
-  owns; the user's (`~/.ninjars`); the
+  workspace (else the build directory), short of the file system's root;
+  the user's (`~/.ninjars`); the
   `--ninjars` files (`/dev/null` ends them; a missing one is an error). A
   file found twice is read once.
+- **Trust** (`system_file`, `workspace_file`): the system's and the
+  workspace's files are never read when someone other than the user and
+  the administrators could have written them; a warning says which and
+  why. On Unix a file must be the user's or root's, and no directory from
+  the build directory up to it may be writable by all with the sticky bit
+  (`/tmp`; writable by all alone is how WSL shows Windows drives). On
+  Windows (`rc::sys`, `GetSecurityInfo`) the file and those directories
+  must be owned by the user, Administrators, SYSTEM or TrustedInstaller,
+  and no allow entry of their DACL (inherit-only ones aside) may give
+  anyone else write, append, delete-child, delete, WRITE_DAC, WRITE_OWNER
+  or a generic right including them; no DACL means everyone. The entry and,
+  through a link, its target are both checked. `%ProgramData%` lets anyone
+  create files but not replace another's, so only its `ninjars` is
+  checked, and one missing at the check isn't read. A descriptor that
+  can't be read counts as untrusted (a missing directory as empty). Past a
+  directory others can write to, the search goes on only to name the file
+  it skips. `~/.ninjars` and `--ninjars` files aren't checked.
 - **Lines**: `COMMAND[:CONFIG] OPTIONS...`, `import FILE`, `try-import FILE`
   (relative to the importing file; import loops are errors). `#` at a word's
   start comments out the rest, a trailing `\` joins the next line, words
@@ -709,9 +857,17 @@ mnemonics) in the repository and `cmake --build` or an IDE builds with them.
   and BES settings, and skips the rest. Bazel's other commands (`test`,
   `query`, `startup`...) are skipped, others warned about.
 - **Options**: each is checked alone (`options::check_rc_option`): known,
-  no target or tool, not one of the command-line-only options above. With
-  no targets in files, a word after an option without `=` is its value,
-  unless the option is a boolean. Values take Bazel's forms everywhere:
+  no target or tool, not one of the command-line-only options above.
+  `--` isn't an option. With no targets in files, a word after an option
+  without `=` is its value, unless the option is a boolean or the word
+  starts with `-`. Lines shared with Bazel follow Bazel's syntax
+  (`bazel_option_len`): short options are Bazel's, skipped with their value
+  (`-c opt`, `-j 200`); a ninja-rs option's separate value is the next word
+  whatever it starts with; after one of Bazel's options, whose booleans
+  ninja-rs doesn't know, a word starting with `--` is the next option and
+  one starting with a single `-` is skipped like a short option
+  (`--copt -fPIC`). That is Bazel's reading of every valid file except a
+  Bazel option whose value is a ninja-rs long option. Values take Bazel's forms everywhere:
   booleans `--name`, `--noname`, `--name=true|false|yes|no|1|0`; an empty
   value unsets an option (`--disk_cache=` turns off a cache a file sets,
   `--remote_executor=` remote execution); durations a number and a unit
@@ -840,7 +996,15 @@ directory), so they are interchangeable with a remote cache's.
   format version is unchanged.
 - **Layout:** `VERSION`, `cas/<hh>/<hash>`, `chunked/<hh>/<hash>`,
   `ac/<hh>/<hash>`, `size`, `gc/lock`, `tmp/` (atomic writes); a version
-  mismatch disables the cache with a warning.
+  mismatch disables the cache with a warning. A malformed hash (from a
+  result or a layout another writer made) names no file: reading misses,
+  writing fails. Each write goes through a file of `tmp/` named by the
+  PID, a counter and a random part, opened only if new: processes, and
+  containers sharing the cache with the same PIDs, never write one file.
+  Collection removes those older than an hour, which writers that died
+  left.
+- **Large blobs** are copied out a chunk at a time (`read_blob_into`), the
+  whole checked against its digest at the end, never read into memory.
 
 ### Split and spliced blobs
 
@@ -852,8 +1016,9 @@ before by a few edits only sends the chunks around them:
   larger than the disk cache's chunk limit is split by the server
   (`GetChunkMapping` from RE API v2.13, `SplitBlob` before, picked from
   `high_api_version`); only the chunks the disk cache lacks are fetched,
-  each checked against its digest before it's stored, and the assembled
-  blob against its own, as REAPI asks. The disk cache keeps the server's
+  64 MiB at a time, each checked against its digest before it's stored,
+  and the blob assembled from the disk cache into a file next to its
+  output, checked against its own digest, as REAPI asks. The disk cache keeps the server's
   chunks and its `SplitBlobResponse` as the layout. A server that can't
   split the blob, or any failure, falls back to fetching it whole.
 - **Upload** (`splice_blob_support`): a missing input larger than four
@@ -917,6 +1082,17 @@ without an executor still share results, across machines and checkouts.
   to the working directory (`PathMapper::rewrite_text`), as a remote
   execution prints them: another checkout replaying a warning gets its own
   file. The disk cache stores local results the same way.
+- **Only results the key describes**, what a remote execution of the
+  action would give, are stored (in the disk cache too): not those of
+  commands with steps on the host (their outputs are post-processed, and
+  the steps would run again on a hit); not while a variable compilers or
+  linkers read is set that the action doesn't set itself (`CPATH`,
+  `INCLUDE`, `LIB`, `CL`, `SOURCE_DATE_EPOCH`, `SDKROOT`...:
+  `backend::RESULT_VARS`; a warning says so once); and not when the
+  command read a file the action's inputs lack (a depfile or
+  `/showIncludes` dependency outside the input tree: the scan missed it,
+  and a remote run wouldn't have it). The remote cache, which other
+  machines read, only gets results of tools the toolchains file declares.
 - `--noremote_upload_local_results` reads only: developer machines can
   use a cache only CI fills. Uploads also stop when the server reports
   `update_enabled = false`, with a warning.
@@ -952,8 +1128,12 @@ stats with its recorded time: ninja's up-to-date checks, build log and deps
 log work unchanged, and a recorded output is as present as a local one. A
 downloaded file gets its recorded time, so downloading it later doesn't make
 what depends on it stale. Remote actions read recorded inputs by digest
-(`InputTree::add_remote_file`). A local write of a recorded path, or a
-remote action producing it again, drops the record; a stale local copy of a
+(`InputTree::add_remote_file`). A record means there is no local file:
+an edge run locally drops the records of its outputs (the engine reports
+them through `Disk::outputs_written`), a build without a remote service or
+a disk cache deletes `.ninja_remote`, and an entry with a malformed digest
+is skipped. A remote action producing a recorded path again drops its
+record too; a stale local copy of a
 remote-only output is deleted so local commands can't read it; `-t clean`
 deletes the file. A file the build itself reads (a dyndep file) is
 downloaded when it is read.
@@ -1040,13 +1220,17 @@ every header and toolchain file.
   nearest directory with `.git`, `.hg`, `.jj`, `.sl` or `.svn`) and the
   toolchain directories listed whole. With inotify (a watch per
   directory), a repository is watched lazily: its root (and its `.git`, for
-  cookies) at first, then the directory of each file checked, with those
-  above it (their renaming moves the file), each vouched for once a sync
+  cookies) at first, then the directory of each file checked and of each
+  directory listed (a search-path entry: a header created there later
+  shows up), with those above them (their renaming moves the files), each
+  vouched for once a sync
   followed its watch (`Watcher::epoch`); a toolchain directory, in the
   checkout or not, with everything under it, directories created there
   since included. A dotfiles repository in the home directory doesn't
   watch the home directory, nor do other build trees in a checkout get
-  watched. Out of watches (ENOSPC), a root gives back all of its own (IDEs
+  watched. A root found around others (a checkout whose toolchain was
+  listed before any of its files) takes them over: their watches go, and
+  what they vouched for is checked again. Out of watches (ENOSPC), a root gives back all of its own (IDEs
   need them too) and is checked once per build for ten minutes.
   `ReadDirectoryChangesW` watches a root whole with one handle. Events drop the
   entries they concern: a file's, its directory's names when it's
@@ -1057,7 +1241,10 @@ every header and toolchain file.
   to (outputs outside the build directory, as an in-source generator
   writes them; the build directory with symlinks resolved): their files
   are checked every time, even within a build, as a generator can rewrite a
-  header between two actions. Nor are paths through symbolic links (events
+  header between two actions. A build directory no build began in for a
+  day is forgotten (CMake's `try_compile` makes hundreds a day); looking a
+  path up costs one lookup per ancestor, however many are known. Nor are
+  paths through symbolic links (events
   come for real paths). Roots on a file system that may not report every
   change are never watched: on Linux, any but an allow-list of local ones
   (ext4, XFS, Btrfs, tmpfs, ZFS...: not NFS, SMB, FUSE, nor WSL's view of
@@ -1068,14 +1255,31 @@ every header and toolchain file.
   meanwhile, stays valid until an event says otherwise (`WATCHED` in
   `cpp_deps::scan::Cache` and `ninja_daemon::files`); other entries are
   valid for one build. A root is in sync after the daemon created a file
-  in it (a cookie, in `.git` when there is one) and saw its event, which
-  comes after every change made before (Watchman's technique): before
-  each build. A root found during a build is trusted from the next one.
-  Lost events (an inotify queue overflow, an overflowed
-  `ReadDirectoryChangesW` buffer) and broken watches put a root out of
-  sync and drop everything under it; a cookie that doesn't come back
-  within two seconds restarts the watch. Roots the daemon can't write to
-  are trusted without a cookie.
+  (a cookie) and saw its event, which comes after every change made before
+  (Watchman's technique): before each build. Cookies go in the
+  repository's own directory (`.git`, `.hg`...) when there is one; else,
+  with inotify, in a directory of the daemon's (`<id>.cookies` beside its
+  log: one queue carries every watch's events, in order); else (a
+  toolchain directory on Windows) at the root's top for a moment, which
+  tree walks skip, the daemon's and the builds' (`COOKIE_PREFIX`). A root
+  found during a build is trusted from the next one. Lost events (an
+  inotify queue overflow, an overflowed `ReadDirectoryChangesW` buffer)
+  and broken watches put a root out of sync and drop everything under it;
+  with inotify the root is then watched again from scratch (a directory
+  replaced meanwhile took its watch along unseen) and vouched for after
+  the sync that follows. A directory whose watch went with nothing
+  reported above it (its file system unmounted: `IN_UNMOUNT`,
+  `IN_IGNORED`) drops everything under it and is watched again when
+  needed; a directory created and removed at once under a toolchain
+  directory isn't a loss. A cookie that doesn't come back within two
+  seconds restarts the watch. Roots the daemon can't write to are trusted
+  without a cookie. File digests are kept for a version of the file: its
+  `FileStamp` and, on Windows, its change time and file ID as well (NTFS
+  gives the old creation time back to a file created again under its name
+  within 15 s, and a rewrite in place with the modification time restored
+  changes nothing else in the stamp). An event drops a file's digest
+  whatever its stamp; a build's digests file is read once per daemon, its
+  entries used only for files the daemon hasn't hashed or seen change.
 - **Backends:** inotify on Linux (a watch per directory, lazily;
   `IN_OPEN` isn't watched, so compilers reading headers aren't events), `ReadDirectoryChangesW` per root on Windows (synchronous reads
   in a thread each; directories' own "modified" events, which follow
@@ -1087,12 +1291,13 @@ every header and toolchain file.
   the daemon: a file per profile, its whole key checked when loading. The
   key has the compiler's path, size and modification time, its banner
   (`--version`, or `cl`'s: a wrapper's or a shim's file doesn't change with
-  the compiler behind it), the flags, the working directory and the
+  the compiler behind it), the flags that change answers (not outputs or
+  per-object flags), the working directory and the
   variables that change answers (`INCLUDE`, `CPATH`, `SDKROOT`,
   `DEVELOPER_DIR`, `VCToolsInstallDir`...). What it doesn't see (a clang
   configuration file's contents) is stale for a day at most: profiles are
   probed again after a day, however often used. Those unused for a month
-  are removed when another is saved.
+  are removed, looked for at most once a day (the `cleaned` file's time).
 
 Measured on 256 compiles (36 standard headers each, a chain of project
 headers), from the disk cache, 32 threads; median of five builds:

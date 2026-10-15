@@ -36,6 +36,19 @@ Local changes:
   `RegisterChunkMapping` from RE API v2.13, `SplitBlob` / `SpliceBlob`
   before); `upload_blobs` uploads large blobs as their missing chunks and
   splices them when the server supports it, and returns the bytes sent.
+- `valid_hash` / `valid_digest`: digests a server gives (chunk lists too)
+  are checked to be 64 lowercase hex digits and a size of at least 0
+  before they name files.
+- `connect_channel` bounds connecting (`CONNECT_TIMEOUT`, 20 s, the TLS
+  handshake included, on reconnections too); a server that never answered
+  isn't called again (`Client::retrying`); a broken `Execute`/`WaitExecution`
+  stream that brought an update of the operation starts the retry count
+  over.
+- `upload_blobs` sends up to 16 batches and ByteStream writes at once
+  (`UPLOADS`); reads are bounded to 32 in flight for all clones
+  (`MAX_READS`), decompressed and hashed on blocking threads;
+  `read_blob_to_file` writes a blob to a file as it arrives, checked
+  against its digest, never whole in memory.
 
 ## rbe-bes (copied)
 
@@ -55,6 +68,11 @@ Local changes:
   `ec02207fc3a9ee282f13820983b1ee5c493a51ec`.
 - `Cargo.toml` uses the ninja-rs workspace dependencies; a Bazel
   `BUILD.bazel` was added.
+- `BesUploader::connecting` connects in the background task (`is_closed`
+  tells a failed upload); the lifecycle start events go alongside the
+  stream (`check_preceding_lifecycle_events_present` is false); every call
+  has a deadline (`BesConfig::rpc_timeout`, 15 s); a backend that never
+  answered isn't called again.
 
 ## Not copied (yet)
 - `rbe-exec` (worker-side helper that substitutes an `@EXECROOT@` token and

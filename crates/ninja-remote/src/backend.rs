@@ -94,6 +94,8 @@ struct Inner {
     /// Hashes of blobs found gone from the remote CAS during this build: a
     /// disk cache result referencing one is stale (see `try_execute`).
     lost: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Whether the build was told why local results aren't cached.
+    env_warned: std::sync::atomic::AtomicBool,
 }
 
 /// Remote actions that ran locally instead, with the first reason of each
@@ -196,6 +198,7 @@ impl Backend {
                 materializing: Default::default(),
                 fallbacks: Fallbacks::default(),
                 lost: Default::default(),
+                env_warned: Default::default(),
             }),
         })
     }
@@ -900,6 +903,9 @@ impl Inner {
             let tree_digest = d.tree_digest.clone().unwrap_or_default();
             let tree = client.fetch_tree(&tree_digest).await?;
             for (rel, f) in rbe_client::tree::tree_files(&tree)? {
+                if !f.digest.as_ref().is_some_and(rbe_client::valid_digest) {
+                    bail!("output directory {}: {} has no well-formed digest", d.path, rel.display());
+                }
                 let local = base.join(rel);
                 files.push((
                     local,
@@ -952,15 +958,15 @@ impl Inner {
                 if stays_remote(local, f) {
                     continue;
                 }
-                if f.contents.is_empty() || d.size_bytes == 0 {
-                    needed.push(d);
+                if f.contents.is_empty() {
+                    needed.push((d, local.clone()));
                 }
             }
             needed
         });
-        let blobs = self.fetch_blobs(client, &needed).await?;
+        let mut fetched = self.fetch_blobs(client, &needed).await?;
         let mut left_remote: std::collections::HashSet<&str> = Default::default();
-        blocking(|| self.write_outputs(p, &files, &blobs, &stays_remote, &thin, &mut left_remote))?;
+        blocking(|| self.write_outputs(p, &files, &mut fetched, &stays_remote, &thin, &mut left_remote))?;
         // The disk cache keeps the result with the outputs it can hold;
         // those left remote stay in the remote CAS (see `try_execute`).
         if keep
@@ -1003,7 +1009,7 @@ impl Inner {
         &self,
         p: &Prepared,
         files: &'f [(PathBuf, re::OutputFile)],
-        blobs: &std::collections::HashMap<String, Vec<u8>>,
+        fetched: &mut Fetched,
         stays_remote: &dyn Fn(&PathBuf, &re::OutputFile) -> bool,
         thin: &std::collections::HashMap<String, Arc<Vec<String>>>,
         left_remote: &mut std::collections::HashSet<&'f str>,
@@ -1044,18 +1050,17 @@ impl Inner {
             if let Some(outputs) = &self.config.remote_outputs {
                 outputs.forget(&f.path);
             }
-            let data: Vec<u8> = if !f.contents.is_empty() {
+            if !f.contents.is_empty() {
                 // Inlined contents must be the digest they come with, as
                 // fetched blobs are (rbe-client checks those).
                 rbe_client::verify(&d, &f.contents).with_context(|| format!("inlined contents of {}", local.display()))?;
-                f.contents.clone()
-            } else if d.size_bytes == 0 {
-                Vec::new()
+                let data = if is_depfile { self.map_depfile(&f.contents, p) } else { f.contents.clone() };
+                write_output(local, &data, f.is_executable)?;
+            } else if is_depfile {
+                write_output(local, &self.map_depfile(&fetched.read(&d)?, p), f.is_executable)?;
             } else {
-                blobs.get(&d.hash).cloned().with_context(|| format!("missing blob for {}", local.display()))?
-            };
-            let data = if is_depfile { self.map_depfile(&data, p) } else { data };
-            write_output(local, &data, f.is_executable)?;
+                fetched.write(local, &d, f.is_executable).with_context(|| format!("writing {}", local.display()))?;
+            }
         }
         Ok(())
     }
@@ -1128,8 +1133,8 @@ impl Inner {
         if wanted.is_empty() {
             return Ok(());
         }
-        let digests: Vec<re::Digest> = wanted.iter().map(|(_, e, _)| e.digest.clone()).collect();
-        let blobs = match self.fetch_blobs(self.client.as_ref(), &digests).await {
+        let needed: Vec<(re::Digest, PathBuf)> = wanted.iter().map(|(local, e, _)| (e.digest.clone(), local.clone())).collect();
+        let mut fetched = match self.fetch_blobs(self.client.as_ref(), &needed).await {
             Ok(b) => b,
             Err(e) => {
                 // Those gone from the remote CAS are rebuilt (rewinding).
@@ -1139,12 +1144,7 @@ impl Inner {
         };
         blocking(|| -> Result<(), MaterializeError> {
             for (local, e, _) in wanted {
-                let data = if e.digest.size_bytes == 0 {
-                    Vec::new()
-                } else {
-                    blobs.get(&e.digest.hash).cloned().ok_or_else(|| MaterializeError::from(format!("missing blob for {}", local.display())))?
-                };
-                write_output(local, &data, e.executable).map_err(|err| MaterializeError::from(format!("{err:#}")))?;
+                fetched.write(local, &e.digest, e.executable).map_err(|err| MaterializeError::from(format!("writing {}: {err:#}", local.display())))?;
                 crate::remote_outputs::set_mtime(local, e.mtime)
                     .map_err(|err| MaterializeError::from(format!("setting the time of {}: {err}", local.display())))?;
                 outputs.forget(&e.path);
@@ -1197,62 +1197,75 @@ impl Inner {
         lost
     }
 
-    /// Blobs from the disk cache, else from the remote CAS (stored on disk
-    /// then). A large blob is fetched as its chunks when the remote splits
-    /// blobs, downloading only those the disk cache lacks.
-    async fn fetch_blobs(&self, client: Option<&Client>, needed: &[re::Digest]) -> Result<std::collections::HashMap<String, Vec<u8>>> {
-        let (mut blobs, mut missing) = blocking(|| {
-            let (mut blobs, mut missing) = (std::collections::HashMap::new(), Vec::new());
-            for d in needed {
-                match self.disk.as_ref().and_then(|disk| disk.read_blob(d)) {
-                    Some(data) => {
-                        blobs.insert(d.hash.clone(), data);
-                    }
-                    None => missing.push(d.clone()),
+    /// Whether a blob is fetched into a file rather than into memory: a
+    /// large one, or one the disk cache stores as chunks.
+    fn streamed(&self, d: &re::Digest) -> bool {
+        d.size_bytes > STREAMED || (self.disk.is_some() && crate::disk_cache::is_chunked(d))
+    }
+
+    /// Blobs for outputs (digest, an output it's for): from the disk cache,
+    /// else from the remote CAS (stored on disk then). A large blob goes to
+    /// a file next to its output, from the disk cache a chunk at a time, or
+    /// from the remote as it arrives (as the chunks the remote splits it
+    /// into when it does, downloading only those the disk cache lacks):
+    /// never whole in memory.
+    async fn fetch_blobs(&self, client: Option<&Client>, needed: &[(re::Digest, PathBuf)]) -> Result<Fetched> {
+        let mut fetched = Fetched::default();
+        let mut seen = std::collections::HashSet::new();
+        let needed: Vec<&(re::Digest, PathBuf)> = needed.iter().filter(|(d, _)| d.size_bytes > 0 && seen.insert(d.hash.as_str())).collect();
+        let missing = blocking(|| {
+            let mut missing = Vec::new();
+            for &(d, dest) in &needed {
+                let found = match &self.disk {
+                    Some(disk) if self.streamed(d) => fetched.stage(d, dest, |f| disk.read_blob_into(d, f)),
+                    Some(disk) => disk.read_blob(d).map(|data| fetched.bytes.insert(d.hash.clone(), data)).is_some(),
+                    None => false,
+                };
+                if !found {
+                    missing.push((d.clone(), dest.clone()));
                 }
             }
-            (blobs, missing)
+            missing
         });
         if missing.is_empty() {
-            return Ok(blobs);
+            return Ok(fetched);
         }
         let Some(client) = client else { bail!("{} blobs are missing from the disk cache", missing.len()) };
-        if let Some(disk) = &self.disk
-            && client.chunking().split
-        {
-            let mut whole = Vec::new();
-            for d in missing {
-                if !crate::disk_cache::is_chunked(&d) {
-                    whole.push(d);
-                    continue;
-                }
-                match fetch_chunked(client, disk, &d).await {
-                    Ok(Some(data)) => {
-                        blobs.insert(d.hash.clone(), data);
-                    }
-                    // Not split by the server: fetch it whole.
-                    Ok(None) => whole.push(d),
-                    Err(e) => {
-                        if self.config.verbose {
-                            eprintln!("ninja-rs: fetching {} as chunks: {e:#}", rbe_client::digest_str(&d));
-                        }
-                        whole.push(d);
-                    }
-                }
-            }
-            missing = whole;
+        let (large, small): (Vec<_>, Vec<_>) = missing.into_iter().partition(|(d, _)| self.streamed(d));
+        let mut streams = tokio::task::JoinSet::new();
+        for (d, dest) in large {
+            let (client, disk, verbose) = (client.clone(), self.disk.clone(), self.config.verbose);
+            streams.spawn(async move {
+                let staged = fetch_into_file(&client, disk.as_deref(), &d, &dest, verbose).await;
+                (d, staged)
+            });
         }
-        let fetched = client.read_blobs(&missing).await?;
+        let small: Vec<re::Digest> = small.into_iter().map(|(d, _)| d).collect();
+        let read = client.read_blobs(&small).await;
+        // Every stream ends before this returns: their files are known.
+        let mut failed = None;
+        while let Some(r) = streams.join_next().await {
+            match r.map_err(anyhow::Error::from).and_then(|(d, staged)| Ok((d, staged?))) {
+                Ok((d, staged)) => {
+                    fetched.files.insert(d.hash, (staged, true));
+                }
+                Err(e) => failed = failed.or(Some(e)),
+            }
+        }
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        let read = read?;
         if let Some(disk) = &self.disk {
             blocking(|| -> Result<()> {
-                for (hash, data) in &fetched {
+                for (hash, data) in &read {
                     disk.put_bytes(&re::Digest { hash: hash.clone(), size_bytes: data.len() as i64 }, data)?;
                 }
                 Ok(())
             })?;
         }
-        blobs.extend(fetched);
-        Ok(blobs)
+        fetched.bytes.extend(read);
+        Ok(fetched)
     }
 
     /// Rewrites a depfile written by the remote compiler to local paths.
@@ -1290,20 +1303,90 @@ impl LocalCapture for Capture {
 /// rather than inside its action cache entry.
 const INLINE_STDOUT_MAX: usize = 64 << 10;
 
+/// Variables compilers and linkers read that change their results. A local
+/// run inherits them, a remote action only has its command's: with one set,
+/// a local result isn't what the action's key describes.
+const RESULT_VARS: &[&str] = &[
+    "CPATH",
+    "C_INCLUDE_PATH",
+    "CPLUS_INCLUDE_PATH",
+    "OBJC_INCLUDE_PATH",
+    "OBJCPLUS_INCLUDE_PATH",
+    "LIBRARY_PATH",
+    "GCC_EXEC_PREFIX",
+    "COMPILER_PATH",
+    "CCC_OVERRIDE_OPTIONS",
+    "DEPENDENCIES_OUTPUT",
+    "SUNPRO_DEPENDENCIES",
+    "SOURCE_DATE_EPOCH",
+    "ZERO_AR_DATE",
+    "SDKROOT",
+    "DEVELOPER_DIR",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
+    "INCLUDE",
+    "EXTERNAL_INCLUDE",
+    "LIB",
+    "LIBPATH",
+    "CL",
+    "_CL_",
+    "LINK",
+    "_LINK_",
+    "VCToolsInstallDir",
+    "VCINSTALLDIR",
+    "WindowsSdkDir",
+    "WindowsSDKVersion",
+    "UniversalCRTSdkDir",
+    "UCRTVersion",
+];
+
+/// The first of `RESULT_VARS` set here that `command` doesn't set itself.
+fn result_var(command: &re::Command) -> Option<&'static str> {
+    let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    RESULT_VARS.iter().copied().find(|v| std::env::var_os(v).is_some() && !command.environment_variables.iter().any(|e| same(&e.name, v)))
+}
+
 impl Capture {
     /// Stores the result of the command, run locally on a cache miss, in the
     /// disk cache and the remote cache (when the server accepts results).
     /// Runs on a blocking thread.
+    ///
+    /// Only a result the action's key describes, one its remote execution
+    /// would give: not after steps on the host, nor with variables the
+    /// action doesn't have, nor when the command read files its inputs
+    /// lack. The remote cache, which other machines read, only gets those
+    /// of tools the toolchains file declares.
     fn store(&mut self, output: &[u8]) -> Result<()> {
         let disk = self.inner.disk.clone();
+        let declared = self.prepared.toolchain_declared;
+        if self.inner.upload && !declared && disk.is_none() {
+            bail!("the command runs a tool the toolchains file doesn't declare");
+        }
         let client = self
             .inner
             .client
             .as_ref()
-            .filter(|_| self.inner.upload)
+            .filter(|_| self.inner.upload && declared)
             .map(|c| c.for_action(&self.inner.action_meta(&self.task), &self.prepared.action_digest.hash));
         if disk.is_none() && client.is_none() {
             return Ok(());
+        }
+        if !self.prepared.local_before.is_empty() || !self.prepared.local_after.is_empty() {
+            bail!("the command runs steps on the host");
+        }
+        if let Some(var) = result_var(&self.prepared.command) {
+            if !self.inner.env_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("ninja-rs: warning: local results aren't cached: {var} is set, and actions don't have it");
+            }
+            bail!("{var} is set");
+        }
+        if self.task.deps.as_deref() == Some("msvc") {
+            let prefix = if self.task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { self.task.msvc_deps_prefix.as_str() };
+            let text = String::from_utf8_lossy(output);
+            let included = text.lines().filter_map(|l| filter_show_includes(l.trim_end_matches('\r'), prefix)).filter(|p| !p.is_empty());
+            if let Some(dep) = undeclared(&mut self.prepared, included) {
+                bail!("{dep} isn't among the action's inputs");
+            }
         }
         let digests = Some(&self.inner.shared.store.digests as &dyn rbe_client::tree::DigestCache);
         let mut blobs = rbe_client::BlobSet::default();
@@ -1333,6 +1416,10 @@ impl Capture {
         if let Some((rel, local)) = self.prepared.depfile.clone()
             && let Ok(data) = std::fs::read(&local)
         {
+            let deps = parse_depfile(&data).map_err(|e| anyhow::anyhow!("{}: {e}", local.display()))?;
+            if let Some(dep) = undeclared(&mut self.prepared, deps.ins.iter().map(String::as_str)) {
+                bail!("{dep} isn't among the action's inputs");
+            }
             let data = self.depfile_to_remote(&data);
             let digest = rbe_client::digest_of(&data);
             if let Some(disk) = &disk {
@@ -1418,6 +1505,14 @@ impl Capture {
     }
 }
 
+/// The first of these files a command read (local paths, relative to the
+/// build directory or absolute) that the action's input tree lacks: a
+/// remote run wouldn't have read it.
+fn undeclared<'a>(p: &mut Prepared, deps: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let windows = p.mapper.windows;
+    deps.into_iter().find(|d| !p.mapper.tree_path(d).is_some_and(|t| p.tree_index.contains(&t, windows))).map(str::to_string)
+}
+
 #[cfg(unix)]
 fn is_executable(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1469,16 +1564,35 @@ fn requested_outputs(p: &Prepared) -> HashMap<&str, &Path> {
 /// Whether a result, from a cache or an execution, is one this action can
 /// use. A result names its outputs: one it wasn't asked for would be
 /// written wherever it says (an absolute path, `..`), by a server or by
-/// whoever can write to a shared cache. Symlinks aren't supported. A
-/// successful result must hold every declared output, or the old local
-/// file would stay and the edge look built (unless a local step after the
-/// remote one may write it).
+/// whoever can write to a shared cache. So do its digests, which become
+/// disk cache paths: each must be a well-formed digest, and each output
+/// named once, with one. Symlinks aren't supported. A successful result
+/// must hold every declared output, or the old local file would stay and
+/// the edge look built (unless a local step after the remote one may
+/// write it).
 fn check_result(p: &Prepared, result: &re::ActionResult) -> Result<(), String> {
     let requested = requested_outputs(p);
+    let mut seen = std::collections::HashSet::new();
     for path in result.output_files.iter().map(|f| &f.path).chain(result.output_directories.iter().map(|d| &d.path)) {
         if !requested.contains_key(path.as_str()) {
             return Err(format!("it names an output that wasn't requested: {path:?}"));
         }
+        if !seen.insert(path.as_str()) {
+            return Err(format!("it names the output {path} twice"));
+        }
+    }
+    let digests = result
+        .output_files
+        .iter()
+        .map(|f| (f.path.as_str(), f.digest.as_ref()))
+        .chain(result.output_directories.iter().map(|d| (d.path.as_str(), d.tree_digest.as_ref())));
+    for (path, d) in digests {
+        if !d.is_some_and(rbe_client::valid_digest) {
+            return Err(format!("its output {path} has no well-formed digest"));
+        }
+    }
+    if let Some(d) = result.stdout_digest.iter().chain(&result.stderr_digest).find(|d| !rbe_client::valid_digest(d)) {
+        return Err(format!("its output streams have a malformed digest {:?}", d.hash));
     }
     #[allow(deprecated)]
     let symlink = result.output_symlinks.iter().chain(&result.output_file_symlinks).chain(&result.output_directory_symlinks).next();
@@ -1524,38 +1638,160 @@ fn lost_inputs_result(task: &Task, lost: Vec<String>, mut output: Vec<u8>) -> Ta
     TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Remote, cas_outputs: Vec::new(), lost_inputs: lost }
 }
 
-/// Fetches a large blob as the chunks the remote splits it into, downloading
-/// only those the disk cache lacks, and stores it there in those chunks.
-/// `None` when the remote can't split it.
-async fn fetch_chunked(client: &Client, disk: &DiskCache, d: &re::Digest) -> Result<Option<Vec<u8>>> {
-    let Some(split) = client.split_blob(d).await? else { return Ok(None) };
-    let lacking: Vec<re::Digest> = split.chunk_digests.iter().filter(|c| !disk.contains_chunk(c)).cloned().collect();
-    let fetched = client.read_blobs(&lacking).await?;
-    blocking(|| assemble_chunks(disk, d, split, &fetched)).map(Some)
+/// Above this size, a blob is fetched into a file as it arrives rather
+/// than into memory.
+const STREAMED: i64 = 4 << 20;
+
+/// Chunks of a large blob fetched at once: they are in memory until stored.
+const CHUNK_GROUP: i64 = 64 << 20;
+
+/// Blobs fetched for outputs: small ones in memory, large ones in files.
+#[derive(Default)]
+struct Fetched {
+    bytes: HashMap<String, Vec<u8>>,
+    /// The file holding a large blob, and whether it's still where it was
+    /// fetched (next to an output it's for): moved to the first output
+    /// written with it, which the others copy.
+    files: HashMap<String, (PathBuf, bool)>,
 }
 
-/// A blob from its chunks, those fetched stored in the disk cache.
-fn assemble_chunks(disk: &DiskCache, d: &re::Digest, split: re::SplitBlobResponse, fetched: &std::collections::HashMap<String, Vec<u8>>) -> Result<Vec<u8>> {
-    let mut data = Vec::with_capacity(d.size_bytes as usize);
-    for c in &split.chunk_digests {
-        match fetched.get(&c.hash) {
-            Some(chunk) => {
-                // Checked before it's stored under that digest.
-                if rbe_client::digest_of(chunk) != *c {
-                    bail!("chunk {} has other contents", rbe_client::digest_str(c));
-                }
-                disk.put_chunk_bytes(c, chunk)?;
-                data.extend_from_slice(chunk);
+impl Fetched {
+    /// Fetches a large blob into a file next to `dest`: `fill` writes it,
+    /// and says whether it's whole and right.
+    fn stage(&mut self, d: &re::Digest, dest: &Path, fill: impl FnOnce(&mut std::fs::File) -> bool) -> bool {
+        let Ok(path) = temp_next_to(dest) else { return false };
+        let filled = std::fs::File::options().write(true).create_new(true).open(&path).is_ok_and(|mut f| fill(&mut f));
+        if filled {
+            self.files.insert(d.hash.clone(), (path, true));
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+        filled
+    }
+
+    /// A blob's contents, for the outputs read here (depfiles).
+    fn read(&self, d: &re::Digest) -> Result<Vec<u8>> {
+        if d.size_bytes == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(data) = self.bytes.get(&d.hash) {
+            return Ok(data.clone());
+        }
+        let (path, _) = self.files.get(&d.hash).with_context(|| format!("missing blob {}", rbe_client::digest_str(d)))?;
+        Ok(std::fs::read(path)?)
+    }
+
+    /// Writes blob `d` as the output `local`, atomically.
+    fn write(&mut self, local: &Path, d: &re::Digest, executable: bool) -> Result<()> {
+        if d.size_bytes == 0 {
+            return write_output(local, &[], executable);
+        }
+        if let Some(data) = self.bytes.get(&d.hash) {
+            return write_output(local, data, executable);
+        }
+        let (src, staged) = self.files.get(&d.hash).cloned().with_context(|| format!("missing blob {}", rbe_client::digest_str(d)))?;
+        if staged && move_output(&src, local, executable).is_ok() {
+            self.files.insert(d.hash.clone(), (local.to_path_buf(), false));
+            return Ok(());
+        }
+        write_output_with(local, executable, |f| std::io::copy(&mut std::fs::File::open(&src)?, f).map(drop))
+    }
+}
+
+/// Files fetched and never moved to an output.
+impl Drop for Fetched {
+    fn drop(&mut self) {
+        for (path, staged) in self.files.values() {
+            if *staged {
+                let _ = std::fs::remove_file(path);
             }
-            None => data.extend_from_slice(&disk.read_chunk(c).with_context(|| format!("chunk {} was evicted", rbe_client::digest_str(c)))?),
         }
     }
-    // REAPI asks clients to check the assembled blob.
-    if rbe_client::digest_of(&data) != *d {
-        bail!("the chunks don't make up the blob");
+}
+
+/// Fetches a large blob from the remote into a file next to `dest`, and
+/// stores it in the disk cache. As the chunks the remote splits it into
+/// when it does, those the disk cache lacks, then assembled from the disk
+/// cache; else as it arrives. Returns the file.
+async fn fetch_into_file(client: &Client, disk: Option<&DiskCache>, d: &re::Digest, dest: &Path, verbose: bool) -> Result<PathBuf> {
+    let path = blocking(|| temp_next_to(dest))?;
+    // Removed if the fetch fails or is stopped (a race lost).
+    let temp = TempFile(Some(path.clone()));
+    let fetched: Result<()> = async {
+        if let Some(disk) = disk
+            && client.chunking().split
+        {
+            match fetch_chunks(client, disk, d).await {
+                Ok(true) => {
+                    let assembled = blocking(|| std::fs::File::create(&path).is_ok_and(|mut f| disk.read_blob_into(d, &mut f)));
+                    if assembled {
+                        return Ok(());
+                    }
+                }
+                // Not split by the server: fetched whole.
+                Ok(false) => {}
+                Err(e) => {
+                    if verbose {
+                        eprintln!("ninja-rs: fetching {} as chunks: {e:#}", rbe_client::digest_str(d));
+                    }
+                }
+            }
+        }
+        client.read_blob_to_file(d, &path).await?;
+        if let Some(disk) = disk {
+            blocking(|| disk.put_file(&path, None))?;
+        }
+        Ok(())
     }
-    disk.put_chunked(d, split)?;
-    Ok(data)
+    .await;
+    fetched.map(|()| temp.keep())
+}
+
+/// A file removed when dropped, unless kept.
+struct TempFile(Option<PathBuf>);
+
+impl TempFile {
+    fn keep(mut self) -> PathBuf {
+        self.0.take().expect("kept once")
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// Stores a large blob in the disk cache as the chunks the remote splits it
+/// into, downloading those the disk cache lacks a group at a time. False
+/// when the remote can't split it.
+async fn fetch_chunks(client: &Client, disk: &DiskCache, d: &re::Digest) -> Result<bool> {
+    let Some(split) = client.split_blob(d).await? else { return Ok(false) };
+    let mut groups: Vec<Vec<re::Digest>> = vec![Vec::new()];
+    let mut bytes = 0;
+    for c in split.chunk_digests.iter().filter(|c| !disk.contains_chunk(c)) {
+        if bytes + c.size_bytes > CHUNK_GROUP && !groups.last().unwrap().is_empty() {
+            groups.push(Vec::new());
+            bytes = 0;
+        }
+        bytes += c.size_bytes;
+        groups.last_mut().unwrap().push(c.clone());
+    }
+    for group in groups.iter().filter(|g| !g.is_empty()) {
+        // Each read is checked to be its digest.
+        let read = client.read_blobs(group).await?;
+        blocking(|| -> Result<()> {
+            for c in group {
+                disk.put_chunk_bytes(c, read.get(&c.hash).with_context(|| format!("chunk {} wasn't read", rbe_client::digest_str(c)))?)?;
+            }
+            Ok(())
+        })?;
+    }
+    // The assembled blob is checked when it's read.
+    blocking(|| disk.put_chunked(d, split))?;
+    Ok(true)
 }
 
 fn prepared_blobs(p: &Prepared) -> rbe_client::BlobSet {
@@ -1575,22 +1811,53 @@ fn same_content(local: &std::path::Path, d: &re::Digest, store: &Store) -> bool 
     }
 }
 
+/// Writes an output atomically, through a temporary file of its own:
+/// tasks writing the same output at once (two downloading it, a rewound
+/// producer and a consumer) each rename a whole file into place, and none
+/// removes another's.
 fn write_output(path: &std::path::Path, data: &[u8], executable: bool) -> Result<()> {
+    use std::io::Write as _;
+    write_output_with(path, executable, |f| f.write_all(data))
+}
+
+/// A file next to `path` (its directory created) no other writer uses.
+fn temp_next_to(path: &Path) -> std::io::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("{}.ninja-rs-tmp", path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()));
-    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    Ok(path.with_extension(format!("{ext}.ninja-rs-tmp-{}", crate::disk_cache::unique_name())))
+}
+
+/// Moves a fetched file into place as an output.
+fn move_output(src: &Path, path: &Path, executable: bool) -> std::io::Result<()> {
     #[cfg(unix)]
     if executable {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(src, std::fs::Permissions::from_mode(0o755))?;
     }
     #[cfg(not(unix))]
     let _ = executable;
-    if std::fs::rename(&tmp, path).is_err() {
-        let _ = std::fs::remove_file(path);
-        std::fs::rename(&tmp, path).with_context(|| format!("renaming to {}", path.display()))?;
+    std::fs::rename(src, path)
+}
+
+/// `write_output`, with the contents `fill` writes.
+fn write_output_with(path: &std::path::Path, executable: bool, fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> Result<()> {
+    let tmp = temp_next_to(path)?;
+    let written = std::fs::File::options().write(true).create_new(true).open(&tmp).and_then(|mut f| fill(&mut f));
+    #[cfg(unix)]
+    let written = written.and_then(|()| {
+        use std::os::unix::fs::PermissionsExt;
+        if executable { std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) } else { Ok(()) }
+    });
+    #[cfg(not(unix))]
+    let _ = executable;
+    // Windows doesn't replace a file opened without FILE_SHARE_DELETE:
+    // removing it first may still work.
+    let placed = written.and_then(|()| std::fs::rename(&tmp, path).or_else(|_| std::fs::remove_file(path).and_then(|()| std::fs::rename(&tmp, path))));
+    if let Err(e) = placed {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e).context(format!("writing {}", path.display())));
     }
     Ok(())
 }
@@ -1625,6 +1892,25 @@ mod tests {
         assert_eq!(fallback_limit(5, FALLBACK_RATIO_MIN_ACTIONS - 1, None, Some(0.1)), None);
         assert_eq!(fallback_limit(2, 20, None, Some(0.1)), None);
         assert!(fallback_limit(3, 20, None, Some(0.1)).unwrap().contains("3 of 20"));
+    }
+
+    /// Tasks writing one output at once (a failed claim's waiters, a
+    /// rewound producer): the file ends whole, and no write fails.
+    #[test]
+    fn concurrent_output_writes() {
+        let dir = std::env::temp_dir().join(format!("ninja-rs-outputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("obj").join("a.o");
+        for _ in 0..50 {
+            std::thread::scope(|s| {
+                for _ in 0..3 {
+                    s.spawn(|| write_output(&out, b"object", false).unwrap());
+                }
+            });
+            assert_eq!(std::fs::read(&out).unwrap(), b"object");
+        }
+        assert_eq!(std::fs::read_dir(dir.join("obj")).unwrap().count(), 1, "temporary files left");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn task(bindings: &[(&str, &str)]) -> Task {

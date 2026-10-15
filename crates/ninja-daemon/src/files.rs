@@ -4,21 +4,34 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use cpp_deps::scan::Watch;
-use rbe_client::DigestCache;
 use rbe_client::proto as re;
-use rbe_client::tree::{FileStamp, MemDigestCache};
+use rbe_client::tree::FileStamp;
 
 use crate::proto::{FileInfo, TreeInfo};
-use crate::watch::{Change, Listener, Watcher, key};
+use crate::watch::{BuildDirs, COOKIE_PREFIX, Change, Listener, Watcher, key, strip_verbatim};
 
 /// The session of entries the watcher vouches for.
 const WATCHED: u64 = u64::MAX;
 
+/// What a digest is valid for: the file's `FileStamp` and, on Windows, its
+/// change time and file ID. (There the stamp has the creation time, which
+/// NTFS gives back to a file created again under its name within 15 s, and
+/// nothing a rewrite in place with the modification time restored
+/// changes.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    file: FileStamp,
+    /// Windows: change time, volume serial number and file ID.
+    id: (u64, u64, u128),
+}
+
 struct FileEntry {
     info: FileInfo,
+    stamp: Stamp,
     session: AtomicU64,
 }
 
@@ -27,17 +40,28 @@ struct TreeEntry {
     session: AtomicU64,
 }
 
+/// A digest kept for a file.
+enum Kept {
+    /// Hashed here, for that version of the file.
+    Hashed(Stamp, re::Digest),
+    /// Saved by a build (`seed`): for its `FileStamp`.
+    Saved(FileStamp, re::Digest),
+    /// The watcher saw the file change since: hashed again, whatever its
+    /// stamp.
+    Changed,
+}
+
 pub struct Files {
     watcher: Arc<Watcher>,
     case_insensitive: bool,
     session: AtomicU64,
-    /// Build directories (keys): always checked.
-    volatile: RwLock<Vec<PathBuf>>,
+    /// Build directories: always checked.
+    volatile: BuildDirs,
     files: RwLock<HashMap<PathBuf, Arc<FileEntry>>>,
     trees: RwLock<HashMap<PathBuf, Arc<TreeEntry>>>,
-    /// Digests by real path, size and modification time: links to a file
-    /// (LLVM's tools) are hashed once, and digests saved by builds reused.
-    hashes: MemDigestCache,
+    /// Digests by real path (keys): links to a file (LLVM's tools) are
+    /// hashed once, and digests saved by builds reused.
+    hashes: Mutex<HashMap<PathBuf, Kept>>,
 }
 
 #[cfg(unix)]
@@ -51,16 +75,67 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
     false
 }
 
+/// A file's metadata (symlinks followed) and stamp.
+#[cfg(not(windows))]
+fn stat(p: &Path) -> std::io::Result<(std::fs::Metadata, Stamp)> {
+    let meta = std::fs::metadata(p)?;
+    let file = FileStamp::of(&meta);
+    Ok((meta, Stamp { file, id: (0, 0, 0) }))
+}
+
+/// A file's metadata (symlinks followed) and stamp.
+#[cfg(windows)]
+fn stat(p: &Path) -> std::io::Result<(std::fs::Metadata, Stamp)> {
+    use std::ffi::c_void;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_BASIC_INFO: i32 = 0;
+    const FILE_ID_INFO: i32 = 0x12;
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicInfo {
+        creation: i64,
+        access: i64,
+        write: i64,
+        change: i64,
+        attributes: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct IdInfo {
+        volume: u64,
+        id: [u8; 16],
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(file: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
+    }
+    // Attributes only: no sharing conflict with writers.
+    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(p)?;
+    let meta = f.metadata()?;
+    let (mut basic, mut id) = (BasicInfo::default(), IdInfo::default());
+    // SAFETY: an open handle, and buffers writable for their sizes. A file
+    // system without them (FAT has no change time) leaves zeros.
+    unsafe {
+        GetFileInformationByHandleEx(f.as_raw_handle(), FILE_BASIC_INFO, (&raw mut basic).cast(), size_of::<BasicInfo>() as u32);
+        GetFileInformationByHandleEx(f.as_raw_handle(), FILE_ID_INFO, (&raw mut id).cast(), size_of::<IdInfo>() as u32);
+    }
+    let file = FileStamp::of(&meta);
+    Ok((meta, Stamp { file, id: (basic.change as u64, id.volume, u128::from_le_bytes(id.id)) }))
+}
+
 impl Files {
     pub fn new(watcher: Arc<Watcher>, case_insensitive: bool) -> Files {
         Files {
             watcher,
             case_insensitive,
             session: AtomicU64::new(1),
-            volatile: RwLock::default(),
+            volatile: BuildDirs::default(),
             files: RwLock::default(),
             trees: RwLock::default(),
-            hashes: MemDigestCache::default(),
+            hashes: Mutex::default(),
         }
     }
 
@@ -69,11 +144,12 @@ impl Files {
     }
 
     pub fn add_volatile(&self, dir: &Path) {
-        let k = key(dir, self.case_insensitive);
-        let mut v = self.volatile.write().unwrap();
-        if !v.contains(&k) {
-            v.push(k);
-        }
+        self.volatile.insert(key(dir, self.case_insensitive), dir);
+    }
+
+    /// Forgets the build directories no build named since `before`.
+    pub fn expire(&self, before: Instant) {
+        self.volatile.expire(before);
     }
 
     /// The number of file digests and trees kept.
@@ -86,10 +162,12 @@ impl Files {
     }
 
     /// Digests a build saved: used for files whose `FileStamp` still
-    /// matches.
+    /// matches, unless the daemon knows better (it hashed the file, or saw
+    /// it change).
     pub fn seed(&self, entries: impl IntoIterator<Item = (PathBuf, FileStamp, String)>) {
+        let mut hashes = self.hashes.lock().unwrap();
         for (p, stamp, hash) in entries {
-            self.hashes.put(&p, stamp, re::Digest { hash, size_bytes: stamp.len as i64 });
+            hashes.entry(key(&p, self.case_insensitive)).or_insert(Kept::Saved(stamp, re::Digest { hash, size_bytes: stamp.len as i64 }));
         }
     }
 
@@ -106,7 +184,7 @@ impl Files {
     }
 
     fn is_volatile(&self, k: &Path) -> bool {
-        self.volatile.read().unwrap().iter().any(|v| k.starts_with(v))
+        self.volatile.contains(k)
     }
 
     fn token(&self, k: &Path, p: &Path) -> Option<u64> {
@@ -126,29 +204,46 @@ impl Files {
             return Ok(e.info.clone());
         }
         let token = self.token(&k, p);
-        let meta = std::fs::metadata(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
+        let (meta, stamp) = stat(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
         if !meta.is_file() {
             return Err(format!("{} is not a file", p.display()));
         }
-        let stamp = FileStamp::of(&meta);
         if let Some(e) = known
-            && e.info.stamp() == stamp
+            && e.stamp == stamp
         {
             e.session.store(self.checked(token), Ordering::Relaxed);
             return Ok(e.info.clone());
         }
-        let d = rbe_client::tree::file_digest(p, Some(&self.hashes)).map_err(|e| format!("{e:#}"))?;
+        let d = self.digest(p, stamp)?;
         let info = FileInfo {
             hash: d.hash,
             size: d.size_bytes as u64,
             executable: is_executable(&meta),
-            mtime_ns: stamp.mtime_ns,
-            change: stamp.change,
-            inode: stamp.inode,
+            mtime_ns: stamp.file.mtime_ns,
+            change: stamp.file.change,
+            inode: stamp.file.inode,
         };
-        let entry = FileEntry { info: info.clone(), session: AtomicU64::new(self.checked(token)) };
-        self.files.write().unwrap().insert(k, Arc::new(entry));
+        // The token compared under the lock: an event counted after it
+        // drops the entry after it's in.
+        let mut files = self.files.write().unwrap();
+        files.insert(k, Arc::new(FileEntry { info: info.clone(), stamp, session: AtomicU64::new(self.checked(token)) }));
         Ok(info)
+    }
+
+    /// `p`'s digest: the one kept for its version, or hashed.
+    fn digest(&self, p: &Path, stamp: Stamp) -> Result<re::Digest, String> {
+        // Links to a file share its entry.
+        let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+        let real = if is_link { std::fs::canonicalize(p).map(strip_verbatim).unwrap_or_else(|_| p.to_path_buf()) } else { p.to_path_buf() };
+        let k = key(&real, self.case_insensitive);
+        match self.hashes.lock().unwrap().get(&k) {
+            Some(Kept::Hashed(s, d)) if *s == stamp => return Ok(d.clone()),
+            Some(Kept::Saved(s, d)) if *s == stamp.file => return Ok(d.clone()),
+            _ => {}
+        }
+        let d = rbe_client::tree::hash_file(p).map_err(|e| format!("{e:#}"))?;
+        self.hashes.lock().unwrap().insert(k, Kept::Hashed(stamp, d.clone()));
+        Ok(d)
     }
 
     /// The files under `dir` (symlinks followed) with their digests, as
@@ -168,9 +263,10 @@ impl Files {
         let real = std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         self.walk(dir, "", &real, &mut info, &mut outside)?;
         let info = Arc::new(info);
+        let mut trees = self.trees.write().unwrap();
         // Changes outside aren't seen.
         let session = if outside { self.session.load(Ordering::Relaxed) } else { self.checked(token) };
-        self.trees.write().unwrap().insert(k, Arc::new(TreeEntry { info: info.clone(), session: AtomicU64::new(session) }));
+        trees.insert(k, Arc::new(TreeEntry { info: info.clone(), session: AtomicU64::new(session) }));
         Ok(info)
     }
 
@@ -183,6 +279,11 @@ impl Files {
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
+            // The watcher's, there for a moment (on Windows, a toolchain
+            // root's go at its top).
+            if name.starts_with(COOKIE_PREFIX) {
+                continue;
+            }
             let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
             let path = e.path();
             if e.file_type().is_ok_and(|t| t.is_symlink()) {
@@ -206,6 +307,12 @@ impl Listener for Files {
         match change {
             Change::Content => {
                 self.files.write().unwrap().remove(&k);
+                // Its stamp may not tell: a build saved only a `FileStamp`
+                // (on Windows, the same after a rewrite in place with the
+                // modification time restored).
+                if let Some(kept) = self.hashes.lock().unwrap().get_mut(&k) {
+                    *kept = Kept::Changed;
+                }
             }
             Change::Names => {}
             Change::Tree => {
@@ -243,6 +350,7 @@ pub fn read_digests(file: &Path) -> Vec<(PathBuf, FileStamp, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn digests_and_trees() {
@@ -271,6 +379,109 @@ mod tests {
         let m = std::fs::metadata(&b).unwrap();
         files.seed([(b.clone(), FileStamp::of(&m), "made-up".to_string())]);
         assert_eq!(files.get(&b).unwrap().hash, "made-up");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file a watcher saw change is hashed again, whatever its stamp:
+    /// neither the digest kept nor one a build saved is used for it.
+    #[test]
+    fn events_drop_digests() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_events_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = dir.join("b.txt");
+        std::fs::write(&b, "bbb").unwrap();
+        let stamp = FileStamp::of(&std::fs::metadata(&b).unwrap());
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        let files = Files::new(w.clone(), cfg!(windows));
+        files.seed([(b.clone(), stamp, "made-up".to_string())]);
+        assert_eq!(files.get(&b).unwrap().hash, "made-up");
+        files.changed(&b, Change::Content);
+        // Another build's saved digests, read meanwhile.
+        files.seed([(b.clone(), stamp, "made-up".to_string())]);
+        files.new_session();
+        assert_eq!(files.get(&b).unwrap().hash, "3e744b9dc39389baf0c5a0660589b8402f3dbb49b89b3e75f2c9355852a3c677");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows: a file rewritten in place with its modification time
+    /// restored, or created again under its name (NTFS gives it its old
+    /// creation time back), where no watch sees it: hashed again.
+    #[cfg(windows)]
+    #[test]
+    fn windows_stamps() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_stamps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("f.h");
+        std::fs::write(&f, "version 1").unwrap();
+        let mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+        let w = Watcher::new(true, Box::new(|_| {}));
+        let files = Files::new(w.clone(), true);
+        for (i, recreate) in [false, true].into_iter().enumerate() {
+            files.new_session();
+            let before = files.get(&f).unwrap();
+            if recreate {
+                std::fs::remove_file(&f).unwrap();
+            }
+            std::fs::write(&f, format!("version {}", i + 2)).unwrap();
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(mtime).unwrap();
+            let after = FileStamp::of(&std::fs::metadata(&f).unwrap());
+            assert_eq!(after, before.stamp(), "the same `FileStamp`");
+            files.new_session();
+            assert_ne!(files.get(&f).unwrap().hash, before.hash, "recreated: {recreate}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The watcher's cookies (on Windows, at the top of a toolchain root
+    /// for a moment) aren't part of trees.
+    #[test]
+    fn trees_skip_cookies() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tc")).unwrap();
+        std::fs::write(dir.join("tc/cc"), "cc").unwrap();
+        std::fs::write(dir.join("tc/.ninja-rs-cookie-1-2"), "").unwrap();
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        let files = Files::new(w.clone(), cfg!(windows));
+        let t = files.tree(&dir.join("tc")).unwrap();
+        assert_eq!(t.files.iter().map(|(f, _)| f.as_str()).collect::<Vec<_>>(), vec!["cc"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lookups don't slow down with the build directories seen (CMake's
+    /// `try_compile` names hundreds a day); those no build named for a
+    /// while are forgotten.
+    #[test]
+    fn many_build_dirs() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_many_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let f = dir.join("src/x.h");
+        std::fs::write(&f, "x").unwrap();
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        let files = Files::new(w.clone(), cfg!(windows));
+        let scratch = |i: usize| dir.join(format!("build/CMakeFiles/CMakeScratch/TryCompile-{i:06x}"));
+        for i in 0..10_000 {
+            w.ignore(&scratch(i));
+            files.add_volatile(&scratch(i));
+        }
+        files.get(&f).unwrap();
+        let t = Instant::now();
+        for _ in 0..5_000 {
+            files.get(&f).unwrap();
+            w.token(&f);
+        }
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+        let k = |p: &Path| key(p, cfg!(windows));
+        assert!(files.is_volatile(&k(&scratch(42).join("a.o"))));
+        std::thread::sleep(Duration::from_millis(10));
+        let before = Instant::now();
+        files.add_volatile(&scratch(7));
+        files.expire(before);
+        assert!(files.is_volatile(&k(&scratch(7).join("a.o"))));
+        assert!(!files.is_volatile(&k(&scratch(42).join("a.o"))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

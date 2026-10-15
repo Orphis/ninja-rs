@@ -1,5 +1,6 @@
 //! End-to-end tests of the command line, running the ninja-rs binary: tools,
-//! `--status` and the jobserver. Expected outputs are ninja 1.14's.
+//! `--status`, the jobserver and interruption. Expected outputs are ninja
+//! 1.14's. Arguments select the tests whose names contain them.
 //!
 //! Commands are this test binary itself: under the name `fake-job` it
 //! records how many jobs run at once and the `MAKEFLAGS` it got.
@@ -54,6 +55,33 @@ fn check(cond: bool, msg: &str) -> Result<(), String> {
 
 fn check_eq(got: &str, want: &str, what: &str) -> Result<(), String> {
     check(got == want, &format!("{what}: got\n{got}\nwant\n{want}"))
+}
+
+/// Build events report an up-to-date artifact with the digest kept from
+/// earlier builds (`.ninja_rs_digests`), remote or not: a build with
+/// nothing to do doesn't hash it again.
+fn test_build_event_digests() -> Result<(), String> {
+    let dir = test_dir("build_event_digests");
+    let manifest = "rule gen\n  command = gen\n  generator = 1\nbuild app.bin: gen\n  rbe_target = app\n  rbe_artifact = 1\n";
+    std::fs::write(dir.join("build.ninja"), manifest).unwrap();
+    let artifact = dir.join("app.bin");
+    std::fs::write(&artifact, "hello").unwrap();
+    // Modified a while ago: a recent file's digest isn't kept.
+    let old = std::time::SystemTime::now() - Duration::from_secs(60);
+    std::fs::File::options().write(true).open(&artifact).unwrap().set_modified(old).unwrap();
+    let hello = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    let reported = |digest: &str| std::fs::read(dir.join("events.bep")).is_ok_and(|e| e.windows(digest.len()).any(|w| w == digest.as_bytes()));
+    let r = ninja(&dir, &["--build_event_binary_file=events.bep"], &[]);
+    check(r.code == 0, &format!("the build failed: {}", r.stderr))?;
+    check(reported(hello), "app.bin's digest isn't reported")?;
+    let kept = std::fs::read_to_string(dir.join(".ninja_rs_digests")).map_err(|e| format!(".ninja_rs_digests: {e}"))?;
+    check(kept.contains(hello), &format!("app.bin's digest isn't kept: {kept}"))?;
+    // A digest only the kept one gives.
+    let other = "f".repeat(64);
+    std::fs::write(dir.join(".ninja_rs_digests"), kept.replace(hello, &other)).unwrap();
+    let r = ninja(&dir, &["--build_event_binary_file=events.bep"], &[]);
+    check(r.code == 0, &format!("the second build failed: {}", r.stderr))?;
+    check(reported(&other), "app.bin was hashed again")
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +452,89 @@ fn test_jobserver_pipe() -> Result<(), String> {
     check(client.try_acquire().is_some(), "the token didn't come back")
 }
 
+/// Starts a build of two commands whose grandchildren write a marker and
+/// the output after 2 s, and interrupts it after 1 s with `interrupt`: it
+/// must stop at once like ninja, end its build events, and leave nothing
+/// behind (its secret flags file included) or written later. Skipped when
+/// `interrupt` can't interrupt.
+fn interrupted_build(name: &str, interrupt: impl FnOnce(&std::process::Child) -> Result<(), String>) -> Result<(), String> {
+    use std::process::Stdio;
+    let dir = test_dir(name);
+    let command = if cfg!(windows) {
+        "cmd /c cmd /c \"ping -n 3 127.0.0.1 >nul & echo late> $out.marker & echo done> $out\""
+    } else {
+        "sh -c 'sh -c \"sleep 2; echo late > $out.marker; echo done > $out\"; true'"
+    };
+    std::fs::write(dir.join("build.ninja"), format!("rule slow\n  command = {command}\nbuild a: slow\nbuild b: slow\n")).unwrap();
+    // Where the secret flags file for nested builds goes.
+    let private = dir.join("private");
+    std::fs::create_dir(&private).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&private, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let mut c = Command::new(ninja_exe());
+    c.current_dir(&dir).args(["-j2", "--remote_header=x=y", "--build_event_binary_file=events.bin"]);
+    c.env_remove("MAKEFLAGS").env_remove("NINJA_STATUS").env_remove(ninja_rs::nested::ENV).env("NINJA_RS_DAEMON_DIR", &private);
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut c, 0x200); // CREATE_NEW_PROCESS_GROUP
+    let start = std::time::Instant::now();
+    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_secs(1));
+    let flags_written = std::fs::read_dir(&private).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("flags-"));
+    if let Err(e) = interrupt(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        println!("{name} not tested: {e}");
+        return Ok(());
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let exited = start.elapsed();
+    std::thread::sleep(Duration::from_secs(4).saturating_sub(start.elapsed()));
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).replace("\r\n", "\n");
+    check(out.status.code() == Some(130), &format!("{name}: {}\n{text}", out.status))?;
+    check(text.contains("ninja: build stopped: interrupted by user.\n"), &format!("{name}:\n{text}"))?;
+    check(exited < Duration::from_secs(2), &format!("{name}: exited after {exited:?}"))?;
+    check(flags_written, &format!("{name}: no secret flags file while building"))?;
+    let events = std::fs::read(dir.join("events.bin")).unwrap_or_default();
+    check(events.windows(b"INTERRUPTED".len()).any(|w| w == b"INTERRUPTED"), &format!("{name}: no interrupted build in the build events"))?;
+    let mut left: Vec<String> = ["a", "b", "a.marker", "b.marker", ".ninja_lock"].into_iter().filter(|f| dir.join(f).exists()).map(String::from).collect();
+    left.extend(std::fs::read_dir(&private).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()));
+    check(left.is_empty(), &format!("{name}: left behind or written after the build: {left:?}"))
+}
+
+/// SIGTERM and SIGHUP interrupt a build as SIGINT does, as in ninja: every
+/// process the commands started gets the signal and is waited for before
+/// the outputs are deleted, and ninja-rs exits with 130.
+#[cfg(unix)]
+fn test_interrupt_signals() -> Result<(), String> {
+    for (name, signal) in [("sigterm", libc::SIGTERM), ("sighup", libc::SIGHUP), ("sigint", libc::SIGINT)] {
+        interrupted_build(name, |child| {
+            // SAFETY: plain system call.
+            unsafe { libc::kill(child.id() as i32, signal) };
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Ctrl-Break interrupts a build as Ctrl-C does, as in ninja; the commands'
+/// jobs are terminated and waited for.
+#[cfg(windows)]
+fn test_interrupt_ctrl_break() -> Result<(), String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+    interrupted_build("ctrl-break", |child| {
+        // SAFETY: plain system call; ninja-rs runs in a process group of
+        // its own. It fails without a console.
+        match unsafe { GenerateConsoleCtrlEvent(1, child.id()) } {
+            0 => Err(format!("Ctrl-Break: {}", std::io::Error::last_os_error())),
+            _ => Ok(()),
+        }
+    })
+}
+
 fn main() -> ExitCode {
     let exe = std::env::current_exe().unwrap();
     let stem = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -449,11 +560,18 @@ fn main() -> ExitCode {
         ("jobserver_pool_from_manifest", test_jobserver_pool_from_manifest),
         ("jobserver_client", test_jobserver_client),
         ("ninjars", test_ninjars),
+        ("build_event_digests", test_build_event_digests),
     ];
     #[cfg(unix)]
     tests.push(("jobserver_pipe", test_jobserver_pipe));
+    #[cfg(unix)]
+    tests.push(("interrupt_signals", test_interrupt_signals));
     #[cfg(windows)]
     tests.push(("msvc_deps_relative", test_msvc_deps_relative));
+    #[cfg(windows)]
+    tests.push(("interrupt_ctrl_break", test_interrupt_ctrl_break));
+    let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+    tests.retain(|(name, _)| filter.is_empty() || filter.iter().any(|f| name.contains(f.as_str())));
     let count = tests.len();
     let mut failed = 0;
     for (name, t) in tests {

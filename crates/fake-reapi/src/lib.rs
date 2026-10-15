@@ -65,6 +65,8 @@ pub struct Stats {
     pub wait_executions: u64,
     /// Most reads (batches and ByteStream) served at once.
     pub max_concurrent_reads: u64,
+    /// Most ByteStream writes received at once.
+    pub max_concurrent_writes: u64,
 }
 
 #[derive(Default)]
@@ -101,6 +103,7 @@ pub struct State {
     write_delay_ms: AtomicU64,
     read_delay_ms: AtomicU64,
     reads_in_flight: AtomicU64,
+    writes_in_flight: AtomicU64,
     /// Calls to fail with UNAVAILABLE, by method (see `fail_next`).
     failures: Mutex<HashMap<&'static str, u32>>,
     /// Executions whose stream breaks once the operation is named (see
@@ -264,6 +267,24 @@ impl State {
 }
 
 struct Reading(Arc<State>);
+
+/// A ByteStream write being received, until it's dropped.
+struct Writing<'a>(&'a State);
+
+impl<'a> Writing<'a> {
+    fn new(state: &'a State) -> Self {
+        let now = state.writes_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut stats = state.stats.lock().unwrap();
+        stats.max_concurrent_writes = stats.max_concurrent_writes.max(now);
+        Self(state)
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.0.writes_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 impl Drop for Reading {
     fn drop(&mut self) {
@@ -495,6 +516,7 @@ impl bs::byte_stream_server::ByteStream for Svc {
 
     async fn write(&self, r: Request<Streaming<bs::WriteRequest>>) -> Result<Response<bs::WriteResponse>, Status> {
         self.0.injected("Write")?;
+        let _writing = Writing::new(&self.0);
         let delay = self.0.write_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;

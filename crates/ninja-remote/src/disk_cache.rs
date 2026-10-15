@@ -68,11 +68,32 @@ pub struct DiskCache {
     root: PathBuf,
     /// Bytes written by this process (eviction only runs after writes).
     written: AtomicU64,
-    counter: AtomicU64,
 }
 
-fn shard(dir: &Path, hash: &str) -> PathBuf {
-    dir.join(&hash[..2.min(hash.len())]).join(hash)
+/// A file name no other writer uses: the PID, a counter and a random part.
+/// The PID alone isn't enough: containers sharing a cache volume have the
+/// same ones.
+pub(crate) fn unique_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+    format!("{}-{}-{:016x}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), h.finish())
+}
+
+/// How old a file in `tmp/` must be for garbage collection to remove it:
+/// one left by a writer that died.
+const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Where a blob or result is stored: none for a malformed hash, which
+/// would name a file elsewhere (`../`, an absolute path), from a result a
+/// server or another cache writer made.
+fn shard(dir: &Path, hash: &str) -> Option<PathBuf> {
+    rbe_client::valid_hash(hash).then(|| dir.join(&hash[..2]).join(hash))
+}
+
+fn malformed(hash: &str) -> std::io::Error {
+    std::io::Error::other(format!("malformed digest {hash:?}"))
 }
 
 /// Marks a file as recently used.
@@ -99,7 +120,7 @@ impl DiskCache {
         for d in ["cas", "chunked", "ac", "tmp", "gc"] {
             std::fs::create_dir_all(root.join(d))?;
         }
-        Ok(Self { root: root.to_path_buf(), written: AtomicU64::new(0), counter: AtomicU64::new(0) })
+        Ok(Self { root: root.to_path_buf(), written: AtomicU64::new(0) })
     }
 
     pub fn root(&self) -> &Path {
@@ -111,25 +132,26 @@ impl DiskCache {
         self.root.join("cpp-deps")
     }
 
-    fn blob_path(&self, hash: &str) -> PathBuf {
+    fn blob_path(&self, hash: &str) -> Option<PathBuf> {
         shard(&self.root.join("cas"), hash)
     }
 
-    fn layout_path(&self, hash: &str) -> PathBuf {
+    fn layout_path(&self, hash: &str) -> Option<PathBuf> {
         shard(&self.root.join("chunked"), hash)
     }
 
-    fn ac_path(&self, hash: &str) -> PathBuf {
+    fn ac_path(&self, hash: &str) -> Option<PathBuf> {
         shard(&self.root.join("ac"), hash)
     }
 
-    /// Writes `data` to `dest` atomically (through a file in `tmp/`).
+    /// Writes `data` to `dest` atomically, through a file in `tmp/` no
+    /// other writer opens (`create_new`: never another's, truncated).
     fn write_atomic(&self, dest: &Path, data: &[u8]) -> std::io::Result<()> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.root.join("tmp").join(format!("{}-{n}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(data)?;
+        let tmp = self.root.join("tmp").join(unique_name());
+        let written = std::fs::File::options().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(data));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -155,7 +177,7 @@ impl DiskCache {
 
     /// Whether `cas/` holds the blob as a single file (marking it used).
     fn contains_whole(&self, d: &re::Digest) -> bool {
-        let p = self.blob_path(&d.hash);
+        let Some(p) = self.blob_path(&d.hash) else { return false };
         match std::fs::metadata(&p) {
             Ok(m) if m.len() as i64 == d.size_bytes => {
                 touch(&p);
@@ -171,7 +193,7 @@ impl DiskCache {
         if !is_chunked(d) {
             return None;
         }
-        let p = self.layout_path(&d.hash);
+        let p = self.layout_path(&d.hash)?;
         let layout = re::SplitBlobResponse::decode(std::fs::read(&p).ok()?.as_slice()).ok()?;
         if layout.chunk_digests.iter().map(|c| c.size_bytes).sum::<i64>() != d.size_bytes {
             return None;
@@ -198,11 +220,34 @@ impl DiskCache {
         Some(data)
     }
 
+    /// Writes the blob's contents to `out` a chunk at a time: a large blob
+    /// is never whole in memory. False when the CAS doesn't hold it, or it
+    /// isn't its digest: what was written is then to be discarded.
+    pub fn read_blob_into(&self, d: &re::Digest, out: &mut dyn Write) -> bool {
+        if d.size_bytes == 0 {
+            return true;
+        }
+        if let Some(data) = self.read_whole(d) {
+            return out.write_all(&data).is_ok();
+        }
+        let Some(chunks) = self.layout(d) else { return false };
+        let mut hasher = Sha256::new();
+        for c in &chunks {
+            let Some(data) = self.read_whole(c) else { return false };
+            hasher.update(&data);
+            if out.write_all(&data).is_err() {
+                return false;
+            }
+        }
+        // The layout names the chunks; the whole must still be the blob.
+        hex::encode(hasher.finalize()) == d.hash
+    }
+
     /// A blob stored whole. One whose contents aren't its digest (a torn
     /// write after a crash, a disk error, a cache shared with another
     /// writer) is removed: a miss, not an output.
     fn read_whole(&self, d: &re::Digest) -> Option<Vec<u8>> {
-        let p = self.blob_path(&d.hash);
+        let p = self.blob_path(&d.hash)?;
         let data = std::fs::read(&p).ok()?;
         // Another size is another digest (the file is keyed by hash).
         if data.len() as i64 != d.size_bytes {
@@ -222,7 +267,7 @@ impl DiskCache {
             return Ok(());
         }
         if !is_chunked(d) {
-            return self.write_atomic(&self.blob_path(&d.hash), data);
+            return self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, data);
         }
         let mut chunks = Vec::new();
         for chunk in CHUNKER.chunks(data) {
@@ -241,7 +286,7 @@ impl DiskCache {
         if !is_chunked(&d) {
             let data = std::fs::read(path)?;
             anyhow::ensure!(data.len() as i64 == d.size_bytes, "{} changed while being stored", path.display());
-            self.write_atomic(&self.blob_path(&d.hash), &data)?;
+            self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, &data)?;
             return Ok(d);
         }
         let file = std::fs::File::open(path)?;
@@ -262,14 +307,17 @@ impl DiskCache {
     fn put_chunk(&self, chunk: &[u8]) -> std::io::Result<re::Digest> {
         let d = rbe_client::digest_of(chunk);
         if !self.contains_whole(&d) {
-            self.write_atomic(&self.blob_path(&d.hash), chunk)?;
+            self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, chunk)?;
         }
         Ok(d)
     }
 
     /// Records a blob's layout. Its chunks must be stored first.
     fn put_layout(&self, d: &re::Digest, layout: re::SplitBlobResponse) -> std::io::Result<()> {
-        self.write_atomic(&self.layout_path(&d.hash), &layout.encode_to_vec())
+        if let Some(c) = layout.chunk_digests.iter().find(|c| !rbe_client::valid_hash(&c.hash)) {
+            return Err(malformed(&c.hash));
+        }
+        self.write_atomic(&self.layout_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, &layout.encode_to_vec())
     }
 
     // Chunks of a blob split elsewhere (by a remote cache), for downloads
@@ -280,17 +328,12 @@ impl DiskCache {
         d.size_bytes == 0 || self.contains_whole(d)
     }
 
-    /// A chunk's contents.
-    pub fn read_chunk(&self, d: &re::Digest) -> Option<Vec<u8>> {
-        if d.size_bytes == 0 { Some(Vec::new()) } else { self.read_whole(d) }
-    }
-
     /// Stores a chunk, whatever its size. Its digest must have been checked.
     pub fn put_chunk_bytes(&self, d: &re::Digest, data: &[u8]) -> std::io::Result<()> {
         if self.contains_chunk(d) {
             return Ok(());
         }
-        self.write_atomic(&self.blob_path(&d.hash), data)
+        self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, data)
     }
 
     /// Records how a large blob (see [`is_chunked`]) was split. Its chunks
@@ -309,7 +352,7 @@ impl DiskCache {
     /// An action's result, and the blobs it references that the cache
     /// doesn't hold: outputs left in a remote CAS (minimal downloads).
     pub fn get_action_result_and_absent(&self, action: &re::Digest) -> Option<(re::ActionResult, Vec<re::Digest>)> {
-        let p = self.ac_path(&action.hash);
+        let p = self.ac_path(&action.hash)?;
         let data = std::fs::read(&p).ok()?;
         let result = re::ActionResult::decode(data.as_slice()).ok()?;
         let blobs = result.output_files.iter().filter_map(|f| f.digest.as_ref()).chain(result.stdout_digest.as_ref()).chain(result.stderr_digest.as_ref());
@@ -323,12 +366,14 @@ impl DiskCache {
 
     /// Forgets an action's result (its outputs proved gone).
     pub fn remove_action_result(&self, action: &re::Digest) {
-        let _ = std::fs::remove_file(self.ac_path(&action.hash));
+        if let Some(p) = self.ac_path(&action.hash) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// Records an action's result. Its blobs must be stored first.
     pub fn put_action_result(&self, action: &re::Digest, result: &re::ActionResult) -> std::io::Result<()> {
-        self.write_atomic(&self.ac_path(&action.hash), &result.encode_to_vec())
+        self.write_atomic(&self.ac_path(&action.hash).ok_or_else(|| malformed(&action.hash))?, &result.encode_to_vec())
     }
 
     pub fn bytes_written(&self) -> u64 {
@@ -349,9 +394,8 @@ impl DiskCache {
 
     /// Like `write_atomic`, for the cache's own files (not counted as data).
     fn write_meta(&self, dest: &Path, data: &[u8]) -> std::io::Result<()> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let tmp = self.root.join("tmp").join(format!("{}-{n}", std::process::id()));
-        std::fs::write(&tmp, data)?;
+        let tmp = self.root.join("tmp").join(unique_name());
+        std::fs::File::options().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(data))?;
         std::fs::rename(&tmp, dest).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })
@@ -368,6 +412,14 @@ impl DiskCache {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        // Files writers that died left in `tmp/`.
+        let now = SystemTime::now();
+        for e in std::fs::read_dir(self.root.join("tmp")).into_iter().flatten().flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).unwrap_or_default() > STALE_TMP);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
         let written = self.written.swap(0, Ordering::Relaxed);
         if let Some(estimate) = self.read_size_estimate().map(|s| s + written)
@@ -455,9 +507,22 @@ mod tests {
         // Contents that aren't the digest's (a torn write) are a miss, and go.
         let e = rbe_client::digest_of(b"world");
         c.put_bytes(&e, b"world").unwrap();
-        std::fs::write(c.blob_path(&e.hash), b"WORLD").unwrap();
+        std::fs::write(c.blob_path(&e.hash).unwrap(), b"WORLD").unwrap();
         assert!(c.read_blob(&e).is_none());
-        assert!(!c.blob_path(&e.hash).exists());
+        assert!(!c.blob_path(&e.hash).unwrap().exists());
+        // A malformed digest (from a result: `..`, an absolute path) names
+        // no file, so it never reaches, nor removes, one outside the cache.
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "not a blob").unwrap();
+        let abs = victim.to_string_lossy().into_owned();
+        for hash in ["../victim.txt", "../../victim.txt", abs.as_str(), "zz", ""] {
+            let bad = re::Digest { hash: hash.into(), size_bytes: 10 };
+            assert!(c.read_blob(&bad).is_none() && !c.contains_blob(&bad), "{hash}");
+            assert!(c.put_bytes(&bad, b"not a blob").is_err(), "{hash}");
+            assert!(c.get_action_result_and_absent(&bad).is_none(), "{hash}");
+            c.remove_action_result(&bad);
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not a blob");
 
         let action = rbe_client::digest_of(b"action");
         let result =
@@ -465,7 +530,7 @@ mod tests {
         c.put_action_result(&action, &result).unwrap();
         assert_eq!(c.get_action_result(&action).unwrap(), result);
         // Without its output, the result is a miss.
-        std::fs::remove_file(c.blob_path(&d.hash)).unwrap();
+        std::fs::remove_file(c.blob_path(&d.hash).unwrap()).unwrap();
         assert!(c.get_action_result(&action).is_none());
 
         // A file's digest and contents.
@@ -486,7 +551,7 @@ mod tests {
                 let d = rbe_client::digest_of(&data);
                 c.put_bytes(&d, &data).unwrap();
                 let past = SystemTime::now() - std::time::Duration::from_secs(1000 - u64::from(i) * 100);
-                std::fs::File::options().write(true).open(c.blob_path(&d.hash)).unwrap().set_modified(past).unwrap();
+                std::fs::File::options().write(true).open(c.blob_path(&d.hash).unwrap()).unwrap().set_modified(past).unwrap();
                 d
             })
             .collect();
@@ -513,8 +578,8 @@ mod tests {
         // isn't seen until the estimate passes the limit.
         let big = vec![2u8; 2000];
         let big_digest = rbe_client::digest_of(&big);
-        std::fs::create_dir_all(c.blob_path(&big_digest.hash).parent().unwrap()).unwrap();
-        std::fs::write(c.blob_path(&big_digest.hash), &big).unwrap();
+        std::fs::create_dir_all(c.blob_path(&big_digest.hash).unwrap().parent().unwrap()).unwrap();
+        std::fs::write(c.blob_path(&big_digest.hash).unwrap(), &big).unwrap();
         assert_eq!(c.collect_garbage(1000, 900).unwrap(), Some((0, 0)));
         assert_eq!(c.read_size_estimate(), Some(100));
         // This process's writes push it over: the walk finds the real size.
@@ -554,7 +619,7 @@ mod tests {
     }
 
     fn stored_layout(c: &DiskCache, d: &re::Digest) -> Vec<re::Digest> {
-        let data = std::fs::read(c.layout_path(&d.hash)).unwrap();
+        let data = std::fs::read(c.layout_path(&d.hash).unwrap()).unwrap();
         re::SplitBlobResponse::decode(data.as_slice()).unwrap().chunk_digests
     }
 
@@ -576,7 +641,7 @@ mod tests {
         let a = noise(8 << 20, 1);
         let da = rbe_client::digest_of(&a);
         c.put_bytes(&da, &a).unwrap();
-        assert!(!c.blob_path(&da.hash).exists());
+        assert!(!c.blob_path(&da.hash).unwrap().exists());
         let chunks_a = stored_layout(&c, &da);
         assert!(chunks_a.len() > 4);
         assert!(chunks_a.iter().all(|d| d.size_bytes <= i64::from(CHUNK_MAX)));
@@ -594,7 +659,7 @@ mod tests {
 
         // A blob lacking a chunk is a miss; the other one is unaffected.
         let only_b = stored_layout(&c, &db).into_iter().find(|d| !chunks_a.contains(d)).unwrap();
-        std::fs::remove_file(c.blob_path(&only_b.hash)).unwrap();
+        std::fs::remove_file(c.blob_path(&only_b.hash).unwrap()).unwrap();
         assert!(!c.contains_blob(&db));
         assert!(c.read_blob(&db).is_none());
         assert_eq!(c.read_blob(&da).unwrap(), a);
@@ -619,7 +684,7 @@ mod tests {
         let small = noise(CHUNK_MAX as usize, 4);
         std::fs::write(&f, &small).unwrap();
         let d = c.put_file(&f, None).unwrap();
-        assert!(c.blob_path(&d.hash).exists() && !c.layout_path(&d.hash).exists());
+        assert!(c.blob_path(&d.hash).unwrap().exists() && !c.layout_path(&d.hash).unwrap().exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -639,6 +704,34 @@ mod tests {
         assert!(removed >= 2);
         assert!(!c.contains_blob(&da));
         assert_eq!(c.read_blob(&db).unwrap(), b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writers sharing a cache and a PID (containers on one volume): each
+    /// result lands under its own key, and stale temporary files go.
+    #[test]
+    fn concurrent_writers() {
+        let (c, dir) = cache("writers");
+        let other = DiskCache::open(&dir).unwrap();
+        let result = |i: u32| re::ActionResult { exit_code: i as i32, ..Default::default() };
+        let action = |i: u32| rbe_client::digest_of(format!("action {i}").as_bytes());
+        std::thread::scope(|s| {
+            for (cache, offset) in [(&c, 0), (&other, 1)] {
+                s.spawn(move || {
+                    for i in (offset..600).step_by(2) {
+                        cache.put_action_result(&action(i), &result(i)).unwrap();
+                    }
+                });
+            }
+        });
+        for i in 0..600 {
+            assert_eq!(c.get_action_result(&action(i)), Some(result(i)), "action {i}");
+        }
+        let stale = dir.join("tmp").join("stale");
+        std::fs::write(&stale, "x").unwrap();
+        std::fs::File::options().write(true).open(&stale).unwrap().set_modified(SystemTime::now() - 2 * STALE_TMP).unwrap();
+        c.collect_garbage(u64::MAX, u64::MAX).unwrap();
+        assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

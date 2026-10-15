@@ -28,11 +28,16 @@ struct Fake {
     break_first_after: Option<usize>,
     /// Refuse every stream with this code.
     refuse: Option<tonic::Code>,
+    /// Lifecycle events are answered once this has permits.
+    lifecycle_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[tonic::async_trait]
 impl PublishBuildEvent for Fake {
     async fn publish_lifecycle_event(&self, req: Request<bes::PublishLifecycleEventRequest>) -> Result<Response<()>, Status> {
+        if let Some(gate) = &self.lifecycle_gate {
+            let _permit = gate.acquire().await.unwrap();
+        }
         self.rec.lock().unwrap().lifecycle.push(req.into_inner());
         Ok(Response::new(()))
     }
@@ -131,9 +136,10 @@ async fn streams_events_in_order_between_lifecycle_events() {
         let id = r.ordered_build_event.as_ref().unwrap().stream_id.as_ref().unwrap();
         assert_eq!((id.build_id.as_str(), id.invocation_id.as_str()), ("build-1", "inv-1"));
         assert_eq!(id.component, bes::stream_id::BuildComponent::Tool as i32);
-        // Keywords and the lifecycle check only on the first event.
+        // Keywords only on the first event. The stream doesn't wait for
+        // the lifecycle events: the server mustn't check for them.
         assert_eq!(r.notification_keywords.is_empty(), i > 0);
-        assert_eq!(r.check_preceding_lifecycle_events_present, i == 0);
+        assert!(!r.check_preceding_lifecycle_events_present);
     }
     for (i, r) in s[..3].iter().enumerate() {
         let Event::BazelEvent(any) = event(r) else { panic!("not a BEP event") };
@@ -221,4 +227,83 @@ async fn without_lifecycle_events_only_the_stream_is_sent() {
     let rec = fake.rec.lock().unwrap();
     assert!(rec.lifecycle.is_empty());
     assert!(!rec.streams[0][0].check_preceding_lifecycle_events_present);
+}
+
+#[tokio::test]
+async fn lifecycle_events_dont_hold_the_stream_back() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let fake = Fake { lifecycle_gate: Some(gate.clone()), ..Default::default() };
+    let up = BesUploader::start(serve(fake.clone()).await, config());
+    for i in 0..3 {
+        up.send(progress(i, "x"));
+    }
+    // The events go out while the lifecycle service hasn't answered.
+    let streamed = async {
+        while fake.rec.lock().unwrap().streams.first().is_none_or(|s| s.len() < 3) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), streamed).await.expect("the stream waited for the lifecycle events");
+    assert!(fake.rec.lock().unwrap().lifecycle.is_empty());
+    gate.add_permits(100);
+    up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+    // The build's end comes after the stream's.
+    assert_eq!(fake.rec.lock().unwrap().lifecycle.len(), 4);
+}
+
+/// A backend that accepts connections and never says anything (as a hung
+/// one does: the kernel still accepts them).
+async fn silent_backend() -> tonic::transport::Channel {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let held: Vec<_> = listener.incoming().collect();
+        drop(held);
+    });
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_silent_backend_costs_one_deadline() {
+    for lifecycle_events in [true, false] {
+        let mut c = config();
+        c.lifecycle_events = lifecycle_events;
+        c.rpc_timeout = Duration::from_millis(300);
+        let up = BesUploader::start(silent_backend().await, c);
+        up.send(progress(0, "x"));
+        let start = std::time::Instant::now();
+        // However long the build waits for the upload (--bes_timeout=0).
+        let finished = tokio::time::timeout(Duration::from_secs(10), up.finish(BuildOutcome { success: true, exit_code: 0 })).await;
+        let err = finished.expect("the upload waited for the backend forever").unwrap_err();
+        assert!(err.to_string().contains("no answer"), "{err}");
+        // Not retried: it never answered anything.
+        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+    }
+}
+
+#[tokio::test]
+async fn connects_in_the_background() {
+    let fake = Fake::default();
+    let channel = serve(fake.clone()).await;
+    let connect = async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok(channel)
+    };
+    let up = BesUploader::connecting(connect, config());
+    // Events sent before the connection are kept for it.
+    up.send(progress(0, "x"));
+    up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+    assert_eq!(seqs(&fake.rec.lock().unwrap().streams[0]), vec![1, 2]);
+
+    // A connection that fails ends the upload: events go nowhere.
+    let up = BesUploader::connecting(async { anyhow::bail!("connecting to grpc://nowhere: refused") }, config());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !up.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the upload didn't end");
+    let err = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap_err();
+    assert!(err.to_string().contains("refused"), "{err}");
 }

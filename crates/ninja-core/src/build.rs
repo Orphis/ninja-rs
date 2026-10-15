@@ -1360,13 +1360,13 @@ impl<'a> Builder<'a> {
                 while capacity > 0 {
                     let Some(edge) = self.find_work() else { break };
                     if let Err(e) = self.start_edge(edge, runner) {
-                        self.cleanup(runner);
+                        self.cleanup(runner).await;
                         self.status.build_finished();
                         return Err(BuildError::new(e));
                     }
                     if self.state.is_phony(edge) {
                         if let Err(e) = self.plan_edge_finished(edge, EdgeResult::Succeeded) {
-                            self.cleanup(runner);
+                            self.cleanup(runner).await;
                             self.status.build_finished();
                             return Err(BuildError::new(e));
                         }
@@ -1386,20 +1386,20 @@ impl<'a> Builder<'a> {
             // See if we can reap any finished commands.
             if pending_commands > 0 {
                 let Some(result) = runner.wait_for_command().await else {
-                    self.cleanup(runner);
+                    self.cleanup(runner).await;
                     self.status.build_finished();
                     return Err(BuildError::new("internal error: runner lost a command"));
                 };
                 pending_commands -= 1;
                 if result.status == ExitStatus::Interrupted {
-                    self.cleanup(runner);
+                    self.cleanup(runner).await;
                     self.status.build_finished();
                     return Err(BuildError { message: "interrupted by user".into(), interrupted: true });
                 }
                 let success = match self.finish_command(result) {
                     Ok(success) => success,
                     Err(e) => {
-                        self.cleanup(runner);
+                        self.cleanup(runner).await;
                         self.status.build_finished();
                         return Err(BuildError::new(e));
                     }
@@ -1610,6 +1610,10 @@ impl<'a> Builder<'a> {
             self.plan_edge_finished(edge, EdgeResult::Failed)?;
             return Ok(false);
         }
+        if result.kind == ExecKind::Local {
+            let outputs: Vec<&str> = self.state.edge(edge).outputs.iter().map(|&o| self.state.path(o)).collect();
+            self.disk.outputs_written(&outputs);
+        }
 
         // Restat the edge outputs.
         let mut record_mtime: TimeStamp = 0;
@@ -1723,11 +1727,11 @@ impl<'a> Builder<'a> {
         Ok(nodes)
     }
 
-    /// On failure or interruption: kills running commands and deletes their
-    /// possibly half-written outputs.
-    fn cleanup(&mut self, runner: &mut dyn CommandRunner) {
+    /// On failure or interruption: stops running commands and, once they
+    /// have exited, deletes their possibly half-written outputs.
+    async fn cleanup(&mut self, runner: &mut dyn CommandRunner) {
         let active = runner.active_edges();
-        runner.abort();
+        runner.abort().await;
         for e in active {
             let depfile = self.state.unescaped_depfile(e);
             let outputs = self.state.edge(e).outputs.clone();

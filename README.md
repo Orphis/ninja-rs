@@ -18,7 +18,49 @@ such as those CMake's Ninja generators write with `CMAKE_NINJA_RBE`.
 
 Design: [docs/design.md](docs/design.md) · path mapping:
 [docs/paths.md](docs/paths.md) · build/toolchain notes:
-[docs/build-notes.md](docs/build-notes.md).
+[docs/build-notes.md](docs/build-notes.md). License: Apache-2.0
+([LICENSE](LICENSE), third-party notices in [NOTICE](NOTICE)).
+
+## Quickstart
+
+A CMake project, built remotely:
+
+1. Build ninja-rs: `cargo build --release -p ninja-rs`
+   (`target/release/ninja-rs`), or with Bazel (see Building).
+2. Build CMake from the `ninja-rbe` branch of the fork at
+   <https://gitlab.kitware.com/Orphis/cmake> (not in upstream CMake, and not
+   published yet): its Ninja generators write the RBE interface
+   ([docs/rbe-interface.md](docs/rbe-interface.md)) with
+   `-DCMAKE_NINJA_RBE=ON`.
+3. Say in the toolchain file what the compiler needs on a worker and which
+   workers run it:
+
+   ```cmake
+   set(CMAKE_CXX_COMPILER /opt/llvm/bin/clang++)
+   # Its executables, runtime libraries and resource directory. Not
+   # sysroots or SDKs: ninja-rs sends the files each action uses from them.
+   set(CMAKE_CXX_COMPILER_REMOTE_INPUTS /opt/llvm/bin /opt/llvm/lib)
+   set(CMAKE_REMOTE_PLATFORM "OSFamily=Linux;container-image=docker://ghcr.io/example/worker@sha256:...")
+   ```
+
+   [hermetic-llvm-cmake](https://github.com/Orphis/hermetic-llvm-cmake)'s
+   toolchain works as it is with its cache inside the source tree
+   (`-DHERMETIC_CACHE_DIR=<source>/.hermetic-cpp`); give it the platform
+   with `-DCMAKE_REMOTE_PLATFORM=...`.
+4. Configure with ninja-rs as the make program, and build:
+
+   ```sh
+   cmake -G Ninja -S . -B build -DCMAKE_NINJA_RBE=ON \
+     -DCMAKE_MAKE_PROGRAM=/path/to/ninja-rs -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake
+   ninja-rs -C build --remote_executor=grpcs://remote.example.com \
+     --remote_mnemonics=Compile,Archive,Link --remote_download_minimal
+   ```
+
+   With a remote cache alone (`--remote_cache=grpc://host:port`) misses run
+   locally and their results are stored; `--disk_cache=DIR` keeps results
+   on this machine. Options can live in a `.ninjars` file (see Settings
+   files). `tests/nativelink/run.sh` does all of this against a local
+   NativeLink.
 
 ## Building
 
@@ -137,10 +179,19 @@ try-import %workspace%/user.ninjars
 - **Files**, read in this order, later options winning: `/etc/ninjars`
   (`%ProgramData%\ninjars` on Windows); the workspace's, the first
   `.ninjars` found from the build directory (`-C`) up to the repository's
-  root, whose directory is `%workspace%` (never in a file system's root, in
-  `/tmp` or another directory shared by all users, nor one another user
-  owns); `~/.ninjars`; the `--ninjars=FILE` files. Then the command line,
-  where each `--config` adds its options in place.
+  root, whose directory is `%workspace%`; `~/.ninjars`; the
+  `--ninjars=FILE` files. Then the command line, where each `--config`
+  adds its options in place.
+- **Trust**: the system's and the workspace's files are skipped, with a
+  warning, when someone other than you and the administrators could have
+  written them: a file another user owns or (Windows) whose permissions let
+  others change it, or a workspace file in or above a directory others can
+  write to, from the build directory up (`/tmp`; never a file system's
+  root). On Windows, directories made outside your profile usually inherit
+  `Authenticated Users: Modify` from the drive's root (`C:\src`,
+  `D:\work`): a `.ninjars` there is skipped until that entry goes, e.g.
+  `icacls D:\work /inheritance:d` then `icacls D:\work /remove:g *S-1-5-11`.
+  `~/.ninjars` and `--ninjars=FILE` files aren't checked.
 - **Commands**: `common` and `always` lines apply to every invocation,
   `build` lines to builds and tools, `exec` lines to `-t exec` (which takes
   the `build` ones too); within a file, `common` lines go first. `common`
@@ -148,7 +199,10 @@ try-import %workspace%/user.ninjars
   can't take; lines of Bazel's other commands (`test`, `query`,
   `startup`...) are skipped, so one file can serve both. A Bazel file
   imported (named `*bazelrc`) is read like `common` lines throughout:
-  `import %workspace%/.bazelrc` takes its remote settings.
+  `import %workspace%/.bazelrc` takes its remote settings. Those lines are
+  read as Bazel reads them: short options there are Bazel's (`-c opt`,
+  `-j 200`), and a separate value is the option's whatever it starts with
+  (`--copt -fPIC`); ninja's `-j` and `-k` go on `build` lines.
 - **Values** as in Bazel: an empty one unsets an option (`--disk_cache=`),
   durations take units (`--bes_timeout=60s`).
 - **Paths**: `~` expands in path options; relative paths are relative to
@@ -168,7 +222,8 @@ It can be used as CMake's make program:
 
 State files live in the build directory (or `$builddir`):
 `.ninja_rs_log`, `.ninja_rs_deps` (ninja-rs formats, so ninja's own files are
-left alone) and `.ninja_rs_digests` (file digest cache for remote builds).
+left alone) and `.ninja_rs_digests` (file digest cache for remote builds and build
+events).
 
 ## Formatting
 

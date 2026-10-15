@@ -9,7 +9,7 @@ use crate::deps_log::DepsLog;
 use crate::disk::{Disk, VirtualDisk};
 use crate::graph::{EdgeId, Existence, State};
 use crate::parser::{ManifestParser, MemFiles, ParserOptions};
-use crate::runner::{CommandRunner, ExecKind, ExitStatus, Task, TaskResult, WaitFuture};
+use crate::runner::{AbortFuture, CommandRunner, ExecKind, ExitStatus, Task, TaskResult, WaitFuture};
 use crate::status::{NullStatus, Verbosity};
 
 struct FakeRunner<'a> {
@@ -141,8 +141,9 @@ impl CommandRunner for FakeRunner<'_> {
         self.active.iter().map(|t| t.edge).collect()
     }
 
-    fn abort(&mut self) {
+    fn abort(&mut self) -> AbortFuture<'_> {
         self.active.clear();
+        Box::pin(std::future::ready(()))
     }
 }
 
@@ -584,7 +585,7 @@ fn pool_with_depth_one_serializes() {
         fn active_edges(&self) -> Vec<EdgeId> {
             self.inner.active_edges()
         }
-        fn abort(&mut self) {
+        fn abort(&mut self) -> AbortFuture<'_> {
             self.inner.abort()
         }
     }

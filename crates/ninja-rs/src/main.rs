@@ -71,12 +71,19 @@ fn main() {
         }
     };
     let code = runtime.block_on(async move {
+        // SIGINT, SIGTERM and SIGHUP (Ctrl-C and Ctrl-Break) interrupt a
+        // build, which stops its commands, ends its build events and
+        // returns; a second one kills the commands.
         let interrupt = Interrupt::new();
-        interrupt.install_ctrl_c();
-        let mut service = Service::new(interrupt);
+        interrupt.install_handlers();
+        let mut service = Service::new(interrupt.clone());
         service.skip_teardown = true;
         service.relay = relay;
-        service.run(&opts).await
+        tokio::select! {
+            code = service.run(&opts) => code,
+            // A third one exits at once, whatever ninja-rs waits for.
+            _ = interrupt.wait_beyond(2) => ninja_rs::EXIT_INTERRUPTED,
+        }
     });
     // Don't wait for lingering blocking tasks (e.g. pipes held open by
     // background processes).

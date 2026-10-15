@@ -12,9 +12,11 @@
 //! takes the `build` ones too). `common` skips the options ninja-rs doesn't
 //! have, and with a note those whose values it can't take, so that one
 //! file can serve Bazel and ninja-rs; so do all the lines of Bazel's own
-//! files (named `*bazelrc`, imported). Bazel's other commands (`test`,
-//! `query`, `startup`...) are skipped. Lines with a config apply when
-//! `--config=CONFIG` is given, where it is given.
+//! files (named `*bazelrc`, imported). Those lines are read as Bazel reads
+//! them: short options are Bazel's (`-c opt`), and a separate value is the
+//! option's whatever it starts with (`--copt -fPIC`). Bazel's other
+//! commands (`test`, `query`, `startup`...) are skipped. Lines with a
+//! config apply when `--config=CONFIG` is given, where it is given.
 //!
 //! The files, read in this order, later options winning:
 //! 1. the system's: `/etc/ninjars` (`%ProgramData%\ninjars` on Windows);
@@ -26,7 +28,11 @@
 //!
 //! then the command line. In each, `common` lines go first, then `build`
 //! lines, then `exec` ones. `--nosystem_rc`, `--noworkspace_rc`,
-//! `--nohome_rc` and `--ignore_all_rc_files` leave files out.
+//! `--nohome_rc` and `--ignore_all_rc_files` leave files out. The system's
+//! and the workspace's files are skipped, with a warning, when someone
+//! other than the user and the administrators could have written them, or
+//! (the workspace's) put them in the directories from the build directory
+//! up.
 
 use std::path::{Path, PathBuf};
 
@@ -182,9 +188,21 @@ pub struct RcFiles {
     pub warnings: Vec<String>,
 }
 
-/// The system's file.
-fn system_file() -> Option<PathBuf> {
-    if cfg!(windows) { std::env::var_os("ProgramData").map(|d| PathBuf::from(d).join("ninjars")) } else { Some(PathBuf::from("/etc/ninjars")) }
+/// The system's file, unless someone other than the user and the
+/// administrators could have written it: anyone can create files in
+/// `%ProgramData%` (but not replace those of others). One made after this
+/// check isn't read.
+fn system_file(warnings: &mut Vec<String>) -> Option<PathBuf> {
+    let f =
+        if cfg!(windows) { PathBuf::from(std::env::var_os("ProgramData").filter(|d| !d.is_empty())?).join("ninjars") } else { PathBuf::from("/etc/ninjars") };
+    if !f.is_file() {
+        return None;
+    }
+    if !trusted_file(&f) {
+        warnings.push(format!("{} skipped: other users can change it", f.display()));
+        return None;
+    }
+    Some(f)
 }
 
 /// Version control directories: a repository's root ends the search for
@@ -193,21 +211,32 @@ const REPOSITORY_MARKERS: &[&str] = &[".git", ".hg", ".jj", ".sl", ".svn"];
 
 /// The workspace's file: the first `.ninjars` from `dir` up to the
 /// repository's root, short of the home directory (whose file is the
-/// user's). A file someone else could have put there is never read: in a
-/// file system's root (`/`, `D:\`) or a directory others can write to
-/// (`/tmp`), or (on Unix) one another user owns.
-pub fn workspace_file(dir: &Path) -> Option<PathBuf> {
+/// user's) and of a file system's root (`/`, `D:\`). A file someone else
+/// could have put there is skipped, with a warning: one in or above a
+/// directory others can write to (`/tmp`), or one others can change.
+pub fn workspace_file(dir: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     let home = options::home_dir();
+    // Past a directory others can write to, files are only looked for to
+    // say why they're skipped.
+    let mut shared = None;
     for d in dir.ancestors() {
-        if home.as_deref() == Some(d) || d.parent().is_none() || writable_by_others(d) {
-            return None;
+        if home.as_deref() == Some(d) || d.parent().is_none() {
+            break;
         }
+        shared = shared.or_else(|| writable_by_others(d).then_some(d));
         let f = d.join(FILE_NAME);
-        if f.is_file() && owned_by_user(&f) {
-            return Some(f);
+        if f.is_file() {
+            match shared {
+                Some(s) => {
+                    warnings.push(format!("{} skipped: other users can write to {}", f.display(), s.display()));
+                    return None;
+                }
+                None if trusted_file(&f) => return Some(f),
+                None => warnings.push(format!("{} skipped: other users can change it", f.display())),
+            }
         }
         if REPOSITORY_MARKERS.iter().any(|m| d.join(m).exists()) {
-            return None;
+            break;
         }
     }
     None
@@ -222,22 +251,265 @@ fn writable_by_others(dir: &Path) -> bool {
     std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o1002 == 0o1002)
 }
 
-#[cfg(not(unix))]
-fn writable_by_others(_dir: &Path) -> bool {
-    false
-}
-
+/// A file only the user and root can change: owned by either.
 #[cfg(unix)]
-fn owned_by_user(file: &Path) -> bool {
+fn trusted_file(file: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     std::fs::metadata(file).is_ok_and(|m| m.uid() == uid || m.uid() == 0)
 }
 
-#[cfg(not(unix))]
-fn owned_by_user(_file: &Path) -> bool {
-    true
+/// A directory in which someone other than the user and the administrators
+/// can add or replace files: its owner, or its permissions say so (those
+/// below a drive's root usually let Authenticated Users modify them). One
+/// whose permissions can't be read counts; one that doesn't exist holds
+/// nothing.
+#[cfg(windows)]
+fn writable_by_others(dir: &Path) -> bool {
+    sys::private(dir).map_or_else(|e| e.kind() != std::io::ErrorKind::NotFound, |private| !private)
+}
+
+/// A file only the user and the administrators can change: owned by one of
+/// them, with no one else allowed to write to it.
+#[cfg(windows)]
+fn trusted_file(file: &Path) -> bool {
+    sys::private(file).unwrap_or(false)
+}
+
+/// Windows: who owns a file or directory and who may change it, from its
+/// security descriptor.
+#[cfg(windows)]
+mod sys {
+    use std::ffi::c_void;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    type Handle = *mut c_void;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const SE_FILE_OBJECT: i32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x4;
+    const TOKEN_QUERY: u32 = 0x8;
+    const TOKEN_USER: i32 = 1;
+    const INHERIT_ONLY_ACE: u8 = 0x8;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
+    const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x5;
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 0x9;
+    const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 0xb;
+    /// Rights that change a file, or what a directory holds: write data
+    /// (add a file), append data (add a subdirectory), delete a child,
+    /// delete, change the permissions or the owner, and the generic rights
+    /// that include them.
+    const WRITE: u32 = 0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000;
+
+    const EVERYONE: &str = "S-1-1-0";
+    /// SYSTEM, Administrators and TrustedInstaller, who can change any
+    /// file anyway.
+    const ADMINISTRATORS: &[&str] = &["S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"];
+    /// CREATOR OWNER and OWNER RIGHTS: the owner.
+    const OWNER: &[&str] = &["S-1-3-0", "S-1-3-4"];
+
+    #[repr(C)]
+    struct Acl {
+        _revision: u8,
+        _sbz1: u8,
+        _size: u16,
+        count: u16,
+        _sbz2: u16,
+    }
+
+    #[repr(C)]
+    struct AceHeader {
+        kind: u8,
+        flags: u8,
+        _size: u16,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(name: *const u16, access: u32, share: u32, security: *const c_void, disposition: u32, flags: u32, template: Handle) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn GetCurrentProcess() -> Handle;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetSecurityInfo(
+            handle: Handle,
+            kind: i32,
+            info: u32,
+            owner: *mut *mut c_void,
+            group: *mut *mut c_void,
+            dacl: *mut *mut Acl,
+            sacl: *mut *mut Acl,
+            descriptor: *mut *mut c_void,
+        ) -> u32;
+        fn GetAce(acl: *const Acl, index: u32, ace: *mut *mut c_void) -> i32;
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(token: Handle, class: i32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut c_void, out: *mut *mut u16) -> i32;
+    }
+
+    /// Who owns a file and who may change it.
+    #[derive(Debug)]
+    pub struct Security {
+        pub owner: String,
+        /// The SIDs the DACL lets change it: everyone without a DACL, or for
+        /// an entry whose SID isn't read.
+        pub writers: Vec<String>,
+    }
+
+    impl Security {
+        /// Whether only `user` and the administrators can change it.
+        pub fn private_to(&self, user: &str) -> bool {
+            let trusted = |sid: &str| sid == user || ADMINISTRATORS.contains(&sid);
+            trusted(&self.owner) && self.writers.iter().all(|w| trusted(w) || OWNER.contains(&w.as_str()))
+        }
+    }
+
+    /// Whether only this user and the administrators can change `path`:
+    /// the entry itself (a link someone else made) and what it links to.
+    pub fn private(path: &Path) -> io::Result<bool> {
+        let Some(user) = current_user() else { return Ok(false) };
+        Ok(security(path, false)?.private_to(user) && security(path, true)?.private_to(user))
+    }
+
+    /// The security of `path`, or of what it links to (`follow`).
+    fn security(path: &Path, follow: bool) -> io::Result<Security> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let flags = FILE_FLAG_BACKUP_SEMANTICS | if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
+        // SAFETY: `wide` is NUL-terminated; the handle is closed below.
+        let h = unsafe { CreateFileW(wide.as_ptr(), READ_CONTROL, FILE_SHARE_ALL, std::ptr::null(), OPEN_EXISTING, flags, std::ptr::null_mut()) };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let (mut owner, mut dacl, mut descriptor) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: an open handle and valid out-parameters; the descriptor,
+        // which `owner` and `dacl` point into, is freed below.
+        let status = unsafe {
+            GetSecurityInfo(
+                h,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        // SAFETY: opened above.
+        unsafe { CloseHandle(h) };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        // SAFETY: from the descriptor, alive until freed below.
+        let result = unsafe { parse(owner, dacl) };
+        // SAFETY: allocated by GetSecurityInfo.
+        unsafe { LocalFree(descriptor) };
+        result
+    }
+
+    /// # Safety
+    /// `owner` is a SID or null, `dacl` an ACL or null, alive during the
+    /// call.
+    unsafe fn parse(owner: *mut c_void, dacl: *mut Acl) -> io::Result<Security> {
+        // No owner: nobody vouches for it.
+        // SAFETY: as the caller promises.
+        let owner = if owner.is_null() { EVERYONE.into() } else { unsafe { sid_string(owner)? } };
+        if dacl.is_null() {
+            // No DACL: everyone has every right.
+            return Ok(Security { owner, writers: vec![EVERYONE.into()] });
+        }
+        let mut writers = Vec::new();
+        // SAFETY: a valid ACL.
+        let count = unsafe { (*dacl).count };
+        for i in 0..count {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: `i` is below the ACL's count.
+            if unsafe { GetAce(dacl, u32::from(i), &mut ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: an ACE starts with its header.
+            let header = unsafe { ace.cast::<AceHeader>().read_unaligned() };
+            // Denied entries only take rights away; inherit-only ones are
+            // for what the directory will hold.
+            let allowed = matches!(
+                header.kind,
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE | ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+            );
+            if !allowed || header.flags & INHERIT_ONLY_ACE != 0 {
+                continue;
+            }
+            // SAFETY: the allowed kinds go on with the access mask, then
+            // (but object ACEs) the SID.
+            let mask = unsafe { ace.cast::<u8>().add(4).cast::<u32>().read_unaligned() };
+            if mask & WRITE != 0 {
+                writers.push(match header.kind {
+                    // Not on files: their SID isn't read, whoever it is.
+                    ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => EVERYONE.into(),
+                    // SAFETY: as above.
+                    _ => unsafe { sid_string(ace.cast::<u8>().add(8).cast())? },
+                });
+            }
+        }
+        Ok(Security { owner, writers })
+    }
+
+    /// `S-1-5-...`.
+    ///
+    /// # Safety
+    /// `sid` is a valid SID.
+    unsafe fn sid_string(sid: *mut c_void) -> io::Result<String> {
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: a valid SID; the string is freed below.
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a NUL-terminated string from ConvertSidToStringSidW.
+        let s = unsafe {
+            let n = (0..).take_while(|&i| *text.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(text, n))
+        };
+        // SAFETY: allocated by ConvertSidToStringSidW.
+        unsafe { LocalFree(text.cast()) };
+        Ok(s)
+    }
+
+    /// The SID of the user this process runs as.
+    fn current_user() -> Option<&'static str> {
+        static USER: OnceLock<Option<String>> = OnceLock::new();
+        USER.get_or_init(|| {
+            let mut token: Handle = std::ptr::null_mut();
+            // SAFETY: the pseudo-handle of this process, a valid
+            // out-parameter; the token is closed below.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+                return None;
+            }
+            // TOKEN_USER: a pointer to the SID (in the buffer), then attributes.
+            let mut buf = vec![0u64; 64];
+            let mut len = 0;
+            // SAFETY: the buffer is large enough for a TOKEN_USER and its SID.
+            let ok = unsafe { GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut len) };
+            // SAFETY: opened above.
+            unsafe { CloseHandle(token) };
+            if ok == 0 {
+                return None;
+            }
+            // SAFETY: the SID points into `buf`, alive here.
+            unsafe { sid_string(buf[0] as usize as *mut c_void) }.ok()
+        })
+        .as_deref()
+    }
 }
 
 fn is_dev_null(f: &str) -> bool {
@@ -248,7 +520,8 @@ impl RcFiles {
     /// Reads the files the command line (`prescan`) selects, for a build in
     /// `build_dir` (absolute).
     pub fn discover(p: &Prescan, build_dir: &Path) -> Result<RcFiles, String> {
-        let found = workspace_file(build_dir);
+        let mut skipped = Vec::new();
+        let found = workspace_file(build_dir, &mut skipped);
         let workspace = found.as_ref().and_then(|f| f.parent()).unwrap_or(build_dir).to_path_buf();
         let mut rc = RcFiles { workspace, ..Default::default() };
         if p.ignore_all {
@@ -256,14 +529,13 @@ impl RcFiles {
         }
         let mut files: Vec<(PathBuf, bool)> = Vec::new();
         if p.system
-            && let Some(f) = system_file()
+            && let Some(f) = system_file(&mut rc.warnings)
         {
             files.push((f, false));
         }
-        if p.workspace
-            && let Some(f) = found
-        {
-            files.push((f, false));
+        if p.workspace {
+            rc.warnings.append(&mut skipped);
+            files.extend(found.map(|f| (f, false)));
         }
         if p.home
             && let Some(h) = options::home_dir()
@@ -587,6 +859,9 @@ fn expand_config(rc: &RcFiles, levels: &[&[&str]], config: &str, stack: &mut Vec
 /// A line's options, checked, with its `--config`s expanded in place.
 fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<String>, out: &mut Expanded) -> Result<(), String> {
     let args = &line.args;
+    // `common` lines, and Bazel's own files, are shared with Bazel: its
+    // options are skipped, and values only Bazel takes.
+    let shared = line.command == "common" || line.file.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("bazelrc"));
     let mut i = 0;
     while i < args.len() {
         if let Some((name, n)) = config_at(args, i) {
@@ -598,16 +873,16 @@ fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<St
             continue;
         }
         let a = &args[i];
-        if !a.starts_with('-') || a == "-" {
+        if !a.starts_with('-') || a == "-" || a == "--" {
             return Err(format!("{}: '{a}' isn't an option", line.origin));
         }
-        // An option's value may be the next word: there are no targets here.
-        let takes_next = !a.contains('=') && args.get(i + 1).is_some_and(|n| !n.starts_with('-'));
-        let n = if takes_next && !(a.starts_with("--") && options::is_bool_option(&a[2..])) { 2 } else { 1 };
+        let n = if shared { bazel_option_len(args, i) } else { option_len(args, i) };
         let group = &args[i..i + n];
-        // `common` lines, and Bazel's own files, are shared with Bazel: its
-        // options are skipped, and values only Bazel takes.
-        let shared = line.command == "common" || line.file.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("bazelrc"));
+        i += n;
+        // Short options there are Bazel's (`-c opt`, `-j 200`), not ninja's.
+        if shared && !a.starts_with("--") {
+            continue;
+        }
         match options::check_rc_option(group) {
             Ok(()) => {
                 for a in group {
@@ -623,9 +898,43 @@ fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<St
             }
             Err(RcOptionError::Unknown(e) | RcOptionError::Invalid(e)) => return Err(format!("{}: {e}", line.origin)),
         }
-        i += n;
     }
     Ok(())
+}
+
+/// How many words the option at `args[i]` takes: with no targets in
+/// files, the next word is its value, unless it is an option or the option
+/// a boolean.
+fn option_len(args: &[String], i: usize) -> usize {
+    let a = &args[i];
+    let takes_next = !a.contains('=') && args.get(i + 1).is_some_and(|n| !n.starts_with('-'));
+    if takes_next && !(a.starts_with("--") && options::is_bool_option(&a[2..])) { 2 } else { 1 }
+}
+
+/// The same on a line shared with Bazel, read as Bazel reads it: an
+/// option's separate value is the next word, whatever it starts with
+/// (`--copt -fPIC`, `--linkopt -v`). ninja-rs knows which of its options
+/// take one. Of Bazel's it doesn't know the booleans: the next word is a
+/// value when it isn't an option, and one starting with a single `-` is
+/// skipped as a short option is (`--keep_going -c opt`, `--copt -fPIC`), so
+/// that only ninja-rs's long options apply, as Bazel would read them.
+fn bazel_option_len(args: &[String], i: usize) -> usize {
+    let a = &args[i];
+    let Some(next) = args.get(i + 1) else { return 1 };
+    let takes_next = match a.strip_prefix("--") {
+        Some(long) if long.contains('=') => false,
+        Some(name) => match options::check_rc_option(std::slice::from_ref(a)) {
+            // A boolean, or an option without a value.
+            Ok(()) => false,
+            Err(RcOptionError::Unknown(_)) => !next.starts_with('-'),
+            // Missing its value, or only for the command line (skipped with
+            // a note): a boolean (--nosystem_rc) takes none.
+            Err(RcOptionError::Invalid(_)) => !options::is_bool_option(name),
+        },
+        // Bazel's short options: `-c opt`, `-k`.
+        None => !next.starts_with('-'),
+    };
+    if takes_next { 2 } else { 1 }
 }
 
 #[cfg(test)]
@@ -760,6 +1069,28 @@ mod tests {
         assert!(expand_in(&dir, "build", &[]).unwrap_err().contains("unrecognized option '--compilation_mode'"));
     }
 
+    /// Lines shared with Bazel are read with Bazel's syntax: a value
+    /// starting with `-` is the option's (`--copt -fPIC` isn't `-f PIC`),
+    /// short options are Bazel's (`-j 200`, `-c opt`), and ninja-rs's
+    /// options take the next word as their value whatever it starts with.
+    #[test]
+    fn shared_lines_have_bazel_syntax() {
+        let dir = tree(
+            "bazel_syntax",
+            &[
+                (".ninjars", "import %workspace%/.bazelrc\ncommon --linkopt -v -k 0 --remote_jobs 3\nbuild -j 4\n"),
+                (
+                    ".bazelrc",
+                    "build --copt -fPIC -j 200 -c opt --keep_going -c dbg --remote_instance_name -main\n\
+                     build --host_copt -O2 -s --remote_verbose\n",
+                ),
+            ],
+        );
+        let e = expand_in(&dir, "build", &[]).unwrap();
+        assert_eq!(e.args, strings(&["--remote_jobs", "3", "--remote_instance_name", "-main", "--remote_verbose", "-j", "4"]));
+        assert!(e.notes.is_empty(), "{:?}", e.notes);
+    }
+
     #[test]
     fn errors() {
         for (content, error) in [
@@ -767,6 +1098,9 @@ mod tests {
             ("always --nope", "unrecognized option '--nope'"),
             ("build all", "'all' isn't an option"),
             ("build --remote_verbose all", "'all' isn't an option"),
+            ("build --", "'--' isn't an option"),
+            ("common -- --remote_verbose", "'--' isn't an option"),
+            ("common --remote_verbose all", "'all' isn't an option"),
             ("build -C dir", "only goes on the command line"),
             ("build --ninjars=x", "only goes on the command line"),
             ("build --version", "only goes on the command line"),
@@ -846,17 +1180,121 @@ mod tests {
         // The repository's root ends the search: a file above it isn't the
         // workspace's.
         let dir = tree("bounds", &[(".ninjars", "build --remote_jobs=1\n"), ("repo/.git/HEAD", ""), ("repo/build/x", "")]);
-        assert_eq!(workspace_file(&dir.join("repo/build")), None);
+        let mut warnings = Vec::new();
+        assert_eq!(workspace_file(&dir.join("repo/build"), &mut warnings), None);
         std::fs::write(dir.join("repo/.ninjars"), "").unwrap();
-        assert_eq!(workspace_file(&dir.join("repo/build")), Some(dir.join("repo").join(FILE_NAME)));
+        assert_eq!(workspace_file(&dir.join("repo/build"), &mut warnings), Some(dir.join("repo").join(FILE_NAME)));
+        assert!(warnings.is_empty(), "{warnings:?}");
         // Nor in a directory others can write to.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let shared = tree("shared", &[(".ninjars", ""), ("b/x", "")]);
             std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
-            assert_eq!(workspace_file(&shared.join("b")), None);
+            assert_eq!(workspace_file(&shared.join("b"), &mut warnings), None);
+            assert!(warnings[0].contains("skipped: other users can write to"), "{warnings:?}");
         }
+    }
+
+    /// Grants `access` (icacls's syntax) to `sid` on `path`.
+    #[cfg(windows)]
+    fn grant(path: &Path, sid: &str, access: &str) {
+        let out = std::process::Command::new("icacls").arg(path).arg("/grant").arg(format!("*{sid}:{access}")).output().unwrap();
+        assert!(out.status.success(), "icacls: {}", String::from_utf8_lossy(&out.stdout));
+    }
+
+    #[cfg(windows)]
+    const AUTHENTICATED_USERS: &str = "S-1-5-11";
+    #[cfg(windows)]
+    const USERS: &str = "S-1-5-32-545";
+
+    /// On Windows, the owners and permissions: below a drive's root,
+    /// directories let Authenticated Users modify them (`C:\build`).
+    #[cfg(windows)]
+    #[test]
+    fn workspace_permissions() {
+        let mut warnings = Vec::new();
+        let dir = tree("acl", &[(".ninjars", ""), ("build/x", "")]);
+        assert_eq!(workspace_file(&dir.join("build"), &mut warnings), Some(dir.join(FILE_NAME)));
+        // Others can write to the directories (inherited by what they hold).
+        grant(&dir, AUTHENTICATED_USERS, "(OI)(CI)(M)");
+        assert_eq!(workspace_file(&dir.join("build"), &mut warnings), None);
+        assert_eq!(warnings, vec![format!("{} skipped: other users can write to {}", dir.join(FILE_NAME).display(), dir.join("build").display())]);
+        // Others can change the file only.
+        let dir = tree("acl_file", &[(".ninjars", ""), ("build/x", "")]);
+        grant(&dir.join(FILE_NAME), USERS, "(W)");
+        warnings.clear();
+        assert_eq!(workspace_file(&dir.join("build"), &mut warnings), None);
+        assert!(warnings[0].ends_with(".ninjars skipped: other users can change it"), "{warnings:?}");
+        // Rights for what a directory will hold (inherit-only) don't count.
+        let dir = tree("acl_inherit", &[(".ninjars", "")]);
+        grant(&dir, AUTHENTICATED_USERS, "(CI)(IO)(M)");
+        let later = dir.join("later");
+        std::fs::create_dir(&later).unwrap();
+        assert_eq!(workspace_file(&dir, &mut warnings), Some(dir.join(FILE_NAME)));
+        assert_eq!(workspace_file(&later, &mut warnings), None);
+        // A link to a file others can change, and a link others can change
+        // (where symbolic links can be made).
+        let dir = tree("acl_link", &[("target", ""), ("ws/build/x", ""), ("trusted", ""), ("ws2/build/x", "")]);
+        grant(&dir.join("target"), USERS, "(M)");
+        if std::os::windows::fs::symlink_file(dir.join("target"), dir.join("ws").join(FILE_NAME)).is_ok() {
+            assert_eq!(workspace_file(&dir.join("ws/build"), &mut warnings), None);
+            let link = dir.join("ws2").join(FILE_NAME);
+            std::os::windows::fs::symlink_file(dir.join("trusted"), &link).unwrap();
+            assert_eq!(workspace_file(&dir.join("ws2/build"), &mut warnings), Some(link.clone()));
+            let out = std::process::Command::new("icacls").arg(&link).args(["/L", "/grant", &format!("*{USERS}:(M)")]).output().unwrap();
+            assert!(out.status.success());
+            assert_eq!(workspace_file(&dir.join("ws2/build"), &mut warnings), None);
+        }
+    }
+
+    /// On Windows, `%ProgramData%\ninjars`: anyone can create files in
+    /// `%ProgramData%`, so its file is read only when the user or the
+    /// administrators own it and no one else can change it.
+    #[cfg(windows)]
+    #[test]
+    fn system_file_permissions() {
+        // As %ProgramData%'s: users can add files and directories.
+        let dir = tree("programdata", &[("ninjars", "build --remote_jobs=5\n")]);
+        grant(&dir, USERS, "(CI)(WD,AD,WEA,WA)");
+        let old = std::env::var_os("ProgramData");
+        let discover = || {
+            // SAFETY: always safe on Windows; no other test reads it.
+            unsafe { std::env::set_var("ProgramData", &dir) };
+            let rc = RcFiles::discover(&Prescan { workspace: false, home: false, ..prescan(&[]) }, &dir);
+            match &old {
+                // SAFETY: as above.
+                Some(old) => unsafe { std::env::set_var("ProgramData", old) },
+                None => unsafe { std::env::remove_var("ProgramData") },
+            }
+            rc.unwrap()
+        };
+        let rc = discover();
+        assert_eq!(rc.files, vec![dir.join("ninjars")]);
+        assert!(rc.warnings.is_empty(), "{:?}", rc.warnings);
+        grant(&dir.join("ninjars"), USERS, "(M)");
+        let rc = discover();
+        assert!(rc.files.is_empty());
+        assert_eq!(rc.warnings, vec![format!("{} skipped: other users can change it", dir.join("ninjars").display())]);
+    }
+
+    /// On Windows, who may own and change a file: the user, the
+    /// administrators, SYSTEM and TrustedInstaller.
+    #[cfg(windows)]
+    #[test]
+    fn trusted_principals() {
+        let user = "S-1-5-21-1-2-3-1000";
+        // A file another user made (this user can't make one).
+        let planted = sys::Security { owner: "S-1-5-21-1-2-3-1001".into(), writers: vec!["S-1-5-18".into()] };
+        assert!(!planted.private_to(user));
+        let own = sys::Security { owner: user.into(), writers: vec!["S-1-5-18".into(), "S-1-3-4".into(), user.into()] };
+        assert!(own.private_to(user));
+        let admins = sys::Security { owner: "S-1-5-32-544".into(), writers: vec!["S-1-5-32-544".into()] };
+        assert!(admins.private_to(user));
+        // TrustedInstaller owns the system's directories, which only it,
+        // SYSTEM and the administrators can write to.
+        let windows = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        assert!(!writable_by_others(&windows), "{}", windows.display());
     }
 
     #[test]

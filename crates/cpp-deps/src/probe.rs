@@ -1,7 +1,7 @@
 //! Asking a compiler what the scanner needs, for a set of flags: its
 //! predefined macros and `__has_*` operators, the dialect of its `#if`
-//! (`true`, `and`...), the files every compile reads first, and the answers
-//! to queries. Three command styles:
+//! (`true`, `and`...), whether it replaces trigraphs, the files every
+//! compile reads first, and the answers to queries. Three command styles:
 //!
 //! - GCC and Clang: `-dM -E`, `-E -P`, `-E -M` on stdin;
 //! - `clang-cl`: `/clang:-dM /E`, `/EP` on a temporary file;
@@ -44,6 +44,9 @@ pub const OPERATORS: &[&str] = &[
 
 const OPERATOR_MARK: &str = "NINJA_RS_OPERATOR_";
 const QUERY_MARK: &str = "NINJA_RS_QUERY";
+/// Defined by a trigraph (`??=` is `#`) when trigraphs are on.
+const TRIGRAPHS: &str = "??=define NINJA_RS_TRIGRAPHS 1\n";
+const TRIGRAPHS_MARK: &str = "NINJA_RS_TRIGRAPHS";
 
 /// How a compiler takes its flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -64,6 +67,9 @@ pub struct Probe {
     /// source.
     pub implicit: Vec<String>,
     pub dialect: Dialect,
+    /// Trigraphs are replaced (GCC's ISO modes, Clang's outside GNU modes
+    /// and Windows, cl's `/Zc:trigraphs`).
+    pub trigraphs: bool,
 }
 
 /// The files of make rules (`target: dep dep \` lines).
@@ -217,12 +223,14 @@ pub fn probe(c: &Compiler) -> Result<Probe, String> {
     let mut probe = Probe::default();
     match style {
         Style::Gcc | Style::ClangCl => {
-            let input: String = OPERATORS.iter().map(|op| format!("#ifdef {op}\n#define {OPERATOR_MARK}{op} 1\n#endif\n")).collect();
+            let mut input: String = OPERATORS.iter().map(|op| format!("#ifdef {op}\n#define {OPERATOR_MARK}{op} 1\n#endif\n")).collect();
+            input.push_str(TRIGRAPHS);
             let flags: &[&str] = if style == Style::Gcc { &["-dM", "-E"] } else { &["/clang:-dM", "/E"] };
             let out = run(c, flags, &input)?;
             for line in out.stdout.lines() {
                 match line.strip_prefix("#define ").and_then(|l| l.strip_prefix(OPERATOR_MARK)) {
                     Some(rest) => probe.operators.push(rest.split(' ').next().unwrap_or_default().to_string()),
+                    None if line.strip_prefix("#define ").is_some_and(|l| l.starts_with(TRIGRAPHS_MARK)) => probe.trigraphs = true,
                     None if line.starts_with("#define ") => {
                         probe.predefines.push_str(line);
                         probe.predefines.push('\n');
@@ -237,9 +245,17 @@ pub fn probe(c: &Compiler) -> Result<Probe, String> {
                 probe.predefines.push_str(line);
                 probe.predefines.push('\n');
             }
-            let input: String = OPERATORS.iter().map(|op| format!("#ifdef {op}\n{OPERATOR_MARK} {op}\n#endif\n")).collect();
+            let mut input: String = OPERATORS.iter().map(|op| format!("#ifdef {op}\n{OPERATOR_MARK} {op}\n#endif\n")).collect();
+            // (Not the macro's name, which the text would expand.)
+            input.push_str(&format!("{TRIGRAPHS}#ifdef {TRIGRAPHS_MARK}\n{OPERATOR_MARK} trigraphs\n#endif\n"));
             let out = run(c, &["/EP"], &input)?;
-            probe.operators = out.stdout.lines().filter_map(|l| l.trim().strip_prefix(OPERATOR_MARK)).map(|op| op.trim().to_string()).collect();
+            for op in out.stdout.lines().filter_map(|l| l.trim().strip_prefix(OPERATOR_MARK)).map(str::trim) {
+                if op == "trigraphs" {
+                    probe.trigraphs = true;
+                } else {
+                    probe.operators.push(op.to_string());
+                }
+            }
         }
     }
     if !probe.predefines.contains("#define") {
@@ -395,11 +411,19 @@ mod tests {
         let std = [if style == Style::Gcc { "-std=c++17" } else { "/std:c++17" }.to_string()];
         let c = Compiler { path: Path::new(&cxx), args: &std, style, lang: "c++", cwd: &cwd, env: None };
         let p = probe(&c).unwrap();
-        assert!(fingerprint(&c).contains("version"), "{}", fingerprint(&c));
+        // Clang's banner, or GCC's.
+        assert!(fingerprint(&c).contains("version") || fingerprint(&c).contains("Free Software Foundation"), "{}", fingerprint(&c));
         assert!(p.predefines.contains("#define __cplusplus 201703L"), "{}", p.predefines);
         assert!(p.operators.iter().any(|o| o == "__has_include"));
         assert!(p.operators.iter().any(|o| o == "__has_builtin"));
         assert!(p.dialect.true_false);
+        // Never in C++17; asked for in GNU modes.
+        assert!(!p.trigraphs);
+        assert!(!p.predefines.contains("NINJA_RS"), "{}", p.predefines);
+        if style == Style::Gcc {
+            let trigraphs = ["-std=gnu11".to_string(), "-trigraphs".to_string()];
+            assert!(probe(&Compiler { args: &trigraphs, lang: "c", ..c }).unwrap().trigraphs);
+        }
         let a = answer(&c, &[("__has_builtin".into(), "__builtin_expect".into()), ("__has_cpp_attribute".into(), "nodiscard".into())]).unwrap();
         assert_eq!(a[0], Some(1));
         assert!(a[1].is_some_and(|v| v >= 201603));
@@ -434,6 +458,9 @@ mod tests {
         assert!(p.operators.iter().any(|o| o == "__has_include"));
         // C++20 implies /permissive-: `and` is an operator.
         assert!(p.dialect.true_false && p.dialect.alt_operators, "{:?}", p.dialect);
+        assert!(!p.trigraphs);
+        let trigraphs = ["/Zc:trigraphs".to_string()];
+        assert!(probe(&Compiler { args: &trigraphs, ..c }).unwrap().trigraphs);
         let a = answer(&c, &[("__has_cpp_attribute".into(), "nodiscard".into())]).unwrap();
         // cl doesn't expand it in text: its value comes from `#if`.
         assert!(a[0].is_some_and(|v| v >= 201907), "{a:?}");

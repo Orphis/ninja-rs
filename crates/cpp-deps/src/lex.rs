@@ -5,8 +5,10 @@
 //! hides a `#`: block comments (also across lines), line comments, string
 //! and character literals, raw string literals (across lines), digit
 //! separators (`1'000` is no character literal) and line splices
-//! (backslash-newline). The result is cached per file version and shared
-//! by every compile that includes the file.
+//! (backslash-newline). Lines end with a newline, a carriage return and a
+//! newline, or a carriage return alone (as GCC and Clang read them). The
+//! result is cached per file version and shared by every compile that
+//! includes the file.
 
 use std::sync::Arc;
 
@@ -107,9 +109,13 @@ pub enum DirKind {
     Elifndef,
     Else,
     Endif,
-    /// `#pragma`, and `_Pragma("...")` operators written in text.
+    /// `#pragma`, and `_Pragma("...")` operators written in text (a line of
+    /// text that may run one through a macro is marked with a `_Pragma`
+    /// token alone).
     Pragma,
-    /// `#error`, `#warning`, `#line`, `#ident`, unknown directives, `#`.
+    /// `#line`, and GNU's line markers (`# 33 "file"`).
+    Line,
+    /// `#error`, `#warning`, `#ident`, unknown directives, `#`.
     Other,
 }
 
@@ -134,6 +140,12 @@ pub struct FileDirectives {
     /// The file is UTF-16 (a byte order mark), which compilers like cl
     /// read, and this lexer doesn't: its directives are unknown.
     pub utf16: bool,
+    /// A carriage return not followed by a newline ends a line here, as in
+    /// GCC and Clang; cl reads such files otherwise.
+    pub lone_cr: bool,
+    /// The file has a trigraph (`??=`, `??/`...), which this lexer doesn't
+    /// replace: its directives are unknown when trigraphs are on.
+    pub trigraphs: bool,
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -557,7 +569,7 @@ impl<'a> Lexer<'a> {
         {
             toks.push(t);
         }
-        if kind == DirKind::Other {
+        if matches!(kind, DirKind::Other | DirKind::Line) {
             self.skip_text_line();
             return toks;
         }
@@ -588,6 +600,7 @@ fn directive_kind(name: &[u8]) -> DirKind {
         b"else" => DirKind::Else,
         b"endif" => DirKind::Endif,
         b"pragma" => DirKind::Pragma,
+        b"line" => DirKind::Line,
         _ => DirKind::Other,
     }
 }
@@ -595,11 +608,22 @@ fn directive_kind(name: &[u8]) -> DirKind {
 /// Lexes a file's directives.
 pub fn lex(content: &[u8]) -> FileDirectives {
     if content.starts_with(&[0xff, 0xfe]) || content.starts_with(&[0xfe, 0xff]) {
-        return FileDirectives { dirs: Vec::new(), guard: None, utf16: true };
+        return FileDirectives { utf16: true, ..Default::default() };
     }
     // A UTF-8 byte order mark (as editors on Windows write) is not text:
     // left in, it would hide a directive on the first line.
     let content = content.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(content);
+    // A lone carriage return ends a line: made a newline, which keeps
+    // every offset.
+    let lone_cr = content.contains(&b'\r') && content.iter().enumerate().any(|(i, &c)| c == b'\r' && content.get(i + 1) != Some(&b'\n'));
+    let unix;
+    let content = if lone_cr {
+        unix = content.iter().enumerate().map(|(i, &c)| if c == b'\r' && content.get(i + 1) != Some(&b'\n') { b'\n' } else { c }).collect::<Vec<u8>>();
+        &unix[..]
+    } else {
+        content
+    };
+    let trigraphs = content.windows(3).any(|w| w[0] == b'?' && w[1] == b'?' && b"=/'()!<>-".contains(&w[2]));
     let mut lx = Lexer { b: content, pos: 0, line: 0, line_pos: 0 };
     let mut dirs = Vec::new();
     // Whether text (not directives) appeared before the first directive,
@@ -622,9 +646,21 @@ pub fn lex(content: &[u8]) -> FileDirectives {
             let start = lx.pos;
             lx.skip_text_line();
             let text = &content[start..lx.pos];
-            if text.windows(7).any(|w| w == b"_Pragma") {
+            if may_run_pragma(text) {
                 let line = lx.line_at(start);
-                dirs.extend(pragma_operators(text).into_iter().map(|toks| Directive { kind: DirKind::Pragma, toks: toks.into_boxed_slice(), line, mac: None }));
+                let toks = tokens(text);
+                dirs.extend(pragma_operators(&toks).into_iter().map(|toks| Directive {
+                    kind: DirKind::Pragma,
+                    toks: toks.into_boxed_slice(),
+                    line,
+                    mac: None,
+                }));
+                // A pragma from a macro (`DO_PRAGMA(push_macro("M"))`,
+                // `__pragma(once)`): text isn't expanded, so it's marked.
+                if macros::pragmas(&toks, false) != macros::Pragmas::None {
+                    let marker = Token { kind: Kind::Ident, sym: intern::PRAGMA_OPERATOR, space: false };
+                    dirs.push(Directive { kind: DirKind::Pragma, toks: Box::new([marker]), line, mac: None });
+                }
             }
             continue;
         }
@@ -639,21 +675,38 @@ pub fn lex(content: &[u8]) -> FileDirectives {
             lx.take_ident_chars();
         }
         let name = lx.text(start);
-        let kind = if name.is_empty() { DirKind::Other } else { directive_kind(&name) };
+        let kind = match lx.peek() {
+            _ if !name.is_empty() => directive_kind(&name),
+            Some(d) if d.is_ascii_digit() => DirKind::Line,
+            _ => DirKind::Other,
+        };
         let toks = lx.directive_tokens(kind);
         let mac = if kind == DirKind::Define { macros::parse_define(&toks).map(Arc::new) } else { None };
         text_last = false;
         dirs.push(Directive { kind, toks: toks.into_boxed_slice(), line, mac });
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
-    FileDirectives { dirs, guard, utf16: false }
+    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs }
+}
+
+/// Whether a line of text may run a pragma that changes macros or
+/// inclusion, `_Pragma("...")` or through a macro (see `macros::pragmas`):
+/// it has `_Pragma` or one of those pragmas' names.
+fn may_run_pragma(text: &[u8]) -> bool {
+    text.iter().enumerate().any(|(i, &c)| {
+        let rest = &text[i..];
+        match c {
+            b'o' => rest.starts_with(b"once"),
+            b'_' => rest.starts_with(b"_Pragma") || rest.starts_with(b"_macro") || rest.starts_with(b"_alias"),
+            _ => false,
+        }
+    })
 }
 
 /// The `_Pragma("...")` operators of a line of text, each as the tokens
 /// of the `#pragma` it stands for (macros that expand to them aren't
 /// seen: text isn't expanded).
-fn pragma_operators(text: &[u8]) -> Vec<Vec<Token>> {
-    let toks = tokens(text);
+fn pragma_operators(toks: &[Token]) -> Vec<Vec<Token>> {
     let mut out = Vec::new();
     for w in toks.windows(4) {
         if let [p, l, s, r] = w
@@ -662,10 +715,7 @@ fn pragma_operators(text: &[u8]) -> Vec<Vec<Token>> {
             && s.kind == Kind::Str
             && r.is(P::RParen)
         {
-            // Destringize: no prefix nor quotes, \" and \ unescaped.
-            let lit = s.sym.as_str();
-            let body = lit.trim_start_matches(|c| c != '"').trim_matches('"');
-            out.push(tokens(body.replace("\\\"", "\"").replace("\\\\", "\\").as_bytes()));
+            out.push(tokens(macros::destringize(s.sym.as_str()).as_bytes()));
         }
     }
     out
@@ -765,6 +815,39 @@ mod tests {
         assert_eq!(t[0].kind, Kind::Str);
         assert_eq!(t[1].kind, Kind::Char);
         assert_eq!(t[2].kind, Kind::Str);
+    }
+
+    #[test]
+    fn line_endings() {
+        // A lone carriage return ends a line (and a splice), as a newline
+        // and a carriage return and a newline do.
+        let fd = lex(b"#pragma once\r#include \"a.h\"\r\n#define X 1 \\\r  + 2\rint y;\r#if X\n#endif\r");
+        assert_eq!(kinds(&fd), vec![DirKind::Pragma, DirKind::Include, DirKind::Define, DirKind::If, DirKind::Endif]);
+        assert_eq!(spell(&fd.dirs[2].toks), vec!["X", "1", "+", "2"]);
+        assert_eq!(fd.dirs.iter().map(|d| d.line).collect::<Vec<_>>(), vec![1, 2, 3, 6, 7]);
+        assert!(fd.lone_cr);
+        assert!(!lex(b"#include \"a.h\"\r\n").lone_cr);
+    }
+
+    #[test]
+    fn line_directives_and_trigraphs() {
+        let fd = lex(b"#line 10 \"x.c\"\n# 33 \"y.c\" 2\n#\n#ident \"x\"\n");
+        assert_eq!(kinds(&fd), vec![DirKind::Line, DirKind::Line, DirKind::Other, DirKind::Other]);
+        assert!(!fd.trigraphs);
+        for t in [&b"??=include <a.h>\n"[..], b"/* *??/\n/\n", b"char c = '??/'';\n", b"x ??- y\n"] {
+            assert!(lex(t).trigraphs, "{:?}", String::from_utf8_lossy(t));
+        }
+        assert!(!lex(b"x ? y : z ?? w;\nint q = a ?: b;\n").trigraphs);
+    }
+
+    #[test]
+    fn pragmas_in_text() {
+        // Written in text: run. From macros: marked (text isn't expanded).
+        let fd = lex(b"_Pragma(\"push_macro(\\\"M\\\")\") int x;\nDO_PRAGMA(pop_macro(\"M\"))\n__pragma(once)\nPRAGMA(\"once\")\n\
+              PRAGMA(GCC diagnostic push)\nint push_macro_count;\nstd::call_once(flag, f); // once\nstatic_assert(false, \"T must occur \" \"once in Types\");\n");
+        let pragmas: Vec<Vec<&str>> = fd.dirs.iter().map(|d| spell(&d.toks)).collect();
+        assert_eq!(pragmas, vec![vec!["push_macro", "(", "\"M\"", ")"], vec!["_Pragma"], vec!["_Pragma"], vec!["_Pragma"]]);
+        assert!(fd.dirs.iter().all(|d| d.kind == DirKind::Pragma));
     }
 
     #[test]

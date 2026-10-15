@@ -8,6 +8,9 @@
 //! # ninja-rs log v1
 //! <start ms>\t<end ms>\t<mtime ns>\t<output>\t<command hash, hex>
 //! ```
+//!
+//! Only complete lines count: a torn last line (a crash, a kill, a full
+//! disk) is ignored, as ninja does, and cut off before the next append.
 
 use crate::hash::HashMap;
 use std::fs::{File, OpenOptions};
@@ -104,6 +107,8 @@ pub struct BuildLog {
     file: Option<File>,
     path: String,
     needs_recompaction: bool,
+    /// The length of the file's complete lines, when it ends with a torn one.
+    truncate_to: Option<u64>,
 }
 
 impl BuildLog {
@@ -128,11 +133,15 @@ impl BuildLog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("loading build log {path}: {e}")),
         };
-        let text = String::from_utf8_lossy(&data);
+        // A torn last line may still parse (a shorter hash), and the next
+        // append would extend it.
+        let complete = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let text = String::from_utf8_lossy(&data[..complete]);
         if !text.starts_with(SIGNATURE) {
             self.needs_recompaction = true;
             return Ok(Some("build log version is too old or invalid; starting over".into()));
         }
+        self.truncate_to = (complete < data.len()).then_some(complete as u64);
         let mut total = 0usize;
         for line in text[SIGNATURE.len()..].lines() {
             let f: Vec<&str> = line.split('\t').collect();
@@ -161,11 +170,21 @@ impl BuildLog {
         if self.needs_recompaction {
             self.recompact(path, is_live)?;
         }
+        self.cut_torn_line()
+    }
+
+    /// Cuts off a torn last line found by `load`, so that appends start on
+    /// a line of their own.
+    fn cut_torn_line(&mut self) -> Result<(), String> {
+        if let Some(len) = self.truncate_to.take() {
+            OpenOptions::new().write(true).open(&self.path).and_then(|f| f.set_len(len)).map_err(|e| format!("truncating build log {}: {e}", self.path))?;
+        }
         Ok(())
     }
 
     fn ensure_open(&mut self) -> Result<&mut File, String> {
         if self.file.is_none() {
+            self.cut_torn_line()?;
             let path = self.path.clone();
             if let Some(parent) = std::path::Path::new(&path).parent()
                 && !parent.as_os_str().is_empty()
@@ -209,6 +228,7 @@ impl BuildLog {
         std::fs::write(&tmp, out).map_err(|e| format!("writing {tmp}: {e}"))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("renaming {tmp}: {e}"))?;
         self.needs_recompaction = false;
+        self.truncate_to = None;
         Ok(())
     }
 
@@ -291,6 +311,34 @@ mod tests {
         let mut log = BuildLog::new();
         assert!(log.load(&p).unwrap().is_some());
         assert!(log.entries().is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn torn_entry_is_ignored_and_cut() {
+        let p = tmp("buildlog4");
+        let entry = |output: &str| LogEntry { output: output.into(), command_hash: hash_command(output), start_time: 1, end_time: 2, mtime: 3 };
+        let mut log = BuildLog::new();
+        log.open_for_write(&p, &|_| true).unwrap();
+        log.record(entry("a")).unwrap();
+        log.record(entry("b")).unwrap();
+        log.close();
+        // Cut inside the last entry's hash: it would parse, with another hash,
+        // and the next append would extend it.
+        let mut data = std::fs::read(&p).unwrap();
+        data.truncate(data.len() - 4);
+        std::fs::write(&p, &data).unwrap();
+        let mut log = BuildLog::new();
+        log.load(&p).unwrap();
+        assert!(log.lookup_by_output("b").is_none());
+        log.open_for_write(&p, &|_| true).unwrap();
+        log.record(entry("c")).unwrap();
+        log.close();
+        let mut log = BuildLog::new();
+        log.load(&p).unwrap();
+        assert_eq!(log.lookup_by_output("a"), Some(&entry("a")));
+        assert!(log.lookup_by_output("b").is_none());
+        assert_eq!(log.lookup_by_output("c"), Some(&entry("c")));
         let _ = std::fs::remove_file(&p);
     }
 }

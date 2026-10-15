@@ -16,8 +16,9 @@
 //!   as Bazel does), or fails with its first failed edge. Its outputs are
 //!   those of its `rbe_artifact` (or `rbe_deliverable`) edges: CAS
 //!   references (`bytestream://`) for outputs built remotely, `file://`
-//!   otherwise. Targets that never complete (after a failure, or an
-//!   interruption) are `Aborted`.
+//!   otherwise, hashed off the build loop (and kept in the file digest
+//!   cache, which build events persist too). Targets that never complete
+//!   (after a failure, or an interruption) are `Aborted`.
 //! - **Actions:** failed edges are reported as `ActionExecuted` (all of them
 //!   with `--build_event_publish_all_actions`); every edge counts in
 //!   `BuildMetrics`.
@@ -28,7 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use bep::build_event::Payload;
@@ -165,6 +166,18 @@ fn default_configuration() -> Configuration {
 /// (target name, `rbe_config`): what a `TargetCompleted` event reports.
 type TargetKey = (String, Option<String>);
 
+/// Output path → (hash, size), for outputs built remotely.
+type CasOutputs = HashMap<String, (String, i64)>;
+
+/// What `report_targets` does next.
+enum Hashing {
+    /// Reports a completed target, with its artifacts (and the CAS
+    /// references of those built remotely).
+    Target { key: TargetKey, paths: Vec<String>, cas: CasOutputs },
+    /// Says when every target before it was reported.
+    Settled(tokio::sync::oneshot::Sender<()>),
+}
+
 struct TargetState {
     label: String,
     config_id: String,
@@ -194,8 +207,7 @@ struct Inner {
     planned: bool,
     targets_file: Arc<Targets>,
     starts: HashMap<EdgeId, SystemTime>,
-    /// Output path → (hash, size), for outputs built remotely.
-    cas: HashMap<String, (String, i64)>,
+    cas: CasOutputs,
     mnemonics: BTreeMap<String, MnemonicStats>,
     /// Runner name → (count, exec kind).
     runners: BTreeMap<&'static str, (i32, &'static str)>,
@@ -209,11 +221,16 @@ struct Inner {
 
 pub struct Bes {
     flags: BesFlags,
+    /// For explaining a failed connection to the backend.
+    tls: crate::options::TlsFlags,
     ids: InvocationIds,
     /// `bytestream://...` of the remote cache, when there is one.
     bytestream: Option<String>,
     store: Arc<Store>,
     uploader: Mutex<Option<BesUploader>>,
+    /// Completed targets waiting for their artifacts' digests (see
+    /// `report_targets`).
+    hashing: tokio::sync::mpsc::UnboundedSender<Hashing>,
     file: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
     /// A nested invocation: its events go to the outermost one instead.
     relay_out: Mutex<Option<ninja_daemon::ipc::Stream>>,
@@ -233,9 +250,10 @@ pub struct Bes {
 }
 
 impl Bes {
-    /// Connects to the backend and opens the file (when given). The events
-    /// describing the invocation go first, once the build's targets are known
-    /// (`announce`), or with the first other event.
+    /// Opens the file (when given) and starts the upload to the backend,
+    /// which connects in the background: the build doesn't wait for it. The
+    /// events describing the invocation go first, once the build's targets
+    /// are known (`announce`), or with the first other event.
     pub async fn start(
         opts: &crate::options::Options,
         ids: &InvocationIds,
@@ -256,20 +274,17 @@ impl Bes {
         });
         let mut uploader = None;
         if let Some(backend) = &flags.backend {
-            let connect = tls.load().map(|t| t.connect_options(backend, "", &[]));
-            let channel = match &connect {
-                Ok(c) => rbe_client::connect_channel(c).await.map_err(|e| format!("{e:#}")),
-                Err(e) => Err(e.clone()),
-            };
-            match channel {
-                Ok(channel) => {
+            match tls.load() {
+                Ok(t) => {
+                    let connect = t.connect_options(backend, "", &[]);
                     let mut config = BesConfig::new(&flags.instance_name, &ids.build_request_id, &ids.invocation_id);
                     config.keywords = flags.keywords.clone();
                     config.keywords.extend([format!("command_name={command}"), "protocol_name=BEP".to_string()]);
                     config.lifecycle_events = flags.lifecycle_events;
                     config.headers = flags.headers.clone();
                     config.trace = std::env::var_os("NINJA_RS_BES_DEBUG").is_some_and(|v| !v.is_empty());
-                    uploader = Some(BesUploader::start(channel, config));
+                    // A failed connection is reported at the end (`finish`).
+                    uploader = Some(BesUploader::connecting(async move { rbe_client::connect_channel(&connect).await }, config));
                 }
                 Err(e) => eprintln!("ninja: warning: build events won't be uploaded: {e}{}", crate::options::tls_hint(&e, backend, tls)),
             }
@@ -285,12 +300,15 @@ impl Bes {
             eprintln!("ninja: streaming build results to: {url}{}", ids.invocation_id);
         }
         let relay_in = relay.as_ref().map(|r| r.address.clone());
+        let (hashing, jobs) = tokio::sync::mpsc::unbounded_channel();
         let bes = Arc::new(Bes {
             flags: flags.clone(),
+            tls: tls.clone(),
             ids: ids.clone(),
             bytestream,
             store,
             uploader: Mutex::new(uploader),
+            hashing,
             file: Mutex::new(file),
             relay_out: Mutex::new(relay_out),
             relay_in,
@@ -304,6 +322,7 @@ impl Bes {
             typed: if exec { opts.tool_args.iter().skip_while(|a| *a == "--").cloned().collect() } else { opts.targets.clone() },
             command,
         });
+        tokio::spawn(report_targets(Arc::downgrade(&bes), jobs));
         if let Some(r) = relay {
             bes.serve_relay(r.listener);
         }
@@ -725,23 +744,47 @@ impl Bes {
         }
     }
 
-    /// Sends `TargetCompleted` for a target (once).
+    /// Sends `TargetCompleted` for a target (once). A successful one with
+    /// artifacts waits for their digests (`report_targets`), unless events
+    /// go nowhere.
     fn complete(&self, key: &TargetKey, success: bool) {
-        let files: Vec<bep::File> = {
+        let (paths, cas) = {
             let mut inner = self.inner.lock().unwrap();
             let Some(t) = inner.targets.get_mut(key) else { return };
             if t.done {
                 return;
             }
             t.done = true;
-            let paths = t.artifacts.clone();
-            if success {
-                let mut seen = BTreeSet::new();
-                paths.iter().filter(|p| seen.insert(p.to_string())).filter_map(|p| self.file_entry(p, &inner.cas)).collect()
-            } else {
-                Vec::new()
-            }
+            let mut seen = BTreeSet::new();
+            let paths: Vec<String> = t.artifacts.iter().filter(|p| seen.insert(p.as_str())).cloned().collect();
+            let cas: CasOutputs = paths.iter().filter_map(|p| Some((p.clone(), inner.cas.get(p)?.clone()))).collect();
+            (paths, cas)
         };
+        if success && !paths.is_empty() && self.has_sink() && self.hashing.send(Hashing::Target { key: key.clone(), paths, cas }).is_ok() {
+            return;
+        }
+        self.report_completed(key, success, Vec::new());
+    }
+
+    /// Whether events go anywhere: to the invocation running this one, the
+    /// file, or an upload that hasn't failed.
+    fn has_sink(&self) -> bool {
+        self.relay_out.lock().unwrap().is_some()
+            || self.file.lock().unwrap().is_some()
+            || self.uploader.lock().unwrap().as_ref().is_some_and(|u| !u.is_closed())
+    }
+
+    /// Waits until the targets completed so far are reported: their
+    /// artifacts' digests are in the store's cache then.
+    pub async fn settle(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.hashing.send(Hashing::Settled(tx)).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// Sends `TargetCompleted` for a target, with its outputs' `files`.
+    fn report_completed(&self, key: &TargetKey, success: bool, files: Vec<bep::File>) {
         self.emit(|i| {
             let t = &i.targets[key];
             let (label, config_id) = (t.label.clone(), t.config_id.clone());
@@ -764,8 +807,9 @@ impl Bes {
     }
 
     /// The BEP entry for an output: a CAS reference when it was built
-    /// remotely (and there is a remote cache), else the local file.
-    fn file_entry(&self, path: &str, cas: &HashMap<String, (String, i64)>) -> Option<bep::File> {
+    /// remotely (and there is a remote cache), else the local file, hashed
+    /// unless the file digest cache knows it.
+    fn file_entry(&self, path: &str, cas: &CasOutputs) -> Option<bep::File> {
         let p = Path::new(path);
         let name = p.file_name()?.to_string_lossy().into_owned();
         let path_prefix =
@@ -892,6 +936,7 @@ impl Bes {
     /// build's end and metrics), and waits for the upload, up to
     /// `--bes_timeout`.
     pub async fn finish(&self, exit_code: i32) {
+        self.settle().await;
         let interrupted = exit_code == crate::EXIT_INTERRUPTED;
         let reason = if interrupted {
             bep::aborted::AbortReason::UserInterrupted
@@ -995,11 +1040,34 @@ impl Bes {
             let timeout = Some(self.flags.timeout).filter(|t| !t.is_zero()).unwrap_or(Duration::MAX);
             match tokio::time::timeout(timeout, u.finish(outcome)).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => eprintln!("ninja: warning: build event upload failed: {e:#}"),
+                Ok(Err(e)) => {
+                    let e = format!("{e:#}");
+                    let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls)).unwrap_or_default();
+                    eprintln!("ninja: warning: build event upload failed: {e}{hint}");
+                }
                 Err(_) => eprintln!("ninja: warning: build event upload didn't finish within {timeout:?}"),
             }
             if let Some(url) = &self.flags.results_url {
                 eprintln!("ninja: streaming build results to: {url}{}", self.ids.invocation_id);
+            }
+        }
+    }
+}
+
+/// Reports completed targets, in order, once their artifacts are hashed:
+/// off the build loop and outside `Bes::inner` (relayed events go on), as
+/// an artifact can be gigabytes.
+async fn report_targets(bes: Weak<Bes>, mut jobs: tokio::sync::mpsc::UnboundedReceiver<Hashing>) {
+    while let Some(job) = jobs.recv().await {
+        match job {
+            Hashing::Target { key, paths, cas } => {
+                let Some(bes) = bes.upgrade() else { return };
+                let b = bes.clone();
+                let files = tokio::task::spawn_blocking(move || paths.iter().filter_map(|p| b.file_entry(p, &cas)).collect()).await;
+                bes.report_completed(&key, true, files.unwrap_or_default());
+            }
+            Hashing::Settled(done) => {
+                let _ = done.send(());
             }
         }
     }
@@ -1100,5 +1168,102 @@ mod tests {
     fn bytestream_prefixes() {
         assert_eq!(bytestream_prefix("grpcs://cache.example.com:443", ""), "bytestream://cache.example.com:443");
         assert_eq!(bytestream_prefix("grpc://127.0.0.1:8980/", "main"), "bytestream://127.0.0.1:8980/main");
+    }
+
+    fn options(args: &[&str]) -> crate::options::Options {
+        let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match crate::options::parse_args(&v).unwrap() {
+            crate::options::ParseOutcome::Run(o) => *o,
+            crate::options::ParseOutcome::Exit(m, _) => panic!("exit: {m}"),
+        }
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ninja_rs_bes_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A build of one target, up to date, whose artifact is `artifact`:
+    /// the graph and the requested node.
+    fn artifact_graph(artifact: &Path) -> (State, NodeId) {
+        let path = artifact.to_string_lossy().replace('$', "$$").replace(':', "$:").replace(' ', "$ ");
+        let manifest = format!("rule gen\n  command = gen\nbuild {path}: gen\n  rbe_target = app\n  rbe_artifact = 1\n");
+        let mut state = State::new();
+        let files = ninja_core::parser::MemFiles::default();
+        ninja_core::parser::ManifestParser::new(&mut state, &files, Default::default()).parse_test(&manifest).unwrap();
+        let node = state.edges[0].outputs[0];
+        (state, node)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn artifacts_arent_hashed_for_events_going_nowhere() {
+        let dir = test_dir("nowhere");
+        let artifact = dir.join("app.bin");
+        std::fs::write(&artifact, "hello").unwrap();
+        let opts = options(&[&format!("--build_event_binary_file={}", dir.join("missing").join("events.bep").display())]);
+        let store = Store::new();
+        let bes = Bes::start(&opts, &InvocationIds::default(), None, store.clone(), None).await;
+        let (state, node) = artifact_graph(&artifact);
+        bes.plan(&state, &Plan::default(), &[node], Default::default(), &[], None);
+        bes.finish(0).await;
+        assert!(store.digests.entries().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn artifacts_are_hashed_off_the_build_loop() {
+        let dir = test_dir("off_the_loop");
+        // An artifact that can't be read until something writes to it.
+        let artifact = dir.join("app.bin");
+        let c_path = std::ffi::CString::new(artifact.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let file = dir.join("events.bep");
+        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+        let (state, node) = artifact_graph(&artifact);
+        // The build goes on, and so do other events (relayed ones).
+        let b = bes.clone();
+        let planned = tokio::task::spawn_blocking(move || {
+            b.plan(&state, &Plan::default(), &[node], Default::default(), &[], None);
+            b.message("ninja: no work to do.\n");
+        });
+        let planned = tokio::time::timeout(Duration::from_secs(5), planned).await;
+        let writer = std::thread::spawn(move || std::fs::write(&artifact, "hello"));
+        planned.expect("the build waited for the artifact's digest").unwrap();
+        writer.join().unwrap().unwrap();
+        bes.finish(0).await;
+        let digests: Vec<String> = read_binary_file(&file)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                Some(Payload::NamedSetOfFiles(s)) => Some(s.files.into_iter().map(|f| f.digest)),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(digests, [rbe_client::digest_of(b"hello").hash]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_build_doesnt_wait_for_the_backend() {
+        // A backend accepting connections and never answering (the TLS
+        // handshake waits for it).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().collect();
+            drop(held);
+        });
+        let opts = options(&[&format!("--bes_backend=grpcs://127.0.0.1:{port}"), "--bes_timeout=1s"]);
+        let started = tokio::time::timeout(Duration::from_secs(5), Bes::start(&opts, &InvocationIds::default(), None, Store::new(), None)).await;
+        let bes = started.expect("the build waited for the backend");
+        // The end waits for the upload as long as --bes_timeout says.
+        let start = Instant::now();
+        bes.finish(0).await;
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
     }
 }

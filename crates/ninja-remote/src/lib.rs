@@ -18,6 +18,7 @@ pub mod action;
 pub mod archive;
 pub mod backend;
 pub mod cmdline;
+pub mod compile_outputs;
 pub mod disk_cache;
 pub mod link;
 pub mod paths;

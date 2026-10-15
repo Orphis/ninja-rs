@@ -303,9 +303,13 @@ impl Service {
                     return EXIT_FAILURE;
                 }
             };
-            // Without a backend (the manifest left RBE), records are moot:
-            // the outputs are built again.
+            // Without a backend (no remote service, or the manifest left RBE),
+            // records are moot: the outputs are built again, locally, and
+            // records kept would outlive them.
             let remote_outputs = remote_outputs.filter(|_| backend.is_some());
+            if backend.is_none() && !opts.dry_run {
+                let _ = std::fs::remove_file(in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE));
+            }
             if let (Some(b), Some(outputs)) = (&backend, &remote_outputs)
                 && !outputs.is_empty()
             {
@@ -316,9 +320,11 @@ impl Service {
                 }
             }
             let remote: Option<Arc<dyn RemoteBackend>> = backend.clone().map(|b| b as Arc<dyn RemoteBackend>);
-            if remote.is_some() && !self.digests_loaded {
+            let keep_digests = remote.is_some() || status.bes.is_some();
+            if keep_digests && !self.digests_loaded {
                 // File digests persist across invocations (keyed by path,
-                // size and mtime) so that toolchains are hashed once.
+                // size and mtime) so that toolchains, and the artifacts
+                // build events report, are hashed once.
                 let f = if build_dir.is_empty() {
                     ninja_remote::store::DIGESTS_FILE.to_string()
                 } else {
@@ -363,7 +369,6 @@ impl Service {
 
             let digests_file =
                 if build_dir.is_empty() { ninja_remote::store::DIGESTS_FILE.to_string() } else { format!("{build_dir}/{}", ninja_remote::store::DIGESTS_FILE) };
-            let use_remote = remote.is_some();
             let jobserver_settings = jobserver::Settings {
                 parallelism: opts.parallelism,
                 explicit_parallelism: opts.explicit_parallelism,
@@ -393,8 +398,15 @@ impl Service {
             {
                 status.warning(&format!("saving {REMOTE_OUTPUTS_FILE}: {e}"));
             }
-            if use_remote && let Err(e) = self.store.save_digests(std::path::Path::new(&digests_file)) {
-                status.warning(&format!("saving {digests_file}: {e}"));
+            if keep_digests {
+                // The digests of artifacts build events are still hashing
+                // are saved too.
+                if let Some(b) = &status.bes {
+                    b.settle().await;
+                }
+                if let Err(e) = self.store.save_digests(std::path::Path::new(&digests_file)) {
+                    status.warning(&format!("saving {digests_file}: {e}"));
+                }
             }
             let (remote_n, hits) = status.printer.remote_counts();
             if remote_n > 0 && opts.verbosity != Verbosity::Quiet {

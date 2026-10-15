@@ -49,7 +49,10 @@ paths (`-rpath`, `-R`, `-install_name`, also through `-Wl,` and
 `-Xlinker`). Rewritten, `-DDATA_DIR="/home/u/proj/data"` would become
 `"../data"` and the program would differ from the one ninja builds (and
 break when run from elsewhere). An action with such a value names the
-checkout, so two checkouts don't share it.
+checkout, so two checkouts don't share it. A definition is `-D` (or `/D`
+on Windows) followed by a macro name and its end, `=`, `#` or `(`: linker
+options spelled alike (`/DEF:x.def`, `/DEFAULTLIB:x.lib`,
+`-DELAYLOAD:x.dll`) name files the link opens, and are rewritten.
 
 A path is rewritten to a path **relative to the working directory** when it
 lies under the exec root, in the input tree or not: an include directory

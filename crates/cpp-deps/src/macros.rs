@@ -11,7 +11,8 @@
 //! Expansion only runs on `#if`/`#elif` expressions and `#include`
 //! operands. In `#if` mode, `defined`, `__has_include` and the compiler's
 //! queries (`__has_builtin` and the like) are evaluated as they appear,
-//! before their operands could be expanded.
+//! before their operands could be expanded (a query naming a macro the
+//! source defined is unknown: compilers may expand it).
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -29,6 +30,90 @@ pub struct Macro {
     /// `__VA_ARGS__`, GNU's `name...` keeps its name).
     pub variadic: bool,
     pub body: Box<[Token]>,
+    /// What the body does through pragmas where it's expanded: in text,
+    /// which the scan doesn't expand.
+    pub pragmas: Pragmas,
+}
+
+/// What tokens do through pragmas that change macros or inclusion
+/// (`once`, `push_macro`, `pop_macro`, `include_alias`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Pragmas {
+    #[default]
+    None,
+    /// Pushes or pops these macros (libc++'s `_LIBCPP_PUSH_MACROS`): no
+    /// effect unless they're defined or undefined meanwhile.
+    Macros(Box<[Sym]>),
+    /// Something else, or an operand the scan can't read.
+    Other,
+}
+
+/// The string literal's contents (`"a\"b"` is `a"b`).
+pub(crate) fn destringize(lit: &str) -> String {
+    let body = lit.trim_start_matches(|c| c != '"').trim_matches('"');
+    body.replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+/// The pragmas that change macros or inclusion.
+const PRAGMAS: [Sym; 4] = [intern::ONCE, intern::PUSH_MACRO, intern::POP_MACRO, intern::INCLUDE_ALIAS];
+
+/// What tokens do through pragmas: `__pragma(...)`, the words of a pragma
+/// given to a macro (`DO_PRAGMA(once)`, `PRAGMA("once")`), and
+/// `_Pragma("...")` (which text runs where it's written: only `literal`
+/// ones count).
+pub(crate) fn pragmas(toks: &[Token], literal: bool) -> Pragmas {
+    let (mut names, mut other) = (Vec::new(), false);
+    // One pragma's tokens (after `#pragma`).
+    fn pragma(p: &[Token], names: &mut Vec<Sym>, other: &mut bool) {
+        match p {
+            [w, l, s, r, ..] if (w.sym == intern::PUSH_MACRO || w.sym == intern::POP_MACRO) && l.is(P::LParen) && s.kind == Kind::Str && r.is(P::RParen) => {
+                names.push(intern::intern(&destringize(s.sym.as_str())));
+            }
+            [w, ..] if PRAGMAS.contains(&w.sym) => *other = true,
+            _ => {}
+        }
+    }
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        let call = toks.get(i + 1).is_some_and(|p| p.is(P::LParen));
+        if call && t.sym == intern::PRAGMA_OPERATOR && toks.get(i + 2).is_some_and(|s| s.kind == Kind::Str) {
+            if literal {
+                pragma(&lex::tokens(destringize(toks[i + 2].sym.as_str()).as_bytes()), &mut names, &mut other);
+            }
+            i += 3;
+            continue;
+        }
+        if call && t.sym == intern::MS_PRAGMA_OPERATOR {
+            let mut depth = 0;
+            let end = (i + 1..toks.len())
+                .find(|&j| {
+                    depth += toks[j].is(P::LParen) as i32 - toks[j].is(P::RParen) as i32;
+                    depth == 0
+                })
+                .unwrap_or(toks.len());
+            pragma(&toks[i + 2..end], &mut names, &mut other);
+            i = end + 1;
+            continue;
+        }
+        // A macro's only argument: `DO_PRAGMA(once)`, `PRAGMA("once")`.
+        let alone = i > 0 && toks[i - 1].is(P::LParen) && toks.get(i + 1).is_some_and(|r| r.is(P::RParen));
+        other |= match t.kind {
+            Kind::Ident => [intern::PUSH_MACRO, intern::POP_MACRO, intern::INCLUDE_ALIAS].contains(&t.sym) || (t.sym == intern::ONCE && alone),
+            Kind::Str if alone => {
+                let text = destringize(t.sym.as_str());
+                let word = text.trim_start().split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap_or_default();
+                matches!(word, "once" | "push_macro" | "pop_macro" | "include_alias")
+            }
+            _ => false,
+        };
+        i += 1;
+    }
+    match (other, names.is_empty()) {
+        (true, _) => Pragmas::Other,
+        (false, false) => Pragmas::Macros(names.into_boxed_slice()),
+        (false, true) => Pragmas::None,
+    }
 }
 
 /// Parses the tokens after `#define`.
@@ -73,13 +158,15 @@ pub fn parse_define(toks: &[Token]) -> Option<Macro> {
         if let Some(first) = body.first_mut() {
             first.space = false;
         }
-        Some(Macro { name, params: Some(params.into_boxed_slice()), variadic, body: body.into_boxed_slice() })
+        let pragmas = pragmas(&body, true);
+        Some(Macro { name, params: Some(params.into_boxed_slice()), variadic, body: body.into_boxed_slice(), pragmas })
     } else {
         let mut body: Vec<Token> = rest.to_vec();
         if let Some(first) = body.first_mut() {
             first.space = false;
         }
-        Some(Macro { name, params: None, variadic: false, body: body.into_boxed_slice() })
+        let pragmas = pragmas(&body, true);
+        Some(Macro { name, params: None, variadic: false, body: body.into_boxed_slice(), pragmas })
     }
 }
 
@@ -144,6 +231,11 @@ pub trait Context {
     fn is_query(&self, op: Sym) -> bool;
     /// A query's value; None when unknown.
     fn query(&mut self, op: Sym, arg: &str) -> Option<i64>;
+    /// Whether `name` is defined otherwise than the compiler predefines
+    /// it (which its answers to queries assume).
+    fn redefined(&self, _name: Sym) -> bool {
+        false
+    }
 }
 
 /// A number token (0 and 1, the usual results, without interning).
@@ -332,6 +424,12 @@ impl<'c> Expander<'c> {
                 self.fail(format!("malformed {}()", name.as_str()));
                 return Some(unknown());
             };
+            // GCC expands the operands of every query, Clang those of some:
+            // a macro defined here would change what the compiler is asked.
+            if op.iter().any(|t| t.t.kind == Kind::Ident && self.ctx.redefined(t.t.sym)) {
+                self.fail(format!("{}() of a macro", name.as_str()));
+                return Some(unknown());
+            }
             let arg: String = op.iter().map(|t| t.t.sym.as_str()).collect();
             return Some(match self.ctx.query(name, &arg) {
                 Some(v) => number(v),
@@ -567,7 +665,7 @@ pub fn parse_defines(text: &str) -> Vec<Macro> {
 
 impl Macro {
     fn clone_macro(&self) -> Macro {
-        Macro { name: self.name, params: self.params.clone(), variadic: self.variadic, body: self.body.clone() }
+        Macro { name: self.name, params: self.params.clone(), variadic: self.variadic, body: self.body.clone(), pragmas: self.pragmas.clone() }
     }
 }
 
@@ -672,6 +770,65 @@ mod tests {
         assert_eq!(expand(defs, "F(1) F(1, 2, 3)", false), "f(1) f(1, 2, 3)");
         assert_eq!(expand(defs, "G(x) G(x, y)", false), "g(x) g(x, y)");
         assert_eq!(expand(defs, "H(x) H(x, y, z)", false), "h(x) h(x, y, z)");
+    }
+
+    #[test]
+    fn pragmas_of_bodies() {
+        let of = |def: &str| parse_defines(def).remove(0).pragmas;
+        let names = |n: &[&str]| Pragmas::Macros(n.iter().map(|s| intern::intern(s)).collect());
+        // libc++'s _LIBCPP_PUSH_MACROS, and MSVC's spelling.
+        assert_eq!(of("#define PUSH _Pragma(\"push_macro(\\\"min\\\")\") _Pragma(\"push_macro(\\\"max\\\")\")\n"), names(&["min", "max"]));
+        assert_eq!(of("#define POP __pragma(pop_macro(\"min\")) __pragma(warning(pop))\n"), names(&["min"]));
+        assert_eq!(of("#define D _Pragma(\"clang diagnostic push\") __pragma(warning(push))\n"), Pragmas::None);
+        assert_eq!(of("#define STR(x) _Pragma(#x)\n"), Pragmas::None);
+        assert_eq!(of("#define VERSION \"1.2\" call_once(f)\n"), Pragmas::None);
+        for other in [
+            "#define ONCE _Pragma(\"once\")\n",
+            "#define ONCE __pragma(once)\n",
+            "#define ALIAS _Pragma(\"include_alias(\\\"a.h\\\", \\\"b.h\\\")\")\n",
+            "#define P DO_PRAGMA(push_macro(\"M\"))\n",
+            "#define P DO_PRAGMA(once)\n",
+            "#define P PRAGMA(\"once\")\n",
+            "#define P(x) _Pragma(\"push_macro(\" #x \")\")\n",
+        ] {
+            assert_eq!(of(other), Pragmas::Other, "{other}");
+        }
+    }
+
+    #[test]
+    fn redefined_query_operands() {
+        struct Redefining(Ctx);
+        impl Context for Redefining {
+            fn lookup(&self, name: Sym) -> Option<Arc<Macro>> {
+                self.0.lookup(name)
+            }
+            fn is_defined(&self, name: Sym) -> bool {
+                self.0.is_defined(name)
+            }
+            fn dynamic(&mut self, name: Sym) -> Option<Token> {
+                self.0.dynamic(name)
+            }
+            fn has_include(&mut self, name: &str, angled: bool, next: bool) -> bool {
+                self.0.has_include(name, angled, next)
+            }
+            fn has_embed(&mut self, name: &str, angled: bool, limit_zero: bool) -> i64 {
+                self.0.has_embed(name, angled, limit_zero)
+            }
+            fn is_query(&self, op: Sym) -> bool {
+                self.0.is_query(op)
+            }
+            fn query(&mut self, op: Sym, arg: &str) -> Option<i64> {
+                self.0.query(op, arg)
+            }
+            fn redefined(&self, name: Sym) -> bool {
+                self.0.macros.contains_key(&name)
+            }
+        }
+        let mut c = Redefining(ctx("#define B __builtin_expect\n"));
+        let mut x = Expander::new(&mut c, true);
+        let out = x.expand_tokens(&lex::tokens(b"__has_builtin(B) || __has_builtin(__builtin_expect)"));
+        assert!(x.error.is_some());
+        assert_eq!(out[0].kind, Kind::Unknown);
     }
 
     #[test]

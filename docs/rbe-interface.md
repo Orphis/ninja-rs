@@ -5,8 +5,10 @@ This is the contract between a build system generator that writes
 execution (REAPI v2) and reports them in build event streams, such as
 `ninja-rs`. It is not specific to one generator: CMake's Ninja generators
 write it with `-DCMAKE_NINJA_RBE=ON`, and any other generator (or a
-hand-written file) can. Design doc: "CMake Ninja RBE Mode: Design"
-(https://claude.ai/code/artifact/f5fd7431-9c04-4cf4-88ce-8c7655c0fd4e).
+hand-written file) can. The CMake side is the `ninja-rbe` branch of
+<https://gitlab.kitware.com/Orphis/cmake> (`CMAKE_NINJA_RBE`,
+`CMAKE_<LANG>_COMPILER_REMOTE_INPUTS`, `CMAKE_REMOTE_PLATFORM`); ninja-rs's
+is described in [design.md](design.md).
 
 Everything here is plain ninja syntax: stock ninja ignores it and still builds
 the project locally. All names start with `rbe_`, so that they don't collide

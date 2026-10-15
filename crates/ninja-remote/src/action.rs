@@ -115,6 +115,10 @@ pub struct Prepared {
     /// Every input with its digest, when `Shared::log_inputs` (for the
     /// execution log).
     pub input_digests: Vec<(String, String)>,
+    /// Every program the action runs is a tool the toolchains file
+    /// declares: one the generator vouches the action describes, with the
+    /// files it sends.
+    pub toolchain_declared: bool,
 }
 
 fn to_s(p: &Path) -> String {
@@ -151,6 +155,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     let exe = &exes[0];
     let toolchains: Vec<_> = exes.iter().filter_map(|e| shared.toolchains.find(e).cloned()).collect();
     let toolchain = shared.toolchains.find(exe).cloned().or_else(|| toolchains.first().cloned());
+    let toolchain_declared = exes.iter().all(|e| shared.toolchains.find(e).is_some());
     let mut warnings = Vec::new();
 
     // Only a single compiler invocation is scanned for includes.
@@ -172,6 +177,9 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     // A driver that compiles nothing links: its linker's inputs are found
     // from its dry run, like a linker's from its arguments.
     let driver_link = style.is_some() && !crate::link::driver_compiles(&expanded);
+    // A compile's other files (split DWARF, coverage notes...), asked for.
+    let compile_outputs =
+        if style.is_some() && !driver_link { crate::compile_outputs::side_outputs(&expanded, style == Some(Style::Msvc))? } else { Vec::new() };
     // A driver without a dry run sends its declared inputs only.
     let link = if steps.len() == 1 && (driver_link || crate::link::linker_flavor(&exe.to_string_lossy()).is_some()) {
         match crate::link::analyze(exe, argv, build_dir, driver_link) {
@@ -539,6 +547,13 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
             side_outputs.push((rel, scanner::normalize(&build_dir.join(o))));
         }
     }
+    for o in &compile_outputs {
+        // Outside the build directory: the action can't return it.
+        let rel = output_rel(&mut mapper, o)?;
+        if !outputs.iter().chain(&side_outputs).chain(&depfile).any(|(r, _)| *r == rel) {
+            side_outputs.push((rel, scanner::normalize(&build_dir.join(o))));
+        }
+    }
     let mut output_paths: Vec<String> = outputs.iter().chain(&side_outputs).map(|(r, _)| r.clone()).collect();
     if let Some((r, _)) = &depfile {
         output_paths.push(r.clone());
@@ -591,6 +606,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         rsp_files,
         input_root_digest,
         input_digests,
+        toolchain_declared,
     })
 }
 

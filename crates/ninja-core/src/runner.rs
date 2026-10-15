@@ -100,6 +100,8 @@ pub struct CasOutput {
 
 pub type WaitFuture<'a> = Pin<Box<dyn Future<Output = Option<TaskResult>> + Send + 'a>>;
 
+pub type AbortFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// What a remote backend did with a task.
 pub enum RemoteOutcome {
     /// The task ran remotely (or was a cache hit); outputs are on disk.
@@ -317,8 +319,9 @@ pub trait CommandRunner: Send {
     /// Waits for the next task to finish. `None` if nothing is running.
     fn wait_for_command(&mut self) -> WaitFuture<'_>;
     fn active_edges(&self) -> Vec<EdgeId>;
-    /// Kills everything running.
-    fn abort(&mut self);
+    /// Stops everything running. Completes once the commands started have
+    /// exited, so that none writes the outputs the engine deletes next.
+    fn abort(&mut self) -> AbortFuture<'_>;
 }
 
 /// `-n`: pretends every command succeeded.
@@ -349,8 +352,9 @@ impl CommandRunner for DryRunRunner {
     fn active_edges(&self) -> Vec<EdgeId> {
         Vec::new()
     }
-    fn abort(&mut self) {
+    fn abort(&mut self) -> AbortFuture<'_> {
         self.finished.clear();
+        Box::pin(std::future::ready(()))
     }
 }
 

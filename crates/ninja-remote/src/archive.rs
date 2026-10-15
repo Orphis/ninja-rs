@@ -153,7 +153,10 @@ fn is_abs(p: &str) -> bool {
 }
 
 /// A member's path as the build names paths: `name` resolved against the
-/// directory of `archive`, both relative to the build directory.
+/// directory of `archive`, both relative to the build directory. Members
+/// are objects the build made: one outside the build directory is refused
+/// (an archive from a result, or its ranged reads, would otherwise make
+/// every action reading it send any file the user can read).
 pub fn member_path(archive: &str, name: &str) -> Result<String, String> {
     if is_abs(name) {
         // Remotely, the path would name a file outside the input root.
@@ -164,7 +167,11 @@ pub fn member_path(archive: &str, name: &str) -> Result<String, String> {
         Some(i) => format!("{}/{}", &archive[..i], name.replace('\\', "/")),
         None => name.replace('\\', "/"),
     };
-    Ok(ninja_core::canon::canonicalize_path_with(&joined, false).0)
+    let path = ninja_core::canon::canonicalize_path_with(&joined, false).0;
+    if path == ".." || path.starts_with("../") {
+        return Err(format!("thin archive {archive} names its member {name} outside the build directory"));
+    }
+    Ok(path)
 }
 
 /// The members of the thin archives among `inputs` (paths relative to the
@@ -272,7 +279,10 @@ mod tests {
         assert_eq!(member_path("lib/libt.a", "../obj/a.o").unwrap(), "obj/a.o");
         assert_eq!(member_path("libt.a", "obj/a.o").unwrap(), "obj/a.o");
         assert_eq!(member_path("lib\\libt.a", "..\\obj\\a.o").unwrap(), "obj/a.o");
-        assert_eq!(member_path("libt.a", "../src/x.o").unwrap(), "../src/x.o");
+        // Outside the build directory: refused, as an archive from a result
+        // could name any file.
+        assert!(member_path("libt.a", "../src/x.o").is_err());
+        assert!(member_path("lib/libt.a", "../../../home/u/.ssh/id_ed25519").is_err());
         assert!(member_path("libt.a", "/abs/a.o").is_err());
         assert!(member_path("libt.a", "C:/abs/a.o").is_err());
     }

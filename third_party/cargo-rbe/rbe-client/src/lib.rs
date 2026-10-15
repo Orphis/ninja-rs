@@ -78,10 +78,16 @@ pub struct Client {
     /// without moving. Executions aren't bounded: a broken one is followed
     /// again (`WaitExecution`).
     timeout: Duration,
+    /// Whether the server answered a call since connecting. Until it has,
+    /// a call it left unanswered isn't made again (see `retrying`). Shared
+    /// by clones.
+    answered: Arc<std::sync::atomic::AtomicBool>,
     /// Blobs being uploaded, by hash: a call needing one another call is
     /// uploading waits for it (`true` once there, `false` if that upload
     /// failed), instead of uploading it too. Shared by clones.
     inflight: Arc<Mutex<HashMap<String, watch::Receiver<Option<bool>>>>>,
+    /// Permits for reads (`MAX_READS`), shared by clones.
+    reads: Arc<tokio::sync::Semaphore>,
 }
 
 /// `--remote_retries` and `--remote_timeout` defaults, Bazel's.
@@ -183,6 +189,13 @@ const MIN_COMPRESSED: usize = 1024;
 /// `ChunkedBlobUploader`).
 const CHUNK_STREAMS: usize = 16;
 
+/// Batches and streams one call uploads at once.
+const UPLOADS: usize = 16;
+
+/// Reads (batches and streams) in flight at once, all calls together: what
+/// they read is in memory until it's written.
+const MAX_READS: usize = 32;
+
 #[derive(Default)]
 struct TransferCounters {
     read: AtomicU64,
@@ -219,9 +232,18 @@ pub struct ActionMeta {
     pub configuration_id: String,
 }
 
+/// How long connecting may take: resolving the name, the TCP connection,
+/// the TLS handshake and HTTP/2's.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Connects a gRPC channel (TLS for `grpcs://`, with an optional client
 /// identity). Shared by the REAPI client and other services (e.g. BES).
 pub async fn connect_channel(opts: &ConnectOptions) -> Result<Channel> {
+    connect_within(opts, CONNECT_TIMEOUT).await
+}
+
+/// `connect_channel`, failing after `timeout`.
+async fn connect_within(opts: &ConnectOptions, timeout: Duration) -> Result<Channel> {
     let (scheme, rest) = opts.endpoint.split_once("://").unwrap_or(("grpcs", opts.endpoint.as_str()));
     let host = rest.split([':', '/']).next().unwrap_or(rest).to_string();
     let (url, tls) = match scheme {
@@ -233,14 +255,17 @@ pub async fn connect_channel(opts: &ConnectOptions) -> Result<Channel> {
     // product (as grpc-java tunes them), not 64 KiB: one large download
     // isn't held back by them.
     let mut endpoint = Endpoint::from_shared(url)?
-        .connect_timeout(Duration::from_secs(20))
+        .connect_timeout(timeout)
         .http2_keep_alive_interval(Duration::from_secs(30))
         .keep_alive_while_idle(true)
         .tcp_nodelay(true)
         .http2_adaptive_window(true);
     if tls {
         let domain = opts.authority_override.clone().unwrap_or(host);
-        let mut cfg = ClientTlsConfig::new().domain_name(domain).with_webpki_roots();
+        // The connect timeout covers the TCP connection only: a server
+        // accepting connections and never answering would hold the
+        // handshake (and every reconnection) forever.
+        let mut cfg = ClientTlsConfig::new().domain_name(domain).with_webpki_roots().timeout(timeout);
         if let Some(ca) = &opts.ca_pem {
             cfg = cfg.ca_certificate(Certificate::from_pem(ca));
         }
@@ -251,7 +276,10 @@ pub async fn connect_channel(opts: &ConnectOptions) -> Result<Channel> {
         }
         endpoint = endpoint.tls_config(cfg)?;
     }
-    endpoint.connect().await.with_context(|| format!("connecting to {}", opts.endpoint))
+    match tokio::time::timeout(timeout, endpoint.connect()).await {
+        Ok(channel) => channel.with_context(|| format!("connecting to {}", opts.endpoint)),
+        Err(_) => bail!("connecting to {}: no connection within {timeout:?}", opts.endpoint),
+    }
 }
 
 pub fn digest_of(data: &[u8]) -> re::Digest {
@@ -278,6 +306,18 @@ pub fn verify(d: &re::Digest, data: &[u8]) -> Result<()> {
         bail!("blob {}: received data hashing to {hash}", digest_str(d));
     }
     Ok(())
+}
+
+/// Whether `hash` is a SHA-256 in lowercase hex, as every digest is. A hash
+/// from a server, a cache or a record becomes a file name (in a disk cache,
+/// a resource name): anything else (`..`, a path) must be refused first.
+pub fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether a digest from elsewhere is well formed (see [`valid_hash`]).
+pub fn valid_digest(d: &re::Digest) -> bool {
+    valid_hash(&d.hash) && d.size_bytes >= 0
 }
 
 pub fn digest_str(d: &re::Digest) -> String {
@@ -318,7 +358,9 @@ impl Client {
             headers: Arc::new(Vec::new()),
             retries: DEFAULT_RETRIES,
             timeout: DEFAULT_TIMEOUT,
+            answered: Default::default(),
             inflight: Default::default(),
+            reads: Arc::new(tokio::sync::Semaphore::new(MAX_READS)),
         }
     }
 
@@ -331,7 +373,9 @@ impl Client {
     }
 
     /// Runs `call` until it succeeds, fails for good, or has failed for a
-    /// transient reason `retries` times, waiting longer each time.
+    /// transient reason `retries` times, waiting longer each time. A server
+    /// that never answered (one accepting connections and saying nothing)
+    /// isn't called again: each call would wait `--remote_timeout` for it.
     async fn retrying<T, F, Fut>(&self, mut call: F) -> Result<T>
     where
         F: FnMut() -> Fut,
@@ -340,7 +384,11 @@ impl Client {
         let mut attempt = 0;
         loop {
             match call().await {
-                Err(e) if attempt < self.retries && status_of(&e).is_some_and(|s| transient(s.code())) => {
+                Err(e)
+                    if attempt < self.retries
+                        && self.answered.load(Ordering::Relaxed)
+                        && status_of(&e).is_some_and(|s| transient(s.code())) =>
+                {
                     tokio::time::sleep(backoff(attempt)).await;
                     attempt += 1;
                 }
@@ -352,7 +400,15 @@ impl Client {
     /// `call`, failing with DEADLINE_EXCEEDED after `--remote_timeout`.
     async fn timed<T>(&self, call: impl std::future::Future<Output = Result<T, tonic::Status>>) -> Result<T, tonic::Status> {
         match tokio::time::timeout(self.timeout, call).await {
-            Ok(r) => r,
+            Ok(r) => {
+                // The server's own status is an answer too; one standing
+                // for a broken connection has the transport's error as its
+                // source.
+                if r.as_ref().err().is_none_or(|s| std::error::Error::source(s).is_none()) {
+                    self.answered.store(true, Ordering::Relaxed);
+                }
+                r
+            }
             Err(_) => Err(tonic::Status::deadline_exceeded(format!("no answer within {:?} (--remote_timeout)", self.timeout))),
         }
     }
@@ -655,6 +711,9 @@ impl Client {
         if split.chunk_digests.iter().map(|c| c.size_bytes).sum::<i64>() != d.size_bytes {
             bail!("the chunks of {} don't add up to its size", digest_str(d));
         }
+        if let Some(c) = split.chunk_digests.iter().find(|c| !valid_digest(c)) {
+            bail!("the chunks of {} include a malformed digest {:?}", digest_str(d), c.hash);
+        }
         Ok(Some(split))
     }
 
@@ -838,6 +897,7 @@ impl Client {
     }
 
     async fn batch_read(&self, digests: Vec<re::Digest>) -> Result<Vec<(String, Vec<u8>)>> {
+        let _read = self.reads.acquire().await.context("reads stopped")?;
         let requested: HashSet<(String, i64)> = digests.iter().map(|d| (d.hash.clone(), d.size_bytes)).collect();
         let resp = self
             .retrying(|| async {
@@ -850,29 +910,77 @@ impl Client {
                 Ok(self.timed(self.cas().batch_read_blobs(request)).await?.into_inner())
             })
             .await?;
-        let mut out = Vec::with_capacity(resp.responses.len());
-        for r in resp.responses {
-            let d = r.digest.clone().unwrap_or_default();
-            if let Some(st) = &r.status
-                && st.code != 0
-            {
-                return Err(tonic::Status::new(tonic::Code::from(st.code), format!("read of {} failed: {}", digest_str(&d), st.message)).into());
+        // Decompressed and hashed off the runtime's workers.
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut out = Vec::with_capacity(resp.responses.len());
+            for r in resp.responses {
+                let d = r.digest.clone().unwrap_or_default();
+                if let Some(st) = &r.status
+                    && st.code != 0
+                {
+                    return Err(tonic::Status::new(tonic::Code::from(st.code), format!("read of {} failed: {}", digest_str(&d), st.message)).into());
+                }
+                // Only what was asked for (whose size bounds what is allocated).
+                if !requested.contains(&(d.hash.clone(), d.size_bytes)) {
+                    bail!("BatchReadBlobs returned {}, which wasn't requested", digest_str(&d));
+                }
+                out.push((d.hash.clone(), this.decode(r.compressor, r.data, &d)?));
             }
-            // Only what was asked for (whose size bounds what is allocated).
-            if !requested.contains(&(d.hash.clone(), d.size_bytes)) {
-                bail!("BatchReadBlobs returned {}, which wasn't requested", digest_str(&d));
-            }
-            out.push((d.hash.clone(), self.decode(r.compressor, r.data, &d)?));
-        }
-        Ok(out)
+            Ok(out)
+        })
+        .await?
     }
 
     async fn bytestream_read(&self, d: &re::Digest) -> Result<Vec<u8>> {
+        let _read = self.reads.acquire().await.context("reads stopped")?;
         let kind = if self.zstd { "compressed-blobs/zstd" } else { "blobs" };
         let resource = format!("{}{kind}/{}/{}", self.prefix(), d.hash, d.size_bytes);
         let wire = self.retrying(|| self.read_stream(&resource, 0, 0)).await.with_context(|| format!("ByteStream read {}", digest_str(d)))?;
         let compressor = if self.zstd { re::compressor::Value::Zstd as i32 } else { 0 };
-        self.decode(compressor, wire, d)
+        let (this, d) = (self.clone(), d.clone());
+        tokio::task::spawn_blocking(move || this.decode(compressor, wire, &d)).await?
+    }
+
+    /// Reads a blob into the file at `path` (created, or truncated) as it
+    /// arrives: decompressed, hashed and written on a blocking thread, so
+    /// that a large blob is never whole in memory. The file is the blob `d`
+    /// once this returns; after an error, it's to be removed.
+    pub async fn read_blob_to_file(&self, d: &re::Digest, path: &std::path::Path) -> Result<()> {
+        let _read = self.reads.acquire().await.context("reads stopped")?;
+        let kind = if self.zstd { "compressed-blobs/zstd" } else { "blobs" };
+        let resource = format!("{}{kind}/{}/{}", self.prefix(), d.hash, d.size_bytes);
+        self.retrying(|| self.read_stream_to_file(&resource, d, path)).await.with_context(|| format!("ByteStream read {}", digest_str(d)))?;
+        self.transfers.read.fetch_add(d.size_bytes.max(0) as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn read_stream_to_file(&self, resource: &str, d: &re::Digest, path: &std::path::Path) -> Result<()> {
+        let request = self.req(ReadRequest { resource_name: resource.to_string(), read_offset: 0, read_limit: 0 });
+        let mut stream = self.timed(ByteStreamClient::new(self.channel.clone()).read(request)).await?.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let writer = {
+            let (d, path, zstd) = (d.clone(), path.to_path_buf(), self.zstd);
+            tokio::task::spawn_blocking(move || write_blob_file(&path, &d, zstd, rx))
+        };
+        let mut wire = 0;
+        let read: Result<()> = async {
+            while let Some(chunk) = self.timed(stream.message()).await? {
+                wire += chunk.data.len() as u64;
+                // The writer stopped: its error says why.
+                if tx.send(chunk.data).await.is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        drop(tx);
+        let written = writer.await.context("writing a blob")?;
+        self.transfers.wire_read.fetch_add(wire, Ordering::Relaxed);
+        // A broken stream first: it's retried.
+        read?;
+        written
     }
 
     /// A ByteStream read, each message within `--remote_timeout`.
@@ -950,8 +1058,10 @@ impl Client {
     /// a stream broken once the operation is named is followed again
     /// (`WaitExecution`); an operation the server lost, or that failed for a
     /// transient reason, executes again (up to `--remote_retries` times).
-    /// FAILED_PRECONDITION comes back as the response's status, however the
-    /// server reports it.
+    /// A stream that brought an update of the operation before breaking
+    /// starts the count over: a long execution whose streams a proxy keeps
+    /// resetting is followed to its end. FAILED_PRECONDITION comes back as
+    /// the response's status, however the server reports it.
     pub async fn execute(&self, action: &re::Digest, skip_cache_lookup: bool) -> Result<re::ExecuteResponse> {
         let request = re::ExecuteRequest {
             instance_name: self.instance.clone(),
@@ -968,9 +1078,13 @@ impl Client {
         let mut attempt = 0;
         loop {
             let executions = ExecutionClient::new(self.channel.clone());
+            let mut moved = false;
             let outcome = match &operation {
-                None => self.follow(executions.clone().execute(self.req(request.clone())).await, &mut operation).await,
-                Some(name) => self.follow(executions.clone().wait_execution(self.req(re::WaitExecutionRequest { name: name.clone() })).await, &mut operation).await,
+                None => self.follow(executions.clone().execute(self.req(request.clone())).await, &mut operation, &mut moved).await,
+                Some(name) => {
+                    let call = executions.clone().wait_execution(self.req(re::WaitExecutionRequest { name: name.clone() })).await;
+                    self.follow(call, &mut operation, &mut moved).await
+                }
             };
             let status = match outcome {
                 // Not DEADLINE_EXCEEDED: the action timed out.
@@ -994,6 +1108,10 @@ impl Client {
             if lost {
                 operation = None;
             }
+            // Still running, and it moved since it was last followed.
+            if moved && operation.is_some() {
+                attempt = 0;
+            }
             if attempt >= self.retries || !(lost || transient(status.code())) {
                 return Err(anyhow::Error::from(status).context(format!("executing {}", digest_str(action))));
             }
@@ -1003,14 +1121,20 @@ impl Client {
     }
 
     /// Follows an operation's updates until it is done: its response, or
-    /// what ended it. Its name, once known, goes in `name`.
+    /// what ended it. Its name, once known, goes in `name`; `moved` tells
+    /// whether an update came for an operation already named.
     async fn follow(
         &self,
         call: Result<tonic::Response<tonic::Streaming<bazel_remote_apis::google::longrunning::Operation>>, tonic::Status>,
         name: &mut Option<String>,
+        moved: &mut bool,
     ) -> std::result::Result<re::ExecuteResponse, Ended> {
         let mut stream = call.map_err(Ended::Stream)?.into_inner();
         while let Some(op) = stream.message().await.map_err(Ended::Stream)? {
+            // An update of an operation already named: it runs. (Naming a
+            // new one isn't: executions the server keeps losing would
+            // start over forever.)
+            *moved |= name.is_some();
             if !op.name.is_empty() {
                 *name = Some(op.name.clone());
             }
@@ -1088,7 +1212,8 @@ enum Ended {
     Operation(tonic::Status),
 }
 
-/// Uploads blobs: small ones batched, large ones through ByteStream.
+/// Uploads blobs: small ones batched, large ones through ByteStream, up to
+/// `UPLOADS` batches and streams at once.
 struct Uploader<'a> {
     client: &'a Client,
     batch: Vec<re::batch_update_blobs_request::Request>,
@@ -1098,11 +1223,13 @@ struct Uploader<'a> {
     /// The blobs it uploads for every call needing them (see
     /// `Client::inflight`), until they are in the CAS.
     claims: HashMap<String, watch::Sender<Option<bool>>>,
+    /// Batches and streams being sent: the hashes of the blobs each sends.
+    running: tokio::task::JoinSet<Result<Vec<String>>>,
 }
 
 impl<'a> Uploader<'a> {
     fn new(client: &'a Client, claims: HashMap<String, watch::Sender<Option<bool>>>) -> Self {
-        Self { client, batch: Vec::new(), batch_bytes: 0, sent: 0, claims }
+        Self { client, batch: Vec::new(), batch_bytes: 0, sent: 0, claims, running: tokio::task::JoinSet::new() }
     }
 
     /// A claimed blob is in the CAS.
@@ -1116,29 +1243,50 @@ impl<'a> Uploader<'a> {
     /// Uploads a blob: a large one read as it is sent, a small one batched.
     async fn add(&mut self, d: &re::Digest, src: &BlobSource) -> Result<()> {
         if d.size_bytes > self.client.max_batch_bytes - 1024 {
-            self.sent += d.size_bytes as u64;
-            self.client.bytestream_write(d, src).await?;
-            self.done(&d.hash);
-            return Ok(());
+            return self.stream(d, src.clone()).await;
         }
         self.add_bytes(d, src.load()?).await
     }
 
+    /// Sends a large blob through ByteStream, alongside the other uploads.
+    async fn stream(&mut self, d: &re::Digest, src: BlobSource) -> Result<()> {
+        self.sent += d.size_bytes as u64;
+        let (client, d) = (self.client.clone(), d.clone());
+        self.spawn(async move { client.bytestream_write(&d, &src).await.map(|()| vec![d.hash]) }).await
+    }
+
+    /// Starts an upload once fewer than `UPLOADS` are running.
+    async fn spawn(&mut self, upload: impl Future<Output = Result<Vec<String>>> + Send + 'static) -> Result<()> {
+        while self.running.len() >= UPLOADS {
+            self.join_one().await?;
+        }
+        self.running.spawn(upload);
+        Ok(())
+    }
+
+    /// Waits for an upload to finish, its blobs then in the CAS.
+    async fn join_one(&mut self) -> Result<()> {
+        if let Some(r) = self.running.join_next().await {
+            for h in r?? {
+                self.done(&h);
+            }
+        }
+        Ok(())
+    }
+
     async fn add_bytes(&mut self, d: &re::Digest, data: Vec<u8>) -> Result<()> {
-        self.sent += data.len() as u64;
         let limit = self.client.max_batch_bytes - 1024;
         if d.size_bytes > limit {
-            self.client.bytestream_write(d, &BlobSource::Bytes(data)).await?;
-            self.done(&d.hash);
-            return Ok(());
+            return self.stream(d, BlobSource::Bytes(data)).await;
         }
+        self.sent += data.len() as u64;
         let (data, compressor) = match self.client.batch_zstd.then(|| compressed(&data)).flatten() {
             Some(c) => (c, re::compressor::Value::Zstd as i32),
             None => (data, re::compressor::Value::Identity as i32),
         };
         let wire = data.len() as i64;
         if self.batch_bytes + wire > limit {
-            self.flush().await?;
+            self.send_batch().await?;
         }
         self.batch_bytes += wire;
         let transfers = &self.client.transfers;
@@ -1148,16 +1296,76 @@ impl<'a> Uploader<'a> {
         Ok(())
     }
 
-    async fn flush(&mut self) -> Result<()> {
+    /// Sends the batch being filled, alongside the other uploads.
+    async fn send_batch(&mut self) -> Result<()> {
         self.batch_bytes = 0;
         let batch = std::mem::take(&mut self.batch);
+        if batch.is_empty() {
+            return Ok(());
+        }
         let hashes: Vec<String> = batch.iter().filter_map(|r| r.digest.as_ref().map(|d| d.hash.clone())).collect();
-        self.client.flush_batch(batch).await?;
-        for h in hashes {
-            self.done(&h);
+        let client = self.client.clone();
+        self.spawn(async move { client.flush_batch(batch).await.map(|()| hashes) }).await
+    }
+
+    /// Sends the batch being filled and waits for every upload.
+    async fn flush(&mut self) -> Result<()> {
+        self.send_batch().await?;
+        while !self.running.is_empty() {
+            self.join_one().await?;
         }
         Ok(())
     }
+}
+
+/// Writes a blob arriving in chunks to `path`: decompressed when `zstd`,
+/// hashed as it's written, and checked to be `d` once complete. More bytes
+/// than `d` says stop it (a decompression bomb).
+fn write_blob_file(path: &std::path::Path, d: &re::Digest, zstd: bool, mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Result<()> {
+    use std::io::Write;
+    struct Hashing<W> {
+        inner: W,
+        hasher: Sha256,
+        len: u64,
+        limit: u64,
+    }
+    impl<W: Write> Write for Hashing<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.len += buf.len() as u64;
+            if self.len > self.limit {
+                return Err(std::io::Error::other("more bytes than its digest says"));
+            }
+            self.hasher.update(buf);
+            self.inner.write_all(buf)?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    let file = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut sink = Hashing { inner: std::io::BufWriter::new(file), hasher: Sha256::new(), len: 0, limit: d.size_bytes.max(0) as u64 };
+    let context = || format!("writing {} to {}", digest_str(d), path.display());
+    if zstd {
+        let mut decoder = zstd::stream::write::Decoder::new(&mut sink).with_context(context)?;
+        while let Some(chunk) = rx.blocking_recv() {
+            decoder.write_all(&chunk).with_context(context)?;
+        }
+        decoder.flush().with_context(context)?;
+    } else {
+        while let Some(chunk) = rx.blocking_recv() {
+            sink.write_all(&chunk).with_context(context)?;
+        }
+    }
+    sink.flush().with_context(context)?;
+    if sink.len != d.size_bytes as u64 {
+        bail!("blob {}: received {} bytes", digest_str(d), sink.len);
+    }
+    let hash = hex::encode(sink.hasher.finalize());
+    if hash != d.hash {
+        bail!("blob {}: received data hashing to {hash}", digest_str(d));
+    }
+    Ok(())
 }
 
 /// Blobs it claimed and didn't upload (a failure, a cancelled call): the
@@ -1196,6 +1404,44 @@ pub fn env_vars(vars: &[(String, String)]) -> Vec<re::command::EnvironmentVariab
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeds `chunks` to `write_blob_file` as a stream would.
+    fn write_chunks(path: &std::path::Path, d: &re::Digest, zstd: bool, chunks: Vec<Vec<u8>>) -> Result<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let feeder = std::thread::spawn(move || {
+            for c in chunks {
+                if tx.blocking_send(c).is_err() {
+                    break;
+                }
+            }
+        });
+        let r = write_blob_file(path, d, zstd, rx);
+        feeder.join().unwrap();
+        r
+    }
+
+    #[test]
+    fn blobs_written_as_they_arrive() {
+        let dir = std::env::temp_dir().join(format!("rbe-blob-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob");
+        let data: Vec<u8> = (0..300_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect();
+        let d = digest_of(&data);
+        let split = |b: &[u8]| b.chunks(65_536).map(<[u8]>::to_vec).collect::<Vec<_>>();
+        write_chunks(&path, &d, false, split(&data)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        let packed = zstd::bulk::compress(&data, 3).unwrap();
+        write_chunks(&path, &d, true, split(&packed)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        // Other contents, a truncated stream, more than the digest says.
+        let mut other = data.clone();
+        other[1000] ^= 1;
+        assert!(write_chunks(&path, &d, false, split(&other)).is_err());
+        assert!(write_chunks(&path, &d, false, split(&data[..data.len() - 1])).is_err());
+        let small = re::Digest { hash: d.hash.clone(), size_bytes: 1000 };
+        assert!(format!("{:#}", write_chunks(&path, &small, true, split(&packed)).unwrap_err()).contains("more bytes"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn compresses_what_shrinks() {
@@ -1260,5 +1506,124 @@ mod tests {
         assert_eq!(got.configuration_id, meta.configuration_id);
         // The original client is unchanged.
         assert_eq!(decode_header(&c.req(())), Some(base));
+    }
+
+    fn options(endpoint: &str) -> ConnectOptions {
+        ConnectOptions {
+            endpoint: endpoint.into(),
+            instance_name: String::new(),
+            client_cert_pem: None,
+            client_key_pem: None,
+            ca_pem: None,
+            authority_override: None,
+            headers: Vec::new(),
+        }
+    }
+
+    /// A server that accepts connections and never says anything (as a
+    /// hung one does: the kernel still accepts them). Its port.
+    fn silent_server() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().collect();
+            drop(held);
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn tls_handshakes_are_bounded() {
+        let opts = options(&format!("grpcs://127.0.0.1:{}", silent_server()));
+        let start = Instant::now();
+        let connected = tokio::time::timeout(Duration::from_secs(10), connect_within(&opts, Duration::from_millis(500))).await;
+        assert!(connected.expect("the TLS handshake wasn't bounded").is_err());
+        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+    }
+
+    #[tokio::test]
+    async fn servers_that_never_answered_are_not_called_again() {
+        let mut c = Client::connect(options(&format!("grpc://127.0.0.1:{}", silent_server())))
+            .await
+            .unwrap()
+            .with_retries(5, Duration::from_millis(300));
+        let start = Instant::now();
+        let err = c.capabilities().await.unwrap_err();
+        assert_eq!(status_of(&err).map(|s| s.code()), Some(tonic::Code::DeadlineExceeded), "{err:#}");
+        // One --remote_timeout, not six and their backoffs (5 s).
+        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    }
+
+    type Operations =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<bazel_remote_apis::google::longrunning::Operation, tonic::Status>> + Send>>;
+
+    /// An Execution service whose streams break `breaks` times before the
+    /// operation completes: after naming it (`Execute`), then after an
+    /// update of it if `updates` (`WaitExecution`).
+    #[derive(Clone)]
+    struct Breaking {
+        breaks: Arc<AtomicU64>,
+        updates: bool,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Breaking {
+        fn stream(&self, follow_up: bool) -> Operations {
+            use bazel_remote_apis::google::longrunning::Operation;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let update = Operation { name: "operations/long".into(), ..Default::default() };
+            let broke = Err(tonic::Status::unavailable("a proxy reset the stream"));
+            if self.breaks.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+                let sent = if follow_up && !self.updates { vec![broke] } else { vec![Ok(update), broke] };
+                return Box::pin(tokio_stream::iter(sent));
+            }
+            let response = re::ExecuteResponse { result: Some(re::ActionResult::default()), ..Default::default() };
+            let any = pb::Any { type_url: "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse".into(), value: response.encode_to_vec() };
+            let done = Operation { done: true, result: Some(operation::Result::Response(any)), ..update.clone() };
+            Box::pin(tokio_stream::iter(vec![Ok(update), Ok(done)]))
+        }
+    }
+
+    #[tonic::async_trait]
+    impl re::execution_server::Execution for Breaking {
+        type ExecuteStream = Operations;
+        async fn execute(&self, _: tonic::Request<re::ExecuteRequest>) -> Result<tonic::Response<Operations>, tonic::Status> {
+            Ok(tonic::Response::new(self.stream(false)))
+        }
+        type WaitExecutionStream = Operations;
+        async fn wait_execution(&self, _: tonic::Request<re::WaitExecutionRequest>) -> Result<tonic::Response<Operations>, tonic::Status> {
+            Ok(tonic::Response::new(self.stream(true)))
+        }
+    }
+
+    /// Executes against `svc` with `--remote_retries=2`: the outcome, and
+    /// the calls made.
+    async fn execute_against(svc: Breaking) -> (Result<re::ExecuteResponse>, u64) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(re::execution_server::ExecutionServer::new(svc.clone()))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let channel = connect_channel(&options(&format!("grpc://{addr}"))).await.unwrap();
+        let c = Client::from_channel(channel, "").with_retries(2, Duration::from_secs(10));
+        let r = c.execute(&digest_of(b"action"), false).await;
+        (r, svc.calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn executions_making_progress_are_followed_however_often_streams_break() {
+        // A long execution whose streams a proxy keeps resetting: each
+        // follow-up got an update, so the retries start over.
+        let svc = Breaking { breaks: Arc::new(AtomicU64::new(6)), updates: true, calls: Arc::default() };
+        let (r, calls) = execute_against(svc).await;
+        assert!(r.unwrap().result.is_some());
+        assert_eq!(calls, 7);
+        // Without updates, the breaks count: Execute, then two follow-ups.
+        let svc = Breaking { breaks: Arc::new(AtomicU64::new(6)), updates: false, calls: Arc::default() };
+        let (r, calls) = execute_against(svc).await;
+        assert_eq!(status_of(&r.unwrap_err()).map(|s| s.code()), Some(tonic::Code::Unavailable));
+        assert_eq!(calls, 3);
     }
 }

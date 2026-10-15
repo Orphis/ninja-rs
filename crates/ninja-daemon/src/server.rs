@@ -1,7 +1,7 @@
 //! The daemon: one per user and ninja-rs binary (`Location`), serving every
 //! build, one thread per connection, until it has been idle for a while.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,14 +19,19 @@ use crate::watch::{RootState, Watcher};
 /// Builds whose environments are kept (a scan names its build's).
 const KEPT_SESSIONS: usize = 64;
 
+/// How long a build directory stays known after a build began in it
+/// (CMake's `try_compile` makes hundreds a day): longer than a build. The
+/// next build there names it again.
+const BUILD_DIRS_KEPT: Duration = Duration::from_secs(24 * 3600);
+
 pub struct Daemon {
     pub driver: Arc<Driver>,
     pub files: Arc<Files>,
     pub watcher: Arc<Watcher>,
     sessions: Mutex<VecDeque<(u64, Arc<Environment>)>>,
     next_session: AtomicU64,
-    /// Digest files read: (file, modification time).
-    seeded: Mutex<HashSet<(PathBuf, Option<SystemTime>)>>,
+    /// Digest files read, and when a build last named each.
+    seeded: Mutex<HashMap<PathBuf, Instant>>,
     started: Instant,
     requests: AtomicU64,
     last_active: Mutex<Instant>,
@@ -81,6 +86,12 @@ impl Daemon {
     /// A build starts: its directory is never trusted, entries the watcher
     /// doesn't vouch for are checked again, and roots are brought in sync.
     fn begin(&self, b: Begin) -> Response {
+        if let Some(before) = Instant::now().checked_sub(BUILD_DIRS_KEPT) {
+            self.watcher.expire(before);
+            self.files.expire(before);
+            self.driver.cache.expire_volatile(before);
+            self.seeded.lock().unwrap().retain(|_, named| *named >= before);
+        }
         for d in std::iter::once(&b.build_dir).chain(&b.volatile) {
             self.driver.cache.add_volatile(d);
             self.files.add_volatile(d);
@@ -88,11 +99,12 @@ impl Daemon {
         self.watcher.ignore(&b.build_dir);
         self.driver.cache.new_session();
         self.files.new_session();
-        if let Some(f) = &b.digests_file {
-            let version = (f.clone(), std::fs::metadata(f).and_then(|m| m.modified()).ok());
-            if self.seeded.lock().unwrap().insert(version) {
-                self.files.seed(files::read_digests(f));
-            }
+        // Read once: every build saves it again, from what the daemon
+        // knows (see `Files::seed`).
+        if let Some(f) = &b.digests_file
+            && self.seeded.lock().unwrap().insert(f.clone(), Instant::now()).is_none()
+        {
+            self.files.seed(files::read_digests(f));
         }
         self.watcher.sync();
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
@@ -179,6 +191,7 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
     let log = Arc::new(logger(loc));
     let log2 = log.clone();
     let daemon = Daemon::new(Box::new(move |m| log2(m)));
+    daemon.watcher.set_cookie_dir(&loc.cookie_dir());
     let mut listener = ipc::Listener::bind(loc)?;
     log(&format!("started (ninja-rs {}), exiting after {idle:?} idle", env!("CARGO_PKG_VERSION")));
     {
@@ -244,5 +257,25 @@ mod tests {
         assert!(superseded(&exe, &loc));
         std::fs::remove_file(&exe).unwrap();
         assert!(superseded(&exe, &loc));
+    }
+
+    /// A build's digests file, saved again by every build, is read once:
+    /// what the daemon keeps per build directory doesn't grow per build.
+    #[test]
+    fn digests_read_once() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_begin_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let digests = dir.join(".ninja_rs_digests");
+        let daemon = Daemon::new(Box::new(|_| {}));
+        for i in 0..3 {
+            std::fs::write(&digests, format!("{}\n", files::DIGESTS_SIGNATURE)).unwrap();
+            let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + i);
+            std::fs::File::options().write(true).open(&digests).unwrap().set_modified(t).unwrap();
+            let b = Begin { build_dir: dir.clone(), digests_file: Some(digests.clone()), ..Default::default() };
+            assert!(matches!(daemon.handle(Request::Begin(b)), Response::Begun { .. }));
+        }
+        assert_eq!(daemon.seeded.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

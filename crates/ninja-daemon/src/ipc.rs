@@ -8,7 +8,7 @@ use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
 
-/// A daemon's files (lock, log, socket) and its name.
+/// A daemon's files (lock, log, socket, cookies) and its name.
 #[derive(Clone, Debug)]
 pub struct Location {
     pub dir: PathBuf,
@@ -47,6 +47,12 @@ impl Location {
 
     pub fn log_file(&self) -> PathBuf {
         self.dir.join(format!("{}.log", self.id))
+    }
+
+    /// Where the watcher's cookies go for roots without a repository
+    /// directory (see `Watcher::set_cookie_dir`).
+    pub fn cookie_dir(&self) -> PathBuf {
+        self.dir.join(format!("{}.cookies", self.id))
     }
 
     /// In the directory, or in a private one in `/tmp` when that path is

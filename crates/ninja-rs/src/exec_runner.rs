@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use ninja_core::graph::EdgeId;
 use ninja_core::runner::{
-    CommandRunner, ExecKind, ExitStatus, LocalCapture, LocalCommand, Race, RemoteBackend, RemoteOutcome, Side, Task, TaskResult, WaitFuture,
+    AbortFuture, CommandRunner, ExecKind, ExitStatus, LocalCapture, LocalCommand, Race, RemoteBackend, RemoteOutcome, Side, Task, TaskResult, WaitFuture,
 };
-use ninja_core::subprocess::{Interrupt, run_argv, run_argv_cancellable, run_local_command_cancellable, run_local_command_env};
+use ninja_core::subprocess::{Interrupt, Stop, run_argv, run_argv_cancellable, run_local_command_cancellable, run_local_command_env};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
 use tokio::task::JoinSet;
 
@@ -112,6 +112,8 @@ pub struct ExecRunner {
     active: HashSet<EdgeId>,
     remote: Option<Arc<dyn RemoteBackend>>,
     interrupt: Arc<Interrupt>,
+    /// Stops the local commands (see `abort`).
+    stop: Arc<Stop>,
     /// Messages about fallbacks, printed by the caller.
     pub verbose_remote: bool,
     /// Race tasks sent remotely with local runs.
@@ -132,6 +134,7 @@ impl ExecRunner {
             active: HashSet::new(),
             remote,
             interrupt,
+            stop: Stop::new(),
             verbose_remote: false,
             racing: None,
         }
@@ -157,6 +160,7 @@ async fn run_local(
     env: &[(String, String)],
     remote: Option<&Arc<dyn RemoteBackend>>,
     command: Option<&LocalCommand>,
+    stop: &Stop,
 ) -> TaskResult {
     if let Some(backend) = remote
         && let Err(e) = backend.materialize(task).await
@@ -168,9 +172,9 @@ async fn run_local(
     let (status, output) = match command {
         Some(cmd) => {
             write_files(cmd);
-            run_argv(&cmd.argv, &cmd.dir, &with_env(env, cmd)).await
+            run_argv(&cmd.argv, &cmd.dir, &with_env(env, cmd), stop).await
         }
-        None => run_local_command_env(&task.command, task.use_console, env).await,
+        None => run_local_command_env(&task.command, task.use_console, env, stop).await,
     };
     let mut r = TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() };
     map_back(task, command, &mut r);
@@ -227,6 +231,7 @@ async fn race_local(
     backend: &Arc<dyn RemoteBackend>,
     race: &Race,
     delay: Duration,
+    stop: &Stop,
 ) -> Option<TaskResult> {
     let mut rx = race.subscribe();
     tokio::select! {
@@ -275,9 +280,9 @@ async fn race_local(
     let ran = match race.state().command {
         Some(cmd) => {
             write_files(&cmd);
-            run_argv_cancellable(&cmd.argv, &cmd.dir, &with_env(env, &cmd), cancel).await
+            run_argv_cancellable(&cmd.argv, &cmd.dir, &with_env(env, &cmd), stop, cancel).await
         }
-        None => run_local_command_cancellable(&task.command, env, cancel).await,
+        None => run_local_command_cancellable(&task.command, env, stop, cancel).await,
     };
     let won = ran.is_some() && race.claim_local();
     race.local_stopped();
@@ -303,13 +308,14 @@ async fn run_raced(
     env: Arc<Vec<(String, String)>>,
     racing: Racing,
     verbose: bool,
+    stop: Arc<Stop>,
 ) -> TaskResult {
     let race = Race::new();
     let remote = async {
         let _permit = remote_slots.acquire().await;
         backend.execute_raced(task.clone(), race.clone()).await
     };
-    let local = race_local(&task, &local_slots, &env, &backend, &race, racing.delay);
+    let local = race_local(&task, &local_slots, &env, &backend, &race, racing.delay, &stop);
     tokio::pin!(remote, local);
     let (mut remote_done, mut local_done) = (false, false);
     // A remote result that wrote nothing, while a local command runs.
@@ -347,7 +353,7 @@ async fn run_raced(
                 if local_done {
                     // The local branch gave up before running.
                     let command = race.state().command;
-                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref()).await;
+                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop).await;
                     return finish_local(r, capture, reason, verbose).await;
                 }
             }
@@ -364,7 +370,7 @@ async fn run_raced(
                         return r;
                     }
                     let command = race.state().command;
-                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref()).await;
+                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop).await;
                     return finish_local(r, capture, reason, verbose).await;
                 }
             }
@@ -401,15 +407,16 @@ impl CommandRunner for ExecRunner {
         let inputs_from = self.remote.clone();
         let remote = self.remote.clone().filter(|r| !task.use_console && r.wants(&task));
         let verbose = self.verbose_remote;
+        let stop = self.stop.clone();
         match remote {
             None => {
-                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, &env, inputs_from.as_ref(), None).await });
+                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, &env, inputs_from.as_ref(), None, &stop).await });
                 self.ids.insert(h.id(), edge);
             }
             Some(backend) if self.racing.is_some() => {
                 let remote_slots = self.remote_slots.clone();
                 let racing = self.racing.clone().expect("racing");
-                let h = self.tasks.spawn(run_raced(task, backend, local_slots, remote_slots, env, racing, verbose));
+                let h = self.tasks.spawn(run_raced(task, backend, local_slots, remote_slots, env, racing, verbose, stop));
                 self.ids.insert(h.id(), edge);
             }
             Some(backend) => {
@@ -431,7 +438,7 @@ impl CommandRunner for ExecRunner {
                             lost_inputs: Vec::new(),
                         },
                         RemoteOutcome::Fallback(reason, command) => {
-                            let mut r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref()).await;
+                            let mut r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop).await;
                             if verbose {
                                 let mut msg = format!("ninja-rs: running locally ({reason})\n").into_bytes();
                                 msg.extend_from_slice(&r.output);
@@ -440,7 +447,7 @@ impl CommandRunner for ExecRunner {
                             r
                         }
                         RemoteOutcome::RunLocally(capture, command) => {
-                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref()).await;
+                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop).await;
                             // Storing outputs reads files: off the async threads.
                             let result = r.clone();
                             let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;
@@ -490,10 +497,17 @@ impl CommandRunner for ExecRunner {
         self.active.iter().copied().collect()
     }
 
-    fn abort(&mut self) {
-        self.tasks.abort_all();
-        self.ids.clear();
-        self.active.clear();
+    fn abort(&mut self) -> AbortFuture<'_> {
+        Box::pin(async move {
+            // Local commands first, waited for, so that none writes outputs
+            // after the build deletes them; then the rest (remote
+            // executions, tasks waiting for a slot) is dropped.
+            self.stop.stop(Some(&self.interrupt)).await;
+            self.tasks.abort_all();
+            while self.tasks.join_next().await.is_some() {}
+            self.ids.clear();
+            self.active.clear();
+        })
     }
 }
 
@@ -520,5 +534,31 @@ mod tests {
         assert!(slots.try_acquire().is_none(), "a raced run took the slot a local task waits for");
         waiter.await.unwrap();
         assert!(slots.try_acquire().is_some());
+    }
+
+    #[tokio::test]
+    async fn abort_waits_for_every_local_process() {
+        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-abort", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The command's grandchild writes the marker after about 2 s.
+        let marker = dir.join("late.txt");
+        let command = if cfg!(windows) {
+            format!("cmd /c cmd /c \"ping -n 3 127.0.0.1 >nul & echo late> {}\"", marker.display())
+        } else {
+            format!("sh -c 'sh -c \"sleep 2; echo late > {}\"; true'", marker.display())
+        };
+        let interrupt = Interrupt::new();
+        let mut runner = ExecRunner::new(2, None, interrupt.clone());
+        runner.start_command(Task { command, ..Default::default() }).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        interrupt.trigger();
+        assert_eq!(runner.wait_for_command().await.map(|r| r.status), Some(ExitStatus::Interrupted));
+        let start = std::time::Instant::now();
+        runner.abort().await;
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!marker.exists(), "a process of the command kept running");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

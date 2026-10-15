@@ -12,6 +12,9 @@
 //! ```
 //!
 //! Path records are appended just before the first deps record using them.
+//! Only complete lines count: a write cut short (a crash, a kill, a full
+//! disk) leaves a torn last line, which is ignored and cut off before the
+//! next append, as ninja does.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -69,6 +72,8 @@ pub struct DepsLog {
     file: Option<File>,
     path: String,
     needs_recompaction: bool,
+    /// The length of the file's complete lines, when it ends with a torn one.
+    truncate_to: Option<u64>,
 }
 
 impl DepsLog {
@@ -113,17 +118,22 @@ impl DepsLog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("loading deps log {path}: {e}")),
         };
-        let text = String::from_utf8_lossy(&data);
+        // A torn last line may still parse (a record missing ids), and the
+        // next append would extend it (a path merged with the next one).
+        let complete = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let text = String::from_utf8_lossy(&data[..complete]);
         if !text.starts_with(SIGNATURE) {
             self.needs_recompaction = true;
             return Ok(Some("deps log version is too old or invalid; starting over".into()));
         }
+        let torn = complete < data.len();
+        self.truncate_to = torn.then_some(complete as u64);
         let mut total = 0usize;
         for line in text[SIGNATURE.len()..].split('\n') {
             if let Some(p) = line.strip_prefix("p\t") {
                 self.intern(p);
             } else if let Some(d) = line.strip_prefix("d\t") {
-                // A truncated or corrupt record is skipped, like ninja does.
+                // A corrupt record is skipped, like ninja does.
                 if let Some(record) = self.parse_record(d) {
                     total += 1;
                     self.deps.insert(record.0, record.1);
@@ -135,7 +145,7 @@ impl DepsLog {
         if total > 1000 && total > self.deps.len() * 3 {
             self.needs_recompaction = true;
         }
-        Ok(None)
+        Ok(torn.then(|| "premature end of file; recovering".into()))
     }
 
     fn parse_record(&self, d: &str) -> Option<(u32, Record)> {
@@ -160,11 +170,21 @@ impl DepsLog {
         if self.needs_recompaction {
             self.recompact(path, is_live)?;
         }
+        self.cut_torn_line()
+    }
+
+    /// Cuts off a torn last line found by `load`, so that appends start on
+    /// a line of their own.
+    fn cut_torn_line(&mut self) -> Result<(), String> {
+        if let Some(len) = self.truncate_to.take() {
+            OpenOptions::new().write(true).open(&self.path).and_then(|f| f.set_len(len)).map_err(|e| format!("truncating deps log {}: {e}", self.path))?;
+        }
         Ok(())
     }
 
     fn ensure_open(&mut self) -> Result<&mut File, String> {
         if self.file.is_none() {
+            self.cut_torn_line()?;
             if let Some(parent) = std::path::Path::new(&self.path).parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -239,6 +259,7 @@ impl DepsLog {
         std::fs::rename(&tmp, path).map_err(|e| format!("renaming {tmp}: {e}"))?;
         self.paths_written = self.paths.len();
         self.needs_recompaction = false;
+        self.truncate_to = None;
         Ok(())
     }
 }
@@ -335,6 +356,66 @@ mod tests {
         let mut old = DepsLog::new();
         assert!(old.load(&p).unwrap().is_some());
         assert!(old.get("out.o").is_none());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn torn_record_is_ignored_and_cut() {
+        let p = tmp("deps-torn-record");
+        let mut log = DepsLog::new();
+        log.open_for_write(&p, &|_| true).unwrap();
+        log.record_deps("b.o", 1, &["b.c"]).unwrap();
+        log.record_deps("a.o", 100, &["a.c", "x.h", "y.h", "z.h"]).unwrap();
+        log.close();
+        // Cut inside the last record's ids (a crash, a full disk): it still
+        // parses, as a shorter list of deps.
+        let mut data = std::fs::read(&p).unwrap();
+        data.truncate(data.iter().rposition(|&b| b == b' ').unwrap());
+        std::fs::write(&p, &data).unwrap();
+        let mut log = DepsLog::new();
+        assert_eq!(log.load(&p).unwrap().as_deref(), Some("premature end of file; recovering"));
+        assert!(log.get("a.o").is_none());
+        assert_eq!(paths(&log, "b.o"), vec!["b.c"]);
+        // A build cuts it off, even one recording nothing.
+        log.open_for_write(&p, &|_| true).unwrap();
+        log.close();
+        assert!(std::fs::read(&p).unwrap().ends_with(b"\n"));
+        let mut log = DepsLog::new();
+        assert_eq!(log.load(&p).unwrap(), None);
+        log.open_for_write(&p, &|_| true).unwrap();
+        log.record_deps("a.o", 200, &["a.c", "x.h"]).unwrap();
+        log.close();
+        let mut log = DepsLog::new();
+        assert_eq!(log.load(&p).unwrap(), None);
+        assert_eq!(paths(&log, "a.o"), vec!["a.c", "x.h"]);
+        assert_eq!(paths(&log, "b.o"), vec!["b.c"]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn torn_path_does_not_merge_with_the_next_append() {
+        let p = tmp("deps-torn-path");
+        let mut log = DepsLog::new();
+        log.open_for_write(&p, &|_| true).unwrap();
+        log.record_deps("a.o", 100, &["a.c", "common.h"]).unwrap();
+        log.record_deps("b.o", 100, &["b.c", "longheadername.h"]).unwrap();
+        log.close();
+        // Cut inside the last path line: appended to, it would become
+        // another path and shift the ids of the paths after it.
+        let text = std::fs::read_to_string(&p).unwrap();
+        std::fs::write(&p, &text[..text.find("longhead").unwrap() + 4]).unwrap();
+        let mut log = DepsLog::new();
+        assert!(log.load(&p).unwrap().is_some());
+        log.open_for_write(&p, &|_| true).unwrap();
+        log.record_deps("c.o", 200, &["c.c", "c.h"]).unwrap();
+        log.record_deps("d.o", 200, &["d.c", "d.h"]).unwrap();
+        log.close();
+        let mut log = DepsLog::new();
+        assert_eq!(log.load(&p).unwrap(), None);
+        assert_eq!(paths(&log, "a.o"), vec!["a.c", "common.h"]);
+        assert!(log.get("b.o").is_none());
+        assert_eq!(paths(&log, "c.o"), vec!["c.c", "c.h"]);
+        assert_eq!(paths(&log, "d.o"), vec!["d.c", "d.h"]);
         let _ = std::fs::remove_file(&p);
     }
 }

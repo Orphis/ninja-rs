@@ -23,3 +23,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Servers misbehaving in ways the fake one doesn't (tests of lib.rs).
+tokio = { workspace = true, features = ["net"] }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true, features = ["router", "server"] }

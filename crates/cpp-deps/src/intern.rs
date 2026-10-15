@@ -55,6 +55,8 @@ known! {
     POP_MACRO = "pop_macro",
     PRAGMA = "pragma",
     PRAGMA_OPERATOR = "_Pragma",
+    MS_PRAGMA_OPERATOR = "__pragma",
+    INCLUDE_ALIAS = "include_alias",
     HAS_EMBED = "__has_embed",
     DATE = "__DATE__",
     TIME = "__TIME__",
