@@ -1,7 +1,8 @@
 //! What ninja-rs' crates share from the operating system: file stamps and
 //! digests (what the digest caches of builds and of the daemon key on),
 //! executable bits, random numbers, file identities and locks (the build
-//! logs'), programs run with a time limit ([`process`]), and on Windows
+//! logs'), processes' identities and parents (who holds a lock), programs
+//! run with a time limit ([`process`]), and on Windows
 //! ([`windows`]) who owns files and processes.
 
 use std::fs;
@@ -175,6 +176,107 @@ pub fn unlock(f: &fs::File) -> io::Result<()> {
     windows::unlock(f)
 }
 
+/// What tells a running process from others with its id: those that had
+/// it before (a lock file naming a process gone), and those that have it
+/// in another pid namespace (two containers sharing a directory).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProcessIdentity {
+    /// When it started: on Linux in clock ticks since boot, on macOS in µs
+    /// since the Unix epoch, on Windows in 100 ns since 1601.
+    pub start: u64,
+    /// Linux: its pid namespace's inode (0 when that can't be read, as
+    /// another user's); 0 elsewhere.
+    pub namespace: u64,
+}
+
+/// A running process, as [`process_info`] tells it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessInfo {
+    pub identity: ProcessIdentity,
+    /// Its parent's id (0: none).
+    pub parent: u32,
+}
+
+/// The running process `pid` (`None`: this one), if it can be asked.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn process_info(pid: Option<u32>) -> Option<ProcessInfo> {
+    let dir = format!("/proc/{}", pid.map_or("self".to_string(), |p| p.to_string()));
+    let stat = fs::read_to_string(format!("{dir}/stat")).ok()?;
+    // `pid (name) state ppid ...`: the name may hold spaces and
+    // parentheses. `starttime` is the 22nd field.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let (parent, start) = (fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?);
+    // `pid:[4026531836]`.
+    let link = fs::read_link(format!("{dir}/ns/pid")).ok();
+    let namespace = link.as_ref().and_then(|l| l.to_str()?.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()).unwrap_or(0);
+    Some(ProcessInfo { identity: ProcessIdentity { start, namespace }, parent })
+}
+
+/// The running process `pid` (`None`: this one), if it can be asked.
+#[cfg(target_os = "macos")]
+pub fn process_info(pid: Option<u32>) -> Option<ProcessInfo> {
+    let pid = libc::c_int::try_from(pid.unwrap_or_else(std::process::id)).ok()?;
+    // SAFETY: fills `info`, of the size given, nothing else.
+    let info = unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        (libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) == size).then_some(info)?
+    };
+    let start = info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec);
+    Some(ProcessInfo { identity: ProcessIdentity { start, namespace: 0 }, parent: info.pbi_ppid })
+}
+
+/// The running process `pid` (`None`: this one), if it can be asked.
+#[cfg(windows)]
+pub fn process_info(pid: Option<u32>) -> Option<ProcessInfo> {
+    windows::process_info(pid.unwrap_or_else(std::process::id))
+}
+
+/// The running process `pid`: not known here.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+pub fn process_info(_pid: Option<u32>) -> Option<ProcessInfo> {
+    None
+}
+
+/// Whether process `pid` runs (a zombie, ended but not waited for,
+/// doesn't); `None` when that can't be asked (another user's process, on
+/// Windows).
+#[cfg(unix)]
+pub fn process_running(pid: u32) -> Option<bool> {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return Some(false) };
+    // SAFETY: signal 0 only checks that the process exists.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return match io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Some(false),
+            // Another user's.
+            Some(libc::EPERM) => Some(!zombie(pid)),
+            _ => None,
+        };
+    }
+    Some(!zombie(pid))
+}
+
+/// Whether process `pid` is a zombie, where `/proc` tells.
+#[cfg(unix)]
+fn zombie(pid: libc::pid_t) -> bool {
+    // "pid (name) S ...": the state follows the name.
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+}
+
+/// Whether process `pid` runs; `None` when that can't be asked (another
+/// user's process).
+#[cfg(windows)]
+pub fn process_running(pid: u32) -> Option<bool> {
+    windows::process_running(pid)
+}
+
+/// Whether process `pid` runs: not known here.
+#[cfg(not(any(unix, windows)))]
+pub fn process_running(_pid: u32) -> Option<bool> {
+    None
+}
+
 /// A file's digest, as REAPI has it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Digest {
@@ -320,6 +422,52 @@ mod tests {
         assert_ne!(identity(&f).unwrap(), identity(&g).unwrap());
         fs::remove_file(&path).unwrap();
         assert!(replaced(&g, &path));
+    }
+
+    /// A process tells its identity and its parent; a child started after
+    /// it tells it for parent, and a start no earlier (on Linux, in clock
+    /// ticks: maybe the same).
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
+    #[test]
+    fn processes_and_their_parents() {
+        let this = process_info(None).unwrap();
+        assert_eq!(process_info(Some(std::process::id())), Some(this));
+        let parent = process_info(Some(this.parent)).unwrap();
+        assert!(parent.identity.start <= this.identity.start);
+        assert_eq!(parent.identity.namespace, this.identity.namespace);
+        if cfg!(any(target_os = "linux", target_os = "android")) {
+            assert_ne!(this.identity.namespace, 0);
+        }
+        let program = if cfg!(windows) { "cmd" } else { "sh" };
+        let args: &[&str] = if cfg!(windows) { &["/c", "pause"] } else { &["-c", "read x"] };
+        let mut child = std::process::Command::new(program).args(args).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        let info = process_info(Some(child.id()));
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let info = info.unwrap();
+        assert_eq!(info.parent, std::process::id());
+        assert!(info.identity.start >= this.identity.start);
+    }
+
+    /// A process runs until it exits; a zombie (exited, not waited for)
+    /// doesn't.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn running_processes() {
+        assert_eq!(process_running(std::process::id()), Some(true));
+        let program = if cfg!(windows) { "cmd" } else { "sh" };
+        let args: &[&str] = if cfg!(windows) { &["/c", "pause"] } else { &["-c", "read x"] };
+        let mut child = std::process::Command::new(program).args(args).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        let pid = child.id();
+        assert_eq!(process_running(pid), Some(true));
+        drop(child.stdin.take());
+        let start = std::time::Instant::now();
+        while process_running(pid) == Some(true) {
+            assert!(start.elapsed() < Duration::from_secs(60), "the child didn't end");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(process_running(pid), Some(false));
+        child.wait().unwrap();
     }
 
     #[test]

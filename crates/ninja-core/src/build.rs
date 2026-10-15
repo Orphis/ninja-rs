@@ -907,41 +907,41 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// The next edge to start, by priority: of the ready ones, and of those
-    /// waiting for slots of a kind the runner has free now. A ready edge
-    /// whose kind of slots are all taken waits (see
-    /// `CommandRunner::has_free_slot`), and the next one is taken; with
-    /// `force` (nothing runs), the best waiting one is when no other is.
-    fn find_work(&mut self, runner: &dyn CommandRunner, force: bool) -> Option<EdgeId> {
+    /// The next edge to start, by priority, and the kind of runner slots
+    /// it takes: of the ready ones, and of those waiting for slots of a
+    /// kind the runner has free now. A ready edge whose kind of slots are
+    /// all taken waits (see `CommandRunner::has_free_slot`), and the next
+    /// one is taken; with `force` (nothing runs), the best waiting one is
+    /// when no other is.
+    fn find_work(&mut self, runner: &dyn CommandRunner, force: bool) -> Option<(EdgeId, usize)> {
         if runner.slot_kinds() <= 1 {
-            return self.plan.ready.pop().map(|(_, Reverse(e))| e);
+            return self.plan.ready.pop().map(|(_, Reverse(e))| (e, 0));
         }
         let best_waiting = |plan: &Plan, free: &dyn Fn(usize) -> bool| {
             (0..plan.waiting.len()).filter(|&k| free(k)).filter_map(|k| plan.waiting[k].peek().map(|&top| (top, k))).max()
         };
         loop {
             let waiting = best_waiting(&self.plan, &|k| runner.has_free_slot(k));
-            match (self.plan.ready.peek().copied(), waiting) {
-                (None, None) => {
-                    let (_, kind) = best_waiting(&self.plan, &|_| force)?;
-                    return self.plan.waiting[kind].pop().map(|(_, Reverse(e))| e);
-                }
-                (ready, Some((top, kind))) if ready.is_none_or(|r| top > r) => return self.plan.waiting[kind].pop().map(|(_, Reverse(e))| e),
+            let kind = match (self.plan.ready.peek().copied(), waiting) {
+                (None, None) => best_waiting(&self.plan, &|_| force)?.1,
+                (ready, Some((top, kind))) if ready.is_none_or(|r| top > r) => kind,
                 _ => {
                     let (weight, Reverse(e)) = self.plan.ready.pop().expect("a ready edge");
                     if self.state.is_phony(e) {
-                        return Some(e);
+                        return Some((e, 0));
                     }
                     let kind = runner.slots_of(&self.task_preview(e));
                     if runner.has_free_slot(kind) {
-                        return Some(e);
+                        return Some((e, kind));
                     }
                     if self.plan.waiting.len() <= kind {
                         self.plan.waiting.resize_with(kind + 1, BinaryHeap::new);
                     }
                     self.plan.waiting[kind].push((weight, Reverse(e)));
+                    continue;
                 }
-            }
+            };
+            return self.plan.waiting[kind].pop().map(|(_, Reverse(e))| (e, kind));
         }
     }
 
@@ -1380,13 +1380,18 @@ impl<'a> Builder<'a> {
     }
 
     fn edge_info(&self, edge: EdgeId) -> EdgeInfo {
+        self.edge_info_with(edge, self.task_bindings(edge).unwrap_or_default())
+    }
+
+    /// `edge_info`, with the edge's `task_bindings`.
+    fn edge_info_with(&self, edge: EdgeId, bindings: Vec<(String, String)>) -> EdgeInfo {
         EdgeInfo {
             edge,
             description: self.state.edge_binding(edge, "description").unwrap_or_default(),
             command: self.state.evaluate_command(edge, false).unwrap_or_default(),
             outputs: self.state.edge(edge).outputs.iter().map(|&o| self.state.path(o).to_string()).collect(),
             use_console: self.state.use_console(edge),
-            bindings: self.task_bindings(edge).unwrap_or_default(),
+            bindings,
             cas_outputs: Vec::new(),
         }
     }
@@ -1458,8 +1463,8 @@ impl<'a> Builder<'a> {
             if failures_allowed > 0 {
                 let mut capacity = runner.can_run_more();
                 while capacity > 0 {
-                    let Some(edge) = self.find_work(&*runner, pending_commands == 0) else { break };
-                    if let Err(e) = self.start_edge(edge, runner) {
+                    let Some((edge, slots)) = self.find_work(&*runner, pending_commands == 0) else { break };
+                    if let Err(e) = self.start_edge(edge, slots, runner) {
                         self.cleanup(runner).await;
                         self.status.build_finished();
                         return Err(BuildError::new(e));
@@ -1546,13 +1551,16 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    fn start_edge(&mut self, edge: EdgeId, runner: &mut dyn CommandRunner) -> Result<(), String> {
+    /// Starts `edge`'s command, in the runner's slots of kind `slots` (see
+    /// `find_work`).
+    fn start_edge(&mut self, edge: EdgeId, slots: usize, runner: &mut dyn CommandRunner) -> Result<(), String> {
         if self.state.is_phony(edge) {
             return Ok(());
         }
+        let bindings = self.task_bindings(edge)?;
         let start_ms = self.elapsed_ms();
         self.running.insert(edge, start_ms);
-        let info = self.edge_info(edge);
+        let mut info = self.edge_info_with(edge, bindings);
         self.status.build_edge_started(&info, start_ms);
 
         let mut build_start: TimeStamp = if self.config.dry_run { 0 } else { -1 };
@@ -1592,7 +1600,6 @@ impl<'a> Builder<'a> {
         }
 
         let inputs = if runner.wants_inputs() { self.task_inputs(edge) } else { Vec::new() };
-        let bindings = self.task_bindings(edge)?;
         let deps = self.state.edge_binding(edge, "deps")?;
         let task = Task {
             edge,
@@ -1608,7 +1615,8 @@ impl<'a> Builder<'a> {
             inputs,
             restat: self.state.edge_binding_bool(edge, "restat"),
             generator: self.state.edge_binding_bool(edge, "generator"),
-            bindings,
+            bindings: std::mem::take(&mut info.bindings),
+            slots,
         };
         runner.start_command(task).map_err(|e| format!("command '{}' failed: {e}", info.command))
     }

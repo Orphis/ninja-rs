@@ -6,14 +6,18 @@
 //! free (see `CommandRunner::has_free_slot`), so that up to
 //! `-j + --remote_jobs` run at once, those waiting for a slot waiting in
 //! the plan. A task still waits for a slot inside its own tokio task when
-//! it needs another than the one it was started for (a remote action run
-//! locally after all), or a jobserver token held elsewhere.
+//! it needs another than the one it was started for, or a jobserver token
+//! held elsewhere: a remote action run locally after all (a fallback) then
+//! counts as a local task, so that the engine starts no more of those
+//! meanwhile. Without remote execution (a disk cache, or a remote cache,
+//! alone), where every miss runs locally, tasks take local slots only, the
+//! cache looked up in theirs.
 //!
 //! With racing (`--remote_racing`), a task sent remotely also runs locally
 //! when a local slot is free: the first branch to finish wins (see
 //! `run_raced`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -91,6 +95,39 @@ impl LocalSlots {
     }
 }
 
+/// How many tasks take slots of each kind (`LOCAL`, `REMOTE`), shared with
+/// the tasks (see `Counted`).
+type Counts = Arc<[AtomicUsize; 2]>;
+
+/// A task in `Counts`, under the kind of slots it takes, until it ends
+/// (dropped, its future done or dropped).
+struct Counted {
+    counts: Counts,
+    kind: AtomicUsize,
+}
+
+impl Counted {
+    fn new(counts: Counts, kind: usize) -> Self {
+        counts[kind].fetch_add(1, Ordering::Relaxed);
+        Self { counts, kind: AtomicUsize::new(kind) }
+    }
+
+    /// The task waits for a local slot, or holds one, from now on.
+    fn local(&self) {
+        let was = self.kind.swap(LOCAL, Ordering::Relaxed);
+        if was != LOCAL {
+            self.counts[LOCAL].fetch_add(1, Ordering::Relaxed);
+            self.counts[was].fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.counts[self.kind.load(Ordering::Relaxed)].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// `--remote_racing`: a task sent remotely also runs locally, after
 /// `delay`, when a local slot is free.
 #[derive(Clone)]
@@ -116,10 +153,13 @@ pub struct ExecRunner {
     jobs: [usize; 2],
     tasks: JoinSet<TaskResult>,
     ids: HashMap<tokio::task::Id, EdgeId>,
-    /// The tasks started and not finished, with the kind of slots each was
-    /// started for.
-    active: HashMap<EdgeId, usize>,
+    /// The tasks started and not reaped, and how many of those running
+    /// take slots of each kind.
+    active: HashSet<EdgeId>,
+    counts: Counts,
     remote: Option<Arc<dyn RemoteBackend>>,
+    /// The backend runs tasks remotely (see `RemoteBackend::executes`).
+    executes: bool,
     interrupt: Arc<Interrupt>,
     /// Stops the local commands (see `abort`).
     stop: Arc<Stop>,
@@ -133,16 +173,19 @@ impl ExecRunner {
     pub fn new(parallelism: usize, remote: Option<Arc<dyn RemoteBackend>>, interrupt: Arc<Interrupt>) -> Self {
         let parallelism = parallelism.max(1);
         let remote_jobs = remote.as_ref().map(|r| r.max_jobs().max(1)).unwrap_or(0);
+        let executes = remote.as_ref().is_some_and(|r| r.executes());
         Self {
             local_slots: Arc::new(LocalSlots::new(SlotKind::Count(Semaphore::new(parallelism.min(Semaphore::MAX_PERMITS))))),
             env: Arc::default(),
             remote_slots: Arc::new(Semaphore::new(remote_jobs.max(1))),
-            capacity: parallelism.saturating_add(remote_jobs),
+            capacity: parallelism.saturating_add(if executes { remote_jobs } else { 0 }),
             jobs: [parallelism, remote_jobs],
             tasks: JoinSet::new(),
             ids: HashMap::new(),
-            active: HashMap::new(),
+            active: HashSet::new(),
+            counts: Counts::default(),
             remote,
+            executes,
             interrupt,
             stop: Stop::new(),
             verbose_remote: false,
@@ -163,7 +206,8 @@ impl ExecRunner {
 
 /// Runs a task on the host, once its inputs that only exist remotely are
 /// downloaded: the remote action's `command` when the backend prepared
-/// one, else the build file's.
+/// one, else the build file's. It counts as local (`counted`) from when it
+/// waits for a local slot.
 async fn run_local(
     task: &Task,
     slots: &LocalSlots,
@@ -171,6 +215,7 @@ async fn run_local(
     remote: Option<&Arc<dyn RemoteBackend>>,
     command: Option<&LocalCommand>,
     stop: &Stop,
+    counted: &Counted,
 ) -> TaskResult {
     if let Some(backend) = remote
         && let Err(e) = backend.materialize(task).await
@@ -178,6 +223,7 @@ async fn run_local(
         let output = format!("ninja: fetching inputs: {}\n", e.message).into_bytes();
         return TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: e.lost };
     }
+    counted.local();
     let _permit = slots.acquire().await;
     let (status, output) = match command {
         Some(cmd) => {
@@ -232,9 +278,10 @@ fn with_env(env: &[(String, String)], cmd: &LocalCommand) -> Vec<(String, String
 /// write the same bytes), its inputs are fetched, and it starts when a
 /// local slot is free, without queueing for one (local tasks keep
 /// priority); when the remote branch gave up, it queues like any local
-/// task, with the task's own command if the action couldn't be prepared.
-/// `None` when the remote branch won, or the inputs couldn't be fetched
-/// while the remote branch still runs.
+/// task, with the task's own command if the action couldn't be prepared,
+/// and counts as one (`counted`). `None` when the remote branch won, or
+/// the inputs couldn't be fetched while the remote branch still runs.
+#[allow(clippy::too_many_arguments)]
 async fn race_local(
     task: &Task,
     slots: &LocalSlots,
@@ -243,6 +290,7 @@ async fn race_local(
     race: &Race,
     delay: Duration,
     stop: &Stop,
+    counted: &Counted,
 ) -> Option<TaskResult> {
     let mut rx = race.subscribe();
     tokio::select! {
@@ -274,6 +322,7 @@ async fn race_local(
             return None;
         }
         if state.local_needed {
+            counted.local();
             break slots.acquire().await?;
         }
         if let Some(slot) = slots.try_acquire() {
@@ -324,13 +373,14 @@ async fn run_raced(
     racing: Racing,
     verbose: bool,
     stop: Arc<Stop>,
+    counted: Counted,
 ) -> TaskResult {
     let race = Race::new();
     let remote = async {
         let _permit = remote_slots.acquire().await;
         with_host_stop(stop.clone(), backend.execute_raced(task.clone(), race.clone())).await
     };
-    let local = race_local(&task, &local_slots, &env, &backend, &race, racing.delay, &stop);
+    let local = race_local(&task, &local_slots, &env, &backend, &race, racing.delay, &stop, &counted);
     tokio::pin!(remote, local);
     let (mut remote_done, mut local_done) = (false, false);
     // A remote result that wrote nothing, while a local command runs.
@@ -368,7 +418,7 @@ async fn run_raced(
                 if local_done {
                     // The local branch gave up before running.
                     let command = race.state().command;
-                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop).await;
+                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop, &counted).await;
                     return finish_local(&task, r, capture, reason, verbose).await;
                 }
             }
@@ -385,7 +435,7 @@ async fn run_raced(
                         return r;
                     }
                     let command = race.state().command;
-                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop).await;
+                    let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop, &counted).await;
                     return finish_local(&task, r, capture, reason, verbose).await;
                 }
             }
@@ -418,24 +468,29 @@ impl CommandRunner for ExecRunner {
         self.capacity.saturating_sub(self.active.len())
     }
 
+    /// Sends the task remotely when the engine started it in remote slots
+    /// (see `slots_of`); without remote execution, to the cache when the
+    /// backend's policy says so, in the local slot it was started in.
     fn start_command(&mut self, task: Task) -> Result<(), String> {
         let edge = task.edge;
         let local_slots = self.local_slots.clone();
         let env = self.env.clone();
         let inputs_from = self.remote.clone();
-        let remote = self.remote.clone().filter(|r| !task.use_console && r.wants(&task));
-        self.active.insert(edge, if remote.is_some() { REMOTE } else { LOCAL });
+        let wanted = |r: &Arc<dyn RemoteBackend>| if self.executes { task.slots == REMOTE } else { !task.use_console && r.wants(&task) };
+        let remote = self.remote.clone().filter(wanted);
+        self.active.insert(edge);
+        let counted = Counted::new(self.counts.clone(), if self.executes && remote.is_some() { REMOTE } else { LOCAL });
         let verbose = self.verbose_remote;
         let stop = self.stop.clone();
         match remote {
             None => {
-                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, &env, inputs_from.as_ref(), None, &stop).await });
+                let h = self.tasks.spawn(async move { run_local(&task, &local_slots, &env, inputs_from.as_ref(), None, &stop, &counted).await });
                 self.ids.insert(h.id(), edge);
             }
             Some(backend) if self.racing.is_some() => {
                 let remote_slots = self.remote_slots.clone();
                 let racing = self.racing.clone().expect("racing");
-                let h = self.tasks.spawn(run_raced(task, backend, local_slots, remote_slots, env, racing, verbose, stop));
+                let h = self.tasks.spawn(run_raced(task, backend, local_slots, remote_slots, env, racing, verbose, stop, counted));
                 self.ids.insert(h.id(), edge);
             }
             Some(backend) => {
@@ -457,14 +512,14 @@ impl CommandRunner for ExecRunner {
                             lost_inputs: Vec::new(),
                         },
                         RemoteOutcome::Fallback(reason, command) => {
-                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop).await;
+                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop, &counted).await;
                             if verbose {
                                 ran_locally(&task, &reason);
                             }
                             r
                         }
                         RemoteOutcome::RunLocally(capture, command) => {
-                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop).await;
+                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop, &counted).await;
                             // Storing outputs reads files: off the async threads.
                             let result = r.clone();
                             let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;
@@ -484,7 +539,7 @@ impl CommandRunner for ExecRunner {
             let joined = tokio::select! {
                 r = self.tasks.join_next_with_id() => r,
                 _ = interrupt.wait() => {
-                    let edge = self.active.keys().next().copied().unwrap_or_default();
+                    let edge = self.active.iter().next().copied().unwrap_or_default();
                     return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
                 }
             };
@@ -511,7 +566,7 @@ impl CommandRunner for ExecRunner {
     }
 
     fn active_edges(&self) -> Vec<EdgeId> {
-        self.active.keys().copied().collect()
+        self.active.iter().copied().collect()
     }
 
     fn abort(&mut self) -> AbortFuture<'_> {
@@ -534,18 +589,19 @@ impl CommandRunner for ExecRunner {
         self.remote.is_some()
     }
 
+    /// Local and remote slots, with remote execution.
     fn slot_kinds(&self) -> usize {
-        if self.remote.is_some() { 2 } else { 1 }
+        if self.executes { 2 } else { 1 }
     }
 
     /// Remote slots for a task the backend's policy sends there (raced ones
     /// too, which take a local slot only when one is free), else local.
     fn slots_of(&self, task: &Task) -> usize {
-        if self.remote.as_ref().is_some_and(|r| !task.use_console && r.wants(task)) { REMOTE } else { LOCAL }
+        if self.executes && self.remote.as_ref().is_some_and(|r| !task.use_console && r.wants(task)) { REMOTE } else { LOCAL }
     }
 
     fn has_free_slot(&self, kind: usize) -> bool {
-        self.active.values().filter(|&&k| k == kind).count() < self.jobs[kind]
+        self.counts[kind].load(Ordering::Relaxed) < self.jobs[kind]
     }
 }
 
@@ -568,17 +624,15 @@ mod tests {
         assert!(slots.try_acquire().is_none());
         // A local task waits for the slot: it gets it when it's given back,
         // not a raced run trying at the same time.
-        let s = slots.clone();
-        let waiter = tokio::spawn(async move {
-            let _slot = s.acquire().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let waiter = slots.acquire();
+        tokio::pin!(waiter);
+        let pending = std::future::poll_fn(|cx| std::task::Poll::Ready(waiter.as_mut().poll(cx).is_pending())).await;
+        assert!(pending, "the slot is held");
         let released = slots.released.notified();
         drop(held);
         released.await;
         assert!(slots.try_acquire().is_none(), "a raced run took the slot a local task waits for");
-        waiter.await.unwrap();
+        assert!(waiter.await.is_some());
         assert!(slots.try_acquire().is_some());
     }
 
@@ -610,13 +664,89 @@ mod tests {
         // A console task runs on the terminal: locally.
         assert_eq!(runner.slots_of(&Task { use_console: true, ..task("remote", 2) }), LOCAL);
         assert!(runner.has_free_slot(REMOTE) && runner.has_free_slot(LOCAL));
-        runner.start_command(task("remote", 0)).unwrap();
+        runner.start_command(Task { slots: REMOTE, ..task("remote", 0) }).unwrap();
         assert!(!runner.has_free_slot(REMOTE) && runner.has_free_slot(LOCAL));
         assert_eq!(runner.can_run_more(), 2);
         runner.abort().await;
         assert!(runner.has_free_slot(REMOTE));
         // Without a backend, one kind.
         assert_eq!(ExecRunner::new(2, None, Interrupt::new()).slot_kinds(), 1);
+    }
+
+    /// A backend sending the tasks of the rule `remote` there, which run
+    /// locally after all (cache misses without remote execution).
+    struct Misses;
+
+    impl RemoteBackend for Misses {
+        fn wants(&self, task: &Task) -> bool {
+            task.rule == "remote"
+        }
+        fn execute(&self, _: Task) -> ninja_core::runner::RemoteFuture {
+            Box::pin(async { RemoteOutcome::Fallback("a cache miss".into(), None) })
+        }
+        fn max_jobs(&self) -> usize {
+            1
+        }
+    }
+
+    /// A task sent remotely that runs locally after all (a cache miss with
+    /// a disk cache alone, a fallback) counts as a local one once it waits
+    /// for a local slot: the engine starts no other local task meanwhile,
+    /// and starts remote ones. (It took a remote slot while it waited.)
+    #[tokio::test]
+    async fn tasks_run_locally_after_all_count_as_local() {
+        let mut runner = ExecRunner::new(1, Some(Arc::new(Misses)), Interrupt::new());
+        let slots = runner.local_slots.clone();
+        let held = slots.try_acquire().expect("a free slot");
+        let command = if cfg!(windows) { "cmd /c exit 0" } else { "true" }.to_string();
+        runner.start_command(Task { rule: "remote".into(), command, slots: REMOTE, ..Default::default() }).unwrap();
+        let start = std::time::Instant::now();
+        while runner.has_free_slot(LOCAL) {
+            assert!(start.elapsed() < PATIENCE, "a task waiting for a local slot doesn't count as local");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(runner.has_free_slot(REMOTE));
+        drop(held);
+        let r = runner.wait_for_command().await.expect("a result");
+        assert_eq!((r.status, r.kind), (ExitStatus::Success, ExecKind::Local));
+        assert!(runner.has_free_slot(LOCAL) && runner.has_free_slot(REMOTE));
+    }
+
+    /// A cache without remote execution, where the tasks of the rule
+    /// `remote` are looked up (counted in `lookups`), and miss.
+    struct CacheAlone {
+        lookups: Arc<AtomicUsize>,
+    }
+
+    impl RemoteBackend for CacheAlone {
+        fn wants(&self, task: &Task) -> bool {
+            task.rule == "remote"
+        }
+        fn execute(&self, _: Task) -> ninja_core::runner::RemoteFuture {
+            self.lookups.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { RemoteOutcome::Fallback("a cache miss".into(), None) })
+        }
+        fn max_jobs(&self) -> usize {
+            50
+        }
+        fn executes(&self) -> bool {
+            false
+        }
+    }
+
+    /// Without remote execution (a disk cache, a remote cache, alone), where
+    /// every miss runs locally, tasks take local slots only: no more start
+    /// than `-j`, in the plan's order. (Up to `-j + --remote_jobs` started,
+    /// the misses waiting in the runner for a local slot, in turn.)
+    #[tokio::test]
+    async fn caches_alone_take_local_slots() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let mut runner = ExecRunner::new(2, Some(Arc::new(CacheAlone { lookups: lookups.clone() })), Interrupt::new());
+        let remote = Task { rule: "remote".into(), command: if cfg!(windows) { "cmd /c exit 0" } else { "true" }.to_string(), ..Default::default() };
+        assert_eq!((runner.slot_kinds(), runner.can_run_more(), runner.slots_of(&remote)), (1, 2, LOCAL));
+        runner.start_command(remote).unwrap();
+        let r = runner.wait_for_command().await.expect("a result");
+        assert_eq!((r.status, lookups.load(Ordering::Relaxed)), (ExitStatus::Success, 1));
     }
 
     /// A backend whose inputs take until `release` to download, saying when
@@ -657,7 +787,8 @@ mod tests {
         // The remote branch gave up: the local one runs.
         race.need_local();
         let (task, stop) = (Task::default(), Stop::new());
-        let local = race_local(&task, &slots, &[], &backend, &race, Duration::ZERO, &stop);
+        let counted = Counted::new(Counts::default(), REMOTE);
+        let local = race_local(&task, &slots, &[], &backend, &race, Duration::ZERO, &stop, &counted);
         tokio::pin!(local);
         tokio::select! {
             _ = &mut local => panic!("ran before its inputs were fetched"),
@@ -680,30 +811,7 @@ mod tests {
 
     /// Whether process `pid` still runs (a zombie doesn't).
     fn alive(pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            // SAFETY: signal 0 only checks that the process exists.
-            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-                return false;
-            }
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-            stat.rsplit_once(')').is_none_or(|(_, rest)| !rest.trim_start().starts_with('Z'))
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
-            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
-            // SAFETY: plain system calls; the handle is owned (closed) below.
-            unsafe {
-                let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-                if h.is_null() {
-                    return false;
-                }
-                let h = OwnedHandle::from_raw_handle(h);
-                WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT
-            }
-        }
+        ninja_os::process_running(pid) == Some(true)
     }
 
     #[tokio::test]
@@ -773,7 +881,7 @@ mod tests {
         let step = format!("trap 'echo > {}; exit 1' INT; echo > {}; while :; do sleep 0.1; done", stopped.display(), ready.display());
         let interrupt = Interrupt::new();
         let mut runner = ExecRunner::new(2, Some(Arc::new(HostStep { step, dir: dir.to_path_buf() })), interrupt.clone());
-        runner.start_command(Task::default()).unwrap();
+        runner.start_command(Task { slots: REMOTE, ..Default::default() }).unwrap();
         while !ready.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

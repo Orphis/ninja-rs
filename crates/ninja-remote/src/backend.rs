@@ -103,14 +103,15 @@ struct Inner {
     /// meanwhile.
     materializing: ClaimMap,
     fallbacks: Fallbacks,
+    /// Results of commands run locally on a cache miss that weren't cached
+    /// (see `Capture::store`), by reason.
+    uncached: Reasons,
     /// Hashes of blobs found gone from the remote CAS during this build: a
     /// disk cache result referencing one is stale (see `try_execute`).
     lost: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Whether the build was told why local results aren't cached.
     env_warned: std::sync::atomic::AtomicBool,
-    /// Whether a disk cache write failed (and the build was told): blobs
-    /// aren't fetched as chunks from then on, for a disk cache that can't
-    /// keep them.
+    /// Whether a disk cache write failed (and the build was told).
     disk_warned: Arc<std::sync::atomic::AtomicBool>,
     /// Bytes downloads hold in memory, in KiB (see `DOWNLOAD_BUDGET_KIB`).
     download_budget: Arc<tokio::sync::Semaphore>,
@@ -136,9 +137,8 @@ type ClaimMap = std::sync::Mutex<std::collections::HashMap<String, tokio::sync::
 struct Fallbacks {
     /// Actions the policy sent remotely.
     started: std::sync::atomic::AtomicUsize,
-    /// Actions that couldn't be sent (`prepare` refused them), by what the
-    /// reason is (see `Fallbacks::unsent`): how many, and the first reason.
-    unsent: std::sync::Mutex<std::collections::BTreeMap<String, (usize, String)>>,
+    /// Actions that couldn't be sent (`prepare` refused them), by reason.
+    unsent: Reasons,
     /// Actions run locally after a remote failure.
     failed: std::sync::Mutex<(usize, Option<String>)>,
     /// Why remote failures no longer fall back, once a limit is crossed.
@@ -149,23 +149,41 @@ struct Fallbacks {
 /// before it says so.
 const UPLOADS_NOTICED: std::time::Duration = std::time::Duration::from_secs(1);
 
-impl Fallbacks {
-    /// Counts an action `prepare` refused, by what the reason is: its
-    /// first line, without the details after it ("what: details", which
-    /// name its files).
-    fn unsent(&self, reason: &str) {
-        let line = first_line(reason);
-        let what = line.split(": ").next().unwrap_or_default().to_string();
-        self.unsent.lock().unwrap().entry(what).or_insert_with(|| (0, line)).0 += 1;
+/// How many times an action is prepared, its inputs changing as they're
+/// uploaded (see `Inner::execute`).
+const PREPARES: usize = 3;
+
+/// Reasons counted by what they are (see `Reasons::what`), for a line at
+/// the end of the build.
+#[derive(Default)]
+struct Reasons(std::sync::Mutex<std::collections::BTreeMap<String, usize>>);
+
+/// The longest reason a summary quotes, in characters.
+const REASON_MAX: usize = 100;
+
+impl Reasons {
+    fn add(&self, reason: &str) {
+        *self.0.lock().unwrap().entry(Self::what(reason)).or_default() += 1;
     }
 
-    /// How many actions couldn't be sent, and why: each reason's count and
-    /// first one, the most frequent first.
-    fn unsent_summary(&self) -> (usize, String) {
-        let mut reasons: Vec<(usize, String)> = self.unsent.lock().unwrap().values().cloned().collect();
-        reasons.sort_by_key(|r| std::cmp::Reverse(r.0));
-        let total = reasons.iter().map(|(n, _)| n).sum();
-        let mut shown: Vec<String> = reasons.iter().take(4).map(|(n, first)| format!("{n}: {first}")).collect();
+    /// What a reason is: its first line, without the details after it
+    /// ("what: details", which name files or quote a command line, which
+    /// can be kilobytes long), and `REASON_MAX` characters at most.
+    fn what(reason: &str) -> String {
+        let line = first_line(reason);
+        let what = line.split(": ").next().unwrap_or_default();
+        match what.char_indices().nth(REASON_MAX) {
+            Some((end, _)) => format!("{}...", &what[..end]),
+            None => what.to_string(),
+        }
+    }
+
+    /// How many, and why: each reason's count, the most frequent first.
+    fn summary(&self) -> (usize, String) {
+        let mut reasons: Vec<(String, usize)> = self.0.lock().unwrap().iter().map(|(what, n)| (what.clone(), *n)).collect();
+        reasons.sort_by_key(|r| std::cmp::Reverse(r.1));
+        let total = reasons.iter().map(|(_, n)| n).sum();
+        let mut shown: Vec<String> = reasons.iter().take(4).map(|(what, n)| format!("{n}: {what}")).collect();
         if reasons.len() > 4 {
             shown.push(format!("{} more reasons", reasons.len() - 4));
         }
@@ -243,6 +261,7 @@ impl Backend {
             volatile: std::iter::once(config.build_dir.clone()).chain(config.volatile.iter().cloned()).collect(),
             written: crate::scanner::WrittenDirs::new(std::iter::once(config.build_dir.clone()).chain(config.written.iter().cloned()), windows),
             action_env: config.action_env.clone(),
+            compiler_scans: Default::default(),
         };
         shared.store.new_build();
         // No command runs yet: copies of response files nothing used for
@@ -263,6 +282,7 @@ impl Backend {
                 config,
                 materializing: Default::default(),
                 fallbacks: Fallbacks::default(),
+                uncached: Reasons::default(),
                 lost: Default::default(),
                 env_warned: Default::default(),
                 disk_warned: Default::default(),
@@ -289,6 +309,8 @@ impl Backend {
             tokio::select! {
                 biased;
                 () = &mut stop => {
+                    // Those done already aren't given up.
+                    while uploads.try_join_next().is_some() {}
                     let left = uploads.len();
                     uploads.shutdown().await;
                     return left;
@@ -326,10 +348,15 @@ impl Backend {
     /// the end of the build, and whether some did after remote failures.
     pub fn fallback_summary(&self) -> Option<(String, bool)> {
         let f = &self.inner.fallbacks;
-        let (unsent, unsent_reasons) = f.unsent_summary();
+        let (unsent, unsent_reasons) = f.unsent.summary();
         let (failed, failed_reason) = f.failed.lock().unwrap().clone();
         // Compiles the chosen include scanner left to the conservative one.
         let scans = self.inner.shared.store.scan.fallback_summary().map(|s| format!("{s}."));
+        // And those the preprocessor left to the compiler.
+        let scans = match (scans, self.inner.shared.compiler_scans.summary()) {
+            (Some(s), Some(c)) => Some(format!("{c} {s}")),
+            (s, c) => s.or(c),
+        };
         if unsent + failed == 0 {
             return scans.map(|s| (s, false));
         }
@@ -346,6 +373,14 @@ impl Backend {
             summary = format!("{summary} {scans}");
         }
         Some((summary, failed > 0))
+    }
+
+    /// How many results of commands run locally on a cache miss weren't
+    /// cached, and why: a line for the end of the build (`--remote_verbose`
+    /// says it of each).
+    pub fn uncached_summary(&self) -> Option<String> {
+        let (n, reasons) = self.inner.uncached.summary();
+        (n > 0).then(|| format!("{n} local result{} not cached: {reasons}.", if n == 1 { " was" } else { "s were" }))
     }
 }
 
@@ -379,6 +414,10 @@ impl RemoteBackend for Backend {
 
     fn max_jobs(&self) -> usize {
         self.inner.config.jobs
+    }
+
+    fn executes(&self) -> bool {
+        self.inner.client.is_some() && !self.inner.config.cache_only
     }
 
     fn materialize(&self, task: &Task) -> MaterializeFuture {
@@ -421,6 +460,10 @@ impl Backend {
 enum Failure {
     /// The action could not be prepared: run locally.
     Prepare(String),
+    /// An input changed since the action was prepared (an editor saving a
+    /// source): found as it was uploaded, and not sent. The action is
+    /// prepared again.
+    InputChanged(PathBuf),
     /// The remote service failed.
     Infra(anyhow::Error),
     /// A cache miss without remote execution (the disk cache alone, or a
@@ -451,6 +494,16 @@ impl std::fmt::Display for DiskMiss {
 }
 
 impl std::error::Error for DiskMiss {}
+
+/// What an upload of an action's inputs failing is: an input changed
+/// since the action was prepared, which isn't sent (see
+/// `rbe_client::SourceChanged`), or a remote failure.
+fn upload_failure(e: anyhow::Error) -> Failure {
+    match rbe_client::SourceChanged::of(&e) {
+        Some(path) => Failure::InputChanged(path.to_path_buf()),
+        None => Failure::Infra(e),
+    }
+}
 
 /// Whether a remote failure is a blob the CAS doesn't have.
 fn is_not_found(e: &anyhow::Error) -> bool {
@@ -733,14 +786,36 @@ impl Inner {
             })
         };
         let mut command = None;
-        match self.clone().try_execute(&task, race.as_ref(), &mut command).await {
+        // Prepared again while an input changes as it's uploaded, up to a
+        // point: one changing all the time (written by something else as the
+        // build goes) makes the action one that can't be sent, not a remote
+        // failure.
+        let mut prepared = 0;
+        let outcome = loop {
+            match self.clone().try_execute(&task, race.as_ref(), &mut command).await {
+                Err(Failure::InputChanged(path)) => {
+                    prepared += 1;
+                    let why = format!("input changed during the build: {}", path.display());
+                    if prepared >= PREPARES {
+                        break Err(Failure::Prepare(why));
+                    }
+                    if self.config.verbose {
+                        message(&format!("{why}; preparing the action again"));
+                    }
+                    self.input_changed(&path);
+                }
+                outcome => break outcome,
+            }
+        };
+        match outcome {
             Ok(r) => RemoteOutcome::Done(r),
             Err(Failure::Lost) => RemoteOutcome::Lost,
+            Err(Failure::InputChanged(_)) => unreachable!("prepared again"),
             Err(Failure::Prepare(reason)) => {
                 if self.config.strict {
                     return failed(format!("ninja: the action can't run remotely (--remote_strict): {reason}\n"));
                 }
-                self.fallbacks.unsent(&reason);
+                self.fallbacks.unsent.add(&reason);
                 RemoteOutcome::Fallback(reason, None)
             }
             Err(Failure::RunLocally(prepared)) => {
@@ -761,6 +836,19 @@ impl Inner {
                 }
             }
         }
+    }
+
+    /// An input found changed as it was uploaded: what's known of it goes
+    /// (its digest, kept with a stamp that may not show the change; the
+    /// toolchain trees holding it), for the action to be prepared again.
+    fn input_changed(&self, path: &Path) {
+        let store = &self.shared.store;
+        if let Err(e) = crate::action::rehash(path, &store.digests)
+            && self.config.verbose
+        {
+            message(&format!("hashing {} again: {e:#}", path.display()));
+        }
+        store.forget_toolchain_trees_holding(path);
     }
 
     /// Counts a local run after a remote failure, unless it crosses a
@@ -948,8 +1036,12 @@ impl Inner {
             return Ok(failed);
         }
         let keep = self.disk.is_some() && result.exit_code == 0;
-        output.extend(blocking(|| self.write_staged(staged, task, &prepared, &result, keep)).map_err(Failure::Infra)?);
         let kind = if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote };
+        match blocking(|| self.write_staged(staged, task, &prepared, &result, keep)) {
+            Ok(out) => output.extend(out),
+            Err(e) if !prepared.local_before.is_empty() => return Ok(unwritten_after_host_steps(task, &e, output, kind)),
+            Err(e) => return Err(Failure::Infra(e)),
+        }
         if result.exit_code == 0
             && let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await
         {
@@ -1017,7 +1109,11 @@ impl Inner {
         if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
             return Ok(Some(failed));
         }
-        output.extend(blocking(|| self.write_staged(staged, task, prepared, &result, false)).map_err(Failure::Infra)?);
+        match blocking(|| self.write_staged(staged, task, prepared, &result, false)) {
+            Ok(out) => output.extend(out),
+            Err(e) if !prepared.local_before.is_empty() => return Ok(Some(unwritten_after_host_steps(task, &e, output, ExecKind::DiskCacheHit))),
+            Err(e) => return Err(Failure::Infra(e)),
+        }
         if let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await {
             failed.kind = ExecKind::DiskCacheHit;
             return Ok(Some(failed));
@@ -1049,7 +1145,7 @@ impl Inner {
                 }
                 return Ok(Executed::InputsLost(lost_inputs_result(task, lost, std::mem::take(output))));
             }
-            return Err(Failure::Infra(e));
+            return Err(upload_failure(e));
         }
         self.shared.store.mark_uploaded(to_upload.0.keys());
         let mut resp = client.execute(digest, skip_cache).await.map_err(Failure::Infra)?;
@@ -1066,7 +1162,7 @@ impl Inner {
             // Blobs believed uploaded were evicted: upload again, once.
             let all = prepared_blobs(prepared);
             self.shared.store.forget_uploaded(all.0.keys());
-            client.upload_blobs(&all).await.map_err(Failure::Infra)?;
+            client.upload_blobs(&all).await.map_err(upload_failure)?;
             self.shared.store.mark_uploaded(all.0.keys());
             resp = client.execute(digest, skip_cache).await.map_err(Failure::Infra)?;
         }
@@ -1649,6 +1745,14 @@ fn cas_outputs(task: &Task, prepared: &Prepared, result: &re::ActionResult) -> V
         .collect()
 }
 
+/// The result of a task whose outputs couldn't be written once its steps on
+/// the host before the remote one ran: a failure, as a local run would run
+/// those again.
+fn unwritten_after_host_steps(task: &Task, e: &anyhow::Error, mut output: Vec<u8>, kind: ExecKind) -> TaskResult {
+    output.extend_from_slice(format!("ninja: {e:#} (not run locally: its steps on the host ran)\n").as_bytes());
+    TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind, cas_outputs: Vec::new(), lost_inputs: Vec::new() }
+}
+
 /// The result of a task whose inputs were lost from the remote CAS: the
 /// engine rebuilds them and runs the task again.
 fn lost_inputs_result(task: &Task, lost: Vec<String>, mut output: Vec<u8>) -> TaskResult {
@@ -1713,18 +1817,28 @@ mod tests {
     use super::*;
 
     /// Actions that couldn't be sent are counted by reason, whatever files
-    /// its details name.
+    /// its details name or command line they quote, which the summary
+    /// leaves out: what each reason is.
     #[test]
     fn unsent_by_reason() {
-        let f = Fallbacks::default();
-        f.unsent("computed #include in a directory the build writes to: /b/gen/a.c");
-        f.unsent("computed #include in a directory the build writes to: /b/gen/b.c\nmore");
-        f.unsent("cannot find program 'tool'");
-        assert_eq!(f.unsent_summary(), (3, "2: computed #include in a directory the build writes to: /b/gen/a.c; 1: cannot find program 'tool'".to_string()));
+        let f = Reasons::default();
+        f.add("computed #include in a directory the build writes to: /b/gen/a.c");
+        f.add("computed #include in a directory the build writes to: /b/gen/b.c\nmore");
+        f.add("cannot find program 'tool'");
+        let command = format!("command needs a shell: sleep 0.3; gcc {} -c a.c -o a.o", "-DX ".repeat(1000));
+        f.add(&command);
+        f.add(&command.replace("a.", "b."));
+        assert_eq!(
+            f.summary(),
+            (5, "2: command needs a shell; 2: computed #include in a directory the build writes to; 1: cannot find program 'tool'".to_string())
+        );
         for i in 0..4 {
-            f.unsent(&format!("reason {i}"));
+            f.add(&format!("reason {i}"));
         }
-        assert!(f.unsent_summary().1.ends_with("; 2 more reasons"), "{}", f.unsent_summary().1);
+        assert!(f.summary().1.ends_with("; 3 more reasons"), "{}", f.summary().1);
+        // A long one without details, cut.
+        let long = "x".repeat(5000);
+        assert_eq!(Reasons::what(&long), format!("{}...", &long[..REASON_MAX]));
     }
 
     #[test]

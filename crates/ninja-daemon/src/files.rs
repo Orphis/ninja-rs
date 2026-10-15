@@ -12,7 +12,8 @@ use cpp_deps::scan::Watch;
 use ninja_os::{Digest, FileStamp};
 
 use crate::proto::{FileInfo, TreeInfo};
-use crate::watch::{Change, Listener, PathMap, Watcher, key, strip_verbatim, walk_skips};
+use crate::watch::{self, Change, Listener, PathKey, PathMap, Watcher, key, strip_verbatim, walk_skips};
+use crate::{Locked, RwLocked};
 
 /// The session of entries the watcher vouches for.
 const WATCHED: u64 = u64::MAX;
@@ -30,6 +31,25 @@ struct TreeEntry {
     /// Or why it couldn't be listed.
     info: Result<Arc<TreeInfo>, String>,
     session: AtomicU64,
+    /// Watched: its files with other names, all in it when walked.
+    linked: Vec<Linked>,
+    /// The session they were last looked at in.
+    checked: AtomicU64,
+}
+
+/// A file of a tree with other names, as the walk found it: a name made
+/// since outside the tree (a change through which isn't reported under
+/// it) changes its number of names and its change time.
+struct Linked {
+    path: PathBuf,
+    stamp: FileStamp,
+    names: u64,
+}
+
+impl Linked {
+    fn unchanged(&self) -> bool {
+        ninja_os::stat(&self.path).is_ok_and(|(_, stamp)| stamp == self.stamp) && watch::names(&self.path).is_ok_and(|n| n == self.names)
+    }
 }
 
 /// A digest kept for a file.
@@ -105,7 +125,7 @@ impl Files {
 
     /// The number of file digests and trees kept.
     pub fn len(&self) -> (usize, usize) {
-        (self.files.read().unwrap().len(), self.trees.read().unwrap().len())
+        (self.files.reading().len(), self.trees.reading().len())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -116,11 +136,11 @@ impl Files {
     /// unless the daemon knows better (it hashed the file, or saw it
     /// change).
     pub fn seed(&self, entries: impl IntoIterator<Item = (PathBuf, FileStamp, String)>) {
-        let mut hashes = self.hashes.lock().unwrap();
+        let mut hashes = self.hashes.locked();
         for (p, stamp, hash) in entries {
             let k = key(&p, self.case_insensitive);
             if !hashes.contains_key(&k) {
-                hashes.insert(k, Kept::Saved(stamp, Digest { hash, size: stamp.len }));
+                hashes.insert(&k, Kept::Saved(stamp, Digest { hash, size: stamp.len }));
             }
         }
     }
@@ -147,7 +167,7 @@ impl Files {
     /// A file's digest, and whether the watcher vouches for it.
     fn check(&self, p: &Path) -> io::Result<(FileInfo, bool)> {
         let k = key(p, self.case_insensitive);
-        let known = self.files.read().unwrap().get(&k).cloned();
+        let known = self.files.reading().get(&k).cloned();
         // A file the build may write is checked every time: a generator
         // can rewrite it between two actions of a session.
         let volatile = self.watcher.volatile_file(&k);
@@ -188,9 +208,9 @@ impl Files {
         };
         // The token compared under the lock: an event counted after it
         // drops the entry after it's in.
-        let mut files = self.files.write().unwrap();
+        let mut files = self.files.writing();
         let checked = self.checked(token, session);
-        files.insert(k, Arc::new(FileEntry { info: info.clone(), stamp, racy, session: AtomicU64::new(checked) }));
+        files.insert(&k, Arc::new(FileEntry { info: info.clone(), stamp, racy, session: AtomicU64::new(checked) }));
         Ok((info, checked == WATCHED))
     }
 
@@ -202,20 +222,20 @@ impl Files {
         let real = if is_link { std::fs::canonicalize(p).map(strip_verbatim).unwrap_or_else(|_| p.to_path_buf()) } else { p.to_path_buf() };
         let k = key(&real, self.case_insensitive);
         let seen = {
-            let mut hashes = self.hashes.lock().unwrap();
+            let mut hashes = self.hashes.locked();
             match hashes.get(&k) {
                 Some(Kept::Hashed(s, d) | Kept::Saved(s, d)) if *s == stamp => return Ok(d.clone()),
                 Some(Kept::Changed(n)) => Some(*n),
                 Some(_) => None,
                 // A change while it's hashed has an entry to mark.
                 None => {
-                    hashes.insert(k.clone(), Kept::Changed(0));
+                    hashes.insert(&k, Kept::Changed(0));
                     Some(0)
                 }
             }
         };
         let version = (k.clone(), stamp);
-        let cell = self.hashing.lock().unwrap().entry(version.clone()).or_default().clone();
+        let cell = self.hashing.locked().entry(version.clone()).or_default().clone();
         let mut hashed = false;
         let d = cell
             .get_or_init(|| {
@@ -226,9 +246,9 @@ impl Files {
         if !hashed {
             return d.map_err(|(kind, e)| io::Error::new(kind, e));
         }
-        self.hashing.lock().unwrap().remove(&version);
+        self.hashing.locked().remove(&version);
         let d = d.map_err(|(kind, e)| io::Error::new(kind, e))?;
-        let mut hashes = self.hashes.lock().unwrap();
+        let mut hashes = self.hashes.locked();
         match hashes.get(&k) {
             // Changed while hashed: the digest may be of the old contents,
             // or of a mix.
@@ -236,40 +256,57 @@ impl Files {
             // It may change again within the same tick, keeping its stamp.
             _ if stamp.is_racy(SystemTime::now()) => {}
             _ => {
-                hashes.insert(k, Kept::Hashed(stamp, d.clone()));
+                hashes.insert(&k, Kept::Hashed(stamp, d.clone()));
             }
         }
         Ok(d)
     }
 
-    /// The tree of `k`, if one is kept for this session.
-    fn kept_tree(&self, k: &Path) -> Option<Result<Arc<TreeInfo>, String>> {
-        self.trees.read().unwrap().get(k).filter(|e| self.current(e.session.load(Ordering::Relaxed))).map(|e| e.info.clone())
+    /// The tree of `k`, if one is kept for this session. One the watcher
+    /// vouches for with files of other names has them looked at once a
+    /// session first (`look`; else it isn't taken until they were).
+    fn kept_tree(&self, k: &Path, look: bool) -> Option<Result<Arc<TreeInfo>, String>> {
+        let e = self.trees.reading().get(k).cloned()?;
+        let session = e.session.load(Ordering::Relaxed);
+        if !self.current(session) {
+            return None;
+        }
+        if session == WATCHED && !e.linked.is_empty() {
+            let now = self.session.load(Ordering::Relaxed);
+            if e.checked.load(Ordering::Relaxed) != now {
+                if !look || !e.linked.iter().all(Linked::unchanged) {
+                    return None;
+                }
+                e.checked.store(now, Ordering::Relaxed);
+            }
+        }
+        Some(e.info.clone())
     }
 
     /// The files under `dir` (symlinks followed) with their digests, as
     /// `InputTree::add_dir` sees them. Kept until a change under it when the
     /// watcher vouches for its files, but for their other names when the
     /// walk sees those all in the tree (hard links, symbolic links within
-    /// it): a change through any is reported under it. One that can't be
+    /// it): a change through any is reported under it (walked again when
+    /// one was made elsewhere since, see `Linked`). One that can't be
     /// listed for a lasting reason (see `lasting`) fails for the session,
     /// or when watched, until a change under it: actions don't each walk it
     /// again. Other failures are tried again.
     pub fn tree(&self, dir: &Path) -> Result<Arc<TreeInfo>, String> {
         let k = key(dir, self.case_insensitive);
-        if let Some(t) = self.kept_tree(&k) {
+        if let Some(t) = self.kept_tree(&k, false) {
             return t;
         }
-        let lock = self.walking.lock().unwrap().entry(k.clone()).or_default().clone();
+        let lock = self.walking.locked().entry(k.clone()).or_default().clone();
         let walked = {
-            let _walk = lock.lock().unwrap();
-            match self.kept_tree(&k) {
+            let _walk = lock.locked();
+            match self.kept_tree(&k, true) {
                 Some(t) => t,
                 None => self.walk_tree(dir, &k),
             }
         };
         // The last one done with it.
-        let mut walking = self.walking.lock().unwrap();
+        let mut walking = self.walking.locked();
         if walking.get(&k).is_some_and(|l| Arc::ptr_eq(l, &lock) && Arc::strong_count(l) == 2) {
             walking.remove(&k);
         }
@@ -285,14 +322,17 @@ impl Files {
         let walked = std::fs::canonicalize(dir).map_err(|e| context("listing", dir, e)).and_then(|real| self.walk(dir, "", &real, &mut walk));
         // Every name of a file with others is in the tree: a change through
         // any is reported under it.
-        walk.unwatched |= walk.names.values().any(|(names, seen)| seen != names);
+        walk.unwatched |= walk.names.values().any(|(seen, l)| *seen != l.names);
         let kept = walked.as_ref().map_or_else(lasting, |_| true);
         let info = walked.map(|()| Arc::new(walk.info)).map_err(|e| e.to_string());
         if kept {
-            let mut trees = self.trees.write().unwrap();
+            let linked = walk.names.into_values().map(|(_, l)| l).collect();
+            let mut trees = self.trees.writing();
             // Changes outside, or to a file with other names, aren't seen.
             let session = if walk.unwatched { session } else { self.checked(token, session) };
-            trees.insert(k.to_path_buf(), Arc::new(TreeEntry { info: info.clone(), session: AtomicU64::new(session) }));
+            let entry =
+                TreeEntry { info: info.clone(), session: AtomicU64::new(session), linked, checked: AtomicU64::new(self.session.load(Ordering::Relaxed)) };
+            trees.insert(k, Arc::new(entry));
         }
         info
     }
@@ -327,7 +367,10 @@ impl Files {
                 if !vouched {
                     match self.watcher.walked_token(&path) {
                         Some(_) if link => {}
-                        Some((_, names)) if names > 1 => w.names.entry(identity(&meta, &info)).or_insert((names, 0)).1 += 1,
+                        Some((_, names)) if names > 1 => {
+                            let first = || (0, Linked { path: path.clone(), stamp: info.stamp(), names });
+                            w.names.entry(identity(&meta, &info)).or_insert_with(first).0 += 1;
+                        }
                         _ => w.unwatched = true,
                     }
                 }
@@ -341,7 +384,7 @@ impl Files {
     /// for there again: see `Listener::forget`).
     fn forget_under(&self, dir: &Path) {
         let k = key(dir, self.case_insensitive);
-        let n = self.hashes.lock().unwrap().remove_under(&k);
+        let n = self.hashes.locked().remove_under(&k);
         self.watcher.sweep(n + 1);
     }
 }
@@ -355,9 +398,9 @@ struct Walk {
     /// the tree holds for the session only.
     unwatched: bool,
     /// Files with other names (hard links: GCC's `gcc` and `<target>-gcc`,
-    /// Git's commands), by identity: how many names each has, and how many
-    /// the walk saw.
-    names: HashMap<(u64, u128), (u64, u64)>,
+    /// Git's commands), by identity: how many names the walk saw, and the
+    /// first one's.
+    names: HashMap<(u64, u128), (u64, Linked)>,
 }
 
 /// A file's identity: its device or volume, and its inode or file ID.
@@ -374,31 +417,32 @@ fn identity(_meta: &std::fs::Metadata, info: &FileInfo) -> (u64, u128) {
 
 impl Listener for Files {
     fn changed(&self, path: &Path, change: Change) {
-        let k = key(path, self.case_insensitive);
+        // Encoded once, for every map and ancestor.
+        let k = PathKey::new(&key(path, self.case_insensitive));
         let mut swept = 1;
         match change {
             Change::Content => {
-                self.files.write().unwrap().remove(&k);
+                self.files.writing().remove(&k);
                 // Its stamp may not tell: a change within a tick of the
                 // file system's clock keeps the change time.
-                if let Some(kept) = self.hashes.lock().unwrap().get_mut(&k) {
+                if let Some(kept) = self.hashes.locked().get_mut(&k) {
                     *kept = Kept::Changed(self.changes.fetch_add(1, Ordering::Relaxed) + 1);
                 }
             }
             Change::Names => {}
             Change::Tree => {
-                swept += self.files.write().unwrap().remove_under(&k);
+                swept += self.files.writing().remove_under(&k);
             }
         }
         // A tree changes with anything under it.
         let hit = {
-            let trees = self.trees.read().unwrap();
-            !trees.is_empty() && (k.ancestors().any(|a| trees.contains_key(a)) || trees.has_under(&k))
+            let trees = self.trees.reading();
+            !trees.is_empty() && (k.ancestors().any(|a| trees.contains_key(&a)) || trees.has_under(&k))
         };
         if hit {
-            let mut trees = self.trees.write().unwrap();
+            let mut trees = self.trees.writing();
             for a in k.ancestors().skip(1) {
-                swept += usize::from(trees.remove(a).is_some());
+                swept += usize::from(trees.remove(&a).is_some());
             }
             swept += trees.remove_under(&k);
         }
@@ -505,7 +549,7 @@ mod tests {
         let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
         let files = Files::new(w.clone(), cfg!(windows));
         let digest = |h: &str| Digest { hash: h.into(), size: 3 };
-        let kept = |p: &Path| match files.hashes.lock().unwrap().get(&key(p, cfg!(windows))) {
+        let kept = |p: &Path| match files.hashes.locked().get(&key(p, cfg!(windows))) {
             Some(Kept::Hashed(_, d)) => Some(d.hash.clone()),
             Some(Kept::Changed(_)) => Some("changed".into()),
             _ => None,
@@ -569,7 +613,7 @@ mod tests {
             std::thread::spawn(move || files.digest(&f, stamp, || panic!("hashed twice")))
         };
         // The second waits for the first.
-        let waiting = || files.hashing.lock().unwrap().get(&version).is_some_and(|c| Arc::strong_count(c) == 3);
+        let waiting = || files.hashing.locked().get(&version).is_some_and(|c| Arc::strong_count(c) == 3);
         let deadline = Instant::now() + Duration::from_secs(60);
         while !waiting() {
             assert!(Instant::now() < deadline, "the second request doesn't wait");
@@ -578,7 +622,7 @@ mod tests {
         go.0.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap().hash, "the one");
         assert_eq!(second.join().unwrap().unwrap().hash, "the one");
-        assert!(files.hashing.lock().unwrap().is_empty());
+        assert!(files.hashing.locked().is_empty());
     }
 
     /// Concurrent requests for a tree walk it once: the others wait, and
@@ -593,8 +637,8 @@ mod tests {
         let files = Arc::new(Files::new(w.clone(), cfg!(windows)));
         let k = key(&tc, cfg!(windows));
         // A walk in progress.
-        let walk = files.walking.lock().unwrap().entry(k.clone()).or_default().clone();
-        let held = walk.lock().unwrap();
+        let walk = files.walking.locked().entry(k.clone()).or_default().clone();
+        let held = walk.locked();
         let requests: Vec<_> = (0..2)
             .map(|_| {
                 let (files, tc) = (files.clone(), tc.clone());
@@ -710,10 +754,11 @@ mod tests {
     }
 
     /// Lookups don't cost more with the build directories seen (CMake's
-    /// `try_compile` names hundreds a day): a lookup per ancestor, as with
-    /// one (in a checkout, which the test's directory may be in, a few
-    /// more). Those no build named for a while are forgotten, with what was
-    /// kept for their files.
+    /// `try_compile` names hundreds a day), nor with the file's depth: a
+    /// lookup or two, what its directory is to builds being kept (it took
+    /// one per ancestor, three times, most of a vouched file's check).
+    /// Those no build named for a while are forgotten, with what was kept
+    /// for their files.
     #[test]
     fn many_build_dirs() {
         let dir = TestDir::new("ninja_daemon_many");
@@ -746,7 +791,7 @@ mod tests {
         let (one, ..) = lookups(1);
         let (many, w, files) = lookups(10_000);
         let depth = f.ancestors().count() as u64;
-        assert!(many <= one + 1_000 * depth, "{many} probes, {one} with one build directory");
+        assert!(one <= 2 * 1_000 + 4 * depth && many <= 2 * 1_000 + 4 * depth, "{many} probes, {one} with one build directory");
         let k = |p: &Path| key(p, cfg!(windows));
         assert!(w.volatile_file(&k(&scratch(42).join("a.o"))));
         // An object built in one, then not named for a while.
@@ -761,14 +806,17 @@ mod tests {
         assert!(w.volatile_file(&k(&scratch(7).join("a.o"))));
         assert!(!w.volatile_file(&k(&scratch(42).join("a.o"))));
         assert_eq!(files.len().0, 1);
-        assert!(!files.hashes.lock().unwrap().keys().any(|p| p.starts_with(k(&scratch(42)))));
+        assert!(!files.hashes.locked().keys().any(|p| p.starts_with(k(&scratch(42)))));
     }
 
     /// A tree whose files with other names have them all in it (GCC's
     /// `gcc` and `<target>-gcc`, hard links; LLVM's `clang++`, a symbolic
     /// link to `clang`) is vouched for: its walk sees every name, and a
     /// change through any is reported under it. Such trees were walked
-    /// again every build. One with a name outside isn't.
+    /// again every build. One with a name outside isn't, nor one made since
+    /// (a change through it isn't reported under the tree, which kept the
+    /// digests of before): the next build sees its number of names, or its
+    /// change time, changed.
     #[test]
     fn linked_trees() {
         if cfg!(not(any(target_os = "linux", windows))) {
@@ -795,7 +843,7 @@ mod tests {
         w.set_cookie_dir(&dir.join("cookies"));
         let files = Arc::new(Files::new(w.clone(), cfg!(windows)));
         w.listen(files.clone());
-        let watched = |t: &Path| files.trees.read().unwrap().get(&key(t, cfg!(windows))).is_some_and(|e| e.session.load(Ordering::Relaxed) == WATCHED);
+        let watched = |t: &Path| files.trees.reading().get(&key(t, cfg!(windows))).is_some_and(|e| e.session.load(Ordering::Relaxed) == WATCHED);
         let deadline = Instant::now() + Duration::from_secs(10);
         while !watched(&tc) {
             assert!(Instant::now() < deadline, "{:?}", w.roots());
@@ -819,7 +867,20 @@ mod tests {
             assert!(Instant::now() < deadline, "the change wasn't seen");
             std::thread::sleep(Duration::from_millis(10));
         };
-        assert_eq!(after.files.iter().find(|(f, _)| f == "bin/gcc").map(|(_, i)| i.size), Some(5));
+        let size = |t: &TreeInfo| t.files.iter().find(|(f, _)| f == "bin/gcc").map(|(_, i)| i.size);
+        assert_eq!(size(&after), Some(5));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !watched(&tc) {
+            assert!(Instant::now() < deadline, "{:?}", w.roots());
+            w.sync();
+            files.new_session();
+            files.tree(&tc).unwrap();
+        }
+        let outside = dir.join("elsewhere/gcc");
+        std::fs::hard_link(&gcc, &outside).unwrap();
+        std::fs::write(&outside, "gcc version 3").unwrap();
+        files.new_session();
+        assert_eq!(size(&files.tree(&tc).unwrap()), Some(13));
     }
 
     /// A root gone (a checkout removed) takes what was kept for it along,
@@ -857,7 +918,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let k = key(&repo, cfg!(windows));
-        assert!(!files.hashes.lock().unwrap().keys().any(|p| p.starts_with(&k)), "{:?}", files.hashes.lock().unwrap().keys().collect::<Vec<_>>());
+        assert!(!files.hashes.locked().keys().any(|p| p.starts_with(&k)), "{:?}", files.hashes.locked().keys().collect::<Vec<_>>());
+    }
+
+    /// Names that lowercase alike aren't one file on case-insensitive file
+    /// systems unless their letters are ASCII's: NTFS tells `k.h` from `K.h`
+    /// (KELVIN SIGN), whose keys were one, each getting the other's digest.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn case_folded_keys() {
+        let dir = TestDir::new("ninja_daemon_kelvin");
+        let (ascii, kelvin) = (dir.join("k.h"), dir.join("\u{212A}.h"));
+        std::fs::write(&ascii, "ascii k").unwrap();
+        std::fs::write(&kelvin, "kelvin sign, longer").unwrap();
+        let w = Watcher::new(true, Box::new(|_| {}));
+        let files = Files::new(w.clone(), true);
+        for _ in 0..2 {
+            assert_eq!((files.get(&ascii).unwrap().size, files.get(&kelvin).unwrap().size), (7, 19));
+        }
+        #[cfg(windows)]
+        assert_eq!(files.get(&dir.join("K.H")).unwrap().size, 7);
     }
 
     #[test]

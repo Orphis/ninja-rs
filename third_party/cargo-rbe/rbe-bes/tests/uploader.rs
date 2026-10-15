@@ -277,6 +277,22 @@ async fn gives_up_after_the_retry_budget() {
     assert!(err.to_string().contains("after 3 attempts"), "{err}");
 }
 
+/// A backend that only ever said it can't serve now (a proxy without a
+/// healthy backend) gets one more try, not the whole budget: the end of
+/// every build would wait for the backoffs. Said without saying "failed"
+/// again (the caller says the upload failed).
+#[tokio::test]
+async fn backends_only_declining_get_one_more_try() {
+    for code in [tonic::Code::Unavailable, tonic::Code::ResourceExhausted] {
+        let fake = Fake { refuse: Some(code), lifecycle_from: Some((0, Some(code))), ..Default::default() };
+        let up = BesUploader::start(serve(fake.clone()).await, config());
+        up.send(progress(0, "x"));
+        let err = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap_err();
+        assert!(err.to_string().starts_with("after 2 attempts: "), "{code:?}: {err}");
+        assert_eq!(fake.lifecycle_received.load(Ordering::SeqCst), 2, "{code:?}");
+    }
+}
+
 #[tokio::test]
 async fn without_lifecycle_events_only_the_stream_is_sent() {
     let fake = Fake::default();
@@ -314,7 +330,7 @@ async fn unanswered_lifecycle_events_hold_the_stream_back_once() {
         up.send(progress(i, "x"));
     }
     let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
-    assert!(summary.lifecycle_error.is_some_and(|e| e.contains("BuildEnqueued") && e.contains("no answer")));
+    assert!(summary.lifecycle_error.as_ref().is_some_and(|e| e.starts_with("BuildEnqueued: ") && e.contains("no answer")), "{:?}", summary.lifecycle_error);
     assert_eq!(seqs(&fake.rec.lock().unwrap().streams[0]), [1, 2, 3, 4]);
     assert_eq!(fake.lifecycle_received.load(Ordering::SeqCst), 1);
 }
@@ -459,6 +475,24 @@ async fn connections_broken_before_any_answer_are_made_again() {
         assert_eq!(seqs(rec.streams.last().unwrap()), [1, 2]);
         assert_eq!(rec.lifecycle.len(), if lifecycle_events { 4 } else { 0 });
     }
+}
+
+/// A connection broken without a word, once the last connection was
+/// refused for the client's certificate (as `rbe_client::connect_watched`
+/// sees it: h2 may lose the connection's own error): that refusal, not
+/// made again.
+#[tokio::test]
+async fn connections_broken_once_a_certificate_was_refused_are_refusals() {
+    let fake = Fake::default();
+    let mut c = config();
+    c.lifecycle_events = false;
+    let (_seeing, seen) = tokio::sync::watch::channel(rbe_client::Seen::Refused("the client's certificate".into()));
+    let channel = resetting_proxy(serve_at(fake.clone()).await).await;
+    let up = BesUploader::connecting_watched(async { Ok(channel) }, Some(seen), c);
+    up.send(progress(0, "x"));
+    let err = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap_err();
+    assert_eq!(rbe_client::fault::certificate(err.as_ref()), Some(rbe_client::fault::Certificate::Client), "{err:#}");
+    assert!(err.to_string().starts_with("after 1 attempt "), "{err}");
 }
 
 #[tokio::test]

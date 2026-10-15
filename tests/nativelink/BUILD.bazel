@@ -1,0 +1,3 @@
+# The NativeLink end-to-end script, whose patterns a test of
+# //crates/ninja-rs:remote_e2e checks against what builds print.
+exports_files(["run.sh"])

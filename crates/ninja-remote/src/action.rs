@@ -20,9 +20,10 @@ use crate::toolchains::{Toolchains, long_path, resolve_program};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IncludeScanner {
     /// Following every `#include`, whatever the conditionals (`scanner`).
-    #[default]
     Conservative,
-    /// The `cpp-deps` preprocessor: exact for GCC and Clang commands.
+    /// The `cpp-deps` preprocessor, exact for GCC, Clang and cl commands;
+    /// the compiler's own when it can't tell.
+    #[default]
     Preprocessor,
     /// The `clang-scan-deps` next to the compiler (Clang).
     ClangScanDeps,
@@ -68,10 +69,47 @@ pub struct Shared {
     /// every time (the preprocessor's cache, everything under them).
     pub volatile: Vec<PathBuf>,
     /// The directories build edges write to (see `WrittenDirs`): the
-    /// conservative scanner's, those only.
+    /// conservative scanner runs a computed include there locally.
     pub written: scanner::WrittenDirs,
     /// `--action_env`: variables every action gets, as given.
     pub action_env: Vec<(String, String)>,
+    /// Compiles the preprocessor left to the compiler.
+    pub compiler_scans: CompilerScans,
+}
+
+/// Compiles whose includes the preprocessor's scanner left to the
+/// compiler, by reason (without what is the compile's): each reason told
+/// once, and those the compiler listed summed up at the end of the build.
+#[derive(Default)]
+pub struct CompilerScans {
+    told: Mutex<std::collections::HashSet<String>>,
+    listed: Mutex<BTreeMap<String, usize>>,
+}
+
+impl CompilerScans {
+    /// Notes a compile left for `reason`: true the first time for it.
+    fn note(&self, reason: &str) -> bool {
+        self.told.lock().unwrap().insert(reason.to_string())
+    }
+
+    /// Notes a compile left for `reason` the compiler listed the includes of.
+    fn listed(&self, reason: String) {
+        *self.listed.lock().unwrap().entry(reason).or_default() += 1;
+    }
+
+    /// A line for the end of the build: how many the compiler listed, and
+    /// why (the most frequent reasons).
+    pub fn summary(&self) -> Option<String> {
+        let reasons = self.listed.lock().unwrap();
+        let total: usize = reasons.values().sum();
+        let mut by: Vec<(&String, &usize)> = reasons.iter().collect();
+        by.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let mut listed: Vec<String> = by.iter().take(4).map(|(why, n)| format!("{n}: {why}")).collect();
+        if by.len() > 4 {
+            listed.push(format!("{} more reasons", by.len() - 4));
+        }
+        (total > 0).then(|| format!("{total} compiles' includes were the compiler's, the preprocessor's scan being unable to tell ({}).", listed.join("; ")))
+    }
 }
 
 impl Shared {
@@ -245,7 +283,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         p.is_file() || shared.remote_outputs.as_ref().zip(p.strip_prefix(build_dir).ok()).is_some_and(|(r, rel)| r.get(&to_s(rel)).is_some())
     };
     let first_style = scanner::compiler_style(&to_s(exe), argv);
-    let (env_before, env_after) = crate::env::env_options(&Tool::of_step(exe, argv, &expanded, first_style, windows, &present), &host_var);
+    let (env_before, env_after) = crate::env::env_options(&Tool::of_step(exe, argv, &expanded, first_style, windows, &present, None), &host_var);
     let effective: Vec<String> = expanded[..1].iter().chain(&env_before).chain(&expanded[1..]).chain(&env_after).cloned().collect();
     // Steps with cl-style command lines, and their response files.
     let cl_steps: Vec<bool> = steps.iter().zip(&exes).map(|(s, e)| cl_style(e, s)).collect();
@@ -280,13 +318,23 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     } else {
         None
     };
-    // The chosen scanner first; the conservative one when it can't tell.
+    // The chosen scanner first. The preprocessor's leaves what it can't tell
+    // exactly to the compiler's; that one leaves what the compiler can't
+    // tell (it can't run here, fails, or takes too long) to the
+    // conservative one.
     let mut scanned = false;
     let mut sources: Vec<PathBuf> = Vec::new();
     if style.is_some() && !driver_link && steps.len() == 1 && shared.include_scanner != IncludeScanner::Conservative {
         let mut argv = expanded.clone();
         argv[0] = to_s(exe);
-        let found: Result<Vec<PathBuf>, String> = match shared.include_scanner {
+        // The compiler's list, with the files a scan found the compile
+        // looks for, which it doesn't list (`__has_include`, `#pragma GCC
+        // dependency`).
+        let compiler = |looked_for: Vec<PathBuf>| {
+            let prefix = (!task.msvc_deps_prefix.is_empty()).then_some(task.msvc_deps_prefix.as_str());
+            cpp_deps::external::compiler_deps(&argv, build_dir, prefix).map(|deps| deps.into_iter().chain(looked_for).collect::<Vec<_>>())
+        };
+        let (found, by) = match shared.include_scanner {
             IncludeScanner::Preprocessor => {
                 let scanned = match shared.daemon().map(|d| d.scan(&argv, build_dir)) {
                     Some(Ok(r)) => r,
@@ -299,27 +347,44 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
                 };
                 // An include it couldn't find (an error for the compile, a
                 // file only the remote has, or a lookup it got wrong) means
-                // inputs may be missing: the conservative scanner then.
+                // inputs may be missing too: the compiler's then.
                 match scanned {
-                    Ok(out) if out.exact() && out.missing.is_empty() => Ok(out.files.into_iter().chain(out.found).collect()),
-                    Ok(out) => {
-                        let why = out
-                            .inexact
-                            .first()
-                            .cloned()
-                            .or_else(|| out.unknown.first().map(|(o, a)| format!("unknown {o}({a})")))
-                            .or_else(|| out.missing.first().map(|m| format!("{m} not found")))
-                            .unwrap_or_default();
-                        Err(format!("not exact ({why})"))
+                    Ok(out) if out.exact() && out.missing.is_empty() => (Ok(out.files.into_iter().chain(out.found).collect()), IncludeScanner::Preprocessor),
+                    left => {
+                        // Why, and the reason without what is the compile's.
+                        let (why, reason, looked_for) = match left {
+                            Ok(out) => {
+                                let (why, reason) = if let Some(w) = out.inexact.first() {
+                                    // ("file:line: what: details", or "what".)
+                                    let what = w.split_once(": ").map_or(w.as_str(), |(_, w)| w);
+                                    (w.clone(), what.split(": ").next().unwrap_or_default().to_string())
+                                } else if let Some((o, a)) = out.unknown.first() {
+                                    (format!("unknown {o}({a})"), format!("unknown {o}"))
+                                } else {
+                                    (format!("{} not found", out.missing.first().cloned().unwrap_or_default()), "an #include not found".to_string())
+                                };
+                                (format!("not exact ({why})"), format!("not exact ({reason})"), out.found)
+                            }
+                            Err(e) => (e.clone(), e.split(": ").next().unwrap_or_default().to_string(), Vec::new()),
+                        };
+                        // Every time with --remote_verbose, else once per reason.
+                        let why = format!("Preprocessor include scanner: {why}; asking the compiler");
+                        if shared.compiler_scans.note(&reason) && !shared.verbose {
+                            ninja_core::status::message(&format!("warning: {why} (other compiles for this reason too: --remote_verbose names them)"));
+                        }
+                        if shared.verbose {
+                            warnings.push(why);
+                        }
+                        let found = compiler(looked_for);
+                        if found.is_ok() {
+                            shared.compiler_scans.listed(reason);
+                        }
+                        (found, IncludeScanner::Compiler)
                     }
-                    Err(e) => Err(e),
                 }
             }
-            IncludeScanner::ClangScanDeps => cpp_deps::external::clang_scan_deps(&argv, build_dir),
-            IncludeScanner::Compiler => {
-                let prefix = (!task.msvc_deps_prefix.is_empty()).then_some(task.msvc_deps_prefix.as_str());
-                cpp_deps::external::compiler_deps(&argv, build_dir, prefix)
-            }
+            IncludeScanner::ClangScanDeps => (cpp_deps::external::clang_scan_deps(&argv, build_dir), IncludeScanner::ClangScanDeps),
+            IncludeScanner::Compiler => (compiler(Vec::new()), IncludeScanner::Compiler),
             IncludeScanner::Conservative => unreachable!(),
         };
         match found {
@@ -333,7 +398,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
             }
             Err(e) => {
                 // Every time with --remote_verbose, else once per reason.
-                let why = format!("{:?} include scanner: {e}; scanning conservatively", shared.include_scanner);
+                let why = format!("{by:?} include scanner: {e}; scanning conservatively");
                 if shared.store.scan.fell_back(&e) && !shared.verbose {
                     ninja_core::status::message(&format!("warning: {why} (other compiles for this reason too: --remote_verbose names them)"));
                 }
@@ -368,14 +433,14 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         }
         // The variables naming include directories the compiler reads.
         if info.style == Some(Style::Msvc) {
-            let tool = Tool::of_step(exe, argv, &effective, first_style, windows, &present);
+            let tool = Tool::of_step(exe, argv, &effective, first_style, windows, &present, None);
             for inc in tool.include_dir_vars().filter_map(std::env::var_os) {
                 sp.angled.extend(std::env::split_paths(&inc).filter(|p| !p.as_os_str().is_empty()).map(|p| scanner::normalize(&build_dir.join(p))));
             }
         }
         let mut roots = info.sources.clone();
         roots.extend(info.forced_includes.iter().cloned());
-        let r = scanner.scan(&roots, &sp);
+        let r = scanner.scan_compile(&roots, &sp, &info.macros);
         if let Some(why) = r.local {
             return Err(why);
         }
@@ -659,7 +724,9 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         .map(|(i, (argv, exe))| {
             let style = scanner::compiler_style(&to_s(exe), argv);
             let argv_read = if i == 0 { &effective } else { argv };
-            Tool::of_step(exe, argv, argv_read, style, windows, &present)
+            // A driver's link: the linker its dry run named.
+            let linker = link.as_ref().filter(|_| i == 0).and_then(|l| l.linker.as_deref());
+            Tool::of_step(exe, argv, argv_read, style, windows, &present, linker)
         })
         .collect();
     let (env, env_refused): (BTreeMap<String, String>, Option<String>) = crate::env::action_env(&tools, &mut mapper, &host_var, &shared.action_env);
@@ -767,8 +834,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
 /// symlink): the stamp taken once, for the key and the check after a local
 /// run.
 fn digest_for(path: &Path, stamp: ninja_os::FileStamp, cache: &dyn DigestCache) -> anyhow::Result<re::Digest> {
-    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
-    let key = if is_link { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
+    let key = digest_key(path);
     if let Some(d) = cache.get(&key, &stamp) {
         return Ok(d);
     }
@@ -776,6 +842,23 @@ fn digest_for(path: &Path, stamp: ninja_os::FileStamp, cache: &dyn DigestCache) 
     let d = rbe_client::tree::hash_file(path)?;
     cache.put_read_at(&key, stamp, d.clone(), read_at);
     Ok(d)
+}
+
+/// What the digest cache keys a file by: the target of a symlink.
+fn digest_key(path: &Path) -> PathBuf {
+    let is_link = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link { std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() }
+}
+
+/// Hashes a file found changed since its digest was taken (an upload's
+/// check) again, for the digest cache: its stamp may not show the change
+/// (within its file system's time granularity).
+pub fn rehash(path: &Path, cache: &dyn DigestCache) -> anyhow::Result<()> {
+    let read_at = std::time::SystemTime::now();
+    let (_, stamp) = ninja_os::stat(path)?;
+    let d = rbe_client::tree::hash_file(path)?;
+    cache.put_read_at(&digest_key(path), stamp, d, read_at);
+    Ok(())
 }
 
 fn output_rel(mapper: &mut PathMapper, o: &str) -> Result<String, String> {
@@ -815,6 +898,7 @@ mod tests {
             volatile: vec![build_dir.to_path_buf()],
             written: crate::scanner::WrittenDirs::new(std::iter::once(build_dir.to_path_buf()), cfg!(windows)),
             action_env: Vec::new(),
+            compiler_scans: CompilerScans::default(),
         }
     }
 
@@ -844,5 +928,146 @@ mod tests {
         for input in ["build/a.o", "src/v.map", "libs/libz.a"] {
             assert!(p.tree_index.contains(input, cfg!(windows)), "{input} isn't an input");
         }
+    }
+
+    /// A compile of `src/main.c` in `dir/build` by a fake GCC-style
+    /// compiler whose `-dM` prints `macros`, with `flags` (in a response
+    /// file, as written there), as the conservative scanner prepares it.
+    fn compile(dir: &Path, compiler: &str, macros: &[&str], flags: &str) -> Result<Prepared, String> {
+        let build = dir.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let cc = crate::scanner::tests::fake_compiler(dir, compiler, macros);
+        std::fs::write(build.join("flags.rsp"), flags).unwrap();
+        let task = Task {
+            command: format!("\"{}\" @flags.rsp -c ../src/main.c -o main.o", cc.display()),
+            outputs: vec!["main.o".into()],
+            bindings: vec![("rbe_mnemonic".into(), "CCompile".into())],
+            ..Default::default()
+        };
+        let mut shared = shared(&build);
+        shared.include_scanner = IncludeScanner::Conservative;
+        prepare(&task, &shared)
+    }
+
+    fn tree(name: &str, files: &[(&str, &str)]) -> test_dirs::TestDir {
+        let dir = test_dirs::TestDir::new(name);
+        for (f, text) in files {
+            std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(f), text).unwrap();
+        }
+        dir
+    }
+
+    /// A computed include of a macro the command line defines as a header
+    /// name (mbedTLS's `MBEDTLS_CONFIG_FILE`) sends it, also where the
+    /// files define a default; one it defines otherwise runs locally.
+    #[test]
+    fn command_line_header_macros() {
+        let build_info = "#if defined(MBEDTLS_CONFIG_FILE)\n#include MBEDTLS_CONFIG_FILE\n#else\n#include \"mbedtls/mbedtls_config.h\"\n#endif\n\
+                          #ifndef USER_FILE\n#define USER_FILE \"default.h\"\n#endif\n#include USER_FILE\n";
+        let dir = tree(
+            "ninja-rs-action-cmdline-macros",
+            &[
+                ("src/main.c", "#include \"mbedtls/build_info.h\"\n"),
+                ("include/mbedtls/build_info.h", build_info),
+                ("include/mbedtls/mbedtls_config.h", ""),
+                ("include/mbedtls/default.h", ""),
+                ("config/my_config.h", ""),
+                ("config/user.h", ""),
+            ],
+        );
+        let flags = "-I../include -I../config -DMBEDTLS_CONFIG_FILE=\\\"my_config.h\\\" \"-DUSER_FILE=<user.h>\"";
+        let p = compile(&dir, "gcc", &[], flags).unwrap();
+        for input in ["config/my_config.h", "config/user.h", "include/mbedtls/build_info.h", "src/main.c"] {
+            assert!(p.tree_index.contains(input, cfg!(windows)), "{input} isn't an input");
+        }
+        let e = compile(&dir, "gcc", &[], "-I../include -DMBEDTLS_CONFIG_FILE=XSTR(my_config.h)").err().unwrap();
+        assert!(e.contains("MBEDTLS_CONFIG_FILE"), "{e}");
+    }
+
+    /// The compiler says it searches includers' directories (Clang for the
+    /// MSVC ABI, by its name) where the flags don't: a forced include next
+    /// to the source is found there.
+    #[test]
+    fn forced_includes_where_the_compiler_says() {
+        let dir = tree("ninja-rs-action-forced", &[("src/main.c", ""), ("src/pre.h", "/*src*/\n"), ("inc/pre.h", "/*inc*/\n")]);
+        let p = compile(&dir, "x86_64-pc-windows-msvc-clang", &["__clang__", "_MSC_VER"], "--target=x86_64-linux-gnu -include pre.h -I../inc").unwrap();
+        for input in ["src/pre.h", "inc/pre.h"] {
+            assert!(p.tree_index.contains(input, cfg!(windows)), "{input} isn't an input");
+        }
+    }
+
+    /// A fake Clang in `dir`: it predefines `__has_include`, searches
+    /// nothing built in, and reads `src/main.c` and `inc/a.h` (`-M`), unless
+    /// `fail-deps` is next to it. On Unix, run once before it's returned
+    /// (see `cpp_deps::test_tool`).
+    fn fake_clang(dir: &Path) -> PathBuf {
+        if cfg!(windows) {
+            let c = dir.join("clang.cmd");
+            let batch = "@echo off\r\nset \"A= %* \"\r\n\
+                         if not \"%A: -v =%\"==\"%A%\" (echo #include ^<...^> search starts here: 1>&2& echo End of search list. 1>&2)\r\n\
+                         if not \"%A: -dM =%\"==\"%A%\" (echo #define __GNUC__ 4& echo #define NINJA_RS_OPERATOR___has_include 1)\r\n\
+                         if not \"%A: -MD =%\"==\"%A%\" if exist \"%~dp0fail-deps\" exit /b 1\r\n\
+                         if not \"%A: -MD =%\"==\"%A%\" (echo main.o: ../src/main.c ../inc/a.h& exit /b 0)\r\n\
+                         if not \"%A: -M =%\"==\"%A%\" echo -:\r\nexit /b 0\r\n";
+            std::fs::write(&c, batch).unwrap();
+            return c;
+        }
+        let c = dir.join("clang");
+        let sh = "#!/bin/sh\ncase \" $* \" in *\" -v \"*) printf '#include <...> search starts here:\\nEnd of search list.\\n' >&2;; esac\n\
+                  case \" $* \" in *\" -dM \"*) printf '#define __GNUC__ 4\\n#define NINJA_RS_OPERATOR___has_include 1\\n';; esac\n\
+                  case \" $* \" in *\" -MD \"*) [ -e \"$(dirname \"$0\")/fail-deps\" ] && exit 1; echo 'main.o: ../src/main.c ../inc/a.h'; exit 0;; esac\n\
+                  case \" $* \" in *\" -M \"*) echo '-:';; esac\nexit 0\n";
+        std::fs::write(&c, sh).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&c, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // (Another test's fork may hold it open for writing a moment.)
+        for _ in 0..1000 {
+            match std::process::Command::new(&c).arg("-Q").status() {
+                Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                r => {
+                    r.unwrap();
+                    return c;
+                }
+            }
+        }
+        panic!("{} stays busy", c.display());
+    }
+
+    /// The preprocessor's scanner leaves what it can't tell exactly to the
+    /// compiler (`-M`), with what the compile looks for that the compiler
+    /// doesn't list (`__has_include`); that one, when the compiler fails,
+    /// to the conservative scanner (which takes both branches).
+    #[test]
+    fn scanner_fallbacks() {
+        let dir = test_dirs::TestDir::new("ninja-rs-action-scanner-fallbacks");
+        let build = dir.join("build");
+        let compiler = fake_clang(&dir);
+        let main = "#if __has_include(\"probe.h\")\n#endif\n#if __COUNTER__ == 0\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n";
+        for (path, contents) in [("src/main.c", main), ("src/probe.h", ""), ("inc/a.h", ""), ("inc/b.h", "")] {
+            std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(path), contents).unwrap();
+        }
+        std::fs::create_dir_all(&build).unwrap();
+        let task = Task {
+            command: format!("{} -I../inc -c ../src/main.c -o main.o", compiler.display()),
+            inputs: vec!["../src/main.c".into()],
+            outputs: vec!["main.o".into()],
+            bindings: vec![("rbe_mnemonic".into(), "CCompile".into())],
+            ..Default::default()
+        };
+        let shared = shared(&build);
+        let inputs = |p: &Prepared| ["src/main.c", "src/probe.h", "inc/a.h", "inc/b.h"].map(|f| p.tree_index.contains(f, cfg!(windows)));
+        let p = prepare(&task, &shared).unwrap();
+        assert_eq!(inputs(&p), [true, true, true, false]);
+        let summary = shared.compiler_scans.summary().unwrap_or_default();
+        assert!(summary.starts_with("1 compiles'") && summary.contains("__COUNTER__"), "{summary}");
+        assert_eq!(shared.store.scan.fallback_summary(), None);
+        std::fs::write(dir.join("fail-deps"), "").unwrap();
+        let p = prepare(&task, &shared).unwrap();
+        assert_eq!(inputs(&p), [true, true, true, true]);
+        assert!(shared.store.scan.fallback_summary().is_some());
+        // (Not one the compiler listed.)
+        assert_eq!(shared.compiler_scans.summary(), Some(summary));
     }
 }

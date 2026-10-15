@@ -120,9 +120,13 @@ pub struct State {
     execute_gate: Mutex<Option<Gate>>,
     /// What reads wait for (see `set_read_gate`).
     read_gate: Mutex<Option<Gate>>,
+    /// What `FindMissingBlobs` waits for (see `set_find_missing_gate`).
+    find_missing_gate: Mutex<Option<Gate>>,
     /// Milliseconds a ByteStream write waits before it reads the blob,
     /// and a read before it answers.
     write_delay_ms: AtomicU64,
+    /// What writes wait for (see `set_write_gate`).
+    write_gate: Mutex<Option<Gate>>,
     read_delay_ms: AtomicU64,
     reads_in_flight: AtomicU64,
     writes_in_flight: AtomicU64,
@@ -148,6 +152,27 @@ pub struct State {
 
 /// See `State::set_tamper`.
 pub type Tamper = Box<dyn Fn(&mut re::ActionResult) + Send + Sync>;
+
+/// The methods `State::fail_next` fails.
+pub const METHODS: [&str; 17] = [
+    "FindMissingBlobs",
+    "BatchUpdateBlobs",
+    "BatchReadBlobs",
+    "GetActionResult",
+    "UpdateActionResult",
+    "GetCapabilities",
+    "Read",
+    "Write",
+    "QueryWriteStatus",
+    "Execute",
+    "WaitExecution",
+    "SplitBlob",
+    "SpliceBlob",
+    "GetChunkMapping",
+    "RegisterChunkMapping",
+    "PublishLifecycleEvent",
+    "PublishBuildToolEventStream",
+];
 
 /// See `State::set_execute_gate`.
 pub type Gate = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -208,17 +233,21 @@ impl State {
     pub fn set_read_gate(&self, gate: Option<Gate>) {
         *self.read_gate.lock().unwrap() = gate;
     }
-    /// Makes the next `times` calls of `method` (`FindMissingBlobs`,
-    /// `BatchUpdateBlobs`, `BatchReadBlobs`, `GetActionResult`,
-    /// `UpdateActionResult`, `GetCapabilities`, `Read`, `Write`,
-    /// `QueryWriteStatus`, `Execute`, `WaitExecution`, `SplitBlob`,
-    /// `SpliceBlob`, `GetChunkMapping`, `RegisterChunkMapping`,
-    /// `PublishLifecycleEvent`, `PublishBuildToolEventStream`) fail with
-    /// UNAVAILABLE, as a transient failure would.
+    /// Makes every `FindMissingBlobs` (which uploads begin with) wait until
+    /// `gate` returns true (polled), as `set_execute_gate` does Execute;
+    /// `None` opens it.
+    pub fn set_find_missing_gate(&self, gate: Option<Gate>) {
+        *self.find_missing_gate.lock().unwrap() = gate;
+    }
+    /// Makes the next `times` calls of `method` (one of `METHODS`) fail
+    /// with UNAVAILABLE, as a transient failure would. Another name (a
+    /// misspelt one would fail nothing) panics.
     pub fn fail_next(&self, method: &'static str, times: u32) {
+        assert!(METHODS.contains(&method), "fail_next: no method {method:?} (the methods: {METHODS:?})");
         *self.failures.lock().unwrap().entry(method).or_default() += times;
     }
     fn injected(&self, method: &'static str) -> Result<(), Status> {
+        debug_assert!(METHODS.contains(&method), "{method} isn't in METHODS");
         let mut failures = self.failures.lock().unwrap();
         match failures.get_mut(method) {
             Some(n) if *n > 0 => {
@@ -247,6 +276,12 @@ impl State {
     /// Makes every ByteStream write wait first, so that uploads overlap.
     pub fn set_write_delay(&self, delay: std::time::Duration) {
         self.write_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+    /// Makes every ByteStream write wait, after its delay and before it
+    /// reads the blob, until `gate` returns true (polled), as
+    /// `set_execute_gate` does Execute; `None` opens it.
+    pub fn set_write_gate(&self, gate: Option<Gate>) {
+        *self.write_gate.lock().unwrap() = gate;
     }
     /// Makes every read (batches and ByteStream) wait first, so that
     /// concurrent ones overlap (see `Stats::max_concurrent_reads`).
@@ -381,6 +416,13 @@ struct Svc(Arc<State>);
 impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
     async fn find_missing_blobs(&self, r: Request<re::FindMissingBlobsRequest>) -> Result<Response<re::FindMissingBlobsResponse>, Status> {
         self.0.injected("FindMissingBlobs")?;
+        loop {
+            let gate = self.0.find_missing_gate.lock().unwrap().clone();
+            match gate {
+                Some(open) if !open() => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                _ => break,
+            }
+        }
         let cas = self.0.cas.lock().unwrap();
         let missing =
             r.into_inner().blob_digests.into_iter().filter(|d| d.size_bytes != 0 && cas.get(&d.hash).is_none_or(|b| b.len() as i64 != d.size_bytes)).collect();
@@ -599,6 +641,13 @@ impl bs::byte_stream_server::ByteStream for Svc {
         let delay = self.0.write_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        loop {
+            let gate = self.0.write_gate.lock().unwrap().clone();
+            match gate {
+                Some(open) if !open() => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                _ => break,
+            }
         }
         let mut stream = r.into_inner();
         let mut resource = String::new();
@@ -1008,6 +1057,17 @@ mod tests {
 
     fn server(dir: &Path) -> Arc<State> {
         Arc::new(State { base: dir.to_path_buf(), ..Default::default() })
+    }
+
+    /// A method `fail_next` doesn't know (misspelt) fails the test, rather
+    /// than fail nothing.
+    #[test]
+    fn unknown_methods_arent_failed_silently() {
+        let state = State::default();
+        for method in METHODS {
+            state.fail_next(method, 1);
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.fail_next("GetCapability", 1))).is_err());
     }
 
     #[test]

@@ -24,16 +24,7 @@ pub fn output(cmd: Command, input: Option<Vec<u8>>, timeout: Duration) -> io::Re
 /// before it runs).
 pub fn output_with_flags(mut cmd: Command, input: Option<Vec<u8>>, timeout: Duration, creation_flags: u32) -> io::Result<Output> {
     let deadline = Instant::now() + timeout;
-    Tree::prepare(&mut cmd, creation_flags);
-    let mut child = cmd.spawn()?;
-    let tree = match Tree::attach(&child) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
-    };
+    let (child, tree) = Tree::spawn(&mut cmd, creation_flags)?;
     let mut run = Running { tree, child, done: false };
     let writer = run.child.stdin.take().map(|mut stdin| std::thread::spawn(move || stdin.write_all(&input.unwrap_or_default())));
     // Each reader says when its pipe ended.
@@ -131,17 +122,13 @@ struct Tree {
 
 #[cfg(unix)]
 impl Tree {
-    fn prepare(cmd: &mut Command, _creation_flags: u32) {
+    /// Starts `cmd` in a process group of its own, which `groups` holds
+    /// from the moment it exists.
+    fn spawn(cmd: &mut Command, _creation_flags: u32) -> io::Result<(Child, Tree)> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
-    }
-
-    fn attach(child: &Child) -> io::Result<Tree> {
-        let group = i32::try_from(child.id()).ok();
-        if let Some(g) = group {
-            groups::add(g);
-        }
-        Ok(Tree { group })
+        let (child, group) = groups::spawn(cmd)?;
+        Ok((child, Tree { group }))
     }
 
     fn kill(&self) {
@@ -173,67 +160,112 @@ impl Drop for Tree {
 /// kills its processes).
 #[cfg(unix)]
 mod groups {
-    use std::sync::{Mutex, Once, TryLockError};
+    use std::io;
+    use std::process::{Child, Command};
+    use std::sync::{Mutex, MutexGuard, Once, TryLockError};
+    use std::time::{Duration, Instant};
 
     static GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
-    pub fn add(group: i32) {
+    /// How long `kill_all` waits for a thread starting or ending a run: one
+    /// stuck holding the lock doesn't keep ninja-rs from exiting.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    fn lock() -> MutexGuard<'static, Vec<i32>> {
+        GROUPS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Spawns `cmd`, which leads a process group of its own, and adds the
+    /// group, holding the lock throughout: `kill_all` waits for it, and so
+    /// finds the group of every process started (added after the spawn
+    /// returned, a process ninja-rs exiting meanwhile was left running,
+    /// with what it started).
+    pub fn spawn(cmd: &mut Command) -> io::Result<(Child, Option<i32>)> {
         static AT_EXIT: Once = Once::new();
         // SAFETY: registers a function `exit` runs, which takes nothing.
         AT_EXIT.call_once(|| unsafe {
             libc::atexit(kill_all);
         });
-        GROUPS.lock().unwrap_or_else(|e| e.into_inner()).push(group);
+        let mut groups = lock();
+        let child = cmd.spawn()?;
+        #[cfg(test)]
+        if let Some(hook) = tests::AFTER_SPAWN.get() {
+            hook();
+        }
+        let group = i32::try_from(child.id()).ok();
+        groups.extend(group);
+        Ok((child, group))
     }
 
     pub fn remove(group: i32) {
-        GROUPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&g| g != group);
+        lock().retain(|&g| g != group);
     }
 
     extern "C" fn kill_all() {
-        // (Other threads still run: while one starting or ending a run holds
-        // the lock, for a moment, the groups are left running.)
-        let groups = match GROUPS.try_lock() {
-            Ok(g) => g,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
+        #[cfg(test)]
+        tests::KILLING.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Other threads still run: one starting a run holds the lock until
+        // its group is added.
+        let deadline = Instant::now() + PATIENCE;
+        let groups = loop {
+            match GROUPS.try_lock() {
+                Ok(g) => break g,
+                Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+                Err(TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+                Err(TryLockError::WouldBlock) => return,
+            }
         };
         for &g in groups.iter() {
             // SAFETY: plain system call.
             unsafe { libc::killpg(g, libc::SIGKILL) };
         }
+        // Held until the process ends: a run starting now would outlive it.
+        std::mem::forget(groups);
+    }
+
+    /// What the tests of the exit hook see of it.
+    #[cfg(test)]
+    pub mod tests {
+        /// Run between a spawn and the adding of its group.
+        pub static AFTER_SPAWN: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+        /// Set once `kill_all` runs.
+        pub static KILLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     }
 }
 
 #[cfg(windows)]
 impl Tree {
-    fn prepare(cmd: &mut Command, creation_flags: u32) {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(creation_flags | windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
-    }
-
-    /// Puts the child in a new job (when it can: a process may not be
-    /// allowed to join one), then resumes it.
-    fn attach(child: &Child) -> io::Result<Tree> {
+    /// Starts `cmd` suspended, puts it in a new job (when it can: a process
+    /// may not be allowed to join one), then resumes it: it starts nothing
+    /// outside the job. (The job is made first, the process waiting for it
+    /// as briefly as can be. ninja-rs exiting meanwhile leaves it suspended,
+    /// never run: std can't create a process in a job.)
+    fn spawn(cmd: &mut Command, creation_flags: u32) -> io::Result<(Child, Tree)> {
         use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
-        // SAFETY: a new anonymous job, owned from then on, and the child's
-        // valid process handle.
+        cmd.creation_flags(creation_flags | windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        // SAFETY: a new anonymous job, owned from then on.
         let job = unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job.is_null() {
-                None
-            } else {
-                let job = OwnedHandle::from_raw_handle(job);
-                // Its processes die with its last handle (ninja-rs exiting
-                // during the run), until the run is done.
-                set_limits(&job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
-                (AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) != 0).then_some(job)
-            }
+            (!job.is_null()).then(|| OwnedHandle::from_raw_handle(job))
         };
-        // SAFETY: the child's process handle, with all access rights.
-        unsafe { resume(child.as_raw_handle()) }?;
-        Ok(Tree { job })
+        // Its processes die with its last handle (ninja-rs exiting during
+        // the run), until the run is done.
+        if let Some(job) = &job {
+            set_limits(job, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+        }
+        let mut child = cmd.spawn()?;
+        // SAFETY: the job's handle is open; the child's process handle is
+        // valid, with all access rights.
+        let job = job.filter(|job| unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } != 0);
+        // SAFETY: as above.
+        if let Err(e) = unsafe { resume(child.as_raw_handle()) } {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        Ok((child, Tree { job }))
     }
 
     fn kill(&self) {
@@ -302,10 +334,8 @@ pub unsafe fn resume(process: std::os::windows::io::RawHandle) -> io::Result<()>
 
 #[cfg(not(any(unix, windows)))]
 impl Tree {
-    fn prepare(_cmd: &mut Command, _creation_flags: u32) {}
-
-    fn attach(_child: &Child) -> io::Result<Tree> {
-        Ok(Tree {})
+    fn spawn(cmd: &mut Command, _creation_flags: u32) -> io::Result<(Child, Tree)> {
+        Ok((cmd.spawn()?, Tree {}))
     }
 
     fn kill(&self) {}
@@ -369,11 +399,10 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            let pid: i32 = std::fs::read_to_string(work.join("grandchild")).unwrap().trim().parse().unwrap();
+            let pid: u32 = std::fs::read_to_string(work.join("grandchild")).unwrap().trim().parse().unwrap();
             // Killed; gone once reaped (by init: its parent was killed too).
             let start = Instant::now();
-            // SAFETY: plain system call; signal 0 only checks the process.
-            while unsafe { libc::kill(pid, 0) } == 0 && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z ")) {
+            while crate::process_running(pid) == Some(true) {
                 assert!(start.elapsed() < Duration::from_secs(30), "process {pid} still runs");
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -441,9 +470,12 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         let mut cmd = hanging(&work);
         cmd.current_dir(&work).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        Tree::prepare(&mut cmd, 0);
-        let child = cmd.spawn().unwrap();
-        let tree = Tree::attach(&child).unwrap();
+        let (child, tree) = Tree::spawn(&mut cmd, 0).unwrap();
+        // On Windows, the job's last handle closing would kill its
+        // processes anyway: the test keeps one until they're checked, so
+        // that only the run's killing them passes.
+        #[cfg(windows)]
+        let job = tree.job.as_ref().map(|j| j.try_clone().unwrap());
         // Until the script started its process.
         let start = Instant::now();
         while !work.join("started").exists() {
@@ -458,13 +490,20 @@ mod tests {
         .join();
         assert!(panicked.is_err());
         assert_killed(&work);
+        #[cfg(windows)]
+        drop(job);
     }
 
     /// What the child of `exiting_kills_the_tree` does: exits while a run
-    /// of `hanging` in `NINJA_OS_EXITING_CHILD` goes on. (Run by that test.)
+    /// of `hanging` in `NINJA_OS_EXITING_CHILD` goes on, once the script
+    /// started its process. On POSIX, before the run's group is added (see
+    /// `exit_meanwhile`), the moment a group added after the spawn was
+    /// missed. (Run by that test.)
     #[test]
     fn exiting_child() {
         let Some(work) = std::env::var_os("NINJA_OS_EXITING_CHILD").map(std::path::PathBuf::from) else { return };
+        #[cfg(unix)]
+        groups::tests::AFTER_SPAWN.set(exit_meanwhile).unwrap();
         let mut cmd = hanging(&work);
         cmd.current_dir(&work).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         std::thread::spawn(move || output(cmd, None, Duration::from_secs(120)));
@@ -475,6 +514,17 @@ mod tests {
         }
         // As ninja-rs does, which unwinds no thread.
         std::process::exit(0);
+    }
+
+    /// Between the spawn of `exiting_child`'s command and the adding of its
+    /// group: waits until ninja-rs exits (its exit hook runs), which the
+    /// test's thread does once the script started its process.
+    #[cfg(unix)]
+    fn exit_meanwhile() {
+        let start = Instant::now();
+        while !groups::tests::KILLING.load(std::sync::atomic::Ordering::SeqCst) && start.elapsed() < Duration::from_secs(60) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// ninja-rs exiting during a run (interrupted) kills what the command
@@ -506,10 +556,9 @@ mod tests {
     fn assert_killed(work: &Path) {
         #[cfg(unix)]
         {
-            let pid: i32 = std::fs::read_to_string(work.join("grandchild")).unwrap().trim().parse().unwrap();
+            let pid: u32 = std::fs::read_to_string(work.join("grandchild")).unwrap().trim().parse().unwrap();
             let start = Instant::now();
-            // SAFETY: plain system call; signal 0 only checks the process.
-            while unsafe { libc::kill(pid, 0) } == 0 && !std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z ")) {
+            while crate::process_running(pid) == Some(true) {
                 assert!(start.elapsed() < Duration::from_secs(30), "process {pid} still runs");
                 std::thread::sleep(Duration::from_millis(10));
             }

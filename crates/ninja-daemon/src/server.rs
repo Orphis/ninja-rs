@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use cpp_deps::driver::Environment;
@@ -15,6 +15,7 @@ use crate::files::{self, Files};
 use crate::ipc::{self, Location};
 use crate::proto::{self, Begin, PROTOCOL, Request, Response, Status};
 use crate::watch::{self, RootState, Watcher};
+use crate::{Locked, RwLocked};
 
 /// Builds whose environments are kept (a scan names its build's): those
 /// that used theirs last.
@@ -41,7 +42,7 @@ pub fn version() -> &'static str {
 }
 
 pub struct Daemon {
-    pub driver: Arc<Driver>,
+    preprocessor: Arc<Preprocessor>,
     pub files: Arc<Files>,
     pub watcher: Arc<Watcher>,
     /// Builds' environments, and when each was last used (`uses`).
@@ -53,6 +54,28 @@ pub struct Daemon {
     started: Instant,
     requests: AtomicU64,
     activity: Mutex<Activity>,
+}
+
+/// The daemon's preprocessor, which the watcher's events reach: another
+/// once a request panicked (see `Daemon::answer`).
+struct Preprocessor {
+    driver: RwLock<Arc<Driver>>,
+    case_insensitive: bool,
+}
+
+impl Preprocessor {
+    /// A new one's driver.
+    fn driver(watcher: &Arc<Watcher>, case_insensitive: bool) -> Arc<Driver> {
+        let driver = Arc::new(Driver::new(Cache::new(vec![], case_insensitive)));
+        driver.cache.set_watch(watcher.clone());
+        driver
+    }
+}
+
+impl watch::Listener for Preprocessor {
+    fn changed(&self, path: &Path, change: watch::Change) {
+        self.driver.reading().cache.changed(path, change);
+    }
 }
 
 /// Whether the daemon is busy: it exits when idle only between requests.
@@ -70,7 +93,7 @@ struct Busy<'a>(&'a Daemon);
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        let mut a = self.0.activity.lock().unwrap();
+        let mut a = self.0.activity.locked();
         a.running -= 1;
         a.last = Instant::now();
     }
@@ -80,13 +103,12 @@ impl Daemon {
     pub fn new(log: Box<dyn Fn(&str) + Send + Sync>) -> Arc<Daemon> {
         let case_insensitive = cfg!(any(windows, target_os = "macos"));
         let watcher = Watcher::new(case_insensitive, log);
-        let driver = Arc::new(Driver::new(Cache::new(vec![], case_insensitive)));
-        driver.cache.set_watch(watcher.clone());
-        watcher.listen(driver.clone());
+        let preprocessor = Arc::new(Preprocessor { driver: RwLock::new(Preprocessor::driver(&watcher, case_insensitive)), case_insensitive });
+        watcher.listen(preprocessor.clone());
         let files = Arc::new(Files::new(watcher.clone(), case_insensitive));
         watcher.listen(files.clone());
         Arc::new(Daemon {
-            driver,
+            preprocessor,
             files,
             watcher,
             sessions: Mutex::default(),
@@ -101,14 +123,14 @@ impl Daemon {
 
     /// How long since the last request ended (none while one runs).
     pub fn idle(&self) -> Duration {
-        let a = self.activity.lock().unwrap();
+        let a = self.activity.locked();
         if a.running > 0 { Duration::ZERO } else { a.last.elapsed() }
     }
 
     /// Marks a request in progress, until the guard goes; None once
     /// exiting.
     fn busy(&self) -> Option<Busy<'_>> {
-        let mut a = self.activity.lock().unwrap();
+        let mut a = self.activity.locked();
         if a.exiting {
             return None;
         }
@@ -120,11 +142,34 @@ impl Daemon {
     /// then, and none starts any more (one in progress, a long toolchain
     /// walk, used to be cut).
     pub fn exit_if_idle(&self, idle: Duration) -> bool {
-        let mut a = self.activity.lock().unwrap();
+        let mut a = self.activity.locked();
         if a.running == 0 && a.last.elapsed() >= idle {
             a.exiting = true;
         }
         a.exiting
+    }
+
+    /// The preprocessor.
+    pub fn driver(&self) -> Arc<Driver> {
+        self.preprocessor.driver.reading().clone()
+    }
+
+    /// Answers `req`; one that panicked (a bug), with an error. What it
+    /// was doing may be half done (an event's entries dropped by some
+    /// listeners, not others): nothing is vouched for until roots are in
+    /// sync again. The locks it held are taken anyway (see `Locked`), but
+    /// the preprocessor's (a compiler's queries are asked holding one): it
+    /// starts again, as with a new daemon (every request after failed).
+    pub fn answer(&self, req: Request) -> Response {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(req))) {
+            Ok(r) => r,
+            Err(e) => {
+                let why = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                *self.preprocessor.driver.writing() = Preprocessor::driver(&self.watcher, self.preprocessor.case_insensitive);
+                self.watcher.distrust(&format!("a request panicked: {why}"));
+                Response::Error(format!("the daemon failed: {why}"))
+            }
+        }
     }
 
     pub fn handle(&self, req: Request) -> Response {
@@ -133,18 +178,27 @@ impl Daemon {
         match req {
             Request::Hello { .. } => Response::Hello { protocol: PROTOCOL, pid: std::process::id(), version: version().to_string() },
             Request::Begin(b) => self.begin(b),
-            Request::Scan { session, argv, cwd } => {
-                let env = self.sessions.lock().unwrap().get_mut(&session).map(|(env, used)| {
+            Request::Scan { session, argv, cwd, wrote } => {
+                let env = self.sessions.locked().get_mut(&session).map(|(env, used)| {
                     *used = self.uses.fetch_add(1, Ordering::Relaxed);
                     env.clone()
                 });
                 match env {
-                    Some(env) => Response::Scanned(self.driver.scan_in(&argv, &cwd, &env).map(Into::into)),
+                    Some(env) => {
+                        self.watcher.fence(wrote);
+                        Response::Scanned(self.driver().scan_in(&argv, &cwd, &env).map(Into::into))
+                    }
                     None => Response::UnknownBuild,
                 }
             }
-            Request::Files { paths } => Response::Files(paths.iter().map(|p| self.files.get(p)).collect()),
-            Request::Tree { dir } => Response::Tree(self.files.tree(&dir).map(|t| (*t).clone())),
+            Request::Files { paths, wrote } => {
+                self.watcher.fence(wrote);
+                Response::Files(paths.iter().map(|p| self.files.get(p)).collect())
+            }
+            Request::Tree { dir, wrote } => {
+                self.watcher.fence(wrote);
+                Response::Tree(self.files.tree(&dir).map(|t| (*t).clone()))
+            }
             Request::Status => Response::Status(self.status()),
             Request::Stop => Response::Stopping,
         }
@@ -156,7 +210,7 @@ impl Daemon {
     fn begin(&self, b: Begin) -> Response {
         if let Some(before) = Instant::now().checked_sub(BUILD_DIRS_KEPT) {
             self.watcher.expire(before);
-            self.seeded.lock().unwrap().retain(|_, named| *named >= before);
+            self.seeded.locked().retain(|_, named| *named >= before);
         }
         // The one set the digests and the preprocessor's cache ask: the
         // build directory, under any of its spellings, whole; the others
@@ -171,19 +225,19 @@ impl Daemon {
                 self.watcher.ignore_outputs(d);
             }
         }
-        self.driver.cache.new_session();
+        self.driver().cache.new_session();
         self.files.new_session();
         // Read once: every build saves it again, from what the daemon
         // knows (see `Files::seed`).
         if let Some(f) = &b.digests_file
-            && self.seeded.lock().unwrap().insert(f.clone(), Instant::now()).is_none()
+            && self.seeded.locked().insert(f.clone(), Instant::now()).is_none()
         {
             self.files.seed(files::read_digests(f));
         }
         self.watcher.sync();
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         let env = Environment { vars: Some(Arc::new(b.env)), profile_dir: b.profile_dir };
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.locked();
         sessions.insert(id, (Arc::new(env), self.uses.fetch_add(1, Ordering::Relaxed)));
         if sessions.len() > KEPT_SESSIONS
             && let Some(lru) = sessions.iter().min_by_key(|(_, (_, used))| *used).map(|(id, _)| *id)
@@ -194,9 +248,10 @@ impl Daemon {
     }
 
     pub fn status(&self) -> Status {
-        let (lexed, listings) = self.driver.cache.len();
+        let driver = self.driver();
+        let (lexed, listings) = driver.cache.len();
         let (digests, trees) = self.files.len();
-        let stats = self.driver.cache.stats();
+        let stats = driver.cache.stats();
         Status {
             pid: std::process::id(),
             version: version().to_string(),
@@ -247,7 +302,7 @@ fn logger(path: &Path, old: &Path, limit: u64) -> Box<dyn Fn(&str) + Send + Sync
         let Some(f) = &file else { return };
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
         let line = format!("{now} [{}] {msg}\n", std::process::id());
-        let (f, len) = &mut *f.lock().unwrap();
+        let (f, len) = &mut *f.locked();
         if *len + line.len() as u64 > limit {
             // Moved aside (the handle follows it), then a new one; or, when
             // it can't be (open elsewhere on Windows), emptied through
@@ -325,6 +380,12 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
     }
     #[cfg(unix)]
     raise_file_limit();
+    // Those of other binaries, rebuilt since (Windows: builds remove them
+    // as they copy the binary for the daemon).
+    #[cfg(unix)]
+    if let Err(e) = loc.remove_others() {
+        log(&format!("removing other daemons' files: {e}"));
+    }
     let log2 = log.clone();
     let daemon = Daemon::new(Box::new(move |m| log2(m)));
     daemon.watcher.set_cookie_dir(&loc.cookie_dir());
@@ -384,14 +445,7 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
 fn connection(daemon: &Daemon, mut stream: ipc::Stream, log: &(dyn Fn(&str) + Send + Sync)) {
     while let Ok(Some(req)) = proto::read::<Request>(&mut stream) {
         let stop = matches!(req, Request::Stop);
-        let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| daemon.handle(req))) {
-            Ok(r) => r,
-            Err(e) => {
-                let why = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
-                log(&format!("a request panicked: {why}"));
-                Response::Error(format!("the daemon failed: {why}"))
-            }
-        };
+        let resp = daemon.answer(req);
         if proto::write(&mut stream, &resp).is_err() {
             return;
         }
@@ -488,7 +542,7 @@ mod tests {
             let b = Begin { build_dir: dir.to_path_buf(), digests_file: Some(digests.clone()), ..Default::default() };
             assert!(matches!(daemon.handle(Request::Begin(b)), Response::Begun { .. }));
         }
-        assert_eq!(daemon.seeded.lock().unwrap().len(), 1);
+        assert_eq!(daemon.seeded.locked().len(), 1);
     }
 
     /// A build's environment is kept while it scans, however many builds
@@ -507,6 +561,7 @@ mod tests {
                 session,
                 argv: vec![dir.join("no-such-cc").to_string_lossy().into_owned(), "-c".into(), "x.c".into()],
                 cwd: dir.to_path_buf(),
+                wrote: false,
             })
         };
         let long = begin("long");
@@ -591,7 +646,7 @@ mod tests {
             let b = Begin { build_dir: dir.join("build"), volatile: vec![out.clone(), repo.clone()], ..Default::default() };
             assert!(matches!(daemon.handle(Request::Begin(b)), Response::Begun { .. }));
         };
-        let size = |p: &Path| match daemon.handle(Request::Files { paths: vec![p.to_path_buf()] }) {
+        let size = |p: &Path| match daemon.handle(Request::Files { paths: vec![p.to_path_buf()], wrote: false }) {
             Response::Files(v) => v[0].as_ref().unwrap().size,
             r => panic!("{r:?}"),
         };
@@ -620,5 +675,173 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(daemon.watcher.token(&repo.join("z.h")), None);
+    }
+
+    /// The daemon reports the version its program gives it (ninja-rs's,
+    /// with the commit it was built from), not its package's: unstamped,
+    /// both are the same, and a check comparing them passed without it.
+    #[test]
+    fn versions_set() {
+        set_version("1.2.3+given");
+        let daemon = Daemon::new(Box::new(|_| {}));
+        assert_eq!(daemon.status().version, "1.2.3+given");
+        assert!(matches!(daemon.handle(Request::Hello { protocol: PROTOCOL }), Response::Hello { version, .. } if version == "1.2.3+given"));
+    }
+
+    /// A file vouched for, rewritten (an output a step doesn't name), then
+    /// asked for at once: the answer is of the new version, though the
+    /// thread reading events hasn't handled its event yet (it's busy). With
+    /// inotify, the queue is read first; on Windows, when the build says a
+    /// command ran since (a cookie comes back first). It used to be of the
+    /// old one.
+    #[test]
+    fn answers_after_changes() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        use cpp_deps::scan::Watch;
+        use std::sync::atomic::AtomicBool;
+        /// Blocks the reader on `trigger`'s event while `stall` is set.
+        struct Staller {
+            trigger: PathBuf,
+            stall: AtomicBool,
+            blocked: AtomicBool,
+        }
+        impl watch::Listener for Staller {
+            fn changed(&self, path: &Path, _: watch::Change) {
+                while path == self.trigger && self.stall.load(Ordering::SeqCst) {
+                    self.blocked.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        let base = TestDir::new("ninja_daemon_answers");
+        for d in ["repo/.git", "repo/sub", "repo/build"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let dir = watch::strip_verbatim(std::fs::canonicalize(&*base).unwrap());
+        let (f, trigger) = (dir.join("repo/sub/gen.h"), dir.join("repo/sub/trigger"));
+        std::fs::write(&f, "v1").unwrap();
+        let daemon = Daemon::new(Box::new(|_| {}));
+        daemon.watcher.set_cookie_dir(&dir.join("cookies"));
+        let staller = Arc::new(Staller { trigger: trigger.clone(), stall: AtomicBool::new(false), blocked: AtomicBool::new(false) });
+        daemon.watcher.listen(staller.clone());
+        let begin = || {
+            let b = Begin { build_dir: dir.join("repo/build"), ..Default::default() };
+            assert!(matches!(daemon.handle(Request::Begin(b)), Response::Begun { .. }));
+        };
+        let size = {
+            let f = f.clone();
+            move |d: &Daemon, wrote: bool| match d.handle(Request::Files { paths: vec![f.clone()], wrote }) {
+                Response::Files(v) => v[0].as_ref().unwrap().size,
+                r => panic!("{r:?}"),
+            }
+        };
+        begin();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.watcher.token(&f).is_none() {
+            assert!(Instant::now() < deadline, "{:?}", daemon.watcher.roots());
+            size(&daemon, false);
+            begin();
+        }
+        assert_eq!(size(&daemon, false), 2);
+        // The reader is busy (with another event), the file rewritten.
+        staller.stall.store(true, Ordering::SeqCst);
+        std::fs::write(&trigger, "").unwrap();
+        while !staller.blocked.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::write(&f, "version 2").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (asking, ask) = (daemon.clone(), size.clone());
+        std::thread::spawn(move || tx.send(ask(&asking, cfg!(windows))));
+        // Answered at once, without the reader, or once it's done.
+        let early = rx.recv_timeout(Duration::from_millis(500)).ok();
+        staller.stall.store(false, Ordering::SeqCst);
+        assert_eq!(early.unwrap_or_else(|| rx.recv().unwrap()), 9);
+    }
+
+    /// A request that panics while it holds a lock (a bug) is answered with
+    /// an error, and those after it aren't: they failed on the lock it left
+    /// poisoned, for the daemon's life. What was vouched for isn't any more
+    /// (some listeners may have dropped an entry, others not), until roots
+    /// are in sync again.
+    #[test]
+    fn panics_answered() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        /// Panics once, dropping what's under `at`.
+        struct Buggy(PathBuf, std::sync::atomic::AtomicBool);
+        impl watch::Listener for Buggy {
+            fn changed(&self, path: &Path, change: watch::Change) {
+                if path == self.0 && change == watch::Change::Tree && !self.1.swap(true, Ordering::SeqCst) {
+                    panic!("a listener's bug");
+                }
+            }
+        }
+        use cpp_deps::scan::Watch;
+        let base = TestDir::new("ninja_daemon_panics");
+        for d in ["repo/.git", "repo/src", "repo/build", "other"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let dir = watch::strip_verbatim(std::fs::canonicalize(&*base).unwrap());
+        let a = dir.join("repo/src/a.h");
+        std::fs::write(&a, "a").unwrap();
+        let (lines, log) = {
+            let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+            let l2 = lines.clone();
+            (lines, Box::new(move |m: &str| l2.locked().push(m.to_string())))
+        };
+        let daemon = Daemon::new(log);
+        daemon.watcher.set_cookie_dir(&dir.join("cookies"));
+        daemon.watcher.listen(Arc::new(Buggy(dir.join("other"), Default::default())));
+        let preprocessor = daemon.driver();
+        let begin = |build_dir: &Path| daemon.answer(Request::Begin(Begin { build_dir: build_dir.to_path_buf(), ..Default::default() }));
+        let size = || match daemon.answer(Request::Files { paths: vec![a.clone()], wrote: false }) {
+            Response::Files(v) => v[0].as_ref().unwrap().size,
+            r => panic!("{r:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.watcher.token(&a).is_none() {
+            assert!(Instant::now() < deadline, "{:?}", daemon.watcher.roots());
+            size();
+            begin(&dir.join("repo/build"));
+        }
+        // Its roots' lock held, as what's under a new build directory goes.
+        let r = begin(&dir.join("other"));
+        assert!(matches!(&r, Response::Error(e) if e.contains("a listener's bug")), "{r:?}");
+        assert!(matches!(daemon.answer(Request::Status), Response::Status(_)));
+        assert_eq!(size(), 1);
+        // Its locks may be poisoned: another.
+        assert!(!Arc::ptr_eq(&preprocessor, &daemon.driver()));
+        assert_eq!(daemon.watcher.token(&a), None);
+        assert!(lines.locked().iter().any(|l| l.contains("a request panicked: a listener's bug")), "{:?}", lines.locked());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.watcher.token(&a).is_none() {
+            assert!(Instant::now() < deadline, "{:?}", daemon.watcher.roots());
+            size();
+            assert!(matches!(begin(&dir.join("repo/build")), Response::Begun { .. }));
+        }
+    }
+
+    /// Unix: a daemon starting removes the files other daemons left (other
+    /// binaries', rebuilt since: logs of 2 MiB each), unless they run. They
+    /// stayed in the runtime directory (a tmpfs) until the next boot.
+    #[cfg(unix)]
+    #[test]
+    fn others_removed_at_start() {
+        let base = TestDir::new("ninja_daemon_others_at_start");
+        let loc = Location { dir: base.join("daemon"), id: "now".into() };
+        loc.create_dir().unwrap();
+        let old = Location { dir: loc.dir.clone(), id: "before".into() };
+        for f in [old.lock_file(), old.log_file(), old.old_log_file(), old.dir.join("before.sock")] {
+            std::fs::write(f, "").unwrap();
+        }
+        let served = loc.clone();
+        std::thread::spawn(move || serve(&served, Duration::from_secs(3600), None));
+        crate::Client::connect_or_start(&loc, || Ok(None)).unwrap();
+        let left: Vec<String> = std::fs::read_dir(&loc.dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(!left.iter().any(|f| f.starts_with("before.")), "{left:?}");
     }
 }

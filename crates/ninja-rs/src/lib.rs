@@ -75,6 +75,10 @@ pub struct Service {
     /// The certificate files warned about as expiring soon, by the current
     /// invocation or those running it (see `nested::TLS_WARNED_ENV`).
     tls_warned: Vec<String>,
+    /// Warnings about the CA of a `--tls_certificate` bundle that verified
+    /// a server's certificate, expiring soon, as connections find them
+    /// (see `options::LoadedTls::ca_check`): the file, and the warning.
+    ca_warnings: Arc<std::sync::Mutex<Vec<(String, String)>>>,
     /// The disk cache, kept across builds (keyed by its directory).
     disk_cache: Option<(String, Arc<ninja_remote::disk_cache::DiskCache>)>,
     digests_loaded: bool,
@@ -99,6 +103,9 @@ pub struct Service {
     pub events: Arc<std::sync::Mutex<Option<Arc<Bes>>>>,
     /// The lock on the logs the current invocation writes.
     logs_lock: Option<LogsLock>,
+    /// The daemon the current build began with: told of the commands run
+    /// on the host (see `daemon::Telling`).
+    daemon: Option<Arc<ninja_daemon::Client>>,
 }
 
 /// The lock on the logs an invocation writes (see `Service::lock_logs`).
@@ -118,6 +125,7 @@ impl Service {
             remote_client: None,
             remote_unreachable: None,
             tls_warned: Vec::new(),
+            ca_warnings: Arc::default(),
             disk_cache: None,
             digests_loaded: false,
             remote_verbose: false,
@@ -130,6 +138,7 @@ impl Service {
             relay: None,
             events: Arc::default(),
             logs_lock: None,
+            daemon: None,
         }
     }
 
@@ -192,7 +201,7 @@ impl Service {
         let bes = if opts.bes.enabled() && opts.tool.as_deref().is_none_or(|t| t == "exec") {
             // The certificates are checked before anything connects.
             let mut warnings = Vec::new();
-            let tls = match opts.bes.backend.as_deref().filter(|b| options::uses_tls(b)) {
+            let (tls, check) = match opts.bes.backend.as_deref().filter(|b| options::uses_tls(b)) {
                 Some(_) => match self.load_tls(opts, |w| warnings.push(format!("ninja: warning: {w}\n"))) {
                     Ok(tls) => tls,
                     Err(e) => {
@@ -200,10 +209,10 @@ impl Service {
                         return EXIT_FAILURE;
                     }
                 },
-                None => ninja_remote::Tls::default(),
+                None => Default::default(),
             };
             let bytestream = opts.remote.endpoint().map(|e| bes::bytestream_prefix(e, &opts.remote.instance_name));
-            let b = Bes::start(opts, tls, &self.ids, bytestream, self.store.clone(), self.relay.take()).await;
+            let b = Bes::start(opts, tls, check, &self.ids, bytestream, self.store.clone(), self.relay.take()).await;
             for w in warnings {
                 ninja_core::status::print_err(&w);
                 b.message(&w);
@@ -230,6 +239,14 @@ impl Service {
         self.logs_lock = None;
         // Interrupted, not a command exiting with 130. A certificate refused
         // meanwhile fails the invocation, whatever the build did.
+        // Connections made again during the build may have found a CA of a
+        // bundle expiring.
+        self.warn_ca(|w| {
+            ninja_core::status::print_err(&format!("ninja: warning: {w}\n"));
+            if let Some(b) = &bes {
+                b.message(&format!("ninja: warning: {w}\n"));
+            }
+        });
         if let Some(b) = bes
             && b.finish(code, code != EXIT_SUCCESS && self.interrupt.is_set()).await
             && code == EXIT_SUCCESS
@@ -241,17 +258,33 @@ impl Service {
     }
 
     /// The TLS settings, for an endpoint connecting with TLS (see
-    /// `TlsFlags::load`). A certificate expiring soon is warned about
-    /// (`warn`) once per invocation, and not by the invocations it runs.
-    fn load_tls(&mut self, opts: &Options, mut warn: impl FnMut(&str)) -> Result<ninja_remote::Tls, String> {
+    /// `TlsFlags::load`), and the check of the CA of a bundle that verifies
+    /// the server's certificate (see `LoadedTls::ca_check`). A certificate
+    /// expiring soon is warned about (`warn`) once per invocation, and not
+    /// by the invocations it runs.
+    fn load_tls(&mut self, opts: &Options, mut warn: impl FnMut(&str)) -> Result<(ninja_remote::Tls, rbe_client::CaCheck), String> {
         let loaded = opts.tls.load()?;
+        let check = loaded.ca_check(self.ca_warnings.clone());
         for (file, warning) in loaded.expiring {
             if !self.tls_warned.contains(&file) {
                 warn(&warning);
                 self.tls_warned.push(file);
             }
         }
-        Ok(loaded.tls)
+        Ok((loaded.tls, check))
+    }
+
+    /// Warns (`warn`) about the CAs of bundles expiring soon that
+    /// connections made since found verifying their server's certificate,
+    /// as `load_tls` does about the certificates it reads.
+    fn warn_ca(&mut self, mut warn: impl FnMut(&str)) {
+        let found = std::mem::take(&mut *self.ca_warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        for (file, warning) in found {
+            if !self.tls_warned.contains(&file) {
+                warn(&warning);
+                self.tls_warned.push(file);
+            }
+        }
     }
 
     async fn run_build_invocation(&mut self, opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
@@ -273,6 +306,7 @@ impl Service {
                         status.error(&e);
                         return EXIT_FAILURE;
                     }
+                    self.warn_ca(|w| status.warning(w));
                     exec(opts, status, &self.interrupt, &self.tls_warned).await
                 }
                 "wincodepage" => tools::tool_wincodepage(&opts.tool_args),
@@ -433,6 +467,7 @@ impl Service {
             if let Err(e) = &connected {
                 status.error(e);
             }
+            self.warn_ca(|w| status.warning(w));
             let backend = match backend {
                 Ok(r) if connected.is_ok() => r,
                 Ok(_) => return EXIT_FAILURE,
@@ -621,6 +656,12 @@ impl Service {
                     status.info(&summary);
                 }
             }
+            // Local results that weren't cached, which is otherwise silent too.
+            if let Some(summary) = backend.as_ref().and_then(|b| b.uncached_summary())
+                && opts.verbosity != Verbosity::Quiet
+            {
+                status.info(&summary);
+            }
             let disk_hits = status.printer.disk_cache_hits();
             if disk_hits > 0 && opts.verbosity != Verbosity::Quiet {
                 status.info(&format!("{disk_hits} disk cache hits."));
@@ -635,7 +676,8 @@ impl Service {
     /// Waits for the local results the backend sends to the remote cache
     /// (see `Backend::finish_uploads`), saying so when that takes a while.
     /// An interrupt, before the wait or during it, gives them up: whether
-    /// one came during it.
+    /// some were (said then; one landing as the build ended too, which then
+    /// exits interrupted, not as if they were stored).
     async fn finish_uploads(&self, backend: &Option<Arc<ninja_remote::Backend>>, status: &mut dyn Status) -> bool {
         let Some(b) = backend else { return false };
         // The wait acts on interrupts: they don't end the invocation at once.
@@ -649,7 +691,7 @@ impl Service {
         };
         let plural = |n: usize| if n == 1 { "" } else { "s" };
         let left = b.finish_uploads(stop, |n| status.info(&format!("waiting for {n} upload{} to the remote cache.", plural(n)))).await;
-        if left == 0 || before {
+        if left == 0 {
             return false;
         }
         status.info(&format!("interrupted: {left} local result{} not stored in the remote cache.", plural(left)));
@@ -718,6 +760,7 @@ impl Service {
         requested: &[String],
         status: &mut dyn Status,
     ) -> Result<Option<Arc<ninja_remote::Backend>>, String> {
+        self.daemon = None;
         if opts.remote.endpoint().is_none() && opts.remote.disk_cache.is_none() {
             return Ok(None);
         }
@@ -754,10 +797,10 @@ impl Service {
                 if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
                     // Certificates are checked before connecting: one that
                     // expired fails the build, unreachable or not.
-                    let tls = if options::uses_tls(endpoint) { self.load_tls(opts, |w| status.warning(w))? } else { ninja_remote::Tls::default() };
+                    let (tls, check) = if options::uses_tls(endpoint) { self.load_tls(opts, |w| status.warning(w))? } else { Default::default() };
                     let connect = tls.connect_options(endpoint, &opts.remote.instance_name, &opts.remote.headers);
-                    match ninja_remote::Client::connect_retrying(connect, opts.remote.retries).await {
-                        Ok(client) => self.remote_client = Some((key.clone(), client)),
+                    match ninja_remote::Client::connect_checked(connect, opts.remote.retries, check).await {
+                        Ok(client) => self.remote_client = Some((key.clone(), client.with_max_concurrency(opts.remote.max_concurrency))),
                         // No connection, or no answer: done without. A
                         // certificate refused, or the settings, aren't.
                         Err(e) if rbe_client::fault::fault(e.as_ref()).unreachable() => {
@@ -765,7 +808,7 @@ impl Service {
                         }
                         Err(e) => {
                             let e = rbe_client::fault::describe(e.as_ref());
-                            return Err(format!("remote execution: {e}{}", options::tls_hint(&e, endpoint, &opts.tls, true)));
+                            return Err(format!("remote execution: {e}{}", options::tls_hint(&e, endpoint, &opts.tls)));
                         }
                     }
                 }
@@ -818,6 +861,7 @@ impl Service {
         } else {
             None
         };
+        self.daemon = daemon.clone();
         // Opened for appending, so that nested invocations' lines (see
         // `nested`) and this one's don't overwrite each other.
         let execution_log = match &opts.remote.execution_log {
@@ -873,7 +917,7 @@ impl Service {
             }
             Err(e) => {
                 let e = rbe_client::fault::describe(e.as_ref());
-                let hint = opts.remote.endpoint().map(|ep| options::tls_hint(&e, ep, &opts.tls, true)).unwrap_or_default();
+                let hint = opts.remote.endpoint().map(|ep| options::tls_hint(&e, ep, &opts.tls)).unwrap_or_default();
                 return Err(format!("remote execution: {e}{hint}"));
             }
         };
@@ -888,8 +932,7 @@ impl Service {
     /// `--remote_strict`), a warning, and builds do without it; else the
     /// build's error.
     fn unreachable(&mut self, key: &str, endpoint: &str, error: &str, opts: &Options, status: &mut dyn Status) -> Result<(), String> {
-        // Nothing answered: a connection closed isn't a certificate refused.
-        let hint = options::tls_hint(error, endpoint, &opts.tls, false) + &options::plaintext_hint(error, endpoint);
+        let hint = options::tls_hint(error, endpoint, &opts.tls) + &options::plaintext_hint(error, endpoint);
         if !opts.remote.local_fallback || opts.remote.strict {
             let local = if opts.remote.strict { "" } else { " (with --remote_local_fallback, the build would run locally)" };
             return Err(format!("the remote service {endpoint} is unreachable{local}: {error}{hint}"));
@@ -1000,10 +1043,17 @@ impl Service {
         if !self.tls_warned.is_empty() {
             env.push((nested::TLS_WARNED_ENV.into(), nested::tls_warned_value(&self.tls_warned)));
         }
+        // Nor say again that its disk cache is Bazel's.
+        if let Some(noted) = self.disk_cache.as_ref().and_then(|(_, c)| c.noted_env()) {
+            env.push((ninja_remote::disk_cache::NOTED_ENV.into(), noted));
+        }
         if !env.is_empty() {
             r.set_env(env);
         }
-        Box::new(r)
+        match &self.daemon {
+            Some(client) => Box::new(daemon::Telling { inner: Box::new(r), client: client.clone() }),
+            None => Box::new(r),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1279,7 +1329,7 @@ pub(crate) fn try_lock_logs(file: &str) -> std::io::Result<LogsAccess> {
         Ok(false) => match lock.holder() {
             // The build running this one, whose commands lost
             // `LOGS_LOCK_ENV` (a wrapper scrubbing the environment).
-            Some(holder) if nested::runs_this(holder.pid) => Ok(LogsAccess::Inherited),
+            Some(holder) if nested::runs_this(&holder) => Ok(LogsAccess::Inherited),
             holder => Ok(LogsAccess::Busy(holder)),
         },
         Err(e) => Err(e),
@@ -1357,8 +1407,9 @@ fn volatile_dirs(state: &State, build_dir: &std::path::Path) -> Vec<std::path::P
 
 /// The directories build edges write to (their outputs'), in the build
 /// directory or not, those in it also by its real spelling: the
-/// conservative scanner looks there every time, and doesn't send them for
-/// computed includes (see `ninja_remote::scanner::WrittenDirs`).
+/// conservative scanner runs a computed include there locally, and sends
+/// their header-like files only for one elsewhere (see
+/// `ninja_remote::scanner::WrittenDirs`).
 fn written_dirs(state: &State, build_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let real = std::fs::canonicalize(build_dir).map(ninja_daemon::watch::strip_verbatim).ok().filter(|r| r != build_dir);
     let mut dirs: Vec<std::path::PathBuf> = real.iter().cloned().collect();

@@ -63,8 +63,9 @@ pub struct Invocation {
     pub forced: Vec<Forced>,
     /// `cl.exe`: its built-in directories are `INCLUDE`'s, unless `/X`.
     pub no_include_env: bool,
-    /// `cl.exe`: the conforming preprocessor (`/Zc:preprocessor`), whose
-    /// `_MSVC_TRADITIONAL` is 0.
+    /// The conforming preprocessor, as the flags say (`/Zc:preprocessor`,
+    /// `/std:c11` for C...): cl's `_MSVC_TRADITIONAL` decides (see
+    /// `Profile::traditional`), which the tests check this against.
     pub conforming: bool,
     /// Clang's MSVC compatibility (its lookups), when flags set it
     /// (`-f[no-]ms-compatibility`, `-fno-ms-extensions`): the scan takes it
@@ -1208,6 +1209,27 @@ const CL_WITH_ARG: &[(&str, Effect)] = &[
     ("o", Effect::Drop),
 ];
 
+/// Whether a cl flag (without its `/` or `-`) turns the conforming
+/// preprocessor on or off (`/Zc:preprocessor-`, in a list too, or the older
+/// `/experimental:preprocessor`); None if it doesn't say.
+fn cl_preprocessor(f: &str) -> Option<bool> {
+    match f {
+        "experimental:preprocessor" => Some(true),
+        "experimental:preprocessor-" => Some(false),
+        _ => f.strip_prefix("Zc:")?.split(',').rev().find_map(|z| match z {
+            "preprocessor" => Some(true),
+            "preprocessor-" => Some(false),
+            _ => None,
+        }),
+    }
+}
+
+/// The C standards whose sources cl preprocesses with the conforming
+/// preprocessor unless told otherwise.
+fn cl_conforming_c(f: &str) -> bool {
+    matches!(f, "std:c11" | "std:c17" | "std:clatest")
+}
+
 fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation, String> {
     let (relative, linked) = (Cell::new(false), RefCell::new(None));
     let abs = |p: &str| -> PathBuf {
@@ -1215,11 +1237,28 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
         joined(cwd, p, &linked)
     };
     let unsupported = |a: &str| Err(format!("unsupported flag {a}"));
+    // Which preprocessor the flags choose (the probe asks cl: this is what
+    // the flags say), from `CL`, the command line and `_CL_`, in order.
+    let (mut preprocessor, mut c_std) = (None, false);
+    let mut note = |f: &str| {
+        preprocessor = cl_preprocessor(f).or(preprocessor);
+        c_std |= cl_conforming_c(f);
+    };
     // cl and clang-cl take flags from `CL` before the command's, and from
     // `_CL_` after: the probe sees them, the scan doesn't.
+    let mut after = Vec::new();
     for var in ["CL", "_CL_"] {
         for a in env.var(var).map(|v| split_windows(&v, false)).unwrap_or_default() {
-            if a.strip_prefix('/').or_else(|| a.strip_prefix('-')).is_none_or(|f| cl_parsed(f) || cl_unsupported(f)) {
+            let f = a.strip_prefix('/').or_else(|| a.strip_prefix('-'));
+            if f.is_some_and(|f| cl_preprocessor(f).is_some() || cl_conforming_c(f)) {
+                if var == "CL" {
+                    note(f.unwrap());
+                } else {
+                    after.push(a);
+                }
+                continue;
+            }
+            if f.is_none_or(|f| cl_parsed(f) || cl_unsupported(f)) {
                 return Err(format!("{var} has {a}"));
             }
         }
@@ -1397,14 +1436,12 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
             inv.probe_args.push(a.clone());
             inv.probe_args.push(v);
         } else {
-            if f == "Zc:preprocessor" || f == "experimental:preprocessor" {
-                inv.conforming = true;
-            }
-            if f == "Zc:preprocessor-" {
-                inv.conforming = false;
-            }
+            note(f);
             inv.probe_args.push(absolute_arg(&a, None, cwd));
         }
+    }
+    for a in after {
+        note(a.strip_prefix('/').or_else(|| a.strip_prefix('-')).unwrap_or_default());
     }
     inv.commands.extend(wp_commands);
     inv.user_dirs.extend(wp_dirs.iter().map(|d| Dir::Path(abs(d))));
@@ -1413,9 +1450,10 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
         return Err(format!("`..` after a symbolic link: {}", link.display()));
     }
     let inv = finish(inv, lang, false)?;
-    // C11 and later use the conforming preprocessor by default.
-    let c_std = inv.probe_args.iter().any(|a| matches!(a.trim_start_matches(['/', '-']), "std:c11" | "std:c17" | "std:clatest"));
-    Ok(Invocation { conforming: inv.conforming || (inv.lang == "c" && c_std), ..inv })
+    // C11 and later use the conforming preprocessor, unless a flag says
+    // otherwise (wherever it is); clang-cl has only that one.
+    let conforming = inv.style == Style::ClangCl || preprocessor.unwrap_or(inv.lang == "c" && c_std);
+    Ok(Invocation { conforming, ..inv })
 }
 
 /// The files and directories a compile command's flags name that the
@@ -1520,6 +1558,12 @@ pub struct Profile {
     /// Clang compiling for the MSVC ABI (`_MSC_VER` too), whose MSVC
     /// compatibility searches includers' directories as cl does.
     pub ms_compat: bool,
+    /// cl's traditional preprocessor: `_MSVC_TRADITIONAL` isn't 0 (older
+    /// versions, which have only that one, don't define it).
+    pub traditional: bool,
+    /// When a comma before `__VA_ARGS__` left out goes (as the compiler
+    /// does it: see `probe::Probe::va_comma`).
+    pub va_comma: crate::macros::VaComma,
     pub builtin_dirs: Vec<Dir>,
     /// Files every compile reads first (see `probe::Probe::implicit`).
     pub implicit: Vec<PathBuf>,
@@ -1540,7 +1584,7 @@ pub struct Profile {
     probed: u64,
 }
 
-const PROFILE_SIGNATURE: &str = "cpp-deps profile 4";
+const PROFILE_SIGNATURE: &str = "cpp-deps profile 5";
 
 /// Profiles unused for this long are removed when another is saved (at
 /// most once a day: see `CLEANED`).
@@ -1574,6 +1618,7 @@ impl Profile {
         let (clang, msc) = (defined("__clang__"), defined("_MSC_VER"));
         // cl's integer suffixes: cl's, and Clang's with Microsoft extensions.
         let ms_suffixes = (msc && !clang) || (clang && defined("_MSC_EXTENSIONS"));
+        let conforming = predefined.get(&intern::intern(probe::TRADITIONAL)).is_some_and(|m| m.body.iter().map(|t| t.sym.as_str()).eq(["0"]));
         Profile {
             predefined: Arc::new(predefined),
             predefines,
@@ -1588,6 +1633,8 @@ impl Profile {
                 Family::Gcc
             },
             ms_compat: clang && msc,
+            traditional: msc && !clang && !conforming,
+            va_comma: Default::default(),
             builtin_dirs,
             implicit,
             answers: Mutex::default(),
@@ -1617,8 +1664,13 @@ impl Profile {
             return Ok(());
         }
         let mut out = format!(
-            "{PROFILE_SIGNATURE}\nkey\t{key}\nprobed\t{}\ndialect\t{}\t{}\ntrigraphs\t{}\n",
-            self.probed, self.dialect.true_false as u8, self.dialect.alt_operators as u8, self.trigraphs as u8
+            "{PROFILE_SIGNATURE}\nkey\t{key}\nprobed\t{}\ndialect\t{}\t{}\ntrigraphs\t{}\nva_comma\t{}\t{}\n",
+            self.probed,
+            self.dialect.true_false as u8,
+            self.dialect.alt_operators as u8,
+            self.trigraphs as u8,
+            self.va_comma.needs_named as u8,
+            self.va_comma.bare as u8
         );
         let mut operators: Vec<&str> = self.operators.iter().map(|o| o.as_str()).collect();
         operators.sort();
@@ -1682,13 +1734,14 @@ impl Profile {
         }
         let (mut probed, mut dialect, mut trigraphs, mut operators, mut dirs, mut implicit, mut answers) =
             (None, None, None, Vec::new(), Vec::new(), Vec::new(), HashMap::new());
-        let mut cwd = None;
+        let (mut cwd, mut va_comma) = (None, None);
         for line in lines {
             let f: Vec<&str> = line.split('\t').collect();
             match f.as_slice() {
                 ["probed", t] => probed = Some(t.parse::<u64>().ok()?),
                 ["dialect", t, a] => dialect = Some(crate::expr::Dialect { true_false: *t == "1", alt_operators: *a == "1", ms_suffixes: false }),
                 ["trigraphs", t] => trigraphs = Some(*t == "1"),
+                ["va_comma", n, b] => va_comma = Some(crate::macros::VaComma { needs_named: *n == "1", bare: *b == "1" }),
                 ["operator", o] => operators.push(o.to_string()),
                 ["dir", p] => dirs.push(Dir::Path(PathBuf::from(p))),
                 ["framework", p] => dirs.push(Dir::Framework(PathBuf::from(p))),
@@ -1708,6 +1761,7 @@ impl Profile {
         let mut profile = Profile::new(predefines.to_string(), operators, dialect?, trigraphs?, dirs, implicit);
         profile.probed = probed;
         profile.cwd = cwd;
+        profile.va_comma = va_comma?;
         *profile.answers.lock().unwrap() = answers;
         // Used: kept by the clean-up of `save`.
         if let Ok(f) = std::fs::File::options().append(true).open(&file) {
@@ -2019,14 +2073,9 @@ impl Driver {
                     .collect(),
             };
             relative |= p.implicit.iter().any(|f| Path::new(f).is_relative());
-            let mut predefines = p.predefines;
-            if inv.style == Style::Msvc {
-                // The probe used the conforming preprocessor.
-                let traditional = if inv.conforming { "0" } else { "1" };
-                predefines.push_str(&format!("#define _MSVC_TRADITIONAL {traditional}\n"));
-            }
             let implicit = p.implicit.iter().map(|f| scan::normalize(&cwd.join(f))).collect();
-            let mut profile = Profile::new(predefines, p.operators, p.dialect, p.trigraphs, builtin_dirs, implicit);
+            let mut profile = Profile::new(p.predefines, p.operators, p.dialect, p.trigraphs, builtin_dirs, implicit);
+            profile.va_comma = p.va_comma;
             profile.cwd = relative.then(|| cwd.to_path_buf());
             if let Some(d) = &env.profile_dir {
                 let _ = profile.save(d, &key);
@@ -2060,41 +2109,7 @@ impl Driver {
 
     /// `scan`, running compilers in `env`.
     pub fn scan_in(&self, argv: &[String], cwd: &Path, env: &Environment) -> Result<Output, String> {
-        self.prune();
-        let inv = parse_in(argv, cwd, env)?;
-        let (profile, key) = self.profile_and_key(&inv, cwd, env)?;
-        if profile.family == Family::Clang && inv.ms_compat.is_some_and(|c| c != profile.ms_compat) {
-            return Err("MSVC compatibility flags the predefined macros don't show".into());
-        }
-        let dirs = |ds: &[Dir]| ds.iter().map(|d| self.search_dir(d, cwd)).collect::<Result<Vec<_>, _>>();
-        let merge = match (inv.style, profile.family) {
-            (Style::Msvc, _) => Merge::Msvc,
-            (Style::Gcc, Family::Gcc) => Merge::Gcc,
-            _ => Merge::Clang,
-        };
-        let system = [&inv.system_dirs[..], &profile.builtin_dirs, &inv.after_dirs];
-        let (quote, user, system) = search_lists(merge, &inv.quote_dirs, &inv.user_dirs, system, |d| self.dir_id(d));
-        let mut angled = dirs(&user)?;
-        angled.extend(dirs(&system)?);
-        let cfg = Config {
-            family: profile.family,
-            dialect: profile.dialect,
-            trigraphs: profile.trigraphs,
-            quote_dirs: dirs(&quote)?,
-            angled_dirs: angled,
-            embed_dirs: inv.embed_dirs.clone(),
-            overlays: inv.overlays.iter().map(|o| self.overlay(o, cwd)).collect::<Result<_, _>>()?,
-            // Clang for the MSVC ABI searches as cl does.
-            msvc_lookup: inv.style != Style::Gcc || profile.ms_compat,
-            predefined: profile.predefined.clone(),
-            commands: inv.commands.clone(),
-            // GCC and Clang process every `-imacros` first, then what the
-            // compiler reads first (`stdc-predef.h`), then `-include`s.
-            forced: inv.imacros.iter().cloned().chain(profile.implicit.iter().cloned().map(Forced::Path)).chain(inv.forced.iter().cloned()).collect(),
-            operators: profile.operators.clone(),
-            relative_paths: inv.relative_paths,
-            assembler: inv.lang == "assembler-with-cpp",
-        };
+        let (inv, profile, key, cfg) = self.configure(argv, cwd, env)?;
         // Each answer may reveal more queries; a few rounds of asking settle
         // them. Concurrent scans share the answers: a scan whose unknown
         // queries were answered meanwhile (by another scan) scans again.
@@ -2144,6 +2159,49 @@ impl Driver {
                 let _ = profile.save(d, &key);
             }
         }
+    }
+
+    /// A compile command's invocation, its compiler's profile (and its
+    /// key), and the scan's configuration.
+    fn configure(&self, argv: &[String], cwd: &Path, env: &Environment) -> Result<(Invocation, Arc<Profile>, String, Config), String> {
+        self.prune();
+        let inv = parse_in(argv, cwd, env)?;
+        let (profile, key) = self.profile_and_key(&inv, cwd, env)?;
+        if profile.family == Family::Clang && inv.ms_compat.is_some_and(|c| c != profile.ms_compat) {
+            return Err("MSVC compatibility flags the predefined macros don't show".into());
+        }
+        let dirs = |ds: &[Dir]| ds.iter().map(|d| self.search_dir(d, cwd)).collect::<Result<Vec<_>, _>>();
+        let merge = match (inv.style, profile.family) {
+            (Style::Msvc, _) => Merge::Msvc,
+            (Style::Gcc, Family::Gcc) => Merge::Gcc,
+            _ => Merge::Clang,
+        };
+        let system = [&inv.system_dirs[..], &profile.builtin_dirs, &inv.after_dirs];
+        let (quote, user, system) = search_lists(merge, &inv.quote_dirs, &inv.user_dirs, system, |d| self.dir_id(d));
+        let mut angled = dirs(&user)?;
+        angled.extend(dirs(&system)?);
+        let cfg = Config {
+            family: profile.family,
+            dialect: profile.dialect,
+            trigraphs: profile.trigraphs,
+            quote_dirs: dirs(&quote)?,
+            angled_dirs: angled,
+            embed_dirs: inv.embed_dirs.clone(),
+            overlays: inv.overlays.iter().map(|o| self.overlay(o, cwd)).collect::<Result<_, _>>()?,
+            // Clang for the MSVC ABI searches as cl does.
+            msvc_lookup: inv.style != Style::Gcc || profile.ms_compat,
+            predefined: profile.predefined.clone(),
+            commands: inv.commands.clone(),
+            // GCC and Clang process every `-imacros` first, then what the
+            // compiler reads first (`stdc-predef.h`), then `-include`s.
+            forced: inv.imacros.iter().cloned().chain(profile.implicit.iter().cloned().map(Forced::Path)).chain(inv.forced.iter().cloned()).collect(),
+            operators: profile.operators.clone(),
+            relative_paths: inv.relative_paths,
+            assembler: inv.lang == "assembler-with-cpp",
+            traditional: profile.traditional,
+            va_comma: profile.va_comma,
+        };
+        Ok((inv, profile, key, cfg))
     }
 }
 
@@ -2389,6 +2447,97 @@ mod tests {
             s(&["/winsysroot", &absolute("C:/ws"), "-vctoolsdir", &absolute("C:/vc"), &format!("/winsdkdir{}", absolute("C:/sdk"))])
         );
         assert!(parse(&s(&["cl.exe", "-imsvc", "C:/sdk", "/c", "x.cc"]), cwd).is_err());
+    }
+
+    /// Which preprocessor cl's flags choose, as cl 19.51 says (its
+    /// `_MSVC_TRADITIONAL`: `real_cl_preprocessor_mode` asks it): the source,
+    /// the flags, `CL`, `_CL_`, and whether it's the conforming one.
+    const CL_PREPROCESSORS: &[(&str, &[&str], &str, &str, bool)] = &[
+        ("x.cc", &[], "", "", false),
+        ("x.c", &[], "", "", false),
+        // C11 and later, for C.
+        ("x.c", &["/std:c11"], "", "", true),
+        ("x.c", &["/std:c17"], "", "", true),
+        ("x.c", &["/std:clatest"], "", "", true),
+        ("x.cc", &["/TC", "/std:c11"], "", "", true),
+        ("x.cc", &["/std:c11"], "", "", false),
+        ("x.c", &["/TP", "/std:c17"], "", "", false),
+        // Not C++'s, nor conformance's.
+        ("x.cc", &["/std:c++20", "/permissive-"], "", "", false),
+        ("x.cc", &["/std:c++latest"], "", "", false),
+        // Said: the last word, whatever the standard.
+        ("x.cc", &["/Zc:preprocessor"], "", "", true),
+        ("x.cc", &["/experimental:preprocessor"], "", "", true),
+        ("x.cc", &["/Zc:__cplusplus,preprocessor"], "", "", true),
+        ("x.cc", &["/Zc:preprocessor,preprocessor-"], "", "", false),
+        ("x.cc", &["/Zc:preprocessor", "/experimental:preprocessor-"], "", "", false),
+        ("x.cc", &["/experimental:preprocessor-", "/Zc:preprocessor"], "", "", true),
+        ("x.c", &["/std:c11", "/Zc:preprocessor-"], "", "", false),
+        ("x.c", &["/Zc:preprocessor-", "/std:c11"], "", "", false),
+        // `CL` comes before the command line, `_CL_` after.
+        ("x.cc", &[], "/Zc:preprocessor", "", true),
+        ("x.cc", &["/Zc:preprocessor-"], "/Zc:preprocessor", "", false),
+        ("x.cc", &["/Zc:preprocessor"], "", "/Zc:preprocessor-", false),
+        ("x.c", &[], "/std:c17", "", true),
+        ("x.c", &["/std:c11"], "", "/Zc:preprocessor-", false),
+        ("x.c", &[], "/Zc:preprocessor-", "/std:c11", false),
+    ];
+
+    /// An environment with `CL` and `_CL_` (and the variables of this
+    /// process, for the compiler).
+    fn cl_env(cl: &str, cl_after: &str) -> Environment {
+        let mut vars: Vec<(String, String)> = std::env::vars().filter(|(k, _)| !["CL", "_CL_"].contains(&k.to_ascii_uppercase().as_str())).collect();
+        vars.extend([("CL".to_string(), cl.to_string()), ("_CL_".to_string(), cl_after.to_string())].into_iter().filter(|(_, v)| !v.is_empty()));
+        Environment { vars: Some(Arc::new(vars)), profile_dir: None }
+    }
+
+    #[test]
+    fn cl_preprocessor_flags() {
+        let cwd = Path::new("C:/b");
+        for &(source, flags, cl, cl_after, conforming) in CL_PREPROCESSORS {
+            let argv: Vec<String> = ["cl.exe"].iter().chain(flags).chain(&["/c", source]).map(|a| a.to_string()).collect();
+            let inv = parse_in(&argv, cwd, &cl_env(cl, cl_after)).unwrap();
+            assert_eq!(inv.conforming, conforming, "{argv:?} CL={cl} _CL_={cl_after}");
+        }
+        // clang-cl has only the conforming one.
+        assert!(parse(&s(&["clang-cl", "/Zc:preprocessor-", "/c", "x.cc"]), cwd).unwrap().conforming);
+        // Other flags in `CL` are still refused.
+        assert!(parse_in(&s(&["cl.exe", "/c", "x.cc"]), cwd, &cl_env("/DX=1 /Zc:preprocessor", "")).is_err());
+    }
+
+    /// cl's word on its preprocessor (`_MSVC_TRADITIONAL`, probed with the
+    /// command's flags and `CL`, `_CL_`) against the flags'
+    /// (`CL_PREPROCESSORS`); clang-cl's (`CPP_DEPS_TEST_CLANG_CL`, when
+    /// set): conforming, without `_MSVC_TRADITIONAL`.
+    #[test]
+    #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
+    fn real_cl_preprocessor_mode() {
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let dir = test_dirs::TestDir::new("cpp_deps_cl_preprocessor_mode");
+        let driver = Driver::new(Cache::new(vec![], true));
+        for &(source, flags, cl_before, cl_after, conforming) in CL_PREPROCESSORS {
+            let argv: Vec<String> = [cl.to_string_lossy().as_ref()].into_iter().chain(flags.iter().copied()).chain(["/c", source]).map(String::from).collect();
+            let env = cl_env(cl_before, cl_after);
+            let inv = parse_in(&argv, &dir, &env).unwrap();
+            let profile = driver.profile(&inv, &dir, &env).unwrap();
+            assert_eq!(profile.traditional, !conforming, "{argv:?} CL={cl_before} _CL_={cl_after}");
+            assert_eq!(inv.conforming, conforming, "{argv:?}: the flags disagree with cl");
+            let value = profile.predefined.get(&intern::intern(probe::TRADITIONAL)).map(|m| m.body.iter().map(|t| t.sym.as_str()).collect::<String>());
+            assert_eq!(value.as_deref(), Some(if conforming { "0" } else { "1" }));
+        }
+        match std::env::var("CPP_DEPS_TEST_CLANG_CL").ok().filter(|v| !v.is_empty()) {
+            Some(_) => {
+                let clang_cl = crate::test_compiler("CPP_DEPS_TEST_CLANG_CL");
+                for flags in [&[][..], &["/Zc:preprocessor-"], &["/Zc:preprocessor"]] {
+                    let argv: Vec<String> =
+                        [clang_cl.to_string_lossy().as_ref()].into_iter().chain(flags.iter().copied()).chain(["/c", "x.cc"]).map(String::from).collect();
+                    let inv = parse(&argv, &dir).unwrap();
+                    let profile = driver.profile(&inv, &dir, &Environment::default()).unwrap();
+                    assert!(inv.conforming && !profile.traditional && !profile.predefined.contains_key(&intern::intern(probe::TRADITIONAL)), "{argv:?}");
+                }
+            }
+            None => println!("NOT TESTED: clang-cl (CPP_DEPS_TEST_CLANG_CL names no compiler)"),
+        }
     }
 
     /// The whole driver against cl.exe: `CPP_DEPS_TEST_CL` (with INCLUDE
@@ -3153,17 +3302,12 @@ mod tests {
     /// A fake Clang in `dir` (`clang++`): it notes its runs in `runs.txt`
     /// and takes a moment to tell its version.
     fn fake_clang(dir: &Path) -> PathBuf {
-        if cfg!(windows) {
-            let c = dir.join("clang++.cmd");
-            std::fs::write(&c, "@echo run>>\"%~dp0runs.txt\"\r\n@ping -n 2 127.0.0.1 >NUL\r\n@echo clang version 99\r\n").unwrap();
-            c
-        } else {
-            let c = dir.join("clang++");
-            std::fs::write(&c, "#!/bin/sh\necho run >> \"$(dirname \"$0\")/runs.txt\"\nsleep 0.5\necho clang version 99\n").unwrap();
-            #[cfg(unix)]
-            std::fs::set_permissions(&c, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-            c
-        }
+        crate::test_tool(
+            dir,
+            "clang++",
+            "@echo run>>\"%~dp0runs.txt\"\r\n@ping -n 2 127.0.0.1 >NUL\r\n@echo clang version 99\r\n",
+            "echo run >> \"$(dirname \"$0\")/runs.txt\"\nsleep 0.5\necho clang version 99\n",
+        )
     }
 
     /// Concurrent scans take a compiler's fingerprint once.
@@ -3525,6 +3669,16 @@ mod tests {
         }
     }
 
+    /// The comma before `__VA_ARGS__` left out or empty (see
+    /// `macros::tests::va_comma_rules`), and its files.
+    const VA_COMMA: &str = "#define ARGC_I(a, b, c, d, n, ...) n\n#define ARGC(...) ARGC_I(x, ## __VA_ARGS__, 3, 2, 1, 0)\n\
+        #define ARGC2(a, ...) ARGC_I(a, ## __VA_ARGS__, 3, 2, 1, 0)\n#define BARE(...) ARGC_I(x, __VA_ARGS__, 3, 2, 1, 0)\n\
+        #if ARGC() == 0\n#include \"dropped.h\"\n#else\n#include \"kept.h\"\n#endif\n\
+        #if ARGC2(y,) == 0\n#include \"empty_dropped.h\"\n#else\n#include \"empty_kept.h\"\n#endif\n\
+        #if BARE() == 0\n#include \"bare_dropped.h\"\n#else\n#include \"bare_kept.h\"\n#endif\n";
+    const VA_COMMA_H: [(&str, &str); 6] =
+        [("dropped.h", ""), ("kept.h", ""), ("empty_dropped.h", ""), ("empty_kept.h", ""), ("bare_dropped.h", ""), ("bare_kept.h", "")];
+
     /// GCC-style differential cases (the second review's, and more).
     const GCC_CASES: &[Case] = &[
         ("plain", &[("main.c", "#include \"a.h\"\n"), ("a.h", "")], &["-c", "main.c"]),
@@ -3718,6 +3872,18 @@ mod tests {
             &[("main.c", "#include \"a.h\"\nstruct o { int include; } x = {\n    .include = 1,\n};\n"), ("a.h", "")],
             &["-c", "main.c"],
         ),
+        // The comma before `__VA_ARGS__`, in GNU and strict modes.
+        ("va_comma", &[("main.c", VA_COMMA), VA_COMMA_H[0], VA_COMMA_H[1], VA_COMMA_H[2], VA_COMMA_H[3], VA_COMMA_H[4], VA_COMMA_H[5]], &["-c", "main.c"]),
+        (
+            "va_comma_c11",
+            &[("main.c", VA_COMMA), VA_COMMA_H[0], VA_COMMA_H[1], VA_COMMA_H[2], VA_COMMA_H[3], VA_COMMA_H[4], VA_COMMA_H[5]],
+            &["-x", "c", "-std=c11", "-c", "main.c"],
+        ),
+        (
+            "va_comma_cxx17",
+            &[("main.cc", VA_COMMA), VA_COMMA_H[0], VA_COMMA_H[1], VA_COMMA_H[2], VA_COMMA_H[3], VA_COMMA_H[4], VA_COMMA_H[5]],
+            &["-std=c++17", "-c", "main.cc"],
+        ),
     ];
 
     /// Clang's (`-Xclang`, its profiles, MSVC compatibility).
@@ -3817,6 +3983,23 @@ mod tests {
             &["/nologo", "/c", "main.cc"],
         ),
         ("int_suffix_cl", &[("main.cc", "#if 0xffui64 == 255 && 1i64\n#include \"a.h\"\n#endif\n"), ("a.h", "")], &["/nologo", "/c", "main.cc"]),
+        // The comma before `__VA_ARGS__`: cl's preprocessors, clang-cl's
+        // MSVC compatibility (and strict C).
+        (
+            "va_comma_cl",
+            &[("main.cc", VA_COMMA), VA_COMMA_H[0], VA_COMMA_H[1], VA_COMMA_H[2], VA_COMMA_H[3], VA_COMMA_H[4], VA_COMMA_H[5]],
+            &["/nologo", "/c", "main.cc"],
+        ),
+        (
+            "va_comma_cl_conforming",
+            &[("main.cc", VA_COMMA), VA_COMMA_H[0], VA_COMMA_H[1], VA_COMMA_H[2], VA_COMMA_H[3], VA_COMMA_H[4], VA_COMMA_H[5]],
+            &["/nologo", "/Zc:preprocessor", "/c", "main.cc"],
+        ),
+        (
+            "va_comma_cl_c11",
+            &[("main.c", VA_COMMA), VA_COMMA_H[0], VA_COMMA_H[1], VA_COMMA_H[2], VA_COMMA_H[3], VA_COMMA_H[4], VA_COMMA_H[5]],
+            &["/nologo", "/std:c11", "/c", "main.c"],
+        ),
     ];
 
     /// The cases against GCC or Clang: `CPP_DEPS_TEST_CXX`.
@@ -3845,6 +4028,9 @@ mod tests {
             "boost_pragma_message",
             "sysroot_eq_I",
             "designated_include_field",
+            "va_comma",
+            "va_comma_c11",
+            "va_comma_cxx17",
         ] {
             assert!(exact.contains(&name), "{name} isn't exact: {exact:?}");
         }
@@ -3880,6 +4066,9 @@ mod tests {
             "o_separate_cl",
             "libcxx_diag_pragma_cl",
             "int_suffix_cl",
+            "va_comma_cl",
+            "va_comma_cl_conforming",
+            "va_comma_cl_c11",
         ] {
             assert!(exact.contains(&name), "{var}: {name} isn't exact: {exact:?}");
         }
@@ -3898,6 +4087,255 @@ mod tests {
     #[cfg_attr(not(cpp_deps_test_clang_cl), ignore = "needs CPP_DEPS_TEST_CLANG_CL, a clang-cl")]
     fn real_clang_cl_differential() {
         cl_differential("CPP_DEPS_TEST_CLANG_CL");
+    }
+
+    /// cl's `/E` of `source` (as `lines.cpp` in `dir`, with `flags`): the
+    /// text after each line's marker `"@n@"`, by n (see
+    /// `macros::tests::spelled`), and whether it had no errors.
+    fn cl_lines(cl: &Path, dir: &Path, flags: &[&str], source: &str, n: usize) -> (Vec<Option<String>>, bool) {
+        std::fs::write(dir.join("lines.cpp"), source).unwrap();
+        let out = std::process::Command::new(cl).args(["/nologo", "/E"]).args(flags).arg("lines.cpp").current_dir(dir).output().unwrap();
+        let mut lines = vec![None; n];
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            let toks = crate::lex::tokens(l.as_bytes());
+            let marker = toks.first().and_then(|t| t.sym.as_str().strip_prefix("\"@")?.strip_suffix("@\"")?.parse::<usize>().ok());
+            if let Some(i) = marker.filter(|&i| i < n) {
+                lines[i] = Some(crate::macros::tests::spelled(&toks[1..]));
+            }
+        }
+        (lines, out.status.success())
+    }
+
+    /// The cases of cl's traditional preprocessor (`macros::tests::
+    /// TRADITIONAL_CASES`) as cl expands them; and the standard expansion,
+    /// where it doesn't fail, as `/Zc:preprocessor` does.
+    #[test]
+    #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
+    fn real_cl_traditional() {
+        use crate::macros::tests::{TRADITIONAL_CASES, TRADITIONAL_DEFS, TRADITIONAL_REFUSED, expanded, spelled};
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let dir = test_dirs::TestDir::new("cpp_deps_cl_traditional");
+        let (refused_defs, refused) = TRADITIONAL_REFUSED;
+        let cases: Vec<(&str, &str, Option<&str>)> =
+            TRADITIONAL_CASES.iter().map(|&(d, t, w)| (d, t, Some(w))).chain(refused.iter().map(|&t| (refused_defs, t, None))).collect();
+        // One source, each case's macros undefined after it.
+        let shared: Vec<intern::Sym> = crate::macros::parse_defines(TRADITIONAL_DEFS).iter().map(|m| m.name).collect();
+        let mut source = TRADITIONAL_DEFS.to_string();
+        for (i, (defs, text, _)) in cases.iter().enumerate() {
+            source.push_str(&format!("{defs}\"@{i}@\" {text}\n"));
+            for m in crate::macros::parse_defines(defs) {
+                assert!(!shared.contains(&m.name), "{} is TRADITIONAL_DEFS'", m.name.as_str());
+                source.push_str(&format!("#undef {}\n", m.name.as_str()));
+            }
+        }
+        for (flags, traditional) in [(&[][..], true), (&["/Zc:preprocessor"][..], false)] {
+            for ((defs, text, want), theirs) in cases.iter().zip(cl_lines(&cl, &dir, flags, &source, cases.len()).0) {
+                let theirs = theirs.unwrap_or_else(|| panic!("{flags:?}: cl printed nothing for {text}"));
+                if let Some(want) = want.filter(|_| traditional) {
+                    assert_eq!(theirs, spelled(&crate::lex::tokens(want.as_bytes())), "cl's {defs}{text}");
+                }
+                match expanded(&format!("{TRADITIONAL_DEFS}{defs}"), text, traditional, false) {
+                    Ok(ours) => assert_eq!(ours, theirs, "{flags:?}: {defs}{text}"),
+                    Err(e) => assert!(!traditional || want.is_none(), "{defs}{text}: {e}"),
+                }
+            }
+        }
+    }
+
+    /// Macros helping `BOOST_PP_LINES`.
+    const BOOST_PP_DEFS: &str = "#define M(z, n, data) data ## n\n#define NESTED(z, n, data) BOOST_PP_REPEAT_ ## z(n, M, data)\n\
+        #define PRED(d, state) BOOST_PP_LESS(state, 4)\n#define OP(d, state) BOOST_PP_INC(state)\n#define SEQ_M(r, data, elem) data elem\n\
+        #define TR(s, data, elem) BOOST_PP_CAT(elem, data)\n#define FOR_PRED(r, state) BOOST_PP_LESS(BOOST_PP_TUPLE_ELEM(2, 0, state), 3)\n\
+        #define FOR_OP(r, state) (BOOST_PP_INC(BOOST_PP_TUPLE_ELEM(2, 0, state)), x)\n#define FOR_M(r, state) BOOST_PP_TUPLE_ELEM(2, 0, state)\n\
+        #define TO(...) BOOST_PP_CAT(BOOST_PP_OVERLOAD(TO_, __VA_ARGS__)(__VA_ARGS__),)\n#define TO_1(a) one a\n#define TO_2(a, b) two a b\n";
+
+    /// Boost.Preprocessor's macros, repetitions, sequences, tuples,
+    /// variadics, arithmetic and loops.
+    const BOOST_PP_LINES: &[&str] = &[
+        "BOOST_PP_CAT(a, BOOST_PP_CAT(b, c)) BOOST_PP_STRINGIZE(BOOST_PP_CAT(a, b))",
+        "BOOST_PP_REPEAT(3, M, x)",
+        "BOOST_PP_REPEAT(4, NESTED, y)",
+        "BOOST_PP_REPEAT_FROM_TO(2, 5, M, z)",
+        "BOOST_PP_ENUM_PARAMS(4, T) BOOST_PP_ENUM_BINARY_PARAMS(3, T, t)",
+        "BOOST_PP_ENUM_TRAILING_PARAMS(2, U) BOOST_PP_ENUM_SHIFTED_PARAMS(3, V)",
+        "BOOST_PP_TUPLE_ELEM(3, 1, (a, b, c)) BOOST_PP_TUPLE_ELEM(1, (a, b, c)) BOOST_PP_TUPLE_ELEM(0, (a))",
+        "BOOST_PP_TUPLE_SIZE((a, b, c)) BOOST_PP_TUPLE_REVERSE((a, b, c)) BOOST_PP_TUPLE_TO_SEQ((a, b, c))",
+        "BOOST_PP_TUPLE_REM()(a, b) BOOST_PP_TUPLE_ENUM((a, b, c)) BOOST_PP_TUPLE_EAT(2)(a, b)",
+        "BOOST_PP_VARIADIC_SIZE(a, b, c, d) BOOST_PP_VARIADIC_SIZE(a) BOOST_PP_VARIADIC_ELEM(2, a, b, c, d)",
+        "BOOST_PP_VARIADIC_TO_SEQ(a, b, c) BOOST_PP_VARIADIC_TO_TUPLE(a, b)",
+        "BOOST_PP_OVERLOAD(PFX_, a, b) TO(x) TO(x, y)",
+        "BOOST_PP_SEQ_SIZE((a)(b)(c)) BOOST_PP_SEQ_ENUM((a)(b)(c)) BOOST_PP_SEQ_ELEM(1, (a)(b)(c))",
+        "BOOST_PP_SEQ_FOR_EACH(SEQ_M, d, (a)(b)(c)) BOOST_PP_SEQ_TRANSFORM(TR, _t, (a)(b))",
+        "BOOST_PP_SEQ_REVERSE((a)(b)(c)) BOOST_PP_SEQ_HEAD((a)(b)) BOOST_PP_SEQ_TAIL((a)(b))",
+        "BOOST_PP_LIST_SIZE((a, (b, BOOST_PP_NIL))) BOOST_PP_ARRAY_SIZE((3, (a, b, c))) BOOST_PP_ARRAY_ELEM(1, (3, (a, b, c)))",
+        "BOOST_PP_ADD(3, 4) BOOST_PP_SUB(9, 4) BOOST_PP_MUL(3, 4) BOOST_PP_DIV(17, 5) BOOST_PP_MOD(17, 5)",
+        "BOOST_PP_INC(7) BOOST_PP_DEC(7) BOOST_PP_MAX(3, 7) BOOST_PP_MIN(3, 7)",
+        "BOOST_PP_LESS(2, 3) BOOST_PP_EQUAL(3, 3) BOOST_PP_GREATER_EQUAL(2, 3) BOOST_PP_NOT_EQUAL(1, 2)",
+        "BOOST_PP_IF(1, yes, no) BOOST_PP_IIF(0, yes, no) BOOST_PP_EXPR_IF(1, e) BOOST_PP_COMMA_IF(1) BOOST_PP_EMPTY()",
+        "BOOST_PP_BOOL(5) BOOST_PP_NOT(0) BOOST_PP_AND(1, 0) BOOST_PP_OR(1, 0) BOOST_PP_BITOR(0, 1)",
+        "BOOST_PP_IS_BEGIN_PARENS((a) b) BOOST_PP_IS_BEGIN_PARENS(a)",
+        "BOOST_PP_WHILE(PRED, OP, 0) BOOST_PP_FOR((0, x), FOR_PRED, FOR_OP, FOR_M)",
+        "BOOST_PP_EXPAND(BOOST_PP_TUPLE_REM(2)(a, b)) BOOST_PP_IDENTITY(x)() BOOST_PP_LIMIT_REPEAT",
+    ];
+
+    /// Boost.Preprocessor (`CPP_DEPS_TEST_BOOST`, the directory holding
+    /// `boost/`) expanded as cl expands it, with either preprocessor: no
+    /// expansion fails, and all are cl's.
+    #[test]
+    #[cfg_attr(not(all(cpp_deps_test_cl, cpp_deps_test_boost)), ignore = "needs CPP_DEPS_TEST_CL and CPP_DEPS_TEST_BOOST")]
+    fn real_cl_boost_preprocessor() {
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let boost = std::env::var("CPP_DEPS_TEST_BOOST").unwrap();
+        let dir = test_dirs::TestDir::new("cpp_deps_cl_boost_pp");
+        let source = format!(
+            "#include <boost/preprocessor.hpp>\n{BOOST_PP_DEFS}{}",
+            BOOST_PP_LINES.iter().enumerate().map(|(i, l)| format!("\"@{i}@\" {l}\n")).collect::<String>()
+        );
+        let lines: Vec<String> = BOOST_PP_LINES.iter().map(|l| l.to_string()).collect();
+        let driver = Driver::new(Cache::new(vec![], cfg!(windows)));
+        for flags in [&["/TP"][..], &["/TP", "/Zc:preprocessor"], &["/TC"], &["/TC", "/std:c11"]] {
+            let flags: Vec<&str> = ["/I", &boost].into_iter().chain(flags.iter().copied()).collect();
+            let (theirs, ok) = cl_lines(&cl, &dir, &flags, &source, lines.len());
+            if !ok {
+                // Boost's MSVC configuration before 1.70 needs the
+                // traditional preprocessor.
+                assert!(flags.contains(&"/Zc:preprocessor") || flags.contains(&"/std:c11"), "{flags:?}: cl failed");
+                println!("NOT TESTED: {flags:?} (cl fails)");
+                continue;
+            }
+            let argv: Vec<String> =
+                [cl.to_string_lossy().as_ref(), "/nologo"].into_iter().chain(flags.iter().copied()).chain(["/c", "lines.cpp"]).map(String::from).collect();
+            let (inv, profile, _, cfg) = driver.configure(&argv, &dir, &Environment::default()).unwrap();
+            assert_eq!(profile.traditional, !inv.conforming, "{flags:?}");
+            let (out, ours) = scan::scan_and_expand(&driver.cache, &cfg, &ProfileOracle(&profile), &inv.source, &lines);
+            assert!(out.exact() && out.missing.is_empty(), "{flags:?}: {:?} {:?}", out.inexact, out.missing);
+            for ((line, ours), theirs) in lines.iter().zip(ours).zip(theirs) {
+                let ours = ours.map(|t| crate::macros::tests::spelled(&t));
+                assert_eq!(ours.as_ref().ok(), theirs.as_ref(), "{flags:?}: {line}: {ours:?}");
+            }
+        }
+    }
+
+    /// Boost.Preprocessor's file and local iteration and slots
+    /// (`CPP_DEPS_TEST_BOOST`), which include files by the values `#if`
+    /// computes, and the traditional preprocessor's own `#if`s, scanned
+    /// exactly and as cl reads them, with either preprocessor.
+    #[test]
+    #[cfg_attr(not(all(cpp_deps_test_cl, cpp_deps_test_boost)), ignore = "needs CPP_DEPS_TEST_CL and CPP_DEPS_TEST_BOOST")]
+    fn real_cl_boost_iteration() {
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let boost = std::env::var("CPP_DEPS_TEST_BOOST").unwrap();
+        let named = |prefix: &str, n: usize| (0..n).map(|i| (format!("{prefix}{i}.h"), String::new())).collect::<Vec<_>>();
+        let pp = "#include <boost/preprocessor/cat.hpp>\n#include <boost/preprocessor/stringize.hpp>\n";
+        let cases: Vec<(&str, Vec<(String, String)>)> = vec![
+            (
+                "local",
+                vec![(
+                    "main.cc".into(),
+                    format!(
+                        "#include <boost/preprocessor/iteration/local.hpp>\n{pp}#define BOOST_PP_LOCAL_LIMITS (1, 4)\n#define BOOST_PP_LOCAL_MACRO(n) int BOOST_PP_CAT(v, n);\n\
+                         #include BOOST_PP_LOCAL_ITERATE()\n#define BOOST_PP_LOCAL_LIMITS (5, 2)\n#define BOOST_PP_LOCAL_MACRO(n) int BOOST_PP_CAT(w, n);\n#include BOOST_PP_LOCAL_ITERATE()\n"
+                    ),
+                )],
+            ),
+            (
+                "file",
+                [
+                    ("main.cc".into(), format!("#include <boost/preprocessor/iteration/iterate.hpp>\n{pp}#define BOOST_PP_ITERATION_LIMITS (0, 3)\n#define BOOST_PP_FILENAME_1 \"it.h\"\n#include BOOST_PP_ITERATE()\n")),
+                    ("it.h".into(), "#if BOOST_PP_IS_ITERATING\n#include BOOST_PP_STRINGIZE(BOOST_PP_CAT(f, BOOST_PP_ITERATION()).h)\n#endif\n".into()),
+                ]
+                .into_iter()
+                .chain(named("f", 6))
+                .collect(),
+            ),
+            (
+                "nested",
+                [
+                    ("main.cc".into(), format!("#include <boost/preprocessor/iteration/iterate.hpp>\n{pp}#define BOOST_PP_ITERATION_PARAMS_1 (3, (1, 3, \"outer.h\"))\n#include BOOST_PP_ITERATE()\n")),
+                    ("outer.h".into(), "#define BOOST_PP_ITERATION_PARAMS_2 (3, (0, BOOST_PP_FRAME_ITERATION(1), \"inner.h\"))\n#include BOOST_PP_ITERATE()\n".into()),
+                    ("inner.h".into(), "#include BOOST_PP_STRINGIZE(BOOST_PP_CAT(BOOST_PP_CAT(g, BOOST_PP_FRAME_ITERATION(1)), BOOST_PP_FRAME_ITERATION(2)).h)\n".into()),
+                ]
+                .into_iter()
+                .chain(named("g", 40))
+                .collect(),
+            ),
+            (
+                "slots",
+                [(
+                    "main.cc".into(),
+                    format!(
+                        "#include <boost/preprocessor/slot/slot.hpp>\n{pp}#define BOOST_PP_VALUE 1 + 2 * 3\n#include BOOST_PP_ASSIGN_SLOT(1)\n\
+                         #include BOOST_PP_STRINGIZE(BOOST_PP_CAT(s, BOOST_PP_SLOT(1)).h)\n#undef BOOST_PP_VALUE\n#define BOOST_PP_VALUE BOOST_PP_SLOT(1) * 2\n\
+                         #include BOOST_PP_ASSIGN_SLOT(2)\n#include BOOST_PP_STRINGIZE(BOOST_PP_CAT(s, BOOST_PP_SLOT(2)).h)\n"
+                    ),
+                )]
+                .into_iter()
+                .chain(named("s", 20))
+                .collect(),
+            ),
+            (
+                "conditions",
+                vec![
+                    (
+                        "main.cc".into(),
+                        "#include <boost/preprocessor.hpp>\n#if BOOST_PP_SEQ_SIZE((a)(b)(c)) == 3 && BOOST_PP_VARIADIC_SIZE(a, b) == 2\n#include \"a.h\"\n#endif\n\
+                         #if BOOST_PP_TUPLE_ELEM(2, 1, (0, 1)) && BOOST_PP_ADD(2, 3) == 5\n#include \"b.h\"\n#endif\n"
+                            .into(),
+                    ),
+                    ("a.h".into(), String::new()),
+                    ("b.h".into(), String::new()),
+                ],
+            ),
+            (
+                "quirks",
+                vec![
+                    (
+                        "main.cc".into(),
+                        "#define G(x, y) x + y\n#define ECHO(...) __VA_ARGS__\n#define EMPTYF()\n#define DEFER(m) m EMPTYF()\n#define PAIR 1, 2\n\
+                         #define G1 G ECHO((1, 2))\n#if G1 == 3\n#include \"a.h\"\n#endif\n#define Q(x) DEFER(G)(x)\n#if Q(PAIR) == 3\n#include \"b.h\"\n#endif\n\
+                         #define CNT(...) CNT_I(__VA_ARGS__, 3, 2, 1, 0)\n#define CNT_I(a, b, c, n, ...) n\n#if CNT(x, y) == 1\n#include \"c.h\"\n#endif\n"
+                            .into(),
+                    ),
+                    ("a.h".into(), String::new()),
+                    ("b.h".into(), String::new()),
+                    ("c.h".into(), String::new()),
+                ],
+            ),
+        ];
+        let tried = test_dirs::TestDir::new("cpp_deps_cl_boost_iteration_tried");
+        for conforming in [false, true] {
+            let mode = if conforming { "conforming" } else { "traditional" };
+            let mut owned: Vec<OwnedCase> = Vec::new();
+            for (name, files) in &cases {
+                if conforming && *name == "quirks" {
+                    continue;
+                }
+                let args: Vec<String> =
+                    ["/nologo", "/I", &boost].into_iter().chain(conforming.then_some("/Zc:preprocessor")).chain(["/c", "main.cc"]).map(String::from).collect();
+                // Boost's MSVC configuration before 1.70 needs the traditional
+                // preprocessor (the quirks are its own).
+                let dir = tried.join(format!("{name}_{mode}"));
+                for (f, text) in files {
+                    std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+                    std::fs::write(dir.join(f), text).unwrap();
+                }
+                let argv: Vec<String> = std::iter::once(cl.to_string_lossy().into_owned()).chain(args.iter().cloned()).collect();
+                match crate::external::compiler_deps(&argv, &dir, None) {
+                    Ok(_) => owned.push((format!("boost_{name}_{mode}"), files.clone(), args)),
+                    Err(e) => {
+                        assert!(conforming, "{name}: {e}");
+                        println!("NOT TESTED: {name} with the conforming preprocessor (cl fails: {e})");
+                    }
+                }
+            }
+            if owned.is_empty() {
+                continue;
+            }
+            let exact = differential_cases(&cl.to_string_lossy(), &owned);
+            for (name, _, _) in &owned {
+                assert!(exact.contains(name), "{name} isn't exact");
+            }
+        }
     }
 
     #[test]

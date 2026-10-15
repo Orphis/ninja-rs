@@ -6,7 +6,8 @@
 //! - GCC and Clang: `-dM -E`, `-E -P`, `-E -M` on stdin;
 //! - `clang-cl`: `/clang:-dM /E`, `/EP` on a temporary file;
 //! - `cl.exe`: `/EP /Zc:preprocessor /PD` (MSVC prints its macros only with
-//!   the conforming preprocessor), `/EP` on a temporary file.
+//!   the conforming preprocessor), `/EP` on a temporary file (with the
+//!   preprocessor the flags choose: its `_MSVC_TRADITIONAL`).
 //!
 //! Results depend on the flags (`-std`, `-target`, `-O`, `-m...`, `-f...`,
 //! `/std:`, `/EH...`, `/MD`...), so callers cache them per compiler and flags.
@@ -17,6 +18,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::expr::Dialect;
+use crate::macros::VaComma;
 
 /// The operators compilers may have, besides `__has_include`.
 pub const OPERATORS: &[&str] = &[
@@ -47,6 +49,8 @@ const QUERY_MARK: &str = "NINJA_RS_QUERY";
 /// Defined by a trigraph (`??=` is `#`) when trigraphs are on.
 const TRIGRAPHS: &str = "??=define NINJA_RS_TRIGRAPHS 1\n";
 const TRIGRAPHS_MARK: &str = "NINJA_RS_TRIGRAPHS";
+/// cl's: 1 with its traditional preprocessor, 0 with the conforming one.
+pub const TRADITIONAL: &str = "_MSVC_TRADITIONAL";
 
 /// How a compiler takes its flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,6 +74,8 @@ pub struct Probe {
     /// Trigraphs are replaced (GCC's ISO modes, Clang's outside GNU modes
     /// and Windows, cl's `/Zc:trigraphs`).
     pub trigraphs: bool,
+    /// When the comma before `__VA_ARGS__` left out goes.
+    pub va_comma: VaComma,
 }
 
 /// The files of make rules (`target: dep dep \` lines).
@@ -288,13 +294,27 @@ pub fn probe(c: &Compiler) -> Result<Probe, String> {
             let mut input: String = OPERATORS.iter().map(|op| format!("#ifdef {op}\n{OPERATOR_MARK} {op}\n#endif\n")).collect();
             // (Not the macro's name, which the text would expand.)
             input.push_str(&format!("{TRIGRAPHS}#ifdef {TRIGRAPHS_MARK}\n{OPERATOR_MARK} trigraphs\n#endif\n"));
+            // Which preprocessor the flags (and `CL`, `_CL_`) choose, unlike
+            // the run above's: cl's word.
+            input.push_str(&format!("{OPERATOR_MARK} traditional {TRADITIONAL}\n"));
             let out = run(c, &["/EP"], &input)?;
+            let mut traditional = None;
             for op in out.stdout.lines().filter_map(|l| l.trim().strip_prefix(OPERATOR_MARK)).map(str::trim) {
                 if op == "trigraphs" {
                     probe.trigraphs = true;
+                } else if let Some(v) = op.strip_prefix("traditional") {
+                    traditional = Some(v.trim().to_string());
                 } else {
                     probe.operators.push(op.to_string());
                 }
+            }
+            let prefix = format!("#define {TRADITIONAL} ");
+            probe.predefines = probe.predefines.lines().filter(|l| !l.starts_with(&prefix)).map(|l| format!("{l}\n")).collect();
+            match traditional.as_deref() {
+                // Undefined: older cl, which has only that one.
+                Some(TRADITIONAL) => {}
+                Some(v) if v.bytes().all(|b| b.is_ascii_digit()) && !v.is_empty() => probe.predefines.push_str(&format!("{prefix}{v}\n")),
+                _ => return Err(format!("{} gave no {TRADITIONAL}", compiler.display())),
             }
         }
     }
@@ -306,7 +326,24 @@ pub fn probe(c: &Compiler) -> Result<Probe, String> {
         probe.implicit = make_deps(&deps.stdout).into_iter().filter(|d| d != "-" && d != "<stdin>").collect();
     }
     probe.dialect = dialect(c);
+    probe.va_comma = va_comma(c);
     Ok(probe)
+}
+
+/// When the compiler drops the comma before `__VA_ARGS__` a call leaves
+/// out, as it preprocesses text (see `VaComma`): GCC's and Clang's strict
+/// modes keep it when the macro has no other parameter, Clang's MSVC
+/// compatibility drops it without `##` too. The usual rules when it can't
+/// tell.
+fn va_comma(c: &Compiler) -> VaComma {
+    let input = "#define NINJA_RS_A(...) NINJA_RS_VA1 x, ## __VA_ARGS__ ;\n#define NINJA_RS_B(...) NINJA_RS_VA2 x, __VA_ARGS__ ;\nNINJA_RS_A()\nNINJA_RS_B()\n";
+    let Ok(out) = run(c, text_flags(c.style), input) else { return VaComma::default() };
+    // Whether the line with a mark kept the comma.
+    let kept = |mark: &str| out.stdout.lines().find(|l| l.contains(mark)).map(|l| l.contains(','));
+    match (kept("NINJA_RS_VA1"), kept("NINJA_RS_VA2")) {
+        (Some(named), Some(bare)) => VaComma { needs_named: named, bare: !bare },
+        _ => VaComma::default(),
+    }
 }
 
 /// The built-in include directories GCC, Clang and `clang-cl` report
@@ -463,17 +500,7 @@ mod tests {
     #[test]
     fn hung_compiler() {
         let dir = test_dirs::TestDir::new("cpp_deps_hung");
-        let script = if cfg!(windows) {
-            let s = dir.join("hung.cmd");
-            std::fs::write(&s, "@ping -n 30 127.0.0.1 >NUL\r\n@echo #define X 1\r\n").unwrap();
-            s
-        } else {
-            let s = dir.join("hung");
-            std::fs::write(&s, "#!/bin/sh\nsleep 30\necho '#define X 1'\n").unwrap();
-            #[cfg(unix)]
-            std::fs::set_permissions(&s, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-            s
-        };
+        let script = crate::test_tool(&dir, "hung", "@ping -n 30 127.0.0.1 >NUL\r\n@echo #define X 1\r\n", "sleep 30\necho '#define X 1'\n");
         // In its directory: what it started dies with it (the directory is
         // then removed).
         let c = Compiler { path: &script, args: &[], style: Style::Gcc, lang: "c", cwd: &dir, env: None, timeout: Duration::from_millis(300) };

@@ -2,8 +2,11 @@
 //! `ninja_daemon`), started by the first build that wants it.
 
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
+use ninja_core::graph::EdgeId;
+use ninja_core::runner::{AbortFuture, CommandRunner, ExecKind, Task, WaitFuture};
 use ninja_core::status::{print_err, print_out};
 use ninja_daemon::{Client, Location, ipc};
 
@@ -36,6 +39,61 @@ pub fn connect() -> io::Result<Client> {
     })
 }
 
+/// Runs commands with `inner`, telling the daemon when one ran on the
+/// host: what it wrote without naming it (a generator's tree, a step
+/// writing into the source tree), which the next action may read, is seen
+/// by the next requests (see `ninja_daemon::watch::Watcher::fence`).
+pub struct Telling {
+    pub inner: Box<dyn CommandRunner>,
+    pub client: Arc<Client>,
+}
+
+impl CommandRunner for Telling {
+    fn can_run_more(&self) -> usize {
+        self.inner.can_run_more()
+    }
+
+    fn start_command(&mut self, task: Task) -> Result<(), String> {
+        self.inner.start_command(task)
+    }
+
+    fn wait_for_command(&mut self) -> WaitFuture<'_> {
+        let client = self.client.clone();
+        let next = self.inner.wait_for_command();
+        Box::pin(async move {
+            let done = next.await;
+            if done.as_ref().is_some_and(|r| r.kind == ExecKind::Local) {
+                client.ran_locally();
+            }
+            done
+        })
+    }
+
+    fn active_edges(&self) -> Vec<EdgeId> {
+        self.inner.active_edges()
+    }
+
+    fn abort(&mut self) -> AbortFuture<'_> {
+        self.inner.abort()
+    }
+
+    fn wants_inputs(&self) -> bool {
+        self.inner.wants_inputs()
+    }
+
+    fn slot_kinds(&self) -> usize {
+        self.inner.slot_kinds()
+    }
+
+    fn slots_of(&self, task: &Task) -> usize {
+        self.inner.slots_of(task)
+    }
+
+    fn has_free_slot(&self, kind: usize) -> bool {
+        self.inner.has_free_slot(kind)
+    }
+}
+
 /// What the daemon runs: this program, or on Windows, where a running
 /// program can't be replaced, a copy in the daemon's directory (so that
 /// ninja-rs can be rebuilt or upgraded while it runs).
@@ -64,8 +122,8 @@ const USAGE: &str = "usage: ninja-rs -t daemon [status|start|stop|run]
 The daemon keeps what builds with --daemon learn (scanned headers, compiler
 profiles, file digests, toolchain trees) and watches the files they come
 from, so that a build checks again only what changed. Builds start it (not
-for 5 minutes after it failed to); it exits after NINJA_RS_DAEMON_IDLE
-seconds without builds [default=10800].
+for 5 minutes after it failed to, or didn't answer); it exits after
+NINJA_RS_DAEMON_IDLE seconds without builds [default=10800].
 
   status  what it keeps and watches (the default)
   start   start it
@@ -122,11 +180,7 @@ pub fn tool(args: &[String]) -> i32 {
             loc.note_start(None);
             match connect().and_then(|c| c.status()) {
                 Ok(s) => {
-                    print_out(&format!(
-                        "ninja-rs daemon running (pid {})
-",
-                        s.pid
-                    ));
+                    print_out(&format!("ninja-rs daemon running (pid {})\n", s.pid));
                     0
                 }
                 Err(e) => {
@@ -146,6 +200,10 @@ pub fn tool(args: &[String]) -> i32 {
                     1
                 }
             },
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                error(&format!("stopping the daemon: it doesn't answer ({e}); see {}", loc.log_file().display()));
+                1
+            }
             Err(_) => {
                 print_out("ninja-rs daemon not running\n");
                 0
@@ -181,18 +239,15 @@ pub fn tool(args: &[String]) -> i32 {
                 print_out(&text);
                 0
             }
+            // Its place is held (it holds the lock): another can't start.
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                print_out(&format!("ninja-rs daemon running, but it doesn't answer ({e})\n  log: {}\n", loc.log_file().display()));
+                1
+            }
             Err(_) => {
-                print_out(
-                    "ninja-rs daemon not running
-",
-                );
+                print_out("ninja-rs daemon not running\n");
                 if let Some(why) = loc.start_failed(ipc::START_FAILED_FOR) {
-                    print_out(&format!(
-                        "  it failed to start: {why}
-  log: {}
-",
-                        loc.log_file().display()
-                    ));
+                    print_out(&format!("  {why}\n  log: {}\n", loc.log_file().display()));
                 }
                 0
             }
@@ -205,5 +260,86 @@ pub fn tool(args: &[String]) -> i32 {
             print_err(&format!("ninja: error: unknown daemon command '{other}'\n{USAGE}"));
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ninja_core::runner::{ExitStatus, TaskResult};
+    use ninja_daemon::proto::{self, PROTOCOL, Request, Response};
+    use std::sync::Mutex;
+
+    /// Gives the results it's made with.
+    struct Finishing(Vec<ExecKind>);
+
+    impl CommandRunner for Finishing {
+        fn can_run_more(&self) -> usize {
+            1
+        }
+        fn start_command(&mut self, _: Task) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait_for_command(&mut self) -> WaitFuture<'_> {
+            let kind = self.0.pop();
+            Box::pin(async move {
+                kind.map(|kind| TaskResult {
+                    edge: EdgeId(0),
+                    status: ExitStatus::Success,
+                    output: Vec::new(),
+                    kind,
+                    cas_outputs: Vec::new(),
+                    lost_inputs: Vec::new(),
+                })
+            })
+        }
+        fn active_edges(&self) -> Vec<EdgeId> {
+            Vec::new()
+        }
+        fn abort(&mut self) -> AbortFuture<'_> {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// A command run on the host is told to the daemon (the next request
+    /// says so, and what it wrote is seen first); one run remotely isn't.
+    #[test]
+    fn local_commands_told() {
+        let base = test_dirs::TestDir::new("ninja_rs_daemon_told");
+        let loc = Location { dir: base.join("daemon"), id: "told".into() };
+        loc.create_dir().unwrap();
+        // A daemon noting what requests say.
+        let said: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let mut listener = ipc::Listener::bind(&loc).unwrap();
+        let noted = said.clone();
+        std::thread::spawn(move || {
+            while let Ok(mut s) = listener.accept() {
+                let noted = noted.clone();
+                std::thread::spawn(move || {
+                    while let Ok(Some(req)) = proto::read::<Request>(&mut s) {
+                        let answer = match req {
+                            Request::Files { paths, wrote } => {
+                                noted.lock().unwrap().push(wrote);
+                                Response::Files(paths.iter().map(|_| Err("none".to_string())).collect())
+                            }
+                            _ => Response::Hello { protocol: PROTOCOL, pid: 1, version: "fake".into() },
+                        };
+                        if proto::write(&mut s, &answer).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Arc::new(Client::connect(&loc).unwrap());
+        let mut runner = Telling { inner: Box::new(Finishing(vec![ExecKind::Local, ExecKind::Remote])), client: client.clone() };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let ask = || client.files(&[base.join("a.h")]).unwrap();
+        rt.block_on(runner.wait_for_command()).unwrap();
+        ask();
+        rt.block_on(runner.wait_for_command()).unwrap();
+        ask();
+        ask();
+        assert_eq!(*said.lock().unwrap(), [false, true, false]);
     }
 }

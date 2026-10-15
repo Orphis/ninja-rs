@@ -16,11 +16,13 @@ hex.workspace = true
 hyper-util.workspace = true
 ninja-os = { path = "../../../crates/ninja-os" }
 prost.workspace = true
-rustls.workspace = true
+rustls = { workspace = true, features = ["ring", "std"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["net"] }
+tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+webpki-roots.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]

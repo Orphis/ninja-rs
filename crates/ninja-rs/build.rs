@@ -6,9 +6,10 @@
 //! checkout of its own (not sources copied into another repository), with
 //! `.dirty` after it when tracked files differ from it. It is this crate's,
 //! the one at the top, rather than one the others depend on: when this runs
-//! again (a commit, a checkout, a change to git's index), only this crate is
-//! built again. Bazel builds don't ask git: they're stamped instead
-//! (`--config=stamp`, `commit.env`).
+//! again (a commit, a checkout, the first edit of a clean tree, a change to
+//! git's index in a dirty one), only this crate is built again. Bazel
+//! builds don't ask git: they're stamped instead (`--config=stamp`,
+//! `commit.env`).
 //!
 //! Even with long paths enabled system-wide, Windows only lifts the 260
 //! character `MAX_PATH` limit for processes whose manifest declares
@@ -105,18 +106,22 @@ fn coff_object(machine: u16, addr32nb: u16) -> Vec<u8> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    commit();
+    // Bazel stamps the commit instead, and its tests read data files (its
+    // build of this script sets this).
+    if std::env::var_os("NINJA_RS_BAZEL").is_none() {
+        let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+        if let Some(root) = manifest.parent().and_then(Path::parent) {
+            // Where the tests find files of the sources, however they run
+            // (by hand, in a debugger: without Cargo's variables).
+            println!("cargo:rustc-env=NINJA_RS_SOURCE_DIR={}", root.display());
+            commit(root);
+        }
+    }
     manifest();
 }
 
-/// Sets `NINJA_RS_COMMIT`, in a git checkout of the workspace.
-fn commit() {
-    // Bazel stamps it instead (its build of this script sets this).
-    if std::env::var_os("NINJA_RS_BAZEL").is_some() {
-        return;
-    }
-    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let Some(root) = manifest.parent().and_then(Path::parent) else { return };
+/// Sets `NINJA_RS_COMMIT`, in a git checkout of the workspace `root`.
+fn commit(root: &Path) {
     // What git says in the workspace root, empty or not.
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git").arg("--no-optional-locks").args(args).current_dir(root).output().ok().filter(|o| o.status.success())?;
@@ -128,19 +133,27 @@ fn commit() {
         git(&["rev-parse", "--show-cdup"]).is_some_and(|up| up.is_empty()) && git(&["ls-files", "--error-unmatch", "crates/ninja-rs/build.rs"]).is_some();
     let Some(commit) = git(&["rev-parse", "--short=12", "HEAD"]).filter(|c| ours && !c.is_empty()) else { return };
     let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_none_or(|s| !s.is_empty());
-    // Run again after a commit, a checkout or a change to the index: HEAD,
-    // the branch's ref (or the packed ones), the index. A file that doesn't
-    // exist would run it always.
-    let mut watched = vec!["HEAD".to_string(), "index".to_string()];
-    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]).filter(|b| !b.is_empty()) {
-        watched.extend([branch, "packed-refs".to_string()]);
+    let git_path = |name: &str| git(&["rev-parse", "--git-path", name]).map(|p| root.join(p));
+    // Run again after a commit or a checkout: HEAD, and the branch's ref,
+    // or when it's packed the directory git will write it to. A path that
+    // doesn't exist would run it always.
+    let mut paths: Vec<PathBuf> = git_path("HEAD").into_iter().collect();
+    if let (Some(branch), Some(refs)) = (git(&["symbolic-ref", "-q", "HEAD"]).filter(|b| !b.is_empty()), git_path("refs")) {
+        paths.extend(git_path(&branch).and_then(|r| r.ancestors().take_while(|p| p.starts_with(&refs)).find(|p| p.exists()).map(Path::to_path_buf)));
     }
-    let mut paths: Vec<PathBuf> = watched.iter().filter_map(|name| git(&["rev-parse", "--git-path", name])).map(|p| root.join(p)).collect();
-    // And after the first edit of a clean tree, which makes it dirty: the
-    // tracked files and directories (rather than every edit, which would
-    // build this crate again each time).
-    if !dirty {
-        paths.extend(git(&["ls-tree", "--name-only", "HEAD"]).unwrap_or_default().lines().map(|name| root.join(name)));
+    if dirty {
+        // Back to clean through git (a commit, a checkout of the files, a
+        // stash): the index changes. (Edits undone otherwise leave the
+        // marker until then: watching the files changed would build this
+        // crate again at each of their edits.)
+        paths.extend(git_path("index"));
+    } else {
+        // The first edit makes it dirty: the tracked files. Not their
+        // directories, which untracked files change (an editor's backup, a
+        // target directory), nor the index, which any `git status` may
+        // rewrite (the other system's, in a checkout Windows and WSL share).
+        let files = git(&["ls-files", "-z"]).unwrap_or_default();
+        paths.extend(files.split('\0').filter(|f| !f.is_empty()).map(|f| root.join(f)));
     }
     for path in paths.iter().filter(|p| p.exists()) {
         println!("cargo:rerun-if-changed={}", path.display());

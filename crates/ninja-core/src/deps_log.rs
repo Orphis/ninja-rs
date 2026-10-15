@@ -17,9 +17,13 @@
 //! a log read positionally would then give outputs each other's deps. As in
 //! ninja, reading stops at the first record that doesn't fit (a path whose
 //! id doesn't follow, a path or id seen before, a malformed line), and the
-//! rest is cut off before the next append: those outputs build again. A
-//! write cut short (a crash, a kill, a full disk) leaves a torn last line,
-//! which is handled the same way.
+//! rest is cut off before the next append: those outputs build again.
+//!
+//! A write cut short (a crash, a kill, a full disk) leaves a torn last
+//! line, which may still parse (ids cut short), and which readers leave
+//! out. The next build cuts it off; a writer appending meanwhile ends it
+//! with a NUL and a newline first, which no path or number holds: readers
+//! skip such a line, and its record (whose output builds again), and go on.
 //!
 //! Builds take the build directory's lock
 //! ([`LogLock`](crate::build_log::LogLock)) so that one at a time writes
@@ -31,10 +35,11 @@
 //!
 //! Records are written in batches ([`DepsLog::flush`]): those of the
 //! commands one turn of the build loop reaped, under one lock, in one
-//! write. When the file goes on with what can't be read (a write cut
-//! short, a process appending without taking turns), the lock's holder
-//! rewrites it from what it knows, and the builds it runs write their
-//! records to the new file; until then, theirs wait in memory.
+//! write. When the file goes on with what can't be read (a process
+//! appending without taking turns), the lock's holder rewrites it from
+//! what it knows, and the builds it runs write their records to the new
+//! file; until then, theirs wait in memory. A record waiting to be written
+//! is the build's newest: one read meanwhile doesn't replace it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -51,6 +56,9 @@ const SIGNATURE: &str = "# ninja-rs deps v3\n";
 const RECOVERING: &str = "premature end of file; recovering";
 /// The file id of a path the file doesn't hold.
 const NOT_IN_FILE: u32 = u32::MAX;
+/// What ends a torn last line another writer left (see the module's
+/// documentation): readers skip a line ending with a NUL.
+const VOID: &str = "\0\n";
 /// How many times a build rewrites a file it keeps finding unreadable (a
 /// process appending without taking turns all along, a file system without
 /// locks) before it stops writing to it: each rewrite writes it all.
@@ -104,6 +112,9 @@ pub struct DepsLog {
     /// Where the records read end, when something follows them (a torn
     /// line, a record that doesn't fit): cut off before the next append.
     truncate_to: Option<u64>,
+    /// What follows them is a torn last line only, which a shared writer
+    /// ends (see `follow`) rather than stop.
+    torn_tail: bool,
     /// The file's length when loaded (`None`: there was none).
     loaded_len: Option<u64>,
     /// The file as this log knows it: which one (its identity), the id
@@ -120,8 +131,11 @@ pub struct DepsLog {
     stopped: bool,
     /// How this log may write the file (see `open_for_write`).
     access: Access,
-    /// The outputs whose records `flush` writes next.
+    /// The outputs whose records `flush` writes next, and by this log's
+    /// ids whether one is among them: a record read from the file doesn't
+    /// replace it (see `read_deps`).
     pending: Vec<u32>,
+    is_pending: Vec<bool>,
     /// The outputs recorded since the log was opened for writing: a file
     /// replacing the one they went to gets them again.
     recorded: Vec<u32>,
@@ -168,7 +182,19 @@ impl DepsLog {
         self.paths.push(path.to_string());
         self.ids.insert(path.to_string(), id);
         self.file_ids.push(NOT_IN_FILE);
+        self.is_pending.push(false);
         id
+    }
+
+    /// Makes `outputs` the records `flush` writes next.
+    fn set_pending(&mut self, outputs: Vec<u32>) {
+        for &out in &self.pending {
+            self.is_pending[out as usize] = false;
+        }
+        for &out in &outputs {
+            self.is_pending[out as usize] = true;
+        }
+        self.pending = outputs;
     }
 
     /// Loads the log; a missing file is not an error. Returns a warning for
@@ -207,6 +233,7 @@ impl DepsLog {
         self.file_end = end as u64;
         if end < data.len() {
             self.truncate_to = Some(end as u64);
+            self.torn_tail = !data[end..].contains(&b'\n');
             return Ok(Some(RECOVERING.into()));
         }
         if total > 1000 && total > self.deps.len() * 3 {
@@ -216,11 +243,15 @@ impl DepsLog {
     }
 
     /// Reads the complete lines of `data` from `offset`, up to the first
-    /// that doesn't fit. Returns where they end, and how many deps records
-    /// they hold.
+    /// that doesn't fit, skipping torn lines a writer ended (see `VOID`).
+    /// Returns where they end, and how many deps records they hold.
     fn read_records(&mut self, data: &[u8], mut offset: usize) -> (usize, usize) {
         let mut total = 0;
         while let Some(len) = data[offset..].iter().position(|&b| b == b'\n') {
+            if len > 0 && data[offset + len - 1] == 0 {
+                offset += len + 1;
+                continue;
+            }
             let Ok(line) = std::str::from_utf8(&data[offset..offset + len]) else { break };
             let fits = if let Some(p) = line.strip_prefix("p\t") {
                 self.read_path(p)
@@ -255,27 +286,33 @@ impl DepsLog {
     }
 
     /// Reads a deps record, `<output id>\t<mtime>\t<id> <id> ...`, of the
-    /// file's ids.
+    /// file's ids. It doesn't replace a record of this log's waiting to be
+    /// written, which is newer: than another writer's made meanwhile, or
+    /// the holder's older one, in the file it rewrote while this log was
+    /// stopped.
     fn read_deps(&mut self, record: &str) -> Option<()> {
         let mut f = record.split('\t');
         let ours = |id: &str| self.from_file.get(id.parse::<usize>().ok()?).copied();
         let out = ours(f.next()?)?;
         let mtime = f.next()?.parse().ok()?;
         let nodes = f.next().unwrap_or("").split(' ').filter(|s| !s.is_empty()).map(ours).collect::<Option<Vec<u32>>>()?;
-        self.deps.insert(out, Record { mtime, nodes });
+        if !self.is_pending[out as usize] {
+            self.deps.insert(out, Record { mtime, nodes });
+        }
         Some(())
     }
 
     /// Prepares for appending, as `access` allows: an exclusive writer
     /// recompacts first if needed (`is_live` tells whose deps stay) and
-    /// cuts off what `load` left out; a shared one does neither, and
-    /// writes nothing to the file if `load` left something out, until the
-    /// holder of the lock rewrites it (see `cant_follow`).
+    /// cuts off what `load` left out; a shared one does neither: it ends a
+    /// torn last line (see `follow`), and if `load` left out more, writes
+    /// nothing to the file until the holder of the lock rewrites it (see
+    /// `cant_follow`).
     pub fn open_for_write(&mut self, path: &str, is_live: &dyn Fn(&str) -> bool, access: Access) -> Result<(), String> {
         self.path = path.to_string();
         self.access = access;
         if access == Access::Shared {
-            self.stopped = self.truncate_to.take().is_some();
+            self.stopped = self.truncate_to.take().is_some() && !self.torn_tail;
             return Ok(());
         }
         // Written to since it was loaded (by a process that doesn't take the
@@ -329,7 +366,7 @@ impl DepsLog {
                 self.from_file.clear();
                 self.file_end = 0;
                 self.stopped = false;
-                self.pending.clone_from(&self.recorded);
+                self.set_pending(self.recorded.clone());
             }
             self.file = Some(f);
         }
@@ -353,6 +390,7 @@ impl DepsLog {
         }
         if !self.path.is_empty() {
             self.pending.push(out);
+            self.is_pending[out as usize] = true;
             self.recorded.push(out);
         }
         self.deps.insert(out, record);
@@ -380,15 +418,18 @@ impl DepsLog {
         }
         let file = self.file.take().expect("opened");
         let written = with_lock(&file, || {
-            if !self.follow(&file)? {
-                return Ok(false);
-            }
             let mut text = String::new();
+            match self.follow(&file)? {
+                Followed::All => {}
+                Followed::Torn => text.push_str(VOID),
+                Followed::Not => return Ok(false),
+            }
             if self.file_end == 0 {
                 text.push_str(SIGNATURE);
             }
             let mut nodes = Vec::new();
             for out in std::mem::take(&mut self.pending) {
+                self.is_pending[out as usize] = false;
                 let record = &self.deps[&out];
                 let mtime = record.mtime;
                 nodes.clone_from(&record.nodes);
@@ -406,9 +447,9 @@ impl DepsLog {
         if written.map_err(|e| format!("Error writing to deps log: {e}"))? { Ok(None) } else { self.cant_follow() }
     }
 
-    /// The file goes on with what this log can't read (a write cut short,
-    /// a process appending without taking turns, on a file system without
-    /// locks too), or was cut. Appended to, its records would be lost to
+    /// The file goes on with what this log can't read (a process appending
+    /// without taking turns, on a file system without locks too), or was
+    /// cut. Appended to, its records would be lost to
     /// every reader. The build holding the directory's lock rewrites it
     /// from what it read and recorded, and goes on (up to `MAX_REWRITES`
     /// times); a build it runs (see `Access::Shared`), which may not, stops
@@ -459,7 +500,7 @@ impl DepsLog {
         self.file_ids.clone_from(&self.from_file);
         self.file_end = text.len() as u64;
         self.known = File::open(&self.path).and_then(|f| ninja_os::identity(&f)).ok();
-        self.pending.clear();
+        self.set_pending(Vec::new());
         self.stopped = false;
         self.truncate_to = None;
         self.loaded_len = Some(text.len() as u64);
@@ -467,17 +508,20 @@ impl DepsLog {
     }
 
     /// Reads what other processes appended to `file` since this log last
-    /// read or wrote it. False when it doesn't fit (or the file was cut).
-    fn follow(&mut self, file: &File) -> std::io::Result<bool> {
-        let len = file.metadata()?.len();
+    /// read or wrote it.
+    fn follow(&mut self, file: &File) -> std::io::Result<Followed> {
+        let mut f = file;
+        // Where it ends, as a seek there tells: its metadata, asked at
+        // every write, takes three times as long. Appends go to the end
+        // wherever the position is.
+        let len = f.seek(SeekFrom::End(0))?;
         if len == self.file_end {
-            return Ok(true);
+            return Ok(Followed::All);
         }
         if len < self.file_end {
-            return Ok(false);
+            return Ok(Followed::Not);
         }
         let mut data = Vec::new();
-        let mut f = file;
         f.seek(SeekFrom::Start(self.file_end))?;
         f.take(len - self.file_end).read_to_end(&mut data)?;
         let start = if self.file_end > 0 {
@@ -485,11 +529,19 @@ impl DepsLog {
         } else if data.starts_with(SIGNATURE.as_bytes()) {
             SIGNATURE.len()
         } else {
-            return Ok(false);
+            return Ok(Followed::Not);
         };
         let (end, _) = self.read_records(&data, start);
         self.file_end += end as u64;
-        Ok(end == data.len())
+        if end == data.len() {
+            return Ok(Followed::All);
+        }
+        if data[end..].contains(&b'\n') {
+            return Ok(Followed::Not);
+        }
+        // What the write ending it follows.
+        self.file_end = len;
+        Ok(Followed::Torn)
     }
 
     /// The file's id of the path `id`, appending its record to `text` if
@@ -529,6 +581,7 @@ impl DepsLog {
         let old_paths = std::mem::take(&mut self.paths);
         self.ids.clear();
         self.file_ids.clear();
+        self.is_pending.clear();
         let mut out = String::from(SIGNATURE);
         for (output, record) in live {
             let first_new = self.paths.len();
@@ -561,6 +614,17 @@ impl Drop for DepsLog {
             self.close();
         }
     }
+}
+
+/// How much of what other processes appended `DepsLog::follow` read.
+enum Followed {
+    /// All of it.
+    All,
+    /// All but a torn last line (one without its newline), which the next
+    /// write ends with `VOID`.
+    Torn,
+    /// Not all: what follows doesn't fit, or the file was cut.
+    Not,
 }
 
 /// What a writer finding the file going on with what it can't read says
@@ -883,7 +947,7 @@ mod tests {
         assert_eq!(log.load(&p).unwrap(), None);
         assert_eq!(log.get("dead.o").unwrap().mtime, 1099);
         assert_eq!(paths(&log, "b.o"), vec!["b.h"]);
-        // A torn record: kept, and nothing appended after it.
+        // A torn record: kept, ended, and skipped.
         std::fs::write(&p, &after[..after.len() - 2]).unwrap();
         let torn = std::fs::read(&p).unwrap();
         let mut shared = DepsLog::new();
@@ -891,8 +955,12 @@ mod tests {
         shared.open_for_write(&p, &|_| true, Access::Shared).unwrap();
         shared.record_deps("c.o", 1, &["c.h"]).unwrap();
         shared.close();
-        assert_eq!(std::fs::read(&p).unwrap(), torn);
-        assert_eq!(paths(&shared, "c.o"), vec!["c.h"]);
+        assert!(std::fs::read(&p).unwrap().starts_with(&torn), "cut");
+        let mut log = DepsLog::new();
+        assert_eq!(log.load(&p).unwrap(), None);
+        assert_eq!(paths(&log, "c.o"), vec!["c.h"]);
+        assert!(log.get("b.o").is_none());
+        assert_eq!(log.get("dead.o").unwrap().mtime, 1099);
     }
 
     /// A log another process replaced while a build appends to it (a
@@ -934,11 +1002,10 @@ mod tests {
         assert_eq!(["a", "b", "c"].map(|o| paths(&last, o)), [vec!["a.h"], vec!["b.h", "a.h"], vec!["c.h"]]);
     }
 
-    /// A torn line (a writer killed, a full disk) or a process appending
-    /// without taking turns: the holder of the lock rewrites the file from
-    /// what it read and recorded, says so once, and goes on. It stopped
-    /// writing for the rest of its build, silently: those outputs built
-    /// again next time.
+    /// A process appending without taking turns: the holder of the lock
+    /// rewrites the file from what it read and recorded, says so once, and
+    /// goes on. It stopped writing for the rest of its build, silently:
+    /// those outputs built again next time.
     #[test]
     fn the_holder_rewrites_a_log_it_cant_read() {
         let (_dir, p) = tmp("deps-rewrite");
@@ -948,7 +1015,8 @@ mod tests {
         log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
         record(&mut log, "c", 2, &["c.h", "old.h"]);
         let ids: Vec<u32> = log.get("c").unwrap().ids().to_vec();
-        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"d\t1\t5\t1 2").unwrap();
+        // A record of its ids: path 9 isn't the file's.
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"d\t1\t5\t1 9\n").unwrap();
         log.record_deps("d", 2, &["d.h"]).unwrap();
         let warning = log.flush().unwrap().unwrap_or_default();
         assert!(warning.starts_with(&format!("deps log {p}: what was appended to it can't be read (")) && warning.ends_with("): rewritten"), "{warning}");
@@ -1008,6 +1076,77 @@ mod tests {
             assert!(read.get(out).is_some(), "{out} isn't recorded");
         }
         assert_eq!(paths(&read, "e"), vec!["e.h"]);
+    }
+
+    /// A build the holder of the lock runs, stopped by a line it can't
+    /// read, builds an output again, whose older record the holder then
+    /// rewrites the log with: its own, newer, stays, in the file and in its
+    /// view. (Read again, the holder's replaced it: the output built again
+    /// next time, or its stale deps were trusted.)
+    #[test]
+    fn a_shared_writer_keeps_its_newer_records_after_the_rewrite() {
+        let (_dir, p) = tmp("deps-shared-newer");
+        two_outputs(&p);
+        let (mut outer, mut inner) = (DepsLog::new(), DepsLog::new());
+        assert_eq!(outer.load(&p).unwrap(), None);
+        assert_eq!(inner.load(&p).unwrap(), None);
+        outer.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        inner.open_for_write(&p, &|_| true, Access::Shared).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"p\t9\tx.h\n").unwrap();
+        // `a` reads new.h now.
+        inner.record_deps("a", 7, &["new.h"]).unwrap();
+        assert!(inner.flush().unwrap().is_some());
+        // The holder rewrites the log, with the record of `a` it loaded.
+        outer.record_deps("c", 2, &["c.h"]).unwrap();
+        assert!(outer.flush().unwrap().is_some());
+        record(&mut inner, "d", 2, &["d.h"]);
+        let newer = (vec!["new.h".to_string()], 7);
+        assert_eq!((paths(&inner, "a"), inner.get("a").unwrap().mtime), newer);
+        for log in [&mut outer, &mut inner] {
+            log.close();
+        }
+        let mut read = DepsLog::new();
+        assert_eq!(read.load(&p).unwrap(), None);
+        assert_eq!((paths(&read, "a"), read.get("a").unwrap().mtime), newer);
+        assert_eq!((paths(&read, "c"), paths(&read, "d")), (vec!["c.h".to_string()], vec!["d.h".to_string()]));
+    }
+
+    /// A torn line (a writer killed, a full disk) stops no writer: the next
+    /// one ends it, and readers skip it, and its record. (A build the
+    /// holder of the lock runs stopped, its records waiting for a rewrite
+    /// the holder made only when it had records of its own to write: lost
+    /// when it had none, its only command being that build.)
+    #[test]
+    fn a_torn_line_stops_no_writer() {
+        let (_dir, p) = tmp("deps-torn-shared");
+        two_outputs(&p);
+        let (mut outer, mut inner) = (DepsLog::new(), DepsLog::new());
+        assert_eq!(outer.load(&p).unwrap(), None);
+        assert_eq!(inner.load(&p).unwrap(), None);
+        outer.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        inner.open_for_write(&p, &|_| true, Access::Shared).unwrap();
+        record(&mut inner, "c", 2, &["c.h"]);
+        // A writer killed in its write: a new path, and a record of b cut
+        // inside its ids (`5 1` of `5 12`), which would still parse.
+        std::fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"p\t5\tk.h\nd\t2\t9\t5 1").unwrap();
+        record(&mut inner, "d", 2, &["d.h", "k.h"]);
+        record(&mut outer, "e", 2, &["e.h", "k.h"]);
+        for log in [&mut outer, &mut inner] {
+            log.close();
+        }
+        let mut read = DepsLog::new();
+        assert_eq!(read.load(&p).unwrap(), None);
+        assert_eq!((paths(&read, "b"), read.get("b").unwrap().mtime), (vec!["old.h".to_string()], 1));
+        for (out, deps) in [("a", vec!["old.h"]), ("c", vec!["c.h"]), ("d", vec!["d.h", "k.h"]), ("e", vec!["e.h", "k.h"])] {
+            assert_eq!(paths(&read, out), deps, "{out}");
+        }
+        // Ended once.
+        assert_eq!(std::fs::read(&p).unwrap().iter().filter(|&&b| b == 0).count(), 1);
+        // The next build cuts nothing: the line ended is one it skips.
+        let len = std::fs::metadata(&p).unwrap().len();
+        read.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        read.close();
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), len);
     }
 
     /// What a writer of `writers_in_processes` (see `writer`) does: the
@@ -1147,9 +1286,7 @@ mod tests {
     }
 
     /// One of the builds the holder of the lock runs is killed while it
-    /// writes (a torn line): the holder rewrites the log, the others write
-    /// their records to the new one. They stopped writing, silently, for
-    /// the rest of their builds.
+    /// writes (a torn line): the next writer ends the line, and all go on.
     #[test]
     fn writers_in_processes_survive_a_torn_line() {
         if let Ok(spec) = std::env::var(WRITER_ENV) {

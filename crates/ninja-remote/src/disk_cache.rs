@@ -19,12 +19,13 @@
 //!
 //! A directory without `VERSION` (removed by a cleaner of old files) is
 //! ours again when it has the `size` only this cache writes (after every
-//! build that wrote to it): `VERSION` is written back. Without it, one with
-//! Bazel's layout (`ac/`, `cas/`, and `tmp/`, `gc/`, but what this cache
-//! adds using it) is Bazel's `--disk_cache`, which a shared `.bazelrc`
-//! names: it is used as it is, without writing `VERSION` there, its
-//! garbage left to its owner, and the build says so once. Any other
-//! directory that isn't empty (a mistyped path) isn't used.
+//! build that wrote to it), or nothing stored in its `ac/` and `cas/`:
+//! `VERSION` is written back. Else, one with Bazel's layout (`ac/`, `cas/`,
+//! and `tmp/`, `gc/`, but what this cache adds using it) is Bazel's
+//! `--disk_cache`, which a shared `.bazelrc` names: it is used as it is,
+//! without writing `VERSION` there, its garbage left to its owner, and the
+//! build says so once (per invocation tree). Any other directory that isn't
+//! empty (a mistyped path) isn't used.
 //!
 //! Content-defined chunking: a blob larger than [`CHUNK_MAX`] is stored as
 //! its FastCDC 2020 chunks (REAPI's `FAST_CDC_2020` with its recommended
@@ -112,30 +113,56 @@ const LAYOUT: &[&str] = &["VERSION", "ac", "cas", "chunked", "tmp", "gc", "size"
 fn layout(root: &Path) -> Layout {
     let Ok(entries) = std::fs::read_dir(root) else { return Layout::Empty };
     let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    // Whether a directory of entries holds one (in its shards).
+    let holds_entries = |top: &str| {
+        std::fs::read_dir(root.join(top))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| !e.path().is_dir() || std::fs::read_dir(e.path()).is_ok_and(|mut s| s.next().is_some()))
+    };
     if names.is_empty() {
         Layout::Empty
     } else if !names.iter().all(|n| LAYOUT.contains(&n.as_str())) || !names.iter().any(|n| n == "ac" || n == "cas") {
         Layout::Other
     } else if names.iter().any(|n| n == "size") {
         Layout::Ours
+    } else if !holds_entries("ac") && !holds_entries("cas") {
+        // Nothing stored yet (by this cache, killed before it wrote its
+        // `size`, or by Bazel): a new cache.
+        Layout::Empty
     } else {
         Layout::Bazel
     }
 }
 
-/// Says once per process that the cache in `root` is Bazel's.
-fn note_bazel_cache(root: &Path) {
+/// The disk caches the invocations running this one said were Bazel's
+/// (see `note_bazel_cache`), which its commands get: the invocations they
+/// run (CMake's `try_compile`s, a nested build) don't say it again. Paths,
+/// separated as in `PATH`.
+pub const NOTED_ENV: &str = "NINJA_RS_BAZEL_DISK_CACHES";
+
+/// The disk caches the invocations running this one said were Bazel's.
+fn noted_by_parents() -> Vec<PathBuf> {
+    std::env::split_paths(&std::env::var_os(NOTED_ENV).unwrap_or_default()).filter(|p| !p.as_os_str().is_empty()).collect()
+}
+
+/// Says once per invocation tree that the cache in `root` is Bazel's: not
+/// when one running this one (`noted`) did, nor again in this process.
+/// Whether it said it.
+fn note_bazel_cache(root: &Path, noted: &[PathBuf]) -> bool {
     static NOTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
-    let mut noted = NOTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if noted.iter().any(|r| r == root) {
-        return;
+    let mut here = NOTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if here.iter().chain(noted).any(|r| r == root) {
+        return false;
     }
-    noted.push(root.to_path_buf());
+    here.push(root.to_path_buf());
     ninja_core::status::message(&format!(
         "note: the disk cache {} is Bazel's (no VERSION): used as it is, its old entries left to Bazel to remove. \
          (If it's ninja-rs's, writing {VERSION} to its VERSION file makes it so.)",
         root.display()
     ));
+    true
 }
 
 /// How old a file in `tmp/` must be for garbage collection to remove it:
@@ -177,7 +204,7 @@ impl DiskCache {
                 }
                 Layout::Bazel => {
                     foreign = true;
-                    note_bazel_cache(root);
+                    note_bazel_cache(root, &noted_by_parents());
                 }
                 Layout::Other => {
                     return Err(std::io::Error::other(format!("{} isn't empty, and isn't a disk cache", root.display())));
@@ -194,6 +221,19 @@ impl DiskCache {
     /// Whether it's another tool's cache, used without collecting garbage.
     pub fn is_foreign(&self) -> bool {
         self.foreign
+    }
+
+    /// `NOTED_ENV` for the commands of an invocation using this cache, when
+    /// it's Bazel's (said then): with the caches those running it said were.
+    pub fn noted_env(&self) -> Option<String> {
+        if !self.foreign {
+            return None;
+        }
+        let mut noted = noted_by_parents();
+        if !noted.contains(&self.root) {
+            noted.push(self.root.clone());
+        }
+        std::env::join_paths(noted).ok().and_then(|v| v.into_string().ok())
     }
 
     pub fn root(&self) -> &Path {
@@ -386,6 +426,61 @@ impl DiskCache {
         Ok(d)
     }
 
+    /// Stores a file's contents, read once, and returns their digest: hashed
+    /// as they're stored (a large file split as it's read, never whole in
+    /// memory), for a file nothing hashed before (a local result's output).
+    pub fn put_file_hashed(&self, path: &Path) -> anyhow::Result<re::Digest> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)?;
+        if !CHUNKER.splits(file.metadata()?.len() as i64) {
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+            let d = rbe_client::digest_of(&data);
+            // As chunks should it have grown meanwhile.
+            self.put_bytes(&d, &data)?;
+            return Ok(d);
+        }
+        let mut whole = Sha256::new();
+        let (mut chunks, mut size) = (Vec::new(), 0);
+        for c in CHUNKER.stream(file) {
+            let c = c.map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+            whole.update(&c.data);
+            size += c.data.len() as i64;
+            chunks.push(self.put_chunk(&c.data)?);
+        }
+        let d = re::Digest { hash: hex::encode(whole.finalize()), size_bytes: size };
+        // Shrunk meanwhile to a blob stored whole: not from these chunks.
+        anyhow::ensure!(is_chunked(&d), "{} changed while being stored", path.display());
+        if !self.contains_blob(&d) {
+            self.put_layout(&d, re::SplitBlobResponse { chunk_digests: chunks, chunking_function: FAST_CDC })?;
+        }
+        Ok(d)
+    }
+
+    /// A blob in a file of its own, to be read whole (an upload): the file
+    /// it's stored in, which nothing changes (a blob's file is only ever
+    /// replaced by another holding it), else its chunks put together in
+    /// `tmp/` (checked to make it up), removed once dropped. None when the
+    /// cache doesn't hold it.
+    pub fn blob_as_file(&self, d: &re::Digest) -> Option<BlobFile> {
+        if let Some(path) = self.blob_file(d) {
+            return Some(BlobFile { path, temporary: false });
+        }
+        let chunks = self.layout(d)?;
+        let file = BlobFile { path: self.root.join("tmp").join(unique_name()), temporary: true };
+        let mut out = std::io::BufWriter::new(std::fs::File::options().write(true).create_new(true).open(&file.path).ok()?);
+        match self.assemble(&chunks, d, &mut out) {
+            Some(true) => {}
+            Some(false) => {
+                self.drop_layout(d);
+                return None;
+            }
+            None => return None,
+        }
+        out.flush().ok()?;
+        Some(file)
+    }
+
     /// Stores a file known to hold the blob `d` (a download, checked as it
     /// was written, into a file only this process writes): read once, and
     /// hashed only to name its chunks. Should the file not be the blob
@@ -546,6 +641,17 @@ impl DiskCache {
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
+        // Unlocked when done, not by closing the file: a command forked
+        // meanwhile holds it open until it starts its program, and with it
+        // the lock (which would make the next collection think another
+        // process is collecting).
+        struct Unlock(std::fs::File);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = self.0.unlock();
+            }
+        }
+        let _unlock = Unlock(lock);
         // Files writers that died left in `tmp/`.
         let now = SystemTime::now();
         for e in std::fs::read_dir(self.root.join("tmp")).into_iter().flatten().flatten() {
@@ -599,6 +705,27 @@ impl DiskCache {
         }
         self.write_size_estimate(total - freed)?;
         Ok(Some((removed, freed)))
+    }
+}
+
+/// A blob in a file of its own (see `DiskCache::blob_as_file`).
+pub struct BlobFile {
+    path: PathBuf,
+    /// Its chunks put together: removed when dropped.
+    temporary: bool,
+}
+
+impl BlobFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for BlobFile {
+    fn drop(&mut self) {
+        if self.temporary {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -952,6 +1079,15 @@ mod tests {
         assert!(!c.is_foreign() && dir.join("VERSION").exists());
         assert_eq!(c.collect_garbage(1, 0).unwrap().map(|(files, _)| files), Some(3));
 
+        // Ours before it wrote its `size` (a build killed, one that stored
+        // nothing), its VERSION gone: still empty, ours.
+        let (_, dir) = cache("version-removed-empty");
+        std::fs::remove_file(dir.join("VERSION")).unwrap();
+        std::fs::create_dir_all(dir.join("cas").join("ab")).unwrap();
+        let c = DiskCache::open(&dir).unwrap();
+        assert!(!c.is_foreign() && dir.join("VERSION").exists());
+        assert_eq!(c.noted_env(), None);
+
         let elsewhere = test_dirs::TestDir::new("ninja-rs-disk-cache-mistyped");
         std::fs::write(elsewhere.join("main.c"), "int main() {}").unwrap();
         assert!(DiskCache::open(&elsewhere).is_err());
@@ -960,6 +1096,24 @@ mod tests {
         std::fs::create_dir(elsewhere.join("tmp")).unwrap();
         std::fs::remove_file(elsewhere.join("main.c")).unwrap();
         assert!(DiskCache::open(&elsewhere).is_err());
+    }
+
+    /// That a cache is Bazel's is said once per invocation tree: not by an
+    /// invocation an invocation saying it runs (it gets the caches it said
+    /// were, see `noted_env`), nor twice in a process.
+    #[test]
+    fn bazel_cache_noted_once() {
+        let (root, other) = (PathBuf::from("/caches/bazel-noted-once"), PathBuf::from("/caches/bazel-noted-by-parent"));
+        assert!(note_bazel_cache(&root, &[]));
+        assert!(!note_bazel_cache(&root, &[]));
+        assert!(!note_bazel_cache(&other, std::slice::from_ref(&other)));
+        let dir = test_dirs::TestDir::new("ninja-rs-disk-cache-noted");
+        let d = rbe_client::digest_of(b"theirs");
+        std::fs::create_dir_all(dir.join("ac").join(&d.hash[..2])).unwrap();
+        std::fs::write(dir.join("ac").join(&d.hash[..2]).join(&d.hash), "").unwrap();
+        let c = DiskCache::open(&dir).unwrap();
+        let noted: Vec<PathBuf> = std::env::split_paths(&c.noted_env().unwrap()).collect();
+        assert!(noted.contains(&dir.to_path_buf()), "{noted:?}");
     }
 
     #[test]

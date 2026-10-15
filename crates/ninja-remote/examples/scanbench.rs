@@ -49,7 +49,7 @@ fn conservative(cache: &ScanCache, c: &Compile) -> Inputs {
     }
     let mut roots = info.sources.clone();
     roots.extend(info.forced_includes.iter().cloned());
-    let r = s.scan(&roots, &sp);
+    let r = s.scan_compile(&roots, &sp, &info.macros);
     if let Some(why) = r.local {
         return Err(why);
     }

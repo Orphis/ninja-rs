@@ -71,7 +71,9 @@ pub trait Status {
 /// prints them on standard error on their own lines at its next update,
 /// never over its status line; else they go there at once.
 pub fn message(msg: &str) {
-    queue(&MESSAGES, format!("ninja: {msg}\n"));
+    if let Some(line) = queue(&MESSAGES, format!("ninja: {msg}\n")) {
+        print_err(&line);
+    }
 }
 
 /// `message`'s lines: the status printers there are, and the lines
@@ -80,13 +82,15 @@ type Messages = std::sync::Mutex<(usize, Vec<String>)>;
 
 static MESSAGES: Messages = std::sync::Mutex::new((0, Vec::new()));
 
-fn queue(messages: &Messages, line: String) {
+/// Queues `line` while there is a status printer; without one, returns it,
+/// to be printed at once.
+fn queue(messages: &Messages, line: String) -> Option<String> {
     let mut m = messages.lock().unwrap_or_else(|e| e.into_inner());
     if m.0 == 0 {
-        print_err(&line);
-    } else {
-        m.1.push(line);
+        return Some(line);
     }
+    m.1.push(line);
+    None
 }
 
 /// The lines waiting, taken; `printers` added to the printers there are.
@@ -140,6 +144,9 @@ pub struct LinePrinter {
     output_buffer: Vec<u8>,
     /// What goes to stderr while the console is locked, after the output.
     error_buffer: String,
+    /// In tests, what it printed (see `write_out`).
+    #[cfg(test)]
+    pub(crate) printed: Vec<u8>,
 }
 
 impl Default for LinePrinter {
@@ -235,6 +242,8 @@ impl LinePrinter {
             line_type_elide: false,
             output_buffer: Vec::new(),
             error_buffer: String::new(),
+            #[cfg(test)]
+            printed: Vec::new(),
         }
     }
 
@@ -255,9 +264,9 @@ impl LinePrinter {
             self.line_type_elide = elide;
             return;
         }
-        let mut out = std::io::stdout().lock();
+        let mut out = String::new();
         if self.smart_terminal {
-            let _ = out.write_all(b"\r");
+            out.push('\r');
         }
         if self.smart_terminal && elide {
             if self.escapes {
@@ -266,8 +275,8 @@ impl LinePrinter {
                 // the last column leaves the cursor on it, and loses it to
                 // the erase, with ninja too.)
                 let shown = terminal::width().map_or_else(|| line.to_string(), |w| elide_middle(line, w));
-                let _ = out.write_all(shown.as_bytes());
-                let _ = out.write_all(b"\x1b[K");
+                out.push_str(&shown);
+                out.push_str("\x1b[K");
             } else {
                 // A console without escape sequences (ninja writes into its
                 // buffer instead): spaces blank out the rest of the previous
@@ -275,27 +284,48 @@ impl LinePrinter {
                 // cursor to the next line.
                 let shown = terminal::width().map_or_else(|| line.to_string(), |w| elide_middle(line, w - 1));
                 let len = shown.chars().count();
-                let _ = out.write_all(shown.as_bytes());
+                out.push_str(&shown);
                 if len < self.last_len {
-                    let _ = out.write_all(" ".repeat(self.last_len - len).as_bytes());
-                    let _ = out.write_all(b"\r");
-                    let _ = out.write_all(shown.as_bytes());
+                    out.push_str(&" ".repeat(self.last_len - len));
+                    out.push('\r');
+                    out.push_str(&shown);
                 }
                 self.last_len = len;
             }
-            let _ = out.flush();
             self.have_blank_line = false;
         } else {
             if self.smart_terminal && !self.escapes && self.last_len > 0 {
-                let _ = out.write_all(" ".repeat(self.last_len).as_bytes());
-                let _ = out.write_all(b"\r");
+                out.push_str(&" ".repeat(self.last_len));
+                out.push('\r');
             }
-            let _ = out.write_all(line.as_bytes());
-            let _ = out.write_all(b"\n");
-            let _ = out.flush();
+            out.push_str(line);
+            out.push('\n');
             self.last_len = 0;
             self.have_blank_line = true;
         }
+        self.write_out(out.as_bytes());
+    }
+
+    /// Writes `data` to stdout, at once. In tests, to `printed`: libtest
+    /// doesn't capture what goes to stdout itself, which mixes with its
+    /// report.
+    fn write_out(&mut self, data: &[u8]) {
+        #[cfg(test)]
+        self.printed.extend_from_slice(data);
+        #[cfg(not(test))]
+        {
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(data);
+            let _ = out.flush();
+        }
+    }
+
+    /// [`print_err`]; in tests, to `printed` (see `write_out`).
+    fn write_err(&mut self, text: &str) {
+        #[cfg(test)]
+        self.printed.extend_from_slice(text.as_bytes());
+        #[cfg(not(test))]
+        print_err(text);
     }
 
     /// Prints arbitrary output on its own line(s).
@@ -319,9 +349,7 @@ impl LinePrinter {
         if self.console_locked {
             self.output_buffer.extend_from_slice(data);
         } else {
-            let mut out = std::io::stdout().lock();
-            let _ = out.write_all(data);
-            let _ = out.flush();
+            self.write_out(data);
         }
     }
 
@@ -334,7 +362,7 @@ impl LinePrinter {
             return;
         }
         self.print_on_new_line(b"");
-        print_err(text);
+        self.write_err(text);
     }
 
     pub fn set_console_locked(&mut self, locked: bool) {
@@ -350,7 +378,7 @@ impl LinePrinter {
             self.print_on_new_line(&buf);
             let errors = std::mem::take(&mut self.error_buffer);
             if !errors.is_empty() {
-                print_err(&errors);
+                self.write_err(&errors);
             }
             if !self.line_buffer.is_empty() {
                 let l = std::mem::take(&mut self.line_buffer);
@@ -1205,6 +1233,9 @@ mod tests {
         failed(&mut s, "a.o");
         failed(&mut s, "b.o");
         assert_eq!(s.summary().as_deref(), Some("ninja: 2 commands failed:\n  a.o\n  b.o\n"));
+        // Printed where the test holds it, not past libtest's capture.
+        let printed = String::from_utf8_lossy(&s.printer.printed).into_owned();
+        assert!(printed.contains("FAILED: [code=1] a.o \ncc a.o\nerror\n") && printed.contains("FAILED: [code=1] b.o "), "{printed}");
         s.failures.extend((0..10).map(|i| format!("{i}.o")));
         let summary = s.summary().unwrap_or_default();
         assert!(summary.starts_with("ninja: 12 commands failed:\n  a.o\n") && summary.ends_with("  7.o\n  and 2 more\n"), "{summary}");
@@ -1303,8 +1334,10 @@ mod tests {
         p.set_console_locked(true);
         p.print_error_on_new_line("ninja: warning: later\n");
         assert_eq!(p.error_buffer, "ninja: warning: later\n");
+        assert!(p.printed.is_empty());
         p.set_console_locked(false);
         assert!(p.error_buffer.is_empty());
+        assert!(p.printed.ends_with(b"ninja: warning: later\n"));
     }
 
     /// As ninja 1.13: the code always, each output followed by a space.
@@ -1321,16 +1354,16 @@ mod tests {
     #[test]
     fn messages_wait_for_the_printer() {
         let messages: Messages = std::sync::Mutex::new((0, Vec::new()));
-        queue(&messages, "ninja: before\n".into());
+        assert_eq!(queue(&messages, "ninja: before\n".into()).as_deref(), Some("ninja: before\n"));
         assert!(messages.lock().unwrap().1.is_empty());
         take_messages(&messages, 1);
-        queue(&messages, "ninja: warning: one\n".into());
-        queue(&messages, "ninja: two\n".into());
+        assert_eq!(queue(&messages, "ninja: warning: one\n".into()), None);
+        assert_eq!(queue(&messages, "ninja: two\n".into()), None);
         assert_eq!(take_messages(&messages, 0), "ninja: warning: one\nninja: two\n");
         assert_eq!(take_messages(&messages, 0), "");
-        queue(&messages, "ninja: last\n".into());
+        assert_eq!(queue(&messages, "ninja: last\n".into()), None);
         assert_eq!(take_messages(&messages, -1), "ninja: last\n");
-        queue(&messages, "ninja: after\n".into());
+        assert_eq!(queue(&messages, "ninja: after\n".into()).as_deref(), Some("ninja: after\n"));
         assert_eq!(*messages.lock().unwrap(), (0, Vec::new()));
     }
 }

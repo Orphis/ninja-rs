@@ -266,7 +266,7 @@ const SHARED_HINT: &str = " (below a drive's root, Authenticated Users may modif
 /// The same, on a Windows drive under WSL mounted without `metadata`.
 #[cfg(unix)]
 const WSL_SHARED_HINT: &str = " (a Windows drive, mounted without `metadata`: who may change its files can't be told, \
-     but in your profile, Users\\<you>, which Windows keeps yours): keep the workspace there, \
+     but in your profile on Windows' drive, C:\\Users\\<you>, which Windows keeps yours): keep the workspace there, \
      or give the file with --ninjars=FILE";
 
 /// `SHARED_HINT`, or `WSL_SHARED_HINT` for `dir`.
@@ -288,8 +288,8 @@ const CHANGE_HINT: &str = ": take others' write access away (icacls), or give it
 /// A directory others can write to: writable by all, as `/tmp` (or a tree
 /// made so with `chmod -R 777`). On a Windows drive under WSL mounted
 /// without `metadata`, whose permissions are made up (see `wsl`), any but
-/// the user's profile (below a drive's root, Authenticated Users may
-/// modify directories).
+/// the user's profile on Windows' drive (below a drive's root,
+/// Authenticated Users may modify directories).
 #[cfg(unix)]
 fn writable_by_others(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -304,7 +304,7 @@ fn writable_by_others(dir: &Path) -> bool {
 /// group: under the umask 002 that goes with them, Fedora's and Debian's
 /// `usergroups`, files are writable by it). On a Windows drive under WSL
 /// mounted without `metadata`, whose permissions are made up (see `wsl`),
-/// one in the user's profile.
+/// one in the user's profile on Windows' drive.
 #[cfg(unix)]
 fn trusted_file(file: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -442,8 +442,10 @@ mod account {
 /// which a `chmod -R 777` tree shares. Without the `metadata` option, their
 /// files keep no Unix permissions: all show as the user's, writable by all,
 /// and Windows' own decide who may change them, which can't be read from
-/// here; but in the user's profile (`Users\<user>`), which Windows keeps
-/// theirs, any file may be another user's.
+/// here; but in the user's profile on the drive Windows is on
+/// (`C:\Users\<user>`), which Windows keeps theirs, any file may be
+/// another user's. (On another drive, any local user may make a
+/// `Users\<user>`.)
 #[cfg(unix)]
 mod wsl {
     use std::path::{Component, Path, PathBuf};
@@ -453,6 +455,9 @@ mod wsl {
         pub mount: PathBuf,
         /// Unix permissions are kept (in NTFS attributes): they count.
         pub metadata: bool,
+        /// The drive's letter, when the mount is the whole drive (not one
+        /// of its directories), uppercase.
+        pub letter: Option<char>,
     }
 
     /// The Windows drive `path` is on, if any.
@@ -466,21 +471,50 @@ mod wsl {
 
     /// `windows_drive`, from `mountinfo`, for `path` (canonical).
     pub fn drive_of(mountinfo: &str, path: &Path) -> Option<Drive> {
-        let (mount, fs, options) = mount_of(mountinfo, path)?;
+        let (mount, fs, source, options) = mount_of(mountinfo, path)?;
         let options: Vec<&str> = options.split([',', ';']).collect();
-        (fs == "drvfs" || (fs == "9p" && options.contains(&"aname=drvfs"))).then(|| Drive { mount, metadata: options.contains(&"metadata") })
+        // `C:\`.
+        let letter = match source.to_str()?.as_bytes() {
+            [l, b':'] | [l, b':', b'\\' | b'/'] if l.is_ascii_alphabetic() => Some(char::from(l.to_ascii_uppercase())),
+            _ => None,
+        };
+        (fs == "drvfs" || (fs == "9p" && options.contains(&"aname=drvfs"))).then(|| Drive { mount, metadata: options.contains(&"metadata"), letter })
+    }
+
+    /// The letter of the drive Windows is on: `SystemDrive`'s when
+    /// `WSLENV` passes it, else that of the Windows directory WSL puts on
+    /// `PATH`, else `C`.
+    pub fn system_drive() -> char {
+        let named = std::env::var("SystemDrive").ok().and_then(|d| d.chars().next().filter(|c| c.is_ascii_alphabetic()));
+        named.map(|c| c.to_ascii_uppercase()).or_else(windows_on_path).unwrap_or('C')
+    }
+
+    /// The drive of the Windows directory on `PATH` (`/mnt/c/WINDOWS/system32`).
+    fn windows_on_path() -> Option<char> {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .filter(|p| {
+                let last: Vec<String> = p.components().rev().take(2).map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase()).collect();
+                last == ["system32", "windows"]
+            })
+            .find_map(|p| drive_of(&mountinfo, &std::fs::canonicalize(p).ok()?)?.letter)
     }
 
     /// Whether `path` is in the profile of the Windows user named one of
-    /// `users` on `drive` (`/mnt/c/Users/ann`): names, as paths, are
-    /// compared regardless of case.
+    /// `users` on `drive`, if that is the drive Windows is on
+    /// (`/mnt/c/Users/ann`): names, as paths, are compared regardless of
+    /// case.
     pub fn in_profile(path: &Path, drive: &Drive, users: &[String]) -> bool {
         let Ok(real) = std::fs::canonicalize(path) else { return false };
-        is_in_profile(&real, drive, users)
+        is_in_profile(&real, drive, system_drive(), users)
     }
 
-    /// `in_profile`, for `path` (canonical).
-    pub fn is_in_profile(path: &Path, drive: &Drive, users: &[String]) -> bool {
+    /// `in_profile`, for `path` (canonical), Windows being on the drive
+    /// `system`.
+    pub fn is_in_profile(path: &Path, drive: &Drive, system: char, users: &[String]) -> bool {
+        if drive.letter != Some(system) {
+            return false;
+        }
         let Ok(rest) = path.strip_prefix(&drive.mount) else { return false };
         let mut names = rest.components().map(|c| match c {
             Component::Normal(n) => n.to_str(),
@@ -490,23 +524,23 @@ mod wsl {
             && names.next().flatten().is_some_and(|n| users.iter().any(|u| u.eq_ignore_ascii_case(n)))
     }
 
-    /// The mount point, file system type and options of the mount holding
-    /// `path` (the last of those mounted on the longest prefix), from
-    /// `mountinfo`.
-    pub fn mount_of<'a>(mountinfo: &'a str, path: &Path) -> Option<(PathBuf, &'a str, &'a str)> {
-        let mut found: Option<(usize, PathBuf, &str, &str)> = None;
+    /// The mount point, file system type, source and options of the mount
+    /// holding `path` (the last of those mounted on the longest prefix),
+    /// from `mountinfo`.
+    pub fn mount_of<'a>(mountinfo: &'a str, path: &Path) -> Option<(PathBuf, &'a str, PathBuf, &'a str)> {
+        let mut found: Option<(usize, PathBuf, &str, &str, &str)> = None;
         for line in mountinfo.lines() {
             // "36 35 98:0 / /mnt/c rw,noatime - 9p C:\134 rw,aname=drvfs;..."
             let Some((mount, fs)) = line.split_once(" - ") else { continue };
             let Some(point) = mount.split(' ').nth(4).map(unescape) else { continue };
             let mut fs = fs.split(' ');
-            let (Some(kind), Some(_source)) = (fs.next(), fs.next()) else { continue };
+            let (Some(kind), Some(source)) = (fs.next(), fs.next()) else { continue };
             let depth = point.components().count();
             if path.starts_with(&point) && found.as_ref().is_none_or(|(d, ..)| depth >= *d) {
-                found = Some((depth, point, kind, fs.next().unwrap_or("")));
+                found = Some((depth, point, kind, source, fs.next().unwrap_or("")));
             }
         }
-        found.map(|(_, point, kind, options)| (point, kind, options))
+        found.map(|(_, point, kind, source, options)| (point, kind, unescape(source), options))
     }
 
     /// A path with `mountinfo`'s octal escapes (`\040` for a space).
@@ -1523,9 +1557,10 @@ build --action_env=PATH
 
     /// WSL's Windows drives are told by their file system: without the
     /// `metadata` option, their files all show as the user's, writable by
-    /// all. Then only the user's profile counts as theirs: a `.ninjars`
-    /// another user put below a drive's root (where Authenticated Users may
-    /// modify directories) was read.
+    /// all. Then only the user's profile on the drive Windows is on counts
+    /// as theirs: a `.ninjars` another user put below a drive's root (where
+    /// Authenticated Users may modify directories) was read, also in a
+    /// `Users\<you>` they made on a data drive.
     #[cfg(unix)]
     #[test]
     fn windows_drives_under_wsl() {
@@ -1535,32 +1570,46 @@ build --action_env=PATH
 133 132 0:71 / /mnt/c/over rw - tmpfs none rw
 134 81 0:72 / /mnt/d\040e rw - drvfs D:\134 rw,noatime
 135 81 0:73 / /mnt/e rw - 9p E:\134 rw,aname=drvfs;path=E:\;metadata;uid=1000
+136 81 0:74 / /mnt/f rw,noatime - 9p F:\134 rw,aname=drvfs;path=F:\;uid=1000;gid=1000
+137 81 0:75 / /Docker/host rw,noatime - 9p C:\134Program\040Files\134Docker rw,aname=drvfs;path=C:\Program Files\Docker
 ";
-        let fs = |p: &str| wsl::mount_of(mountinfo, Path::new(p)).map(|(point, kind, _)| (point, kind));
+        let fs = |p: &str| wsl::mount_of(mountinfo, Path::new(p)).map(|(point, kind, ..)| (point, kind));
         assert_eq!(fs("/mnt/c/src/.ninjars"), Some(("/mnt/c".into(), "9p")));
         assert_eq!(fs("/mnt/cc"), Some(("/".into(), "ext4")));
         assert_eq!(fs("/mnt/c/over/x"), Some(("/mnt/c/over".into(), "tmpfs")));
         assert_eq!(fs("/mnt/d e/x"), Some(("/mnt/d e".into(), "drvfs")));
-        let drive = |p: &str| wsl::drive_of(mountinfo, Path::new(p)).map(|d| (d.mount, d.metadata));
-        assert_eq!(drive("/mnt/c/src/.ninjars"), Some(("/mnt/c".into(), false)));
-        assert_eq!(drive("/mnt/d e/x"), Some(("/mnt/d e".into(), false)));
-        assert_eq!(drive("/mnt/e/x"), Some(("/mnt/e".into(), true)));
+        let drive = |p: &str| wsl::drive_of(mountinfo, Path::new(p)).map(|d| (d.mount, d.metadata, d.letter));
+        assert_eq!(drive("/mnt/c/src/.ninjars"), Some(("/mnt/c".into(), false, Some('C'))));
+        assert_eq!(drive("/mnt/d e/x"), Some(("/mnt/d e".into(), false, Some('D'))));
+        assert_eq!(drive("/mnt/e/x"), Some(("/mnt/e".into(), true, Some('E'))));
+        assert_eq!(drive("/Docker/host/x"), Some(("/Docker/host".into(), false, None)));
         for not_a_drive in ["/mnt/cc", "/mnt/c/over/x", "/usr/lib/wsl/drivers/x"] {
             assert!(drive(not_a_drive).is_none(), "{not_a_drive}");
         }
-        // The user's profile.
-        let c = wsl::drive_of(mountinfo, Path::new("/mnt/c")).unwrap();
+        // The user's profile, on the drive Windows is on (C:, or D:). On
+        // another drive, any local user may make `Users\ann`; a mount of a
+        // directory has none.
         let users = ["ann".to_string(), "Ann.Smith".to_string()];
-        let in_profile = |p: &str| wsl::is_in_profile(Path::new(p), &c, &users);
-        assert!(in_profile("/mnt/c/Users/ann/src/.ninjars") && in_profile("/mnt/c/users/ANN") && in_profile("/mnt/c/Users/ann.smith/x"));
-        for elsewhere in
-            ["/mnt/c/src/.ninjars", "/mnt/c/Users/Public/.ninjars", "/mnt/c/Users/.ninjars", "/mnt/c/Users/bob/x", "/mnt/c/x/Users/ann", "/mnt/d/Users/ann"]
-        {
-            assert!(!in_profile(elsewhere), "{elsewhere}");
+        let in_profile = |p: &str, system: char| wsl::is_in_profile(Path::new(p), &wsl::drive_of(mountinfo, Path::new(p)).unwrap(), system, &users);
+        assert!(in_profile("/mnt/c/Users/ann/src/.ninjars", 'C') && in_profile("/mnt/c/users/ANN", 'C') && in_profile("/mnt/c/Users/ann.smith/x", 'C'));
+        assert!(in_profile("/mnt/d e/Users/ann/x", 'D'));
+        for (elsewhere, system) in [
+            ("/mnt/c/src/.ninjars", 'C'),
+            ("/mnt/c/Users/Public/.ninjars", 'C'),
+            ("/mnt/c/Users/.ninjars", 'C'),
+            ("/mnt/c/Users/bob/x", 'C'),
+            ("/mnt/c/x/Users/ann", 'C'),
+            ("/mnt/d e/Users/ann", 'C'),
+            ("/mnt/f/Users/ann/x", 'C'),
+            ("/Docker/host/Users/ann/x", 'C'),
+            ("/mnt/c/Users/ann/x", 'D'),
+        ] {
+            assert!(!in_profile(elsewhere, system), "{elsewhere} ({system}:)");
         }
         // A real one, here.
         if Path::new("/mnt/c/Windows").is_dir() {
             let c = wsl::windows_drive(Path::new("/mnt/c")).expect("a Windows drive");
+            assert_eq!((c.letter, wsl::system_drive()), (Some('C'), 'C'));
             if !c.metadata {
                 assert!(writable_by_others(Path::new("/mnt/c")) && writable_by_others(Path::new("/mnt/c/Users/Public")));
             }

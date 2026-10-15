@@ -181,147 +181,41 @@ fn sweep_secret_flags(dir: &Path) {
 /// Whether process `pid` may still run: one that can't be asked about
 /// counts (another user's, on Windows; a reused id keeps a file a while).
 fn process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
-        // SAFETY: signal 0 only checks that the process exists.
-        unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_TIMEOUT};
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
-        // SAFETY: plain system calls; the handle is owned (closed) below.
-        unsafe {
-            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-            if h.is_null() {
-                return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32);
-            }
-            let h = OwnedHandle::from_raw_handle(h);
-            WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT
-        }
-    }
+    ninja_os::process_running(pid) != Some(false)
 }
 
-/// Whether process `pid` runs this one: its parent, or the parent's, and so
-/// on. A generator's `-t restat` whose environment lost `LOGS_LOCK_ENV` (a
-/// wrapper scrubbing it) recognizes the build running it, which holds the
-/// lock, by the pid its lock file names, rather than wait for it forever.
-/// False where processes' parents can't be asked for.
-pub(crate) fn runs_this(pid: u32) -> bool {
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-    {
+/// Whether the process holding a lock (`holder`, as its lock file says)
+/// runs this one: its parent, or the parent's, and so on. A generator's
+/// `-t restat` whose environment lost `LOGS_LOCK_ENV` (a wrapper scrubbing
+/// it) recognizes the build running it, which holds the lock, rather than
+/// wait for it forever. Its id alone isn't enough: an ancestor's id in a
+/// pid namespace (a container) may be the holder's in another, and an id
+/// named by a lock file left behind may be another process's since. False
+/// where processes' parents can't be asked for, or the lock file doesn't
+/// say which process holds it.
+pub(crate) fn runs_this(holder: &ninja_core::build_log::Holder) -> bool {
+    let Some(wanted) = holder.process else { return false };
+    let Some(mut child) = ninja_os::process_info(None) else { return false };
+    // A bound, should ids ever make a cycle.
+    for _ in 0..256 {
+        let pid = child.parent;
+        if pid == 0 {
+            return false;
+        }
+        let Some(parent) = ninja_os::process_info(Some(pid)) else { return false };
         // On Unix, a process whose parent exits gets another (init, a
-        // subreaper): ids in the chain are those of running processes.
-        let mut current = std::process::id();
-        // A bound, should ids ever make a cycle.
-        for _ in 0..256 {
-            match parent_of(current) {
-                Some(parent) if parent == pid => return true,
-                Some(parent) if parent > 1 && parent != current => current = parent,
-                _ => return false,
-            }
+        // subreaper): ids in the chain are those of running processes. On
+        // Windows it keeps its parent's id, which a process created since
+        // may have: not its parent.
+        if cfg!(windows) && parent.identity.start > child.identity.start {
+            return false;
         }
-        false
-    }
-    #[cfg(windows)]
-    {
-        windows_ancestry::runs_this(pid)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-/// The parent of process `pid`, as `/proc` says.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn parent_of(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // `pid (name) state ppid ...`: the name may hold spaces and parentheses.
-    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// The parent of process `pid`, as `proc_pidinfo` says.
-#[cfg(target_os = "macos")]
-fn parent_of(pid: u32) -> Option<u32> {
-    // SAFETY: fills `info`, of the size given, nothing else.
-    unsafe {
-        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let filled = libc::proc_pidinfo(libc::c_int::try_from(pid).ok()?, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size);
-        (filled == size).then_some(info.pbi_ppid)
-    }
-}
-
-/// `runs_this` on Windows, where a process keeps the id of its parent,
-/// which another process may have taken since the parent exited: that
-/// one, created after, isn't the parent.
-#[cfg(windows)]
-mod windows_ancestry {
-    use std::os::windows::io::{FromRawHandle, OwnedHandle};
-
-    use windows_sys::Win32::Foundation::{FILETIME, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
-    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-
-    pub fn runs_this(pid: u32) -> bool {
-        let parents = parents();
-        let mut current = std::process::id();
-        let Some(mut created) = creation_time(current) else { return false };
-        for _ in 0..256 {
-            let Some(&parent) = parents.get(&current) else { return false };
-            let Some(parent_created) = creation_time(parent).filter(|&c| c <= created) else { return false };
-            if parent == pid {
-                return true;
-            }
-            (current, created) = (parent, parent_created);
+        if pid == holder.pid {
+            return parent.identity == wanted;
         }
-        false
+        child = parent;
     }
-
-    /// Each running process's parent id.
-    fn parents() -> std::collections::HashMap<u32, u32> {
-        let mut parents = std::collections::HashMap::new();
-        // SAFETY: plain system calls; the snapshot handle is owned (closed)
-        // below, and the entry's size is set as they want it.
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snapshot == INVALID_HANDLE_VALUE {
-                return parents;
-            }
-            let _owned = OwnedHandle::from_raw_handle(snapshot);
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
-            while more {
-                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
-                more = Process32NextW(snapshot, &mut entry) != 0;
-            }
-        }
-        parents
-    }
-
-    /// When process `pid` was created (100 ns since 1601), if it can be
-    /// asked.
-    fn creation_time(pid: u32) -> Option<u64> {
-        // SAFETY: plain system calls; the handle is owned (closed) below.
-        unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if h.is_null() {
-                return None;
-            }
-            let h = OwnedHandle::from_raw_handle(h);
-            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-            let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
-            if GetProcessTimes(std::os::windows::io::AsRawHandle::as_raw_handle(&h), &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
-                return None;
-            }
-            Some(u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
-        }
-    }
+    false
 }
 
 /// Options not passed on: per invocation (ids, build events, logs written
@@ -541,6 +435,28 @@ mod tests {
         assert!(!file(gone.id()).exists(), "the file of a process gone stayed");
         assert!(file(running.id()).exists(), "the file of a running process was removed");
         assert!(secrets.0.exists());
+    }
+
+    /// A lock's holder runs this process when it is an ancestor: its id,
+    /// and which process has it. One with an ancestor's id that started at
+    /// another time (the id reused since), or in another pid namespace (a
+    /// container sharing the directory), doesn't; nor one whose lock file
+    /// doesn't say which process it is. (The id alone was enough.)
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", windows))]
+    #[test]
+    fn holders_are_ancestors_by_identity() {
+        let parent = ninja_os::process_info(None).unwrap().parent;
+        let identity = ninja_os::process_info(Some(parent)).unwrap().identity;
+        let holder = |process| ninja_core::build_log::Holder { pid: parent, since_ms: 0, process };
+        assert!(runs_this(&holder(Some(identity))));
+        let earlier = ninja_os::ProcessIdentity { start: identity.start - 1, ..identity };
+        let elsewhere = ninja_os::ProcessIdentity { namespace: identity.namespace + 1, ..identity };
+        for other in [Some(earlier), Some(elsewhere), None] {
+            assert!(!runs_this(&holder(other)), "{other:?}");
+        }
+        // This process isn't an ancestor of its own.
+        let this = ninja_os::process_info(None).unwrap().identity;
+        assert!(!runs_this(&ninja_core::build_log::Holder { pid: std::process::id(), since_ms: 0, process: Some(this) }));
     }
 
     /// Tools other than `-t exec` run no builds: nothing to pass on (the

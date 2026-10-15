@@ -1,7 +1,7 @@
 //! Directories for tests: under Bazel's `TEST_TMPDIR` when it is set (the
 //! system's temporary directory otherwise), one per test and process, and
 //! removed when the test is done with them. A test that panicked leaves its
-//! directory, to look into.
+//! directory, to look into. And the files tests read: Bazel's runfiles.
 
 #![allow(clippy::disallowed_macros)] // Tests say what they leave.
 
@@ -75,6 +75,27 @@ impl Drop for TestDir {
             eprintln!("warning: removing {}: {e}", path.display());
         }
     }
+}
+
+/// A data file of the test's Bazel target, `path` from the workspace's
+/// top: in the runfiles tree, or (Bazel on Windows, which makes none)
+/// where the manifest of them says. None without Bazel.
+pub fn runfile(path: &str) -> Option<PathBuf> {
+    let key = format!("{}/{path}", std::env::var("TEST_WORKSPACE").unwrap_or_else(|_| "_main".into()));
+    let tree = PathBuf::from(std::env::var_os("TEST_SRCDIR")?).join(&key);
+    if tree.exists() {
+        return Some(tree);
+    }
+    let manifest = std::fs::read_to_string(std::env::var_os("RUNFILES_MANIFEST_FILE")?).ok()?;
+    manifest.lines().find_map(|l| l.strip_prefix(&key)?.strip_prefix(' ')).map(PathBuf::from)
+}
+
+/// A file of the workspace a test reads, `path` from its top: a data file
+/// under Bazel (`runfile`), else under `sources`, the workspace's top as the
+/// build found it (a build script's, at compile time: a test binary run by
+/// hand, in a debugger or an IDE has no Cargo variables).
+pub fn workspace_file(path: &str, sources: Option<&str>) -> Option<PathBuf> {
+    runfile(path).or_else(|| Some(Path::new(sources?).join(path)))
 }
 
 /// Removes a directory and what it holds. On Windows, files of processes

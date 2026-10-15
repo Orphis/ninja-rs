@@ -17,7 +17,7 @@ use crate::hmap::HeaderMap;
 use crate::intern::{self, Sym};
 use crate::lex::{self, DirKind, Directive, FileDirectives, Kind, P, Token};
 use crate::macros::{self, Context, Expander, Macro, Pragmas, XTok};
-use crate::path_map::PathMap;
+use crate::path_map::{PathKey, PathMap};
 use crate::vfs::{Overlay, Redirect};
 
 pub type MacroTable = HashMap<Sym, Arc<Macro>>;
@@ -107,6 +107,11 @@ pub struct Config {
     /// The source is assembly (`.S`): text may be an assembler's
     /// `.include`, which reads a file the preprocessor doesn't see.
     pub assembler: bool,
+    /// cl's traditional preprocessor (`_MSVC_TRADITIONAL` 1), whose macros
+    /// expand otherwise (see `macros::Expander::expand_traditional`).
+    pub traditional: bool,
+    /// When a comma before `__VA_ARGS__` left out goes.
+    pub va_comma: macros::VaComma,
 }
 
 /// A file processed before the main one, and how the compiler finds it.
@@ -191,11 +196,25 @@ fn stat(p: &Path) -> Option<(FileStamp, FileId)> {
     Some((stamp, id))
 }
 
+/// `p` with its ASCII letters lowercase: how case-insensitive file systems
+/// are keyed. Not other letters: NTFS compares names with its volume's
+/// table (Unicode's simple uppercase, of the version it was formatted
+/// with), in which some that lowercase alike are different names (`K`,
+/// KELVIN SIGN, isn't `k`; `ẞ` isn't `ß`): two files would share a key. A
+/// name with others may be spelled several ways (several keys): see the
+/// watcher's.
+pub fn fold_case(p: &Path) -> PathBuf {
+    PathBuf::from(p.as_os_str().to_ascii_lowercase())
+}
+
 /// A file's key and stamp (what tells its versions apart: a file replaced
 /// by one of the same size with its modification time restored, as `cp -p`
 /// or an archive extraction leaves it, has a new one).
 type Version = (PathBuf, FileStamp);
 type Lexing = Arc<OnceLock<Option<Arc<FileDirectives>>>>;
+
+/// A name's parts: where each starts and ends in it, by their ends.
+type Parts = Vec<(usize, usize, Sym)>;
 
 /// The session of entries a watch vouches for: valid until it reports a
 /// change (`Cache::changed`).
@@ -300,14 +319,15 @@ impl Cache {
 
     /// What a watcher saw change: entries it concerns are checked again.
     pub fn changed(&self, path: &Path, change: Change) {
-        let key = self.key(path);
+        // Encoded once, for both maps.
+        let key = PathKey::new(&self.key(path));
         match change {
             Change::Content => {
-                self.files.write().unwrap().remove(key.as_ref());
-                self.dirs.write().unwrap().remove(key.as_ref());
+                self.files.write().unwrap().remove(&key);
+                self.dirs.write().unwrap().remove(&key);
             }
             Change::Names => {
-                self.dirs.write().unwrap().remove(key.as_ref());
+                self.dirs.write().unwrap().remove(&key);
             }
             Change::Tree => {
                 self.files.write().unwrap().remove_under(&key);
@@ -325,9 +345,10 @@ impl Cache {
         self.len() == (0, 0)
     }
 
-    /// `p` as a key of the maps: lowercase on case-insensitive file systems.
+    /// `p` as a key of the maps: on case-insensitive file systems, its
+    /// ASCII letters lowercase (see `fold_case`).
     fn key<'a>(&self, p: &'a Path) -> Cow<'a, Path> {
-        if self.case_insensitive { Cow::Owned(PathBuf::from(p.to_string_lossy().to_lowercase())) } else { Cow::Borrowed(p) }
+        if self.case_insensitive { Cow::Owned(fold_case(p)) } else { Cow::Borrowed(p) }
     }
 
     /// Whether an entry checked in `session` is still valid.
@@ -376,7 +397,7 @@ impl Cache {
     }
 
     fn name_key(&self, name: &str) -> String {
-        if self.case_insensitive { name.to_lowercase() } else { name.to_string() }
+        if self.case_insensitive { name.to_ascii_lowercase() } else { name.to_string() }
     }
 
     /// The regular files (and links to them) of a directory.
@@ -408,7 +429,7 @@ impl Cache {
         // Where a link leads changes without its directory: a listing with
         // one holds for the session.
         let session = if linked { self.session() } else { self.checked(token) };
-        dirs.insert(key.into_owned(), (session, l.clone()));
+        dirs.insert(key.as_ref(), (session, l.clone()));
         l
     }
 
@@ -417,7 +438,11 @@ impl Cache {
             return p.is_file();
         }
         let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return false };
-        self.listing(dir).is_some_and(|l| l.contains(&self.name_key(&name.to_string_lossy())))
+        let name = name.to_string_lossy();
+        // Names are compared as the file system does but for other letters
+        // than ASCII's (see `fold_case`): one with those it may know under
+        // another case, it's asked.
+        self.listing(dir).is_some_and(|l| l.contains(&self.name_key(&name))) || (self.case_insensitive && !name.is_ascii() && p.is_file())
     }
 
     /// A file's directives, lexed once per version.
@@ -457,7 +482,7 @@ impl Cache {
                 // The token compared under the lock: an event counted after
                 // it drops the entry once it's in.
                 let mut files = self.files.write().unwrap();
-                files.insert(version.0.clone(), Arc::new(Entry { stamp, id, session: AtomicU64::new(self.checked(token)), fd: fd.clone() }));
+                files.insert(&version.0, Arc::new(Entry { stamp, id, session: AtomicU64::new(self.checked(token)), fd: fd.clone() }));
                 Some(fd)
             })
             .clone();
@@ -602,6 +627,19 @@ struct State<'a> {
     /// `lex::name_hash`), for text that calls them.
     arg_pragmas: HashSet<Sym>,
     arg_pragma_hashes: Vec<u64>,
+    /// Once there are such macros, the macros defined so far by their
+    /// names' hashes, for the text that names one that pastes names (see
+    /// `text_may_run_pragma`).
+    macro_hashes: HashMap<u64, Sym>,
+    /// The names that are a part of one of those macros' (`DO_` and
+    /// `PRAGMA` of `DO_PRAGMA`), which pastes would make it of, and their
+    /// hashes; those in the replacements of macros defined so far (see
+    /// `pasted_pragma_name`).
+    fragments: HashSet<Sym>,
+    fragment_hashes: HashMap<u64, Sym>,
+    replaced_fragments: HashSet<Sym>,
+    /// Those names' lengths and parts.
+    fragmented: Vec<(usize, Parts)>,
     /// The macros undefined so far (see `text_runs_pragma`).
     undefined: HashSet<Sym>,
     /// The files with `#pragma once` (or `#import`ed), by key; their
@@ -729,12 +767,20 @@ impl Context for State<'_> {
     fn arg_pragma(&self, name: Sym) -> bool {
         !self.arg_pragmas.is_empty() && self.arg_pragmas.contains(&name)
     }
+
+    fn traditional(&self) -> bool {
+        self.cfg.traditional
+    }
+
+    fn va_comma(&self) -> macros::VaComma {
+        self.cfg.va_comma
+    }
 }
 
 impl State<'_> {
     fn key(&self, p: &Path) -> String {
         let s = p.to_string_lossy();
-        if self.cache.case_insensitive { s.to_lowercase() } else { s.into_owned() }
+        if self.cache.case_insensitive { s.to_ascii_lowercase() } else { s.into_owned() }
     }
 
     fn inexact(&mut self, why: String) {
@@ -953,14 +999,16 @@ impl State<'_> {
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         self.stack.push(Frame { path, real, dir, found_at, alt_at, relative, line: 0, line_set: false, id, len: stamp.len, hash: fd.hash });
         self.run(&fd);
-        // Its text calls a macro whose pragmas its arguments make: text
-        // isn't expanded.
+        // Its text runs a pragma a macro's arguments make: text isn't
+        // expanded.
         let frame = self.stack.pop();
-        if self.arg_pragma_hashes.iter().any(|h| fd.calls.binary_search(h).is_ok())
+        let mut pastes = HashMap::new();
+        if !self.arg_pragmas.is_empty()
             && let Some(f) = frame
-            && self.text_runs_pragma(&f.real, &fd)
+            && self.text_may_run_pragma(&fd, &mut pastes)
+            && self.text_runs_pragma(&f.real, &fd, &mut pastes)
         {
-            self.inexact(format!("{}:{}: text calls a macro whose pragmas its arguments make", f.path.display(), f.line));
+            self.inexact(format!("{}:{}: text may run a pragma a macro's arguments make", f.path.display(), f.line));
         }
     }
 
@@ -1018,19 +1066,58 @@ impl State<'_> {
             })
     }
 
-    /// Whether a file's text, which may call macros whose pragmas their
-    /// arguments make (see `arg_pragmas`), runs one: unless their every
-    /// argument is words that aren't macros (nor were in this scan: text
-    /// came before the end of the file) nor pragmas' (`DO_PRAGMA(GCC
-    /// diagnostic push)`), strings that don't start with one, numbers or
-    /// punctuation. Its text is read again for this, once per version.
-    fn text_runs_pragma(&self, real: &Path, fd: &FileDirectives) -> bool {
-        let text = fd.text.get_or_init(|| {
-            let content = std::fs::read(real).ok().filter(|c| lex::content_hash(c) == fd.hash)?;
-            Some(lex::text_tokens(&content).into_boxed_slice())
-        });
-        let Some(toks) = text else { return true };
-        let harmless = |a: &Token| match a.kind {
+    /// Whether a file's text may run a pragma its arguments make, by what it
+    /// names: a macro whose pragmas its arguments make (see `arg_pragmas`),
+    /// or one that pastes names, which may make one.
+    fn text_may_run_pragma(&self, fd: &FileDirectives, pastes: &mut HashMap<Sym, bool>) -> bool {
+        if fd.names.iter().any(|h| self.arg_pragma_hashes.contains(h)) {
+            return true;
+        }
+        let named: Vec<Sym> = fd.names.iter().filter_map(|h| self.fragment_hashes.get(h).copied()).collect();
+        self.pasted_pragma_name(&named) && fd.names.iter().any(|h| self.macro_hashes.get(h).is_some_and(|&n| self.pastes(n, pastes, 0)))
+    }
+
+    /// Whether pastes may make the name of a macro whose pragmas its
+    /// arguments make: one of those names is made of parts (two or more,
+    /// see `fragments`) that replacements or `text` have.
+    fn pasted_pragma_name(&self, text: &[Sym]) -> bool {
+        let has = |part: &Sym| self.replaced_fragments.contains(part) || text.contains(part);
+        self.fragmented.iter().any(|(len, parts)| {
+            // Where parts may end, made of parts (sorted by their ends).
+            let mut ends = vec![false; len + 1];
+            ends[0] = true;
+            for &(start, end, part) in parts {
+                ends[end] |= ends[start] && has(&part);
+            }
+            ends[*len]
+        })
+    }
+
+    /// Whether a macro pastes names (`##`), or one its replacement names
+    /// does (memoized in `pastes`; maybe, for one naming itself through
+    /// others, or too deep).
+    fn pastes(&self, name: Sym, pastes: &mut HashMap<Sym, bool>, depth: usize) -> bool {
+        if let Some(&p) = pastes.get(&name) {
+            return p;
+        }
+        let Some(m) = self.macros.get(&name) else { return false };
+        if depth > 64 {
+            return true;
+        }
+        pastes.insert(name, true);
+        let params = m.params.as_deref().unwrap_or(&[]);
+        let p = m.body.iter().any(|t| t.is(P::HashHash))
+            || m.body.iter().any(|t| t.ident().is_some_and(|n| n != name && !params.contains(&n) && self.pastes(n, pastes, depth + 1)));
+        pastes.insert(name, p);
+        p
+    }
+
+    /// Whether an argument text gives a macro whose pragmas its arguments
+    /// make runs nothing: words that aren't macros (nor were in this scan:
+    /// text came before the end of the file) nor pragmas', strings that
+    /// don't start with one, numbers or punctuation.
+    fn harmless(&self, a: &Token) -> bool {
+        match a.kind {
             Kind::Ident => {
                 !self.macros.contains_key(&a.sym)
                     && !self.undefined.contains(&a.sym)
@@ -1043,19 +1130,49 @@ impl State<'_> {
             Kind::Number | Kind::Char => true,
             Kind::Punct(p) => !matches!(p, P::Hash | P::HashHash),
             _ => false,
-        };
+        }
+    }
+
+    /// Whether a file's text, which may run pragmas its arguments make (see
+    /// `text_may_run_pragma`), runs one: where it names a macro whose
+    /// pragmas its arguments make, unless it calls it there with harmless
+    /// arguments (`DO_PRAGMA(GCC diagnostic push)`, see `harmless`); where
+    /// it calls one that pastes names, if its expansion names one (see
+    /// `macros::call_runs_pragma`). Its text is read again for this, once
+    /// per version.
+    fn text_runs_pragma(&mut self, real: &Path, fd: &FileDirectives, pastes: &mut HashMap<Sym, bool>) -> bool {
+        let text = fd.text.get_or_init(|| {
+            let content = std::fs::read(real).ok().filter(|c| lex::content_hash(c) == fd.hash)?;
+            Some(lex::text_tokens(&content).into_boxed_slice())
+        });
+        let Some(toks) = text else { return true };
         let mut i = 0;
         while i < toks.len() {
-            if toks[i].kind == Kind::Ident && self.arg_pragmas.contains(&toks[i].sym) {
+            let name = toks[i].ident().filter(|n| self.macros.contains_key(n));
+            if let Some(n) = name
+                && self.arg_pragmas.contains(&n)
+            {
                 // (Not called here: maybe through what follows.)
                 if !toks.get(i + 1).is_some_and(|p| p.is(P::LParen)) {
                     return true;
                 }
                 let end = macros::closing(toks, i + 1);
-                if end == toks.len() || !toks[i + 2..end].iter().all(harmless) {
+                let args = &toks[(i + 2).min(end)..end];
+                if end == toks.len() || macros::dependency_words(args) || !args.iter().all(|a| self.harmless(a)) {
                     return true;
                 }
                 i = end;
+            } else if let Some(n) = name
+                && self.pastes(n, pastes, 0)
+            {
+                // A paste makes such a name of its parts: in the call, or in
+                // replacements.
+                let call = self.macros.get(&n).is_some_and(|m| m.params.is_some()) && toks.get(i + 1).is_some_and(|p| p.is(P::LParen));
+                let end = if call { macros::closing(toks, i + 1) } else { i };
+                let parts: Vec<Sym> = toks[i..end.min(toks.len())].iter().map(|t| t.sym).filter(|s| self.fragments.contains(s)).collect();
+                if self.pasted_pragma_name(&parts) && (end == toks.len() || macros::call_runs_pragma(&toks[i..=end], self)) {
+                    return true;
+                }
             }
             i += 1;
         }
@@ -1152,7 +1269,17 @@ impl State<'_> {
             // `_Pragma(OPERAND)` in text, its operand made by macros (see
             // `macros::operand_pragmas`), or a pragma run through a macro.
             let pragmas = match &d.toks[..] {
-                [_, l, operand @ .., r] if l.is(P::LParen) && r.is(P::RParen) => macros::operand_pragmas(operand, None, &[], self).0,
+                [_, l, operand @ .., r] if l.is(P::LParen) && r.is(P::RParen) => {
+                    match macros::operand_words(operand, self).filter(|w| macros::dependency_words(w)) {
+                        Some(words) => {
+                            if self.cfg.family != Family::Msvc {
+                                self.dependency(&words[2..]);
+                            }
+                            Pragmas::None
+                        }
+                        None => macros::operand_pragmas(operand, None, &[], self).0,
+                    }
+                }
                 _ => Pragmas::Other,
             };
             match pragmas {
@@ -1193,6 +1320,7 @@ impl State<'_> {
             match prev {
                 Some(m) => {
                     self.macros.insert(name, m);
+                    self.defined(name);
                 }
                 None => {
                     self.macros.remove(&name);
@@ -1220,6 +1348,53 @@ impl State<'_> {
                 }
             }
             None => self.out.missing.push(name),
+        }
+    }
+
+    /// After a macro is defined: noted for the text that names it, and the
+    /// parts of names of macros whose pragmas their arguments make its
+    /// replacement has (see `pasted_pragma_name`).
+    fn defined(&mut self, name: Sym) {
+        if self.arg_pragmas.is_empty() {
+            return;
+        }
+        self.macro_hashes.insert(lex::name_hash(name.as_str().as_bytes()), name);
+        if let Some(m) = self.macros.get(&name).cloned() {
+            self.replaced_fragments_of(&m);
+        }
+    }
+
+    /// Notes the parts of names of macros whose pragmas their arguments make
+    /// a macro's replacement has (not its parameters: what they stand for
+    /// is the arguments').
+    fn replaced_fragments_of(&mut self, m: &Macro) {
+        let params = m.params.as_deref().unwrap_or(&[]);
+        for t in m.body.iter() {
+            if self.fragments.contains(&t.sym) && !params.contains(&t.sym) {
+                self.replaced_fragments.insert(t.sym);
+            }
+        }
+    }
+
+    /// The files `#pragma GCC dependency` names in a macro's `_Pragma`s
+    /// (whose text use makes the scan inexact: see `macros::pragmas`), as
+    /// found here: inputs (where it's used, they may be others).
+    fn dependencies_of(&mut self, m: &Macro) {
+        if self.cfg.family == Family::Msvc || !m.body.iter().any(|t| t.sym == intern::PRAGMA_OPERATOR) {
+            return;
+        }
+        for w in m.body.windows(4) {
+            if let [p, l, s, r] = w
+                && p.sym == intern::PRAGMA_OPERATOR
+                && l.is(P::LParen)
+                && s.kind == Kind::Str
+                && r.is(P::RParen)
+            {
+                let words = lex::tokens(macros::destringize(s.sym.as_str()).as_bytes());
+                if macros::dependency_words(&words) {
+                    self.dependency(&words[2..]);
+                }
+            }
         }
     }
 
@@ -1264,6 +1439,24 @@ impl State<'_> {
         // `DO_PRAGMA`), and text that calls it is seen.
         if arg && self.arg_pragmas.insert(m.name) {
             self.arg_pragma_hashes.push(lex::name_hash(m.name.as_str().as_bytes()));
+            if self.arg_pragmas.len() == 1 {
+                self.macro_hashes = self.macros.keys().map(|&n| (lex::name_hash(n.as_str().as_bytes()), n)).collect();
+            }
+            // Its name's parts, and the replacements that have one.
+            let name = m.name.as_str();
+            let mut parts = Vec::new();
+            for end in (1..=name.len()).filter(|&e| name.is_char_boundary(e)) {
+                for start in (0..end).filter(|&s| name.is_char_boundary(s) && end - s < name.len()) {
+                    let part = intern::intern(&name[start..end]);
+                    self.fragments.insert(part);
+                    self.fragment_hashes.insert(lex::name_hash(&name.as_bytes()[start..end]), part);
+                    parts.push((start, end, part));
+                }
+            }
+            self.fragmented.push((name.len(), parts));
+            for o in self.macros.values().cloned().collect::<Vec<_>>() {
+                self.replaced_fragments_of(&o);
+            }
             let naming: Vec<Arc<Macro>> =
                 self.macros.values().filter(|o| o.name != m.name && o.body.iter().any(|t| t.kind == Kind::Ident && t.sym == m.name)).cloned().collect();
             for o in naming {
@@ -1320,8 +1513,10 @@ impl State<'_> {
                         if self.macros.get(&m.name).is_none_or(|old| **old != **m) {
                             self.changing(m.name);
                             self.macros.insert(m.name, m.clone());
+                            self.defined(m.name);
                             self.classify(m);
                             self.changed(m.name);
+                            self.dependencies_of(m);
                         }
                     }
                 }
@@ -1390,6 +1585,27 @@ fn command_text(commands: &[CommandMacro]) -> String {
 
 /// Scans a translation unit: the files its preprocessor reads.
 pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Output {
+    scanned(cache, cfg, oracle, main).out
+}
+
+/// Scans a translation unit, then expands `lines` of text with the macros
+/// defined at its end, as the compiler would (for tests against it).
+#[cfg(test)]
+pub(crate) fn scan_and_expand(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path, lines: &[String]) -> (Output, Vec<Result<Vec<Token>, String>>) {
+    let mut st = scanned(cache, cfg, oracle, main);
+    let expanded = lines
+        .iter()
+        .map(|l| {
+            let mut x = Expander::new(&mut st, false);
+            let toks = x.expand_tokens(&lex::tokens(l.as_bytes()));
+            x.error.take().map_or(Ok(toks), Err)
+        })
+        .collect();
+    (st.out, expanded)
+}
+
+/// The state at the end of a scan.
+fn scanned<'a>(cache: &'a Cache, cfg: &'a Config, oracle: &'a dyn Oracle, main: &Path) -> State<'a> {
     let main = normalize(main);
     let mut st = State {
         cfg,
@@ -1401,6 +1617,11 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
         pragma_users: HashMap::new(),
         arg_pragmas: HashSet::new(),
         arg_pragma_hashes: Vec::new(),
+        macro_hashes: HashMap::new(),
+        fragments: HashSet::new(),
+        fragment_hashes: HashMap::new(),
+        replaced_fragments: HashSet::new(),
+        fragmented: Vec::new(),
         undefined: HashSet::new(),
         once: HashSet::new(),
         once_ids: HashMap::new(),
@@ -1455,14 +1676,14 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
     st.base = None;
     let Some(real) = st.locate(&main).filter(|r| cache.directives(r).is_some()) else {
         st.out.missing.push(main.to_string_lossy().into_owned());
-        return st.out;
+        return st;
     };
     st.include_file(Found { path: main, real, at: None, alt_at: None, relative: false }, false);
     for note in st.notes.take() {
         st.inexact(note);
     }
     // The main file first.
-    st.out
+    st
 }
 
 #[cfg(test)]
@@ -1765,6 +1986,19 @@ mod tests {
         assert!(!exact("wrap_before.c", &format!("#define WRAP(x) DO_PRAGMA(x)\n{do_pragma}#define ONCE_WORD once\nWRAP(ONCE_WORD)\n")));
         assert!(!exact("alias.c", &format!("{do_pragma}#define DP DO_PRAGMA\n#define ONCE_WORD once\nDP(ONCE_WORD)\n")));
         assert!(!exact("in_body.c", &format!("{do_pragma}#define ONCE_WORD once\n#define ONCE DO_PRAGMA(ONCE_WORD)\n")));
+        // Given to another macro, or after a comment; or a name pasted
+        // (the sixth review's).
+        let once = format!("{do_pragma}#define ONCE_WORD once\n");
+        assert!(!exact("as_argument.c", &format!("{once}#define CALL(f, a) f(a)\nCALL(DO_PRAGMA, ONCE_WORD)\n")));
+        assert!(!exact("obj_alias_later.c", &format!("{once}#define APPLY(m) m(ONCE_WORD)\nAPPLY(DO_PRAGMA)\n")));
+        assert!(!exact("comment_before_paren.c", &format!("{once}DO_PRAGMA /* c */ (ONCE_WORD)\n")));
+        assert!(!exact("paste.c", &format!("{once}#define CAT(a, b) a##b\nCAT(DO_, PRAGMA)(ONCE_WORD)\n")));
+        assert!(!exact("paste_wrapped.c", &format!("{once}#define CAT(a, b) CAT_I(a, b)\n#define CAT_I(a, b) a##b\nCAT(DO_, PRAGMA)(ONCE_WORD)\n")));
+        // Pasting other names is harmless.
+        assert!(exact(
+            "paste_other.c",
+            &format!("{once}#define CAT(a, b) CAT_I(a, b)\n#define CAT_I(a, b) a##b\nint CAT(x, y) = CAT(1, 2);\n#include \"a.h\"\n")
+        ));
         assert!(exact("arg_words.c", &format!("{do_pragma}DO_PRAGMA(GCC diagnostic ignored \"-Wx\")\nDO_PRAGMA(message(\"hi\" 1))\n#include \"a.h\"\n")));
         // A TODO message with the place: harmless.
         let todo = "#define TODO(m) _Pragma(XSTR(message(__FILE__ \":\" XSTR(__LINE__) \": \" m)))\n";
@@ -2237,6 +2471,29 @@ mod tests {
         assert!(out.found.is_empty() && out.missing.is_empty(), "{:?} {:?}", out.found, out.missing);
     }
 
+    /// `#pragma GCC dependency` run by `_Pragma`: written in text (its
+    /// operand a string, or made by macros), or by a macro text uses
+    /// (inexact: where it's used, and so where the file is, is unknown; the
+    /// file found from where it's defined is an input).
+    #[test]
+    fn pragma_dependency_operators() {
+        let d = Dir::new("dependency_operators");
+        d.file("inc/dep.txt", "");
+        let scanned = |name: &str, text: &str| scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &d.file(name, text));
+        for (name, text) in [
+            ("text.c", "_Pragma(\"GCC dependency \\\"dep.txt\\\"\")\nint x;\n"),
+            ("operand.c", "#define STR(x) #x\n_Pragma(STR(GCC dependency \"dep.txt\")) int x;\n"),
+        ] {
+            let out = scanned(name, text);
+            assert_eq!(d.rel(&out.found), vec!["inc/dep.txt"], "{name}");
+            assert!(out.exact(), "{name}: {:?}", out.inexact);
+        }
+        let out = scanned("macro.c", "#define DEP _Pragma(\"GCC dependency \\\"dep.txt\\\"\")\nDEP\nint x;\n");
+        assert_eq!(d.rel(&out.found), vec!["inc/dep.txt"]);
+        assert!(!out.exact());
+        assert!(!scanned("macro_operand.c", "#define STR(x) #x\n#define DEP _Pragma(STR(GCC dependency \"dep.txt\"))\nDEP\n").exact());
+    }
+
     /// `#pragma once` is about the file, not its path: the same file under
     /// another name (a link) is skipped by the compiler here, maybe not
     /// remotely, as an identical copy is by GCC: inexact, unless including
@@ -2360,5 +2617,18 @@ mod tests {
         assert_eq!(d.rel(&out.files), vec!["main.c", "local.bin", "data/data.bin", "inc/yes.h", "inc/once.h", "inc/counted.h", "inc/popped.h"]);
         assert_eq!(d.rel(&out.found), vec!["data/empty.bin", "local.bin"]);
         assert!(out.exact(), "{:?}", out.inexact);
+    }
+
+    /// Windows: names are found as NTFS finds them, whose letters other
+    /// than ASCII's are keyed as spelled: `é.h` is `É.h`; `k.h` isn't `K.h`
+    /// (KELVIN SIGN), though it's its lowercase.
+    #[cfg(windows)]
+    #[test]
+    fn names_found_as_on_disk() {
+        let d = Dir::new("case_names");
+        let (e, kelvin) = (d.file("inc/\u{c9}.h", "e"), d.file("inc/\u{212A}.h", "kelvin"));
+        let cache = Cache::new(vec![], true);
+        assert!(cache.exists(&e) && cache.exists(&d.0.join("inc/\u{e9}.h")) && cache.exists(&kelvin));
+        assert!(!cache.exists(&d.0.join("inc/k.h")) && !cache.exists(&d.0.join("inc/K.H")));
     }
 }

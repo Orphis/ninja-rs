@@ -61,12 +61,17 @@ pub struct LogLock {
     locked: bool,
 }
 
-/// Who holds a build directory's lock, as its lock file says.
+/// Who holds a build directory's lock, as its lock file says:
+/// `<pid> <since ms> <start> <pid namespace>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Holder {
     pub pid: u32,
     /// When it took the lock, in ms since the Unix epoch.
     pub since_ms: u64,
+    /// What tells it from other processes with its id (see
+    /// `ninja_os::ProcessIdentity`), unless it couldn't tell (an older
+    /// ninja-rs didn't).
+    pub process: Option<ninja_os::ProcessIdentity>,
 }
 
 impl Holder {
@@ -107,7 +112,8 @@ impl LogLock {
         }
         self.locked = true;
         let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_millis();
-        self.say(format!("{} {since}\n", std::process::id()).as_bytes());
+        let process = ninja_os::process_info(None).map_or(String::new(), |p| format!(" {} {}", p.identity.start, p.identity.namespace));
+        self.say(format!("{} {since}{process}\n", std::process::id()).as_bytes());
         Ok(true)
     }
 
@@ -121,8 +127,10 @@ impl LogLock {
     /// couldn't write it: an older ninja-rs, another user's file).
     pub fn holder(&self) -> Option<Holder> {
         let text = std::fs::read_to_string(&self.path).ok()?;
-        let (pid, since) = text.lines().next()?.split_once(' ')?;
-        Some(Holder { pid: pid.parse().ok()?, since_ms: since.parse().ok()? })
+        let fields: Vec<&str> = text.lines().next()?.split(' ').collect();
+        let number = |i: usize| -> Option<u64> { fields.get(i)?.parse().ok() };
+        let process = number(2).zip(number(3)).map(|(start, namespace)| ninja_os::ProcessIdentity { start, namespace });
+        Some(Holder { pid: number(0)?.try_into().ok()?, since_ms: number(1)?, process })
     }
 
     /// Writes `text` into the lock file, if this process may (through a
@@ -749,11 +757,16 @@ mod tests {
         assert!(!other.lock(false).unwrap());
         let holder = other.holder().unwrap();
         assert_eq!(holder.pid, std::process::id());
+        assert_eq!(holder.process, ninja_os::process_info(None).map(|p| p.identity));
         assert!(holder.describe().starts_with(&format!("pid {}, started ", std::process::id())), "{}", holder.describe());
         assert_eq!(held.identity().unwrap(), other.identity().unwrap());
         drop(held);
         assert_eq!(other.holder(), None);
         assert!(other.lock(false).unwrap());
+        drop(other);
+        // As an older ninja-rs said it: who, not which process.
+        std::fs::write(&p, "123 456\n").unwrap();
+        assert_eq!(LogLock::open(&p).unwrap().holder(), Some(Holder { pid: 123, since_ms: 456, process: None }));
     }
 
     /// A lock file this user can't write (another user's, in a build

@@ -45,6 +45,7 @@ rust_test(
     srcs = ["tests/uploader.rs"],
     deps = [
         ":rbe-bes",
+        "//third_party/cargo-rbe/rbe-client",
         "@crates//:anyhow",
         "@crates//:prost",
         "@crates//:tokio",

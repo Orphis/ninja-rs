@@ -28,7 +28,8 @@
 //!
 //! Build events never fail the build: problems are warnings, but for a
 //! certificate refused (the server's, or the client's), which ends the
-//! invocation before the build when connecting, or fails it at the end.
+//! invocation before the build when connecting (or at the service's first
+//! answer, when it refuses the client's), or fails it at the end.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -49,6 +50,7 @@ use rbe_bes::events::{EventStream, id};
 use rbe_bes::proto::build_event_stream as bep;
 use rbe_bes::proto::command_line as cl;
 use rbe_bes::uploader::{BesConfig, BesUploader, BuildOutcome};
+use rbe_client::Seen;
 use rbe_client::fault::{self, Fault};
 
 use crate::options::BesFlags;
@@ -240,9 +242,11 @@ pub struct Bes {
     bytestream: Option<String>,
     store: Arc<Store>,
     uploader: Mutex<Option<BesUploader>>,
-    /// The backend's connection, once made or failed: the error ending the
-    /// invocation, if any (see `connected`).
-    connection: Option<tokio::sync::watch::Receiver<Option<Option<String>>>>,
+    /// The backend's connection: how connecting went, and what its
+    /// connections came to (see `connected`).
+    connection: Option<(tokio::sync::watch::Receiver<Made>, tokio::sync::watch::Receiver<Seen>)>,
+    /// Whether the backend connects with TLS.
+    backend_tls: bool,
     /// How long `connected` waits for it.
     connect_deadline: tokio::time::Instant,
     /// Completed targets waiting for their artifacts' digests (see
@@ -272,13 +276,16 @@ pub struct Bes {
 impl Bes {
     /// Opens the file (when given) and starts the upload to the backend,
     /// which connects in the background (with `tls`, the settings
-    /// `TlsFlags::load` read for a `grpcs://` backend): the build only waits
-    /// for that connection a while (`connected`). The events describing the
+    /// `TlsFlags::load` read for a `grpcs://` backend, and `check`, of a
+    /// CA of a bundle verifying its certificate): the build only waits for
+    /// that connection a while (`connected`). The events describing the
     /// invocation go first, once the build's targets are known
     /// (`announce`), or with the first other event.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         opts: &crate::options::Options,
         tls_settings: ninja_remote::Tls,
+        check: rbe_client::CaCheck,
         ids: &InvocationIds,
         bytestream: Option<String>,
         store: Arc<Store>,
@@ -308,20 +315,26 @@ impl Bes {
             // A certificate refused, or settings that can't connect (nothing
             // was contacted), end the invocation (`connected`); a backend
             // that can't be reached, or speaks something else, is reported
-            // at the end (`finish`).
-            let (made, outcome) = tokio::sync::watch::channel(None);
+            // at the end (`finish`). A connection that broke to no service
+            // at all is made again once: a backend that never answered
+            // isn't waited for long.
+            let (seen, connecting) = rbe_client::connect_watched(connect, fault::FIRST_CONTACT_RETRIES, check);
+            let (made, outcome) = tokio::sync::watch::channel(Made::Connecting);
             let (backend, tls) = (backend.clone(), tls.clone());
             let connecting = async move {
-                let channel = rbe_client::connect_channel(&connect).await;
-                let fatal = channel.as_ref().err().filter(|e| fault::certificate(e.as_ref()).is_some() || fault::fault(e.as_ref()) == Fault::None).map(|e| {
-                    let e = fault::describe(e.as_ref());
-                    format!("build events: {e}{}", crate::options::tls_hint(&e, &backend, &tls, true))
+                let channel = connecting.await;
+                made.send_replace(match &channel {
+                    Ok(_) => Made::Connected,
+                    Err(e) if fault::certificate(e.as_ref()).is_some() || fault::fault(e.as_ref()) == Fault::None => {
+                        let e = fault::describe(e.as_ref());
+                        Made::Fatal(format!("build events: {e}{}", crate::options::tls_hint(&e, &backend, &tls)))
+                    }
+                    Err(_) => Made::Failed,
                 });
-                made.send_replace(Some(fatal));
                 channel
             };
-            uploader = Some(BesUploader::connecting(connecting, config));
-            connection = Some(outcome);
+            uploader = Some(BesUploader::connecting_watched(connecting, Some(seen.clone()), config));
+            connection = Some((outcome, seen));
         }
         let file = flags.binary_file.as_ref().and_then(|p| match std::fs::File::create(p) {
             Ok(f) => Some(std::io::BufWriter::new(f)),
@@ -344,6 +357,7 @@ impl Bes {
             store,
             uploader: Mutex::new(uploader),
             connection,
+            backend_tls: flags.backend.as_deref().is_some_and(crate::options::uses_tls),
             connect_deadline: tokio::time::Instant::now() + flags.rpc_timeout.min(rbe_bes::uploader::LIFECYCLE_TIMEOUT),
             hashing,
             hurry,
@@ -373,27 +387,58 @@ impl Bes {
         self.relay_out.lock().unwrap().take();
     }
 
-    /// Waits for the backend's connection (its TLS handshake), as long as
-    /// the opening of an upload may take (5 s, or `--bes_rpc_timeout` if
-    /// shorter, from `start`). A certificate refused, the server's or the
-    /// client's, or settings that can't connect, are the invocation's error,
-    /// before the build runs anything: the upload is over then. A backend
-    /// that can't be reached, or hasn't answered yet, isn't: the upload's
-    /// end says how it went (`finish`).
+    /// Waits for the backend's first answer (over TLS: the service's
+    /// HTTP/2 SETTINGS, which come once it took the client's certificate,
+    /// if it asked for one), as long as the opening of an upload may take
+    /// (5 s, or `--bes_rpc_timeout` if shorter, from `start`). A
+    /// certificate refused, the server's or the client's, or settings that
+    /// can't connect, are the invocation's error, before the build runs
+    /// anything: the upload is over then. A backend that can't be reached
+    /// (a connection broken to no service at all is made again meanwhile),
+    /// or hasn't answered yet, isn't: the upload's end says how it went
+    /// (`finish`).
     pub async fn connected(&self) -> Result<(), String> {
-        let Some(mut outcome) = self.connection.clone() else { return Ok(()) };
-        let fatal = match tokio::time::timeout_at(self.connect_deadline, outcome.wait_for(Option::is_some)).await {
-            Ok(Ok(made)) => made.clone().flatten(),
-            _ => None,
-        };
-        match fatal {
-            Some(e) => {
+        match self.contact().await {
+            Contact::Fatal(e) => {
                 // Said once: not again at the end.
                 self.uploader.lock().unwrap().take();
                 Err(e)
             }
-            None => Ok(()),
+            _ => Ok(()),
         }
+    }
+
+    /// What `connected` waits for (see `Contact`).
+    async fn contact(&self) -> Contact {
+        let Some((mut made, mut seen)) = self.connection.clone() else { return Contact::None };
+        let waited = async {
+            let (mut made_open, mut seen_open) = (true, true);
+            loop {
+                match &*seen.borrow_and_update() {
+                    Seen::Refused(e) => {
+                        let backend = self.flags.backend.as_deref().unwrap_or_default();
+                        return Contact::Fatal(format!("build events: {backend}: {e}{}", crate::options::tls_hint(e, backend, &self.tls)));
+                    }
+                    Seen::Answered => return Contact::Answered,
+                    Seen::Unheard => return Contact::Unheard,
+                    Seen::Nothing => {}
+                }
+                match &*made.borrow_and_update() {
+                    Made::Fatal(e) => return Contact::Fatal(e.clone()),
+                    Made::Failed => return Contact::Failed,
+                    Made::Connected if !self.backend_tls => return Contact::Plaintext,
+                    Made::Connected | Made::Connecting => {}
+                }
+                if !made_open && !seen_open {
+                    return Contact::Unknown;
+                }
+                tokio::select! {
+                    r = made.changed(), if made_open => made_open = r.is_ok(),
+                    r = seen.changed(), if seen_open => seen_open = r.is_ok(),
+                }
+            }
+        };
+        tokio::time::timeout_at(self.connect_deadline, waited).await.unwrap_or(Contact::Unknown)
     }
 
     /// Accepts nested invocations' connections: each sends its build
@@ -588,7 +633,8 @@ impl Bes {
     /// Bazel's structured command line: its sections, which UIs show, with
     /// the options and the targets named on the command line as the
     /// residual. The `original` one has the options typed, the `canonical`
-    /// one those of `.ninjars` files and the outer invocation too.
+    /// one those in effect: of `.ninjars` files and the outer invocation
+    /// too, but those left out for one they conflict with.
     fn structured_command_line(&self, label: &str) -> cl::CommandLine {
         let chunk = |label: &str, chunk: Vec<String>| cl::CommandLineSection {
             section_label: label.into(),
@@ -598,7 +644,7 @@ impl Bes {
         let given = self
             .given
             .iter()
-            .filter(|g| label != "original" || g.explicit)
+            .filter(|g| if label == "original" { g.explicit } else { !g.left_out })
             .map(|g| cl::Option { combined_form: g.combined_form.clone(), option_name: g.name.clone(), option_value: g.value.clone(), ..Default::default() })
             .collect();
         cl::CommandLine {
@@ -644,7 +690,7 @@ impl Bes {
         children.push(id::build_finished());
         let command_lines: Vec<_> = ["original", "canonical"].iter().map(|l| (*l, self.structured_command_line(l))).collect();
         let explicit: Vec<String> = argv.iter().skip(1).cloned().collect();
-        let options: Vec<String> = self.given.iter().map(|g| g.combined_form.clone()).chain(self.typed.iter().cloned()).collect();
+        let options: Vec<String> = self.given.iter().filter(|g| !g.left_out).map(|g| g.combined_form.clone()).chain(self.typed.iter().cloned()).collect();
         let status = [("BUILD_HOST", host_name()), ("BUILD_USER", user_name()), ("BUILD_TIMESTAMP", (millis(start) / 1000).to_string())];
         let metadata = self.flags.build_metadata.iter().cloned().collect();
         inner.patterns = Some(patterns);
@@ -1145,13 +1191,12 @@ impl Bes {
                 }
                 Ok(Err(e)) => {
                     refused = fault::certificate(e.as_ref()).is_some();
-                    // The stream's failure says whether the backend answered;
-                    // any other failure came before it could.
-                    let first_contact = e.downcast_ref::<rbe_bes::uploader::Failed>().is_none_or(|f| !f.answered());
+                    // The stream's failure says after how many attempts.
+                    let after = if e.is::<rbe_bes::uploader::Failed>() { " " } else { ": " };
                     let e = fault::describe(e.as_ref());
-                    let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls, first_contact)).unwrap_or_default();
+                    let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls)).unwrap_or_default();
                     let level = if refused { "error" } else { "warning" };
-                    print_err(&format!("ninja: {level}: build event upload failed: {e}{hint}\n"));
+                    print_err(&format!("ninja: {level}: build event upload failed{after}{e}{hint}\n"));
                 }
                 Err(_) if acked.get() => {
                     print_err(&format!("ninja: warning: build events were uploaded, their lifecycle events didn't finish within {timeout:?}\n"))
@@ -1164,6 +1209,32 @@ impl Bes {
         }
         refused
     }
+}
+
+/// How connecting to the build event service went (see `Bes::connected`).
+#[derive(Clone, Debug)]
+enum Made {
+    Connecting,
+    Connected,
+    /// Failed, ending the invocation: a certificate refused, or settings
+    /// that can't connect (said in words).
+    Fatal(String),
+    /// Failed otherwise: the upload's end says how.
+    Failed,
+}
+
+/// What `Bes::connected` waited for: no backend, its first answer over TLS,
+/// a connection without TLS, one broken to no service at all, a
+/// connection failed, the invocation's error, or nothing in time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Contact {
+    None,
+    Answered,
+    Plaintext,
+    Unheard,
+    Failed,
+    Fatal(String),
+    Unknown,
 }
 
 /// A `file://` URI for an absolute path: `file:///C:/x` on Windows, and
@@ -1365,8 +1436,9 @@ mod tests {
     }
 
     /// How long tests wait for what a healthy run does at once: only a
-    /// broken one gets there (the machine may be busy).
-    const PATIENCE: Duration = Duration::from_secs(60);
+    /// broken one gets there (the machine may be busy). Well within the
+    /// 60 s Bazel gives the tests, for a hung one to say where it hung.
+    const PATIENCE: Duration = Duration::from_secs(20);
 
     /// A build of one target, up to date, whose artifact is `artifact`:
     /// the graph and the requested node.
@@ -1380,6 +1452,26 @@ mod tests {
         (state, node)
     }
 
+    /// The canonical command line holds the options in effect: not one left
+    /// out for another it conflicts with, which the original one, as typed,
+    /// holds. (Both held it.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn options_left_out_arent_canonical() {
+        let opts = options(&["--remote_executor=grpc://e.example:1", "--remote_cache=grpc://c.example:1"]);
+        assert!(opts.given.iter().any(|g| g.name == "remote_cache" && g.left_out));
+        let bes = Bes::start(&opts, Default::default(), Default::default(), &InvocationIds::default(), None, Store::new(), None).await;
+        let names = |label: &str| -> Vec<String> {
+            let line = bes.structured_command_line(label);
+            let section = line.sections.into_iter().find(|s| s.section_label == "command options").expect("options");
+            match section.section_type {
+                Some(cl::command_line_section::SectionType::OptionList(l)) => l.option.into_iter().map(|o| o.option_name).collect(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(names("original"), ["remote_executor", "remote_cache"]);
+        assert_eq!(names("canonical"), ["remote_executor"]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn artifacts_arent_hashed_for_events_going_nowhere() {
         let dir = test_dir("nowhere");
@@ -1387,7 +1479,7 @@ mod tests {
         std::fs::write(&artifact, "hello").unwrap();
         let opts = options(&[&format!("--build_event_binary_file={}", dir.join("missing").join("events.bep").display())]);
         let store = Store::new();
-        let bes = Bes::start(&opts, Default::default(), &InvocationIds::default(), None, store.clone(), None).await;
+        let bes = Bes::start(&opts, Default::default(), Default::default(), &InvocationIds::default(), None, store.clone(), None).await;
         let (state, node) = artifact_graph(&artifact);
         bes.plan(&state, &Plan::default(), &[node], Default::default(), &[], None);
         bes.finish(0, false).await;
@@ -1406,6 +1498,7 @@ mod tests {
         let file = dir.join("events.bep");
         let bes = Bes::start(
             &options(&[&format!("--build_event_binary_file={}", file.display())]),
+            Default::default(),
             Default::default(),
             &InvocationIds::default(),
             None,
@@ -1450,7 +1543,9 @@ mod tests {
         // Only --bes_timeout bounds the wait for the upload: calls could
         // take an hour.
         let opts = options(&[&format!("--bes_backend=grpcs://127.0.0.1:{port}"), "--bes_timeout=1s", "--bes_rpc_timeout=1h"]);
-        let started = tokio::time::timeout(PATIENCE, Bes::start(&opts, Default::default(), &InvocationIds::default(), None, Store::new(), None)).await;
+        let started =
+            tokio::time::timeout(PATIENCE, Bes::start(&opts, Default::default(), Default::default(), &InvocationIds::default(), None, Store::new(), None))
+                .await;
         let bes = started.expect("the build waited for the backend");
         // The handshake is waited for 5 s at most, and its silence doesn't
         // stop the build.
@@ -1458,6 +1553,24 @@ mod tests {
         assert_eq!(connected, Ok(()));
         // The end waits for the upload as long as --bes_timeout says.
         tokio::time::timeout(PATIENCE, bes.finish(0, false)).await.expect("the end waited for the upload beyond --bes_timeout");
+    }
+
+    /// A backend whose connections break before anything came from it,
+    /// without a client certificate asked for (a TLS tunnel whose far end
+    /// is down), holds the start of the build no longer: it can't be
+    /// refusing a certificate. The connection is made again meanwhile.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broken_tunnels_dont_hold_the_build() {
+        use fake_reapi::misbehaving::{Misbehaving, Misbehavior};
+        for reset in [false, true] {
+            let tunnel = Misbehaving::start(Misbehavior::Closing { reset });
+            let opts = options(&[&format!("--bes_backend={}", tunnel.endpoint("grpcs")), "--bes_timeout=1s"]);
+            let bes = Bes::start(&opts, Default::default(), Default::default(), &InvocationIds::default(), None, Store::new(), None).await;
+            let contact = tokio::time::timeout(PATIENCE, bes.contact()).await.expect("the build waited for the backend");
+            assert_eq!(contact, Contact::Unheard, "reset {reset}");
+            assert_eq!(bes.connected().await, Ok(()));
+            tokio::time::timeout(PATIENCE, bes.finish(0, false)).await.expect("the end waited for the upload beyond --bes_timeout");
+        }
     }
 
     /// A build of up-to-date targets, each with one artifact edge: the
@@ -1512,6 +1625,7 @@ mod tests {
         let bes = Bes::start(
             &options(&[&format!("--build_event_binary_file={}", file.display())]),
             Default::default(),
+            Default::default(),
             &InvocationIds::default(),
             None,
             Store::new(),
@@ -1541,6 +1655,7 @@ mod tests {
         let store = Store::new();
         let bes = Bes::start(
             &options(&[&format!("--build_event_binary_file={}", file.display())]),
+            Default::default(),
             Default::default(),
             &InvocationIds::default(),
             None,
@@ -1572,6 +1687,7 @@ mod tests {
         let bes = Bes::start(
             &options(&[&format!("--build_event_binary_file={}", file.display())]),
             Default::default(),
+            Default::default(),
             &InvocationIds::default(),
             None,
             Store::new(),
@@ -1597,7 +1713,7 @@ mod tests {
         let dir = test_dir("dyndep");
         let (a, b, d) = (dir.join("a.o"), dir.join("b.o"), dir.join("d.o"));
         let (state, nodes) = targets_graph(&[("app", &a), ("app", &b), ("app", &d)]);
-        let bes = Bes::start(&options(&[]), Default::default(), &InvocationIds::default(), None, Store::new(), None).await;
+        let bes = Bes::start(&options(&[]), Default::default(), Default::default(), &InvocationIds::default(), None, Store::new(), None).await;
         // The plan wants a and b; a dyndep file brings d later.
         let mut plan = Plan::default();
         for e in [EdgeId(0), EdgeId(1)] {
@@ -1641,6 +1757,7 @@ mod tests {
             let file = dir.join(format!("{code}-{interrupted}.bep"));
             let bes = Bes::start(
                 &options(&[&format!("--build_event_binary_file={}", file.display())]),
+                Default::default(),
                 Default::default(),
                 &InvocationIds::default(),
                 None,

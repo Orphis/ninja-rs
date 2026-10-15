@@ -88,6 +88,7 @@ rust_test(
     data = [
         ":ninja-rs",
         "//crates/fake-reapi:test_certs",
+        "//tests/nativelink:run.sh",
     ],
     rustc_env = {"CARGO_BIN_EXE_ninja-rs": "$(rootpath :ninja-rs)"},
     shard_count = 4,

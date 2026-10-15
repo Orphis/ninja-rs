@@ -4,8 +4,9 @@
 //! longer than `TEST_TIMEOUT`. Arguments select tests as libtest's do (and
 //! Bazel's `--test_filter`), Bazel's sharding splits them, and the results
 //! go to Bazel's `XML_OUTPUT_FILE`, a test case each. The processes a
-//! test starts through `spawn` (or `output`, `status`) don't outlive it
-//! when it runs out of time.
+//! test starts go through `spawn` (or `output`, `status`), which the
+//! `launches_through_the_harness` tests check: they don't outlive it when
+//! it runs out of time, nor do the commands of a ninja-rs among them.
 //! Tests decide from markers, counters and the order of events, with
 //! timeouts far above what a healthy run takes, rather than from how long
 //! things take: the machine may be busy.
@@ -59,12 +60,16 @@ static RESULTS: Mutex<Results> = Mutex::new(Results { suite: String::new(), done
 /// The running test, and when the watchdog fails it.
 static RUNNING: Mutex<Option<(&'static str, Instant, Instant)>> = Mutex::new(None);
 
-/// A process the running test started (`spawn`).
+/// A process the running test started (`spawn`): on POSIX the leader of a
+/// process group of its own, on Windows in a job of its own, with what it
+/// starts.
 struct Started {
     pid: u32,
     /// A handle of it, which keeps its id from naming another process.
     #[cfg(windows)]
     handle: std::os::windows::io::OwnedHandle,
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
 }
 
 /// What the running test started and hasn't waited for through this
@@ -311,17 +316,62 @@ fn watchdog(dir: PathBuf) {
 }
 
 /// Starts `c` for the running test, as `Command::spawn`: a process the
-/// watchdog kills if the test runs out of time.
+/// watchdog stops if the test runs out of time, with what it started. On
+/// POSIX it leads a process group of its own, on Windows it's in a job of
+/// its own.
 pub fn spawn(c: &mut Command) -> io::Result<Child> {
-    let child = c.spawn()?;
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(c, 0);
+    track(c.spawn()?)
+}
+
+/// `spawn`, for a command that makes itself the leader of a process group
+/// (`setsid` in `pre_exec`, which fails in a group made for it).
+#[cfg(unix)]
+pub fn spawn_leader(c: &mut Command) -> io::Result<Child> {
+    track(c.spawn()?)
+}
+
+fn track(child: Child) -> io::Result<Child> {
     #[cfg(windows)]
     let Ok(handle) = std::os::windows::io::AsHandle::as_handle(&child).try_clone_to_owned() else { return Ok(child) };
     STARTED.lock().unwrap().push(Started {
         pid: child.id(),
         #[cfg(windows)]
+        job: job_of(&handle),
+        #[cfg(windows)]
         handle,
     });
     Ok(child)
+}
+
+/// A new job holding `process` (just started: it may have started nothing
+/// yet), for the watchdog to terminate with what it starts. Processes may
+/// leave it (the daemon asks to), and closing it kills none (a daemon a
+/// build started stays for the next).
+#[cfg(windows)]
+fn job_of(process: &std::os::windows::io::OwnedHandle) -> Option<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    // SAFETY: a new anonymous job, owned from then on; the buffer has the
+    // class's size; `process` is a valid process handle.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let job = OwnedHandle::from_raw_handle(job);
+        let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+            BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION { LimitFlags: JOB_OBJECT_LIMIT_BREAKAWAY_OK, ..Default::default() },
+            ..Default::default()
+        };
+        let size = size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        SetInformationJobObject(job.as_raw_handle(), JobObjectExtendedLimitInformation, (&raw const limits).cast(), size);
+        (AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) != 0).then_some(job)
+    }
 }
 
 /// Runs `c` through `spawn`, as `Command::status`.
@@ -347,25 +397,56 @@ fn forget(pid: u32) {
     STARTED.lock().unwrap().retain(|s| s.pid != pid);
 }
 
-/// Kills what the running test started that still runs.
+/// How long the watchdog gives what the test started to stop, interrupted
+/// (a ninja-rs stopping its commands), before it kills them.
+const GRACE: Duration = Duration::from_secs(10);
+
+/// Stops what the running test started that still runs, and what that
+/// started. On POSIX, SIGTERM to its process group (ninja-rs stops its
+/// commands, in groups of their own, as when interrupted), then once it
+/// exited, or after `GRACE`, SIGKILL to what's left of the group. On
+/// Windows, its job is terminated (the commands of a ninja-rs are in jobs
+/// within it).
 fn kill_started() {
-    for s in STARTED.lock().unwrap().drain(..) {
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            // SAFETY: the handle is open (a process that exited stays so).
-            unsafe { windows_sys::Win32::System::Threading::TerminateProcess(s.handle.as_raw_handle(), 1) };
-        }
-        #[cfg(unix)]
-        {
-            let pid = s.pid as libc::pid_t;
-            // SAFETY: plain system calls. Only a child still running: one
-            // waited for may have given its id to another process.
-            unsafe {
-                if libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) == 0 {
-                    libc::kill(pid, libc::SIGKILL);
-                }
+    let started: Vec<Started> = STARTED.lock().unwrap().drain(..).collect();
+    #[cfg(windows)]
+    for s in &started {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: the handles are open (a process that exited stays so).
+        unsafe {
+            match &s.job {
+                Some(job) => windows_sys::Win32::System::JobObjects::TerminateJobObject(job.as_raw_handle(), 1),
+                None => windows_sys::Win32::System::Threading::TerminateProcess(s.handle.as_raw_handle(), 1),
             }
+        };
+    }
+    #[cfg(unix)]
+    {
+        // Whether `pid` still runs; reaped once it exited. Only the groups
+        // of leaders not waited for by the test: one waited for may have
+        // given its id to another process (once reaped here, the group's id
+        // stays its own while it has processes).
+        // SAFETY (here and below): plain system calls.
+        let running = |pid: &libc::pid_t| unsafe { libc::waitpid(*pid, std::ptr::null_mut(), libc::WNOHANG) } == 0;
+        let (mut leaders, mut groups) = (Vec::new(), Vec::new());
+        for pid in started.iter().map(|s| s.pid as libc::pid_t) {
+            match unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } {
+                0 => leaders.push(pid),
+                reaped if reaped == pid => groups.push(pid),
+                _ => {}
+            }
+        }
+        for &pid in &leaders {
+            unsafe { libc::killpg(pid, libc::SIGTERM) };
+        }
+        groups.extend(&leaders);
+        let start = Instant::now();
+        while !leaders.is_empty() && start.elapsed() < GRACE {
+            std::thread::sleep(Duration::from_millis(20));
+            leaders.retain(running);
+        }
+        for &pid in &groups {
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
         }
     }
 }
@@ -431,22 +512,40 @@ pub fn ninja_exe() -> PathBuf {
         if Path::new(path).exists() {
             return std::path::absolute(path).unwrap();
         }
-        runfile(path).expect("ninja-rs binary not found")
+        test_dirs::runfile(path).expect("ninja-rs binary not found")
     })
     .clone()
 }
 
-/// A data file of the test's Bazel target, `path` from the workspace's
-/// top: in the runfiles tree, or (Bazel on Windows, which makes none)
-/// where the manifest of them says. None without Bazel.
-pub fn runfile(path: &str) -> Option<PathBuf> {
-    let key = format!("{}/{path}", std::env::var("TEST_WORKSPACE").unwrap_or_else(|_| "_main".into()));
-    let tree = PathBuf::from(std::env::var_os("TEST_SRCDIR")?).join(&key);
-    if tree.exists() {
-        return Some(tree);
+/// A file of the sources, `path` from the workspace's top (see
+/// `test_dirs::workspace_file`), however the test binary runs.
+pub fn source_file(path: &str) -> PathBuf {
+    test_dirs::workspace_file(path, option_env!("NINJA_RS_SOURCE_DIR")).unwrap_or_else(|| panic!("{path}: not a data file of the test, and no sources"))
+}
+
+/// Leaves out of `c`'s environment what would change how ninja-rs runs
+/// (`MAKEFLAGS`, `NINJA_STATUS`, an outer invocation's, the daemon's: every
+/// `NINJA_RS_` variable).
+pub fn hermetic(c: &mut Command) -> &mut Command {
+    c.env_remove("MAKEFLAGS").env_remove("NINJA_STATUS");
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("NINJA_RS_") {
+            c.env_remove(name);
+        }
     }
-    let manifest = std::fs::read_to_string(std::env::var_os("RUNFILES_MANIFEST_FILE")?).ok()?;
-    manifest.lines().find_map(|l| l.strip_prefix(&key)?.strip_prefix(' ')).map(PathBuf::from)
+    c
+}
+
+/// That `source`, a test file, starts no process with `Command`'s own
+/// `spawn`, `output` or `status` rather than this module's, which the
+/// watchdog wouldn't stop (clippy can't forbid them in tests only). A line
+/// after a comment saying it isn't a test's process (a tool's child) may.
+pub fn launches_through_the_harness(source: &str) -> Result<(), String> {
+    let launch = |l: &str| !l.trim_start().starts_with("//") && [".spawn()", ".output()", ".status()"].iter().any(|m| l.contains(m));
+    let lines: Vec<&str> = source.lines().collect();
+    let excused = |i: usize| i > 0 && lines[i - 1].trim_start().starts_with("//") && lines[i - 1].contains("not a test's process");
+    let outside: Vec<String> = (0..lines.len()).filter(|&i| launch(lines[i]) && !excused(i)).map(|i| format!("line {}: {}", i + 1, lines[i].trim())).collect();
+    if outside.is_empty() { Ok(()) } else { Err(format!("started without harness::spawn, status or output:\n{}", outside.join("\n"))) }
 }
 
 /// Waits for `done`, polling, up to `PATIENCE`.

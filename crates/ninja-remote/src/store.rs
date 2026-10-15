@@ -9,7 +9,7 @@
 //! (keyed by path and `FileStamp`); the other caches are in memory for now
 //! but keyed so that they could be persisted the same way.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -52,20 +52,98 @@ pub fn walk_files(dir: &Path, rel: &str, out: &mut Vec<String>) {
 }
 
 /// The most files, and bytes, the directories of computed includes send
-/// (see `dir_files`): above, the compile runs locally.
-pub const DIR_FILES_MAX: usize = 1000;
+/// (see `walk`): above, they're narrowed, else the compile runs locally
+/// (see `Scanner::computed_files`).
+pub const DIR_FILES_MAX: usize = 5000;
 pub const DIR_BYTES_MAX: u64 = 64 << 20;
 
 /// How deep `dir_files` goes (links to directories are followed).
 pub const DIR_DEPTH_MAX: usize = 16;
 
-/// The files under `dirs`, for computed includes the scanner can't name:
-/// their subdirectories' too (Boost.MPL's reach `preprocessed/plain/`), but
-/// not those of the directories `written` says the build writes to (a
-/// source root may hold the build directory), of another build directory
-/// (a configuration's beside it), nor repositories' own (see
-/// `walk_skips`). Err (the compile runs locally, with the reason) above
-/// `DIR_FILES_MAX` files or `DIR_BYTES_MAX` bytes.
+/// What a walk of a directory found for computed includes (see `walk`).
+#[derive(Debug, Default)]
+pub struct Walk {
+    /// The files, with their sizes.
+    pub files: Vec<(PathBuf, u64)>,
+    /// The directories listed, how deep under each the walk went, and
+    /// their stamps, taken before (None: not a directory).
+    pub dirs: Vec<(PathBuf, usize, Option<ninja_os::FileStamp>)>,
+    /// Other build directories, listed but not walked, with their stamps.
+    pub builds: Vec<(PathBuf, Option<ninja_os::FileStamp>)>,
+    /// Each stamp's time was a clock tick older than when it was taken: a
+    /// change since shows in it (see `FileStamp::is_racy`).
+    pub trusted: bool,
+    /// Why the walk stopped: over `DIR_FILES_MAX` files (or directories)
+    /// or `DIR_BYTES_MAX` bytes.
+    pub over: Option<String>,
+}
+
+/// The files under `dir`, to `depth` levels below it, for computed
+/// includes the scanner can't name: their subdirectories' too (Boost.MPL's
+/// reach `preprocessed/plain/`), but not another build directory's (a
+/// configuration's beside it, the build directory in a source root) nor
+/// repositories' own (see `walk_skips`); of the directories `written`
+/// says the build writes to, the header-like files (generated headers, not
+/// objects or logs). Links are followed.
+pub fn walk(dir: &Path, depth: usize, written: &dyn Fn(&Path) -> bool) -> Walk {
+    let mut w = Walk { trusted: true, ..Default::default() };
+    let (mut bytes, mut todo, mut walked, mut files) = (0u64, vec![(dir.to_path_buf(), depth)], HashSet::new(), HashSet::new());
+    let mb = DIR_BYTES_MAX >> 20;
+    while let Some((d, depth)) = todo.pop() {
+        // (A directory under another one walked once; as many directories
+        // as files at most: links may loop.)
+        if !walked.insert((d.clone(), depth)) {
+            continue;
+        }
+        if walked.len() > DIR_FILES_MAX {
+            w.over = Some(format!("computed #include with over {DIR_FILES_MAX} directories to send: {}...", d.display()));
+            break;
+        }
+        let at = std::time::SystemTime::now();
+        let stamp = ninja_os::stat(&d).ok().filter(|(m, _)| m.is_dir()).map(|(_, s)| s);
+        w.trusted &= stamp.is_none_or(|s| !s.is_racy(at));
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            w.dirs.push((d, depth, stamp));
+            continue;
+        };
+        let entries: Vec<_> = rd.flatten().filter(|e| !ninja_daemon::watch::walk_skips(&e.file_name())).collect();
+        // Another build directory, CMake's or one ninja ran in.
+        if d != dir && entries.iter().any(|e| ["CMakeCache.txt", ".ninja_log"].iter().any(|b| e.file_name().eq_ignore_ascii_case(b))) {
+            w.builds.push((d, stamp));
+            continue;
+        }
+        w.dirs.push((d.clone(), depth, stamp));
+        let headers_only = written(&d);
+        for e in entries {
+            let p = e.path();
+            // (Links followed.)
+            let meta = match e.file_type() {
+                Ok(t) if !t.is_symlink() => e.metadata(),
+                _ => std::fs::metadata(&p),
+            };
+            let Ok(meta) = meta else { continue };
+            if meta.is_dir() {
+                if depth > 0 {
+                    todo.push((p, depth - 1));
+                }
+                continue;
+            }
+            if !meta.is_file() || (headers_only && !crate::scanner::header_like(&e.file_name().to_string_lossy())) || !files.insert(p.clone()) {
+                continue;
+            }
+            bytes += meta.len();
+            w.files.push((p, meta.len()));
+            if w.files.len() > DIR_FILES_MAX || bytes > DIR_BYTES_MAX {
+                w.over = Some(format!("computed #include with over {DIR_FILES_MAX} files or {mb} MB to send: {}...", d.display()));
+                return w;
+            }
+        }
+    }
+    w
+}
+
+/// The files under `dirs` (see `walk`). Err above `DIR_FILES_MAX` files
+/// or `DIR_BYTES_MAX` bytes.
 pub fn dir_files<'a>(dirs: impl IntoIterator<Item = &'a PathBuf>, written: &dyn Fn(&Path) -> bool) -> Result<Vec<PathBuf>, String> {
     files_under(dirs.into_iter().map(|d| (d.clone(), DIR_DEPTH_MAX)), written)
 }
@@ -73,45 +151,18 @@ pub fn dir_files<'a>(dirs: impl IntoIterator<Item = &'a PathBuf>, written: &dyn 
 /// `dir_files`, each directory with how deep under it to go (0: its own
 /// files only).
 pub fn files_under(dirs: impl IntoIterator<Item = (PathBuf, usize)>, written: &dyn Fn(&Path) -> bool) -> Result<Vec<PathBuf>, String> {
-    let (mut files, mut bytes) = (BTreeSet::new(), 0u64);
-    let mut todo: Vec<(PathBuf, usize)> = dirs.into_iter().collect();
-    let mut walked = HashSet::new();
-    let mb = DIR_BYTES_MAX >> 20;
-    while let Some((dir, depth)) = todo.pop() {
-        // (A directory under another one walked once; as many directories
-        // as files at most: links may loop.)
-        if !walked.insert((dir.clone(), depth)) {
-            continue;
+    let mut files = std::collections::BTreeMap::new();
+    for (dir, depth) in dirs {
+        let w = walk(&dir, depth, written);
+        if let Some(why) = w.over {
+            return Err(why);
         }
-        if walked.len() > DIR_FILES_MAX {
-            return Err(format!("computed #include with over {DIR_FILES_MAX} directories to send: {}...", dir.display()));
-        }
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten().filter(|e| !ninja_daemon::watch::walk_skips(&e.file_name())) {
-            let p = e.path();
-            // (Links followed.)
-            let Ok(meta) = std::fs::metadata(&p) else { continue };
-            if meta.is_dir() {
-                if depth > 0 && !written(&p) && !is_build_dir(&p) {
-                    todo.push((p, depth - 1));
-                }
-                continue;
-            }
-            if !meta.is_file() || !files.insert(p) {
-                continue;
-            }
-            bytes += meta.len();
-            if files.len() > DIR_FILES_MAX || bytes > DIR_BYTES_MAX {
-                return Err(format!("computed #include with over {DIR_FILES_MAX} files or {mb} MB to send: {}...", dir.display()));
-            }
+        files.extend(w.files);
+        if files.len() > DIR_FILES_MAX || files.values().sum::<u64>() > DIR_BYTES_MAX {
+            return Err(format!("computed #include with over {DIR_FILES_MAX} files or {} MB to send: {}...", DIR_BYTES_MAX >> 20, dir.display()));
         }
     }
-    Ok(files.into_iter().collect())
-}
-
-/// Whether `dir` is a build directory: CMake's, or one ninja ran in.
-fn is_build_dir(dir: &Path) -> bool {
-    ["CMakeCache.txt", ".ninja_log"].iter().any(|f| dir.join(f).is_file())
+    Ok(files.into_keys().collect())
 }
 
 impl ToolchainTree {
@@ -133,7 +184,15 @@ impl ToolchainTree {
     }
 }
 
-type TreeCell = Arc<Mutex<Option<Result<Arc<ToolchainTree>, String>>>>;
+/// A toolchain tree, or why it couldn't be built and when, unless that
+/// lasts (see `lasting`).
+type TreeCell = Arc<Mutex<Option<Result<Arc<ToolchainTree>, (String, Option<std::time::Instant>)>>>>;
+
+/// How long a toolchain tree's failure that doesn't last is kept: the
+/// actions meanwhile don't each walk and hash the directory again to fail
+/// the same way (a file held without read sharing for a while, by an
+/// indexer or a virus scanner), and one after tries again.
+const TRANSIENT_KEPT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What is known of files, for a version of each (its stamp).
 type Stamped<T> = Mutex<HashMap<PathBuf, (ninja_os::FileStamp, T)>>;
@@ -176,13 +235,26 @@ impl Store {
     /// The Merkle tree of a toolchain input directory (cached; concurrent
     /// callers for the same directory wait for the first one): from the
     /// files `daemon` lists (None: no daemon), or read here (also when the
-    /// daemon couldn't list them). A lasting failure is kept too (see
-    /// `lasting`): actions don't each walk the directory again.
+    /// daemon couldn't list them). A failure is kept too, a lasting one (see
+    /// `lasting`) for good, another for a while (`TRANSIENT_KEPT`): actions
+    /// don't each walk the directory again.
     pub fn toolchain_tree(&self, dir: &Path, daemon: &dyn Fn(&Path) -> Option<Result<TreeInfo, String>>) -> Result<Arc<ToolchainTree>, String> {
+        self.toolchain_tree_keeping(dir, daemon, TRANSIENT_KEPT)
+    }
+
+    /// `toolchain_tree`, a failure that doesn't last kept for `transient`.
+    fn toolchain_tree_keeping(
+        &self,
+        dir: &Path,
+        daemon: &dyn Fn(&Path) -> Option<Result<TreeInfo, String>>,
+        transient: std::time::Duration,
+    ) -> Result<Arc<ToolchainTree>, String> {
         let cell = self.toolchain_trees.lock().unwrap().entry(dir.to_path_buf()).or_default().clone();
         let mut kept = cell.lock().unwrap();
-        if let Some(t) = &*kept {
-            return t.clone();
+        match &*kept {
+            Some(Ok(t)) => return Ok(t.clone()),
+            Some(Err((why, failed))) if failed.is_none_or(|at| at.elapsed() < transient) => return Err(why.clone()),
+            _ => {}
         }
         let listed = daemon(dir).and_then(Result::ok).and_then(|listed| ToolchainTree::from_listing(dir, listed).ok());
         if let Some(t) = listed {
@@ -203,12 +275,17 @@ impl Store {
             }
             Err(e) => {
                 let why = format!("{e:#}");
-                if lasting(&e) {
-                    *kept = Some(Err(why.clone()));
-                }
+                let failed = (!lasting(&e)).then(std::time::Instant::now);
+                *kept = Some(Err((why.clone(), failed)));
                 Err(why)
             }
         }
+    }
+
+    /// Forgets the trees of the toolchain directories holding `path`, found
+    /// changed: they're built again.
+    pub fn forget_toolchain_trees_holding(&self, path: &Path) {
+        self.toolchain_trees.lock().unwrap().retain(|dir, _| !path.starts_with(dir));
     }
 
     /// The members of `path` if it's a thin archive (see `archive`), read
@@ -260,6 +337,11 @@ impl Store {
     pub fn filter_unknown(&self, blobs: BlobSet) -> BlobSet {
         let known = self.uploaded.lock().unwrap();
         BlobSet(blobs.0.into_iter().filter(|(h, _)| !known.contains(h)).collect())
+    }
+
+    /// Whether a blob is known to be in the CAS.
+    pub fn is_uploaded(&self, hash: &str) -> bool {
+        self.uploaded.lock().unwrap().contains(hash)
     }
 
     pub fn mark_uploaded<'a>(&self, hashes: impl IntoIterator<Item = &'a String>) {
@@ -408,6 +490,15 @@ mod tests {
         let c = Store::default().toolchain_tree(&dir, &|_| Some(Ok(listed.clone()))).unwrap();
         assert_eq!(c.digest, a.digest);
         assert_eq!(c.files, a.files);
+        // Built again once a file of it is found changed (by an upload),
+        // not before; other trees are kept.
+        let other = test_dirs::TestDir::new("ninja_rs_tc_other");
+        let o = s.toolchain_tree(&other, &|_| None).unwrap();
+        std::fs::write(dir.join("bin/cc"), "yy").unwrap();
+        assert!(Arc::ptr_eq(&s.toolchain_tree(&dir, &|_| None).unwrap(), &a));
+        s.forget_toolchain_trees_holding(&dir.join("bin").join("cc"));
+        assert_ne!(s.toolchain_tree(&dir, &|_| None).unwrap().digest, a.digest);
+        assert!(Arc::ptr_eq(&s.toolchain_tree(&other, &|_| None).unwrap(), &o));
     }
 
     /// A tree that couldn't be built is kept for the invocation: actions
@@ -448,9 +539,9 @@ mod tests {
         assert!(lasting(&anyhow::anyhow!("path conflict at bin")));
     }
 
-    /// A file locked for a moment while the tree is built (Windows: opened
-    /// without sharing, by an installer or a virus scanner): the next action
-    /// builds it again, once it's released.
+    /// A file locked while the tree is built (Windows: opened without
+    /// sharing, by an installer or a virus scanner): the failure is kept for
+    /// a while, then an action builds the tree again, once it's released.
     #[cfg(windows)]
     #[test]
     fn locked_toolchain_file() {
@@ -459,10 +550,14 @@ mod tests {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/cc"), "x").unwrap();
         let s = Store::default();
+        let hour = std::time::Duration::from_secs(3600);
         let lock = std::fs::File::options().read(true).share_mode(0).open(dir.join("bin/cc")).unwrap();
-        assert!(s.toolchain_tree(&dir, &|_| None).is_err());
+        assert!(s.toolchain_tree_keeping(&dir, &|_| None, hour).is_err());
         drop(lock);
-        assert_eq!(*s.toolchain_tree(&dir, &|_| None).unwrap().files, vec!["bin/cc".to_string()]);
+        // Kept: not walked again meanwhile.
+        assert!(s.toolchain_tree_keeping(&dir, &|_| None, hour).is_err());
+        let tree = s.toolchain_tree_keeping(&dir, &|_| None, std::time::Duration::ZERO).unwrap();
+        assert_eq!(*tree.files, vec!["bin/cc".to_string()]);
     }
 
     /// Thin archives' members and linker directives are read again for a

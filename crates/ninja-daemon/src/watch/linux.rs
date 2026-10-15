@@ -7,8 +7,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::atomic::AtomicBool;
 
 pub(super) fn backend(sink: Weak<Watcher>) -> io::Result<Box<dyn Backend>> {
-    // SAFETY: plain syscall.
-    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
+    // SAFETY: plain syscall. Not blocking: requests read what's queued
+    // (see `drain`).
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if fd < 0 {
         let e = io::Error::last_os_error();
         let hint = match e.raw_os_error() {
@@ -20,6 +21,7 @@ pub(super) fn backend(sink: Weak<Watcher>) -> io::Result<Box<dyn Backend>> {
     }
     let inotify = Arc::new(Inotify {
         fd,
+        events: Mutex::new(vec![0u8; 1 << 16]),
         wds: Mutex::default(),
         whole: RwLock::default(),
         sink,
@@ -27,8 +29,8 @@ pub(super) fn backend(sink: Weak<Watcher>) -> io::Result<Box<dyn Backend>> {
         polling: Arc::new(AtomicBool::new(false)),
         mounts_error: Mutex::default(),
     });
-    // Read before roots are watched.
-    inotify.refresh_mounts();
+    // What's mounted is read once set up (`sync`), before roots are
+    // watched.
     let reader = inotify.clone();
     std::thread::spawn(move || reader.read_loop());
     Ok(Box::new(Shared(inotify)))
@@ -109,31 +111,37 @@ fn watch_mounts(mut table: std::fs::File, sink: Weak<Watcher>, polling: Arc<Atom
 struct Shared(Arc<Inotify>);
 
 impl Backend for Shared {
+    /// A root that is a symbolic link (a checkout linked from the home
+    /// directory) is watched where it leads: events name what's in it as
+    /// it's spelled. Nothing below it is watched through one.
     fn watch(&self, root: &Path, cookie_dir: &Path, whole: bool) -> io::Result<()> {
         if whole {
-            self.watch_dir(root, true)?;
+            self.0.whole.writing().add(root);
+            self.0.add_tree(root, true).inspect_err(|_| {
+                self.0.whole.writing().remove(root);
+            })?;
         } else {
-            self.0.add_one(root)?;
+            self.0.add_one(root, true)?;
         }
         // Where its cookies go, unless watched with it.
         if cookie_dir != root && !(whole && cookie_dir.starts_with(root)) {
-            self.0.add_one(cookie_dir)?;
+            self.0.add_one(cookie_dir, false)?;
         }
         Ok(())
     }
 
     fn watch_dir(&self, dir: &Path, whole: bool) -> io::Result<()> {
         if !whole {
-            return self.0.add_one(dir);
+            return self.0.add_one(dir, false);
         }
-        self.0.whole.write().unwrap().add(dir);
-        self.0.add_tree(dir).inspect_err(|_| {
-            self.0.whole.write().unwrap().remove(dir);
+        self.0.whole.writing().add(dir);
+        self.0.add_tree(dir, false).inspect_err(|_| {
+            self.0.whole.writing().remove(dir);
         })
     }
 
     fn unwatch(&self, dir: &Path) {
-        self.0.whole.write().unwrap().remove_under(dir);
+        self.0.whole.writing().remove_under(dir);
         self.0.remove_tree(dir);
     }
 
@@ -150,7 +158,7 @@ impl Backend for Shared {
         if self.0.is_ignored(dir) || !under(&self.0.whole, dir) {
             return Ok(());
         }
-        match self.0.add_tree(dir) {
+        match self.0.add_tree(dir, false) {
             Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(()),
             r => r,
         }
@@ -160,12 +168,21 @@ impl Backend for Shared {
     fn sync(&self) {
         self.0.refresh_mounts();
     }
+
+    /// Events are queued as changes are made: those queued now are every
+    /// change made before.
+    fn drain(&self) -> bool {
+        if let Some(sink) = self.0.sink.upgrade() {
+            self.0.read_events(&sink);
+        }
+        true
+    }
 }
 
 /// Whether `dir` is in one of `dirs`.
 fn under(dirs: &RwLock<PathSet>, dir: &Path) -> bool {
-    let dirs = dirs.read().unwrap();
-    !dirs.is_empty() && dir.ancestors().any(|a| dirs.contains(a))
+    let dirs = dirs.reading();
+    !dirs.is_empty() && PathKey::new(dir).ancestors().any(|a| dirs.contains(&a))
 }
 
 /// Watch descriptors and their directories, and the other way round
@@ -189,7 +206,7 @@ impl Wds {
     /// Forgets the watches of `dir` and under it: theirs.
     fn take_under(&mut self, dir: &Path) -> Vec<i32> {
         let mut under = Vec::new();
-        self.by_dir.take_under(dir, |_, wd| under.push(wd));
+        self.by_dir.take_under(dir, |wd| under.push(wd));
         for wd in &under {
             self.dirs.remove(wd);
         }
@@ -199,6 +216,9 @@ impl Wds {
 
 struct Inotify {
     fd: i32,
+    /// Where events are read: whoever reads them (the reader, or a request
+    /// draining the queue) handles them before another reads more.
+    events: Mutex<Vec<u8>>,
     wds: Mutex<Wds>,
     /// Directories watched with everything under them: directories
     /// created there are watched as they appear.
@@ -254,7 +274,7 @@ impl Inotify {
         use std::os::fd::AsRawFd;
         const MOUNTINFO: &str = "/proc/self/mountinfo";
         let Some(w) = self.sink.upgrade() else { return };
-        let mut mounts = self.mounts.lock().unwrap();
+        let mut mounts = self.mounts.locked();
         let read = match mounts.as_mut() {
             None => std::fs::File::open(MOUNTINFO).and_then(|mut f| {
                 let table = read_mounts(&mut f, w.case_insensitive)?;
@@ -270,7 +290,7 @@ impl Inotify {
         };
         match read {
             Ok(table) => {
-                *self.mounts_error.lock().unwrap() = None;
+                *self.mounts_error.locked() = None;
                 if let Some(table) = table {
                     w.mounts_changed(table);
                 }
@@ -278,7 +298,7 @@ impl Inotify {
             Err(e) => {
                 *mounts = None;
                 let e = e.to_string();
-                let mut said = self.mounts_error.lock().unwrap();
+                let mut said = self.mounts_error.locked();
                 if said.as_ref() != Some(&e) {
                     (w.log)(&format!("reading {MOUNTINFO}: {e}: file systems mounted in roots go unnoticed"));
                     *said = Some(e);
@@ -298,23 +318,26 @@ impl Inotify {
         }
     }
 
-    /// Watches `dir` alone (not in a build directory).
-    fn add_one(&self, dir: &Path) -> io::Result<()> {
+    /// Watches `dir` alone (not in a build directory); through it when
+    /// it's a symbolic link and `follow`.
+    fn add_one(&self, dir: &Path, follow: bool) -> io::Result<()> {
         if self.is_ignored(dir) {
             return Err(build_dir(dir));
         }
-        self.add(dir).map(drop).map_err(|e| io::Error::new(e.kind(), format!("watching {}: {e}", dir.display())))
+        self.add(dir, follow).map(drop).map_err(|e| io::Error::new(e.kind(), format!("watching {}: {e}", dir.display())))
     }
 
-    /// Adds a watch on `dir`: whether it's new.
-    fn add(&self, dir: &Path) -> io::Result<bool> {
+    /// Adds a watch on `dir` (through it when it's a symbolic link and
+    /// `follow`): whether it's new.
+    fn add(&self, dir: &Path, follow: bool) -> io::Result<bool> {
         let c = CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        let mask = if follow { MASK & !libc::IN_DONT_FOLLOW } else { MASK };
         // SAFETY: `c` is a valid C string.
-        let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), MASK) };
+        let wd = unsafe { libc::inotify_add_watch(self.fd, c.as_ptr(), mask) };
         if wd < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(self.wds.lock().unwrap().insert(wd, dir))
+        Ok(self.wds.locked().insert(wd, dir))
     }
 
     /// Watches `dir` and the directories under it (not into
@@ -323,8 +346,9 @@ impl Inotify {
     /// one that can't be watched or listed otherwise (out of watches,
     /// of file descriptors, unreadable) fails it all: those it added
     /// are given back (out of watches, all under `dir`), lest the
-    /// directory be trusted with parts unwatched.
-    fn add_tree(&self, dir: &Path) -> io::Result<()> {
+    /// directory be trusted with parts unwatched. `follow`: `dir` itself
+    /// through a symbolic link.
+    fn add_tree(&self, dir: &Path, follow: bool) -> io::Result<()> {
         if self.is_ignored(dir) {
             return Err(build_dir(dir));
         }
@@ -345,7 +369,7 @@ impl Inotify {
             if !top && self.is_ignored(&d) {
                 continue;
             }
-            match self.add(&d) {
+            match self.add(&d, follow && top) {
                 Ok(true) => added.push(d.clone()),
                 Ok(false) => {}
                 Err(e) if !top && gone(&e) => continue,
@@ -373,7 +397,7 @@ impl Inotify {
 
     /// Stops watching `dir` alone.
     fn remove_one(&self, dir: &Path) {
-        let mut wds = self.wds.lock().unwrap();
+        let mut wds = self.wds.locked();
         if let Some(wd) = wds.by_dir.remove(dir) {
             wds.dirs.remove(&wd);
             // SAFETY: plain syscall.
@@ -384,7 +408,7 @@ impl Inotify {
     /// Stops watching `dir` and the directories under it: their
     /// watches' last events (`IN_IGNORED`) then name nothing.
     fn remove_tree(&self, dir: &Path) {
-        let removed = self.wds.lock().unwrap().take_under(dir);
+        let removed = self.wds.locked().take_under(dir);
         for wd in &removed {
             // SAFETY: plain syscall (one the kernel removed already
             // fails, harmlessly).
@@ -395,11 +419,13 @@ impl Inotify {
         }
     }
 
+    /// Waits for events, and reads them, until reading fails (events
+    /// lost then).
     fn read_loop(&self) {
-        let mut buf = vec![0u8; 1 << 16];
         loop {
-            // SAFETY: `buf` is writable for its length.
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd.
+            let n = unsafe { libc::poll(&mut pfd, 1, -1) };
             let Some(sink) = self.sink.upgrade() else { return };
             if n < 0 {
                 if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
@@ -407,6 +433,29 @@ impl Inotify {
                 }
                 sink.lost(None);
                 return;
+            }
+            if !self.read_events(&sink) {
+                return;
+            }
+        }
+    }
+
+    /// Reads the events queued, and handles them: whether reading worked
+    /// (else events were lost, and the watcher told).
+    fn read_events(&self, sink: &Watcher) -> bool {
+        let mut buf = self.events.locked();
+        loop {
+            // SAFETY: `buf` is writable for its length.
+            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n < 0 {
+                match io::Error::last_os_error().kind() {
+                    io::ErrorKind::WouldBlock => return true,
+                    io::ErrorKind::Interrupted => continue,
+                    _ => {
+                        sink.lost(None);
+                        return false;
+                    }
+                }
             }
             let mut off = 0usize;
             let header = std::mem::size_of::<libc::inotify_event>();
@@ -416,7 +465,7 @@ impl Inotify {
                 let name_bytes = &buf[off + header..off + header + ev.len as usize];
                 let name = &name_bytes[..name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len())];
                 off += header + ev.len as usize;
-                self.handle(&sink, &ev, name);
+                self.handle(sink, &ev, name);
             }
         }
     }
@@ -426,7 +475,7 @@ impl Inotify {
             sink.lost(None);
             return;
         }
-        let Some(dir) = self.wds.lock().unwrap().dirs.get(&ev.wd).cloned() else { return };
+        let Some(dir) = self.wds.locked().dirs.get(&ev.wd).cloned() else { return };
         if ev.mask & (libc::IN_IGNORED | libc::IN_UNMOUNT) != 0 {
             // The watch went. A directory removed or renamed: its parent
             // reported it first, which forgot its watches (they name
@@ -437,7 +486,7 @@ impl Inotify {
             // Otherwise its file system was unmounted, which nothing
             // reported.
             let current = {
-                let mut wds = self.wds.lock().unwrap();
+                let mut wds = self.wds.locked();
                 let current = wds.by_dir.get(&dir) == Some(&ev.wd);
                 if !current {
                     wds.dirs.remove(&ev.wd);
@@ -460,7 +509,7 @@ impl Inotify {
         if is_dir && ev.mask & (libc::IN_MOVED_FROM | libc::IN_DELETE) != 0 {
             // Its watches would report the old paths, or are going: the
             // event on the path drops what was under it.
-            self.whole.write().unwrap().remove_under(&path);
+            self.whole.writing().remove_under(&path);
             self.remove_tree(&path);
         }
         // Under a directory watched whole, new directories are watched
@@ -468,7 +517,7 @@ impl Inotify {
         // already (or a file now) has its own events; one that can't be
         // watched is a loss.
         if is_dir && ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 && under(&self.whole, &path) && !self.is_ignored(&path) {
-            match self.add_tree(&path) {
+            match self.add_tree(&path, false) {
                 Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {}
                 Err(_) => sink.lost(Some(&path)),
                 Ok(()) => {}
@@ -485,6 +534,11 @@ impl Inotify {
         }
         sink.event(&path, ev.mask & STRUCTURAL != 0);
     }
+}
+
+/// Names aren't spelled short here.
+pub(super) fn short_spelled(_dir: &Path) -> Option<PathBuf> {
+    None
 }
 
 /// Checks that `dir`'s file system reports every change: a network or
@@ -518,7 +572,7 @@ mod tests {
     struct Recorder(Mutex<Vec<(PathBuf, Change)>>);
     impl Listener for Recorder {
         fn changed(&self, path: &Path, change: Change) {
-            self.0.lock().unwrap().push((path.to_path_buf(), change));
+            self.0.locked().push((path.to_path_buf(), change));
         }
     }
 
@@ -538,6 +592,7 @@ mod tests {
         }
         Inotify {
             fd: -1,
+            events: Mutex::default(),
             wds: Mutex::new(table),
             whole: Default::default(),
             sink: Arc::downgrade(w),
@@ -577,7 +632,7 @@ mod tests {
         in_sync(&w, &f);
         let backend = inotify(&w, &[(1, dir.join("mnt")), (2, dir.clone())]);
         backend.handle(&w, &event(1, libc::IN_UNMOUNT), b"");
-        assert!(rec.0.lock().unwrap().iter().any(|(p, c)| *p == dir.join("mnt") && *c == Change::Tree));
+        assert!(rec.0.locked().iter().any(|(p, c)| *p == dir.join("mnt") && *c == Change::Tree));
         assert_eq!(w.token(&f), None);
         w.sync();
         assert!(w.token(&f).is_some());
@@ -607,11 +662,11 @@ mod tests {
         backend.handle(&w, &event(1, libc::IN_DELETE | libc::IN_ISDIR), b"sub");
         backend.handle(&w, &event(2, libc::IN_DELETE_SELF), b"");
         backend.handle(&w, &event(2, libc::IN_IGNORED), b"");
-        let drops = rec.0.lock().unwrap().iter().filter(|(p, c)| *p == sub && *c == Change::Tree).count();
-        assert_eq!(drops, 1, "{:?}", rec.0.lock().unwrap());
-        assert!(backend.wds.lock().unwrap().dirs.keys().eq([1].iter()));
+        let drops = rec.0.locked().iter().filter(|(p, c)| *p == sub && *c == Change::Tree).count();
+        assert_eq!(drops, 1, "{:?}", rec.0.locked());
+        assert!(backend.wds.locked().dirs.keys().eq([1].iter()));
         // Watched again when needed.
-        assert!(!w.watched.read().unwrap().contains_key(&sub));
+        assert!(!w.watched.reading().contains_key(&sub));
     }
 
     /// A tree watched whole with a directory that can't be watched
@@ -722,7 +777,7 @@ mod tests {
         assert_eq!(w.token(&f), None);
         wait_for("the root in sync", in_sync);
         assert!(w.token(&g).is_some());
-        let mut table = w.mount_table.read().unwrap().clone();
+        let mut table = w.mount_table.reading().clone();
         table.push((dir.join("a"), true));
         w.mounts_changed(table.clone());
         assert_eq!(w.token(&f), None);

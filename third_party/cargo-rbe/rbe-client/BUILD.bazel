@@ -18,8 +18,10 @@ rust_library(
         "@crates//:rustls",
         "@crates//:sha2",
         "@crates//:tokio",
+        "@crates//:tokio-rustls",
         "@crates//:tokio-stream",
         "@crates//:tonic",
+        "@crates//:webpki-roots",
         "@crates//:zstd",
     ],
 )

@@ -135,27 +135,54 @@ impl Location {
         std::fs::File::options().write(true).open(self.lock_file()).is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
     }
 
+    /// Its lock, taken (Some(None): it has none), unless its daemon runs:
+    /// one can't start while it's held.
+    fn hold(&self) -> Option<Option<std::fs::File>> {
+        match std::fs::File::options().write(true).open(self.lock_file()) {
+            Ok(f) => f.try_lock().is_ok().then_some(Some(f)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Some(None),
+            Err(_) => None,
+        }
+    }
+
     /// Removes the files of other daemons in its directory (of other
-    /// ninja-rs binaries: copies, locks, logs, cookies, failures) unless
-    /// they run; and copies left half made (`{id}.{pid}.tmp`, a build that
-    /// stopped while copying) a while ago.
+    /// ninja-rs binaries: copies, locks, logs, sockets, cookies, failures)
+    /// unless they run, their locks held meanwhile (one starting would find
+    /// its log gone); and copies left half made (`{id}.{pid}.tmp`, a build
+    /// that stopped while copying) a while ago.
     pub fn remove_others(&self) -> io::Result<()> {
         const TMP_KEPT: Duration = Duration::from_secs(10 * 60);
+        let mut held: std::collections::HashMap<String, Option<Option<std::fs::File>>> = std::collections::HashMap::new();
+        let mut gone = |id: &str| held.entry(id.to_string()).or_insert_with(|| Location { dir: self.dir.clone(), id: id.to_string() }.hold()).is_some();
         for e in std::fs::read_dir(&self.dir)?.flatten() {
             let path = e.path();
             // `{id}.{kind}`: ids have no dots.
             let Some((id, kind)) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once('.')) else { continue };
             let tmp = kind.ends_with(".tmp");
-            if !tmp && (id == self.id || !matches!(kind, "exe" | "lock" | "log" | "log.1" | "cookies" | "failed")) {
+            if !tmp && (id == self.id || !matches!(kind, "exe" | "lock" | "log" | "log.1" | "sock" | "cookies" | "failed")) {
                 continue;
             }
             if tmp && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < TMP_KEPT) {
                 continue;
             }
-            if !tmp && (Location { dir: self.dir.clone(), id: id.to_string() }).running() {
+            if !tmp && !gone(id) {
                 continue;
             }
             let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        }
+        // Sockets in the directory of those whose path would be too long.
+        #[cfg(unix)]
+        if let Some(sockets) = self.socket().parent().filter(|d| *d != self.dir)
+            && let Ok(entries) = std::fs::read_dir(sockets)
+        {
+            let ours = format!("{}-", short_hash(&[self.dir.to_string_lossy().as_bytes()]));
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let Some(id) = name.to_str().and_then(|n| n.strip_prefix(&ours)?.strip_suffix(".sock")) else { continue };
+                if id != self.id && gone(id) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
         }
         Ok(())
     }
@@ -847,8 +874,9 @@ mod tests {
     }
 
     /// The files of other daemons go, unless they run (they used to go
-    /// all, those of running ones included); so do copies left half made a
-    /// while ago (they never went, 20 MB each), not those being made.
+    /// all, those of running ones included; their sockets stayed); so do
+    /// copies left half made a while ago (they never went, 20 MB each), not
+    /// those being made.
     #[test]
     fn others_removed() {
         let base = test_dirs::TestDir::new("ninja_daemon_others");
@@ -856,7 +884,8 @@ mod tests {
         let (me, running, gone) = (at("me"), at("running"), at("gone"));
         me.create_dir().unwrap();
         for loc in [&me, &running, &gone] {
-            for f in [loc.lock_file(), loc.log_file(), loc.old_log_file(), loc.dir.join(format!("{}.exe", loc.id))] {
+            let socket = loc.dir.join(format!("{}.sock", loc.id));
+            for f in [loc.lock_file(), loc.log_file(), loc.old_log_file(), loc.dir.join(format!("{}.exe", loc.id)), socket] {
                 std::fs::write(f, "").unwrap();
             }
             std::fs::create_dir(loc.cookie_dir()).unwrap();
@@ -874,8 +903,8 @@ mod tests {
         me.remove_others().unwrap();
         let mut left: Vec<String> = std::fs::read_dir(&me.dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        let mine = ["me.cookies", "me.exe", "me.failed", "me.lock", "me.log", "me.log.1"];
-        let running = ["running.cookies", "running.exe", "running.failed", "running.lock", "running.log", "running.log.1"];
+        let mine = ["me.cookies", "me.exe", "me.failed", "me.lock", "me.log", "me.log.1", "me.sock"];
+        let running = ["running.cookies", "running.exe", "running.failed", "running.lock", "running.log", "running.log.1", "running.sock"];
         let expected: Vec<&str> = std::iter::once("gone.5678.tmp").chain(mine).chain(running).collect();
         assert_eq!(left, expected);
     }

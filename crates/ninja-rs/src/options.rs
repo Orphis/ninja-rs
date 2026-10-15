@@ -295,6 +295,29 @@ pub struct LoadedTls {
     /// The files holding a certificate that expires soon, with the warning
     /// about it (see `certs::check`).
     pub expiring: Vec<(String, String)>,
+    /// A `--tls_certificate` file holding several CAs: its path and its
+    /// certificates (DER), which only the one verifying a server's
+    /// certificate is checked of, once connected (see `ca_check`).
+    pub bundle: Option<(String, Vec<Vec<u8>>)>,
+}
+
+impl LoadedTls {
+    /// The check of the CA of `bundle` that verified a server's
+    /// certificate (see `certs::check_verifying`): an error refuses the
+    /// server's certificate (the connection fails, as for one expired); a
+    /// warning goes to `warnings`, with the file's path. None without a
+    /// bundle: a single CA is checked before connecting.
+    pub fn ca_check(&self, warnings: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) -> rbe_client::CaCheck {
+        let Some((path, certs)) = self.bundle.clone() else { return rbe_client::CaCheck::default() };
+        rbe_client::CaCheck::new(move |verified| {
+            let source = format!("--tls_certificate={path}");
+            let warning = crate::certs::check_verifying(&source, &certs, verified, std::time::SystemTime::now())?;
+            if let Some(w) = warning {
+                warnings.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((path.clone(), w));
+            }
+            Ok(())
+        })
+    }
 }
 
 impl TlsFlags {
@@ -303,14 +326,16 @@ impl TlsFlags {
     /// would leave the CAs trusted none, or the client without a key. The
     /// certificates' dates are checked now (see `certs::check`): before
     /// connecting, which a certificate refused may end with no more than a
-    /// connection closed.
+    /// connection closed. But for those of a `--tls_certificate` file holding
+    /// several CAs (a bundle): only the one verifying the server's
+    /// certificate is, once known (see `LoadedTls::ca_check`).
     pub fn load(&self) -> Result<LoadedTls, String> {
         self.load_at(std::time::SystemTime::now())
     }
 
     /// `load`, the certificates' dates checked at `now`.
     pub fn load_at(&self, now: std::time::SystemTime) -> Result<LoadedTls, String> {
-        let mut expiring = Vec::new();
+        let (mut expiring, mut bundle) = (Vec::new(), None);
         // `kind` names the certificates' (`client`, `CA`); none for a key.
         let mut read = |flag: &str, p: &Option<String>, kind: Option<&str>| -> Result<Option<Vec<u8>>, String> {
             let Some(p) = p else { return Ok(None) };
@@ -318,10 +343,15 @@ impl TlsFlags {
             let found = match kind {
                 Some(kind) => {
                     let certs = crate::certs::pem_certificates(&data).map_err(|e| format!("--{flag}={p}: {e}"))?;
-                    if let Some(warning) = crate::certs::check(kind, &format!("--{flag}={p}"), &certs, now)? {
-                        expiring.push((p.clone(), warning));
+                    if kind == "CA" && certs.len() > 1 {
+                        bundle = Some((p.clone(), certs));
+                        true
+                    } else {
+                        if let Some(warning) = crate::certs::check(kind, &format!("--{flag}={p}"), &certs, now)? {
+                            expiring.push((p.clone(), warning));
+                        }
+                        !certs.is_empty()
                     }
-                    !certs.is_empty()
                 }
                 // An encrypted key (PKCS#8, or OpenSSL's PKCS#1 with a
                 // `Proc-Type` header) rustls doesn't read.
@@ -343,7 +373,7 @@ impl TlsFlags {
             client_key: read("tls_client_key", &self.client_key, None)?,
             authority_override: self.authority_override.clone(),
         };
-        Ok(LoadedTls { tls, expiring })
+        Ok(LoadedTls { tls, expiring, bundle })
     }
 }
 
@@ -365,15 +395,14 @@ fn pem_labels(data: &[u8]) -> impl Iterator<Item = &str> {
 
 /// Explains a failed connection to a `grpcs://` endpoint (or one without a
 /// scheme, which means TLS): whose certificate was refused, the client's
-/// (by the server, whose alert says why) or the server's (by this client),
-/// what was sent or checked, and what the error usually means. Empty for
-/// other errors. A connection closed is only explained when the server
-/// never answered anything (`first_contact`): with TLS 1.3, a server
-/// refusing the client's certificate may just close it after the
-/// handshake; later, it's a broken connection (made again already). An
-/// alert comes first: one saying a certificate expired is about the
-/// client's, not the server's.
-pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool) -> String {
+/// (by the server, whose alert says why, or that closed the connection
+/// once it asked for it: see `rbe_client::fault::ClientCertificateRefused`)
+/// or the server's (by this client), what was sent or checked, and what the
+/// error usually means. Empty for other errors (a CA of a bundle that
+/// verified the server's certificate, refused for its dates, says why
+/// itself). An alert comes first: one saying a certificate expired is
+/// about the client's, not the server's.
+pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags) -> String {
     let Some(rest) = tls_host(endpoint) else {
         return String::new();
     };
@@ -386,8 +415,14 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
     // The alert the server sent, as rustls names them (`CertificateExpired`).
     let alert = e.split_once("alert: ").map(|(_, a)| a.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or_default());
     let client_refused = |why: &str| format!("the server refused the client's certificate{why}: sent {cert}");
-    let hint = if let Some(alert) = alert.filter(|a| a.contains("certificate") || ["unknownca", "accessdenied", "handshakefailure", "decrypterror"].contains(a))
-    {
+    let hint = if e.contains("which verified the server's certificate") {
+        return String::new();
+    } else if e.contains(&rbe_client::fault::CLIENT_CERTIFICATE_REFUSED.to_ascii_lowercase()) {
+        match tls.client_certificate {
+            None => "the server requires a client certificate: --tls_client_certificate and --tls_client_key give one".to_string(),
+            Some(_) => client_refused(" (it didn't say why)"),
+        }
+    } else if let Some(alert) = alert.filter(|a| a.contains("certificate") || ["unknownca", "accessdenied", "handshakefailure", "decrypterror"].contains(a)) {
         match alert {
             "certificaterequired" | "nocertificate" if tls.client_certificate.is_none() => {
                 "the server requires a client certificate: --tls_client_certificate and --tls_client_key give one".to_string()
@@ -427,14 +462,6 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
         "the server's certificate isn't one for a server (its extended key usage)".to_string()
     } else if e.contains("invalid peer certificate") {
         "the server's certificate was refused".to_string()
-    } else if first_contact
-        && ["broken pipe", "connection closed", "connection reset", "unexpected eof", "forcibly closed", "connection was aborted", "connection aborted"]
-            .iter()
-            .any(|c| e.contains(c))
-    {
-        format!(
-            "the server closed the connection before answering anything, as when it refuses the client's certificate (sent {cert}), or doesn't speak TLS (grpc:// connects without)"
-        )
     } else {
         return String::new();
     };
@@ -442,15 +469,16 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
 }
 
 /// Explains a connection to a plaintext endpoint (`grpc://`) that broke
-/// before anything answered (`rbe_client::fault::Unreachable`), which a
-/// TLS server does too (Windows resets it before the client reads the
-/// server's alert): empty for other errors.
+/// before anything answered (`rbe_client::fault::Unreachable`): beyond a
+/// tunnel whose far end is down, a server speaking TLS (whose alert
+/// Windows resets before the client reads it, and that is a protocol error
+/// otherwise). Empty for other errors.
 pub fn plaintext_hint(error: &str, endpoint: &str) -> String {
     let plaintext = endpoint.starts_with("grpc://") || endpoint.starts_with("http://");
     if !plaintext || !error.contains("the connection broke before anything answered") {
         return String::new();
     }
-    "\n  a server that speaks TLS closes plaintext connections so too: grpcs:// connects with TLS".to_string()
+    "\n  as when the far end of a tunnel is down, or the server speaks TLS (grpcs:// connects with TLS)".to_string()
 }
 
 /// Build event reporting, with Bazel's flag names.
@@ -564,6 +592,9 @@ pub struct RemoteFlags {
     /// `--remote_timeout`: how long a call may take, or a transfer go
     /// without moving (executions aren't bounded).
     pub timeout: std::time::Duration,
+    /// `--remote_max_concurrency_per_connection`: the streams the service
+    /// allows on one connection (calls and executions on one stay below).
+    pub max_concurrency: usize,
     /// `--action_env=NAME=VALUE`, or `NAME` for the value ninja-rs has:
     /// variables every remote action gets, in order (the last wins).
     pub action_env: Vec<(String, Option<String>)>,
@@ -732,6 +763,9 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
                              moving (30s, 2m; seconds without a unit). Executions
                              aren't bounded: a broken one is followed again
                              (WaitExecution) [default=60s]
+  --remote_max_concurrency_per_connection=N  calls the remote service takes at once
+                             on one connection (HTTP/2 streams): calls and executions
+                             stay below it, more executions open more [default=100]
   --disk_cache=DIR           local action cache and CAS (also without --remote_executor)
   --remote_download_outputs=all|minimal|toplevel
                              outputs of remote actions to download: all, or only
@@ -743,10 +777,11 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --execution_log_file=FILE  log every remote action (key, command, inputs) as JSON lines
   --remote_include_scanner=conservative|preprocessor|clang-scan-deps|compiler
                              how compiles' inputs are found: following every #include;
-                             evaluating the preprocessor exactly (GCC and Clang commands);
-                             the clang-scan-deps next to the compiler; or the compiler
-                             itself (-M, /showIncludes). The conservative scanner when
-                             the chosen one can't tell [default=conservative]
+                             evaluating the preprocessor exactly (GCC, Clang and cl
+                             commands), else asking the compiler; the clang-scan-deps
+                             next to the compiler; or the compiler itself (-M,
+                             /showIncludes). The conservative scanner when the chosen
+                             one can't tell [default=preprocessor]
   --disk_cache_max_size=SIZE evict least recently used entries above SIZE [default=10G]
   --[no]remote_cache_compression  blobs travel compressed with zstd when the remote
                              supports it [default=on]
@@ -831,6 +866,7 @@ fn blank() -> Options {
             cache_compression: true,
             retries: rbe_client::DEFAULT_RETRIES,
             timeout: rbe_client::DEFAULT_TIMEOUT,
+            max_concurrency: rbe_client::DEFAULT_MAX_CONCURRENCY,
             ..Default::default()
         },
         bes: BesFlags::default(),
@@ -1019,6 +1055,11 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                     if o.remote.timeout.is_zero() {
                         return Err("invalid --remote_timeout value '0'".into());
                     }
+                }
+                "remote_max_concurrency_per_connection" => {
+                    let v = value(&mut i)?;
+                    o.remote.max_concurrency =
+                        v.parse().ok().filter(|&n| n > 0).ok_or_else(|| format!("invalid --remote_max_concurrency_per_connection value '{v}'"))?;
                 }
                 "remote_max_fallback_ratio" => {
                     let v = value(&mut i)?;
@@ -1361,20 +1402,37 @@ mod tests {
     #[test]
     fn tls_hints() {
         let tls = TlsFlags { client_certificate: Some("/c.pem".into()), certificate: Some("/ca.pem".into()), ..Default::default() };
-        let hint = |e: &str, endpoint: &str, first_contact: bool| tls_hint(e, endpoint, &tls, first_contact);
-        // A server refusing the client's certificate.
-        let refused = hint("transport error: received fatal alert: CertificateRequired", "grpcs://h:1", false);
+        let hint = |e: &str, endpoint: &str| tls_hint(e, endpoint, &tls);
+        // A server refusing the client's certificate: with an alert, or
+        // closing the connection once it asked for it.
+        let refused = hint("transport error: received fatal alert: CertificateRequired", "grpcs://h:1");
         assert!(refused.contains("refused the client's certificate: sent the client certificate /c.pem"), "{refused}");
-        assert!(hint("transport error: broken pipe", "grpcs://h:1", true).contains("sent the client certificate /c.pem"));
-        // A connection that broke later isn't the certificate's fault.
-        assert_eq!(hint("transport error: connection reset", "grpcs://h:1", false), "");
-        assert!(tls_hint("invalid peer certificate: UnknownIssuer", "h:1", &TlsFlags::default(), true).contains("--tls_certificate names a CA instead"));
-        assert!(hint("invalid peer certificate: UnknownIssuer", "h:1", true).contains("checked against /ca.pem only"));
-        assert!(hint("invalid peer certificate: NotValidForName", "grpcs://[::1]:8980", true).contains("isn't valid for ::1"));
-        let expired = hint("invalid peer certificate: Expired", "grpcs://h:1", true);
+        let closed = format!("UNKNOWN: transport error: {} (connection reset): it refused the certificate", rbe_client::fault::CLIENT_CERTIFICATE_REFUSED);
+        assert!(hint(&closed, "grpcs://h:1").contains("refused the client's certificate (it didn't say why): sent the client certificate /c.pem"));
+        let required = tls_hint(&closed, "grpcs://h:1", &TlsFlags::default());
+        assert!(required.contains("the server requires a client certificate"), "{required}");
+        // A connection that broke otherwise isn't the certificate's fault
+        // (a TLS-terminating proxy whose backend is down).
+        for e in [
+            "transport error: connection reset",
+            "transport error: broken pipe",
+            "An existing connection was forcibly closed by the remote host. (os error 10054)",
+        ] {
+            assert_eq!(hint(e, "grpcs://h:1"), "", "{e}");
+        }
+        assert!(tls_hint("invalid peer certificate: UnknownIssuer", "h:1", &TlsFlags::default()).contains("--tls_certificate names a CA instead"));
+        assert!(hint("invalid peer certificate: UnknownIssuer", "h:1").contains("checked against /ca.pem only"));
+        assert!(hint("invalid peer certificate: NotValidForName", "grpcs://[::1]:8980").contains("isn't valid for ::1"));
+        let expired = hint("invalid peer certificate: Expired", "grpcs://h:1");
         assert!(expired.contains("has expired") && !expired.contains("trusted"), "{expired}");
+        // A CA of a bundle that verified it, as it says itself: not the
+        // server's certificate.
+        assert_eq!(
+            hint("CA certificate 2 of 3 (--tls_certificate=/b.pem), which verified the server's certificate, expired on 2026-10-01 12:00 UTC", "grpcs://h:1"),
+            ""
+        );
         // The client's certificate expired, as the server says it.
-        let expired = hint("transport error: connection error: received fatal alert: CertificateExpired", "grpcs://h:1", true);
+        let expired = hint("transport error: connection error: received fatal alert: CertificateExpired", "grpcs://h:1");
         assert!(expired.contains("refused the client's certificate as expired"), "{expired}");
         // Whose certificate, and what of it, as rustls says it.
         for (error, said) in [
@@ -1405,30 +1463,23 @@ mod tests {
             ),
             ("keys may not be consistent: KeyMismatch", "the client certificate /c.pem and its key (--tls_client_key) don't match"),
         ] {
-            let h = hint(&format!("transport error: {error}"), "grpcs://h:1", true);
+            let h = hint(&format!("transport error: {error}"), "grpcs://h:1");
             assert!(h.contains(said), "{error}: {h}");
         }
-        let required = tls_hint("received fatal alert: CertificateRequired", "h:1", &TlsFlags::default(), true);
+        let required = tls_hint("received fatal alert: CertificateRequired", "h:1", &TlsFlags::default());
         assert!(required.contains("the server requires a client certificate"), "{required}");
         // The endpoint's words don't count.
         let named = "grpcs://expired-unknownissuer.example:1";
-        assert_eq!(hint(&format!("connecting to {named}: transport error: connection refused"), named, true), "");
+        assert_eq!(hint(&format!("connecting to {named}: transport error: connection refused"), named), "");
         // Which endpoints use the certificates at all.
         assert!(uses_tls("grpcs://h:1") && uses_tls("https://h:1") && uses_tls("h:1") && !uses_tls("grpc://h:1") && !uses_tls("http://h:1"));
-        // Windows' words for a connection reset, or aborted, and hyper's.
-        for e in [
-            "An existing connection was forcibly closed by the remote host. (os error 10054)",
-            "An established connection was aborted by the software in your host machine. (os error 10053)",
-            "connection error: connection aborted",
-        ] {
-            assert!(hint(&format!("transport error: {e}"), "grpcs://h:1", true).contains("closed the connection before answering"), "{e}");
-        }
-        assert_eq!(hint("transport error: broken pipe", "grpc://h:1", true), "");
-        assert_eq!(hint("not found", "grpcs://h:1", true), "");
+        assert_eq!(hint("transport error: broken pipe", "grpc://h:1"), "");
+        assert_eq!(hint("not found", "grpcs://h:1"), "");
         // A plaintext connection broken before anything answered may be to
-        // a TLS server.
+        // a TLS server, after a tunnel whose far end is down.
         let broke = "GetCapabilities: the connection broke before anything answered: UNKNOWN: transport error: connection aborted";
-        assert!(plaintext_hint(broke, "grpc://h:1").contains("grpcs:// connects with TLS"));
+        let said = plaintext_hint(broke, "grpc://h:1");
+        assert!(said.contains("the far end of a tunnel is down, or the server speaks TLS (grpcs:// connects with TLS)"), "{said}");
         assert_eq!(plaintext_hint(broke, "grpcs://h:1"), "");
         assert_eq!(plaintext_hint("connecting to grpc://h:1: transport error: tcp connect error: refused", "grpc://h:1"), "");
     }
@@ -1508,12 +1559,16 @@ mod tests {
         let (file_warned, warning) = &loaded.expiring[0];
         assert!(file_warned.ends_with("soon.pem") && warning.ends_with("soon.pem) expires on 2026-10-04 12:00 UTC, in 3 days"), "{warning}");
 
-        // A bundle: each certificate counts.
-        assert!(ca("bundle-ok.pem", &[year, year]).unwrap().expiring.is_empty());
-        let warned = ca("bundle-soon.pem", &[year, soon, (now - DAY, now + 5 * DAY)]).unwrap().expiring;
-        assert!(warned.len() == 1 && warned[0].1.starts_with("CA certificate 2 of 3 (--tls_certificate="), "{warned:?}");
-        let err = ca("bundle-expired.pem", &[year, soon, expired]).unwrap_err();
-        assert!(err.starts_with("CA certificate 3 of 3 (--tls_certificate=") && err.contains(" expired on "), "{err}");
+        // A single CA counts.
+        let err = ca("ca-expired.pem", &[expired]).unwrap_err();
+        assert!(err.starts_with("the CA certificate (--tls_certificate=") && err.contains(" expired on "), "{err}");
+        // A bundle's CAs don't by themselves: only the one that verifies a
+        // server's certificate will (see `LoadedTls::ca_check`).
+        for certs in [&[year, soon, expired][..], &[early, year]] {
+            let loaded = ca("bundle.pem", certs).unwrap();
+            assert!(loaded.expiring.is_empty(), "{:?}", loaded.expiring);
+            assert_eq!(loaded.bundle.map(|(_, c)| c.len()), Some(certs.len()));
+        }
         // Both files expiring: a warning each.
         let both = TlsFlags {
             certificate: file("ca-soon.pem", &[soon]),
@@ -1524,6 +1579,38 @@ mod tests {
         assert_eq!(both.load_at(now).unwrap().expiring.len(), 2);
         // No date to check without the files.
         assert!(TlsFlags::default().load_at(now).unwrap().expiring.is_empty());
+    }
+
+    /// The CA of a bundle that verified a server's certificate is checked
+    /// once connected: one expired refuses the server's certificate, one
+    /// expiring soon is warned about (once, by the caller), the others
+    /// don't count.
+    #[test]
+    fn bundles_check_the_ca_that_verified() {
+        let dir = test_dirs::TestDir::new("ninja-rs-tls-bundles");
+        let now = std::time::SystemTime::now();
+        let made = |from, to| fake_reapi::certs::made_up(from, to);
+        let (year, expired, soon) = (made(now - DAY, now + 365 * DAY), made(now - 365 * DAY, now - DAY), made(now - DAY, now + 3 * DAY));
+        let path = dir.join("bundle.pem");
+        std::fs::write(&path, [year.as_str(), expired.as_str(), soon.as_str()].concat()).unwrap();
+        let loaded = TlsFlags { certificate: Some(path.to_string_lossy().into_owned()), ..Default::default() }.load().unwrap();
+        let der = |pem: &str| crate::certs::pem_certificates(pem.as_bytes()).unwrap().remove(0);
+        let warnings = std::sync::Arc::default();
+        let rbe_client::CaCheck(Some(check)) = loaded.ca_check(std::sync::Arc::clone(&warnings)) else { panic!("no check of a bundle") };
+        assert_eq!(check(&[&der(&year)]), Ok(()));
+        let err = check(&[&der(&expired)]).unwrap_err();
+        assert!(err.starts_with("CA certificate 2 of 3 (--tls_certificate=") && err.contains("which verified the server's certificate, expired on"), "{err}");
+        assert!(warnings.lock().unwrap().is_empty());
+        assert_eq!(check(&[&der(&soon)]), Ok(()));
+        let warned = warnings.lock().unwrap().clone();
+        assert!(warned.len() == 1 && warned[0].1.starts_with("CA certificate 3 of 3") && warned[0].1.contains(" expires on "), "{warned:?}");
+        // Of two that verified it (cross-signed), one good is enough.
+        assert_eq!(check(&[&der(&expired), &der(&year)]), Ok(()));
+        // A single CA isn't checked again.
+        let single = dir.join("single.pem");
+        std::fs::write(&single, &year).unwrap();
+        let loaded = TlsFlags { certificate: Some(single.to_string_lossy().into_owned()), ..Default::default() }.load().unwrap();
+        assert!(loaded.bundle.is_none() && loaded.ca_check(std::sync::Arc::default()).0.is_none());
     }
 
     #[test]
@@ -1559,8 +1646,17 @@ mod tests {
         assert_eq!(root, std::path::absolute("rel/root").unwrap().to_string_lossy());
         let o = p(&["--remote_retries=2", "--remote_timeout=5m"]);
         assert_eq!((o.remote.retries, o.remote.timeout), (2, Duration::from_secs(300)));
-        for bad in ["--bes_timeout=60x", "--bes_timeout=s", "--bes_timeout=-1s", "--remote_download_outputs=some", "--remote_retries=-1", "--remote_timeout=0"]
-        {
+        assert_eq!(o.remote.max_concurrency, 100);
+        assert_eq!(p(&["--remote_max_concurrency_per_connection=32"]).remote.max_concurrency, 32);
+        for bad in [
+            "--bes_timeout=60x",
+            "--bes_timeout=s",
+            "--bes_timeout=-1s",
+            "--remote_download_outputs=some",
+            "--remote_retries=-1",
+            "--remote_timeout=0",
+            "--remote_max_concurrency_per_connection=0",
+        ] {
             assert!(parse_args(&[bad.to_string()]).is_err(), "{bad}");
         }
     }
@@ -1580,19 +1676,11 @@ mod tests {
     /// and the module's (MODULE.bazel), which BUILD files give the crates.
     #[test]
     fn version_is_the_workspace_one() {
-        let path = |f: &str| match std::env::var_os("TEST_SRCDIR") {
-            // Bazel: a data file, in the runfiles tree, or (Windows) in
-            // the manifest of them.
-            Some(r) => {
-                let tree = std::path::PathBuf::from(r).join("_main").join(f);
-                let manifest = std::env::var_os("RUNFILES_MANIFEST_FILE").and_then(|m| std::fs::read_to_string(m).ok()).unwrap_or_default();
-                let key = format!("_main/{f} ");
-                manifest.lines().find_map(|l| l.strip_prefix(&key)).map_or(tree, std::path::PathBuf::from)
-            }
-            // Cargo: the package directory, set when tests run.
-            None => std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default()).join("../..").join(f),
+        // Bazel's data files, or the sources Cargo's build found (build.rs).
+        let read = |f: &str| {
+            let path = test_dirs::workspace_file(f, option_env!("NINJA_RS_SOURCE_DIR")).unwrap_or_else(|| panic!("{f}: no data file, no sources"));
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
         };
-        let read = |f: &str| std::fs::read_to_string(path(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
         // The first `version = "..."` after `after`.
         let version_after = |text: &str, after: &str| -> String {
             let rest = &text[text.find(after).unwrap_or_else(|| panic!("no {after}"))..];
@@ -1606,5 +1694,19 @@ mod tests {
         // `+1a2b3c4d5e6f`, `.dirty` after it when the tree was.
         let hex = commit.strip_prefix('+').map(|c| c.strip_suffix(".dirty").unwrap_or(c));
         assert!(commit.is_empty() || hex.is_some_and(|c| c.len() >= 7 && c.bytes().all(|b| b.is_ascii_hexdigit())), "{commit}");
+    }
+
+    /// The same, the test binary run without Cargo (by hand, in a debugger
+    /// or an IDE): without its variables, in another directory.
+    #[test]
+    fn version_test_without_cargo() {
+        let dir = test_dirs::TestDir::new("ninja_rs_without_cargo");
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", "options::tests::version_is_the_workspace_one"]).current_dir(&dir);
+        for (name, _) in std::env::vars_os().filter(|(n, _)| n.to_string_lossy().starts_with("CARGO")) {
+            c.env_remove(name);
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
 }

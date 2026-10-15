@@ -35,7 +35,6 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
-    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
@@ -44,9 +43,9 @@ windows-sys = { workspace = true, features = [
 fake-reapi = { path = "../fake-reapi" }
 test-dirs = { path = "../test-dirs" }
 
-# The peak memory of builds (remote_e2e).
+# The peak memory of builds (remote_e2e); the jobs the e2e harness stops.
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus"] }
+windows-sys = { workspace = true, features = ["Win32_System_JobObjects", "Win32_System_ProcessStatus"] }
 
 [[test]]
 name = "remote_e2e"

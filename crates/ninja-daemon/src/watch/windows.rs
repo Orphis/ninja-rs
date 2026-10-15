@@ -100,13 +100,13 @@ impl Backend for Directories {
         let stop = Arc::new(Stop { flag: AtomicBool::new(false), event: event()? });
         let (tx, rx) = std::sync::mpsc::channel();
         let root = root.to_path_buf();
-        if let Some(old) = self.active.lock().unwrap().insert(root.clone(), stop.clone()) {
+        if let Some(old) = self.active.locked().insert(root.clone(), stop.clone()) {
             old.stop();
         }
         let (sink, active) = (self.sink.clone(), self.active.clone());
         std::thread::spawn(move || {
             read_loop(&handle, &root, sink, tx, &stop);
-            let mut active = active.lock().unwrap();
+            let mut active = active.locked();
             if active.get(&root).is_some_and(|s| Arc::ptr_eq(s, &stop)) {
                 active.remove(&root);
             }
@@ -115,7 +115,7 @@ impl Backend for Directories {
     }
 
     fn unwatch(&self, dir: &Path) {
-        self.active.lock().unwrap().retain(|root, stop| {
+        self.active.locked().retain(|root, stop| {
             let under = root.starts_with(dir);
             if under {
                 stop.stop();
@@ -203,7 +203,8 @@ fn read_loop(handle: &OwnedHandle, root: &Path, sink: Weak<Watcher>, started: st
             }
             let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
             let (next, action, len) = (u32_at(off), u32_at(off + 4), u32_at(off + 8) as usize);
-            let name: Vec<u16> = bytes[off + 12..off + 12 + len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            let (units, _) = bytes[off + 12..off + 12 + len].as_chunks::<2>();
+            let name: Vec<u16> = units.iter().map(|&u| u16::from_le_bytes(u)).collect();
             let path = root.join(std::ffi::OsString::from_wide(&name));
             match long_path(&path) {
                 // Build directories' (most of a build's events) go
@@ -268,6 +269,15 @@ fn long_path(path: &Path) -> Option<Named> {
         return Some(Named::Path(d.join(name)));
     }
     dir.ancestors().find_map(expand).map(Named::Under)
+}
+
+/// `dir` with long names, when it's spelled with short (8.3) ones: events
+/// name what's under it by the long ones.
+pub(super) fn short_spelled(dir: &Path) -> Option<PathBuf> {
+    match long_path(dir)? {
+        Named::Path(long) if long != dir => Some(long),
+        _ => None,
+    }
 }
 
 /// Checks that `dir`'s file system reports every change (see the

@@ -29,6 +29,12 @@
 //! whole dropped the others'. The build holding the directory's lock
 //! rewrites it without the records dropped when they get many (see
 //! `load_compacting`). Versions 1 and 2, without `- ` lines, are read too.
+//!
+//! A change cut short (a crash, a full disk) leaves a torn last line, which
+//! may still parse (a path cut short: another path's record), and which
+//! readers leave out. The next writer ends it with a NUL, which no path
+//! holds, and a newline: readers skip such a line, and the change it was
+//! part of, if it describes the record before it.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -105,8 +111,9 @@ impl Records {
 }
 
 /// Opens `file` to append changes to, with its version line if it is new,
-/// and a torn last line (a write cut short) ended, so that the changes
-/// start on a line of their own.
+/// and a torn last line (a write cut short) ended as one readers skip (see
+/// the module's documentation), so that the changes start on a line of
+/// their own.
 fn open_journal(file: &Path) -> std::io::Result<File> {
     let mut f = OpenOptions::new().read(true).append(true).create(true).open(file)?;
     let len = f.metadata()?.len();
@@ -117,10 +124,19 @@ fn open_journal(file: &Path) -> std::io::Result<File> {
         f.seek(SeekFrom::Start(len - 1))?;
         f.read_exact(&mut last)?;
         if last[0] != b'\n' {
-            f.write_all(b"\n")?;
+            f.write_all(VOID)?;
         }
     }
     Ok(f)
+}
+
+/// What ends a torn last line: readers skip a line ending with a NUL.
+const VOID: &[u8] = b"\0\n";
+
+/// Whether a line, maybe torn, describes the record before it (`+ ` and
+/// `= ` lines).
+fn describes_record(line: &[u8]) -> bool {
+    matches!(line.first(), Some(b'+' | b'='))
 }
 
 /// An entry's lines, in the file's format.
@@ -154,12 +170,22 @@ impl RemoteOutputs {
     /// Loads the store from `file` (empty when missing or unreadable).
     pub fn load(file: &Path) -> Self {
         let mut records = Records::default();
-        if let Ok(text) = std::fs::read_to_string(file)
-            && matches!(text.lines().next(), Some(HEADER | HEADER_V2 | HEADER_V1))
-        {
+        let data = std::fs::read(file).unwrap_or_default();
+        // Whole lines: a torn last one is left out (see the module's
+        // documentation).
+        let whole = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let mut lines = data[..whole].split_inclusive(|&b| b == b'\n').map(|l| &l[..l.len() - 1]);
+        if lines.next().is_some_and(|h| [HEADER, HEADER_V2, HEADER_V1].iter().any(|v| v.as_bytes() == h)) {
             // The last entry read, while the lines after it describe it.
             let mut last: Option<Entry> = None;
-            for line in text.lines().skip(1) {
+            for line in lines {
+                // Torn: ended by a writer, or cut inside a character.
+                let Some(line) = std::str::from_utf8(line).ok().filter(|l| !l.ends_with('\0')) else {
+                    if describes_record(line) {
+                        last = None;
+                    }
+                    continue;
+                };
                 if let Some(name) = line.strip_prefix("+ ") {
                     if let Some(e) = &mut last {
                         Arc::make_mut(e.members.get_or_insert_with(Default::default)).push(name.to_string());
@@ -193,6 +219,9 @@ impl RemoteOutputs {
                 }
                 last = Some(Entry { path: path.to_string(), digest, executable: x == "x", mtime, members: None, owner: None });
                 records.lines += 1;
+            }
+            if describes_record(&data[whole..]) {
+                last = None;
             }
             if let Some(e) = last {
                 records.insert(e);
@@ -466,20 +495,67 @@ mod tests {
         assert_eq!((read.get("a.o"), read.get("b.o")), (Some(entry("a.o", 1)), Some(entry("b.o", 2))));
     }
 
+    /// A change cut inside its path still parses, as a record of another
+    /// path: it is no record, before the next change ends its line and
+    /// after. (Ended, it was a whole record: `obj/app` existing with the
+    /// digest of `obj/app.o`.)
+    #[test]
+    fn a_record_cut_inside_its_path_is_none() {
+        let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs-torn-path");
+        let file = dir.join(REMOTE_OUTPUTS_FILE);
+        let full = entry_lines(&entry("obj/app.o", 1));
+        let cut = &full[..full.find(".o").unwrap()];
+        std::fs::write(&file, format!("{HEADER}\n{}{cut}", entry_lines(&entry("a.o", 1)))).unwrap();
+        let read = |what: &str| {
+            let read = RemoteOutputs::load(&file);
+            assert_eq!(read.get("a.o"), Some(entry("a.o", 1)), "{what}");
+            assert_eq!(read.get("obj/app"), None, "{what}");
+            read
+        };
+        read("torn").record(entry("b.o", 2));
+        assert_eq!(read("ended").get("b.o"), Some(entry("b.o", 2)));
+    }
+
+    /// A change cut in a line describing its record (a thin archive's
+    /// member, a side output's owner): the record is none. (It stood with
+    /// a member cut short, or members missing.)
+    #[test]
+    fn a_record_cut_in_what_describes_it_is_none() {
+        let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs-torn-member");
+        let file = dir.join(REMOTE_OUTPUTS_FILE);
+        let thin = Entry { members: Some(Arc::new(vec!["../obj/a.o".into(), "../obj/b c.o".into()])), ..entry("lib/libt.a", 8) };
+        let full = entry_lines(&thin);
+        for cut in [full.find("b c").unwrap(), full.rfind('+').unwrap() + 1] {
+            std::fs::write(&file, format!("{HEADER}\n{}{}", entry_lines(&entry("a.o", 1)), &full[..cut])).unwrap();
+            let s = RemoteOutputs::load(&file);
+            assert_eq!((s.get("a.o"), s.get("lib/libt.a")), (Some(entry("a.o", 1)), None), "{cut}");
+            s.record(entry("b.o", 2));
+            let read = RemoteOutputs::load(&file);
+            assert_eq!((read.get("lib/libt.a"), read.get("b.o")), (None, Some(entry("b.o", 2))), "{cut}");
+        }
+    }
+
+    /// A path cut inside one of its characters leaves the file's other
+    /// records readable. (The whole file was unreadable: every output
+    /// built again, then and in every build after.)
+    #[test]
+    fn a_character_cut_short_hides_nothing_else() {
+        let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs-torn-char");
+        let file = dir.join(REMOTE_OUTPUTS_FILE);
+        let full = entry_lines(&entry("obj/é.o", 1));
+        let mut data = format!("{HEADER}\n{}", entry_lines(&entry("a.o", 1))).into_bytes();
+        data.extend_from_slice(&full.as_bytes()[..full.find('é').unwrap() + 1]);
+        std::fs::write(&file, data).unwrap();
+        RemoteOutputs::load(&file).record(entry("b.o", 2));
+        let read = RemoteOutputs::load(&file);
+        assert_eq!((read.get("a.o"), read.get("b.o"), read.len()), (Some(entry("a.o", 1)), Some(entry("b.o", 2)), 2));
+    }
+
     #[test]
     fn reads_version_1() {
         let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs-v1");
         let file = dir.join(REMOTE_OUTPUTS_FILE);
-        std::fs::write(
-            &file,
-            format!(
-                "{HEADER_V1}
-5 {} 3 - obj/a.o
-",
-                "ab".repeat(32)
-            ),
-        )
-        .unwrap();
+        std::fs::write(&file, format!("{HEADER_V1}\n5 {} 3 - obj/a.o\n", "ab".repeat(32))).unwrap();
         let t = RemoteOutputs::load(&file);
         assert_eq!(t.get("obj/a.o").unwrap().mtime, 5);
     }

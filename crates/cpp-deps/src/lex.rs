@@ -153,25 +153,65 @@ pub struct FileDirectives {
     /// contents (with their sizes) without reading them again (see
     /// `#pragma once` in `scan`).
     pub hash: u64,
-    /// The names text may call (see `name_hash`), sorted: text isn't
-    /// expanded, but a call of a macro whose pragma its arguments make is
-    /// seen (see `Context::arg_pragma`).
-    pub calls: Box<[u64]>,
+    /// The names in text (see `name_hash`), sorted: text isn't expanded,
+    /// but what may run a pragma its arguments make is seen (see
+    /// `Context::arg_pragma`).
+    pub names: Box<[u64]>,
     /// The tokens of the text, when a scan looks at such a call: read
     /// again then (rarely), once (None: the file changed since).
     pub text: OnceLock<Option<Box<[Token]>>>,
 }
 
-/// A name's hash (see `FileDirectives::calls`).
+/// A name's hash (see `FileDirectives::names`): never 0.
 pub(crate) fn name_hash(name: &[u8]) -> u64 {
     // FNV-1a.
-    name.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| (h ^ u64::from(c)).wrapping_mul(0x0100_0000_01b3))
+    name.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| (h ^ u64::from(c)).wrapping_mul(0x0100_0000_01b3)).max(1)
 }
 
-/// Adds the hashes of the names a line of text may call to `out`: those
-/// followed by `(`, or ending the line (the call may go on on the next).
-/// (Names in its comments and strings too.)
-fn calls(text: &[u8], out: &mut Vec<u64>) {
+/// The hashes of a file's names, each once: an open-addressed table
+/// (most names come back often), 0 marking free slots.
+struct NameSet {
+    slots: Vec<u64>,
+    len: usize,
+}
+
+impl NameSet {
+    fn new() -> Self {
+        NameSet { slots: vec![0; 256], len: 0 }
+    }
+
+    fn insert(&mut self, h: u64) {
+        let mask = self.slots.len() - 1;
+        let mut i = (h ^ (h >> 32)) as usize & mask;
+        while self.slots[i] != 0 {
+            if self.slots[i] == h {
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = h;
+        self.len += 1;
+        if self.len * 2 > self.slots.len() {
+            let grown = vec![0; self.slots.len() * 2];
+            let old = std::mem::replace(&mut self.slots, grown);
+            self.len = 0;
+            for h in old.into_iter().filter(|&h| h != 0) {
+                self.insert(h);
+            }
+        }
+    }
+
+    /// The hashes, sorted.
+    fn sorted(self) -> Box<[u64]> {
+        let mut v: Vec<u64> = self.slots.into_iter().filter(|&h| h != 0).collect();
+        v.sort_unstable();
+        v.into_boxed_slice()
+    }
+}
+
+/// Adds the hashes of the names of a line of text to `out` (in its
+/// comments and strings too).
+fn names(text: &[u8], out: &mut NameSet) {
     let mut i = 0;
     while i < text.len() {
         if !is_ident_start(text[i]) || (i > 0 && is_ident_char(text[i - 1])) {
@@ -182,17 +222,7 @@ fn calls(text: &[u8], out: &mut Vec<u64>) {
         while i < text.len() && is_ident_char(text[i]) {
             i += 1;
         }
-        let mut j = i;
-        loop {
-            match text.get(j) {
-                Some(b' ' | b'\t' | b'\r' | b'\n' | b'\\') => j += 1,
-                Some(b'(') | None => {
-                    out.push(name_hash(&text[start..i]));
-                    break;
-                }
-                Some(_) => break,
-            }
-        }
+        out.insert(name_hash(&text[start..i]));
     }
 }
 
@@ -688,7 +718,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
     let mut text_first = false;
     let mut text_last = false;
     let mut asm_include = false;
-    let mut called = Vec::new();
+    let mut named = NameSet::new();
     loop {
         lx.skip_space();
         let Some(c) = lx.peek() else { break };
@@ -708,7 +738,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
             asm_include |= [&b".include"[..], b".incbin"]
                 .iter()
                 .any(|d| text.strip_prefix(*d).is_some_and(|rest| rest.first().is_some_and(|c| c.is_ascii_whitespace() || *c == b'"')));
-            calls(text, &mut called);
+            names(text, &mut named);
             if may_run_pragma(text) {
                 let line = lx.line_at(start);
                 let toks = tokens(text);
@@ -767,9 +797,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
         dirs.push(Directive { kind, toks: toks.into_boxed_slice(), line, mac });
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
-    called.sort_unstable();
-    called.dedup();
-    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs, asm_include, hash, calls: called.into_boxed_slice(), text: OnceLock::new() }
+    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs, asm_include, hash, names: named.sorted(), text: OnceLock::new() }
 }
 
 /// The first token of a `#pragma` the lexer makes for text that gives a
@@ -974,12 +1002,14 @@ mod tests {
 
     /// The names text may call, and its tokens.
     #[test]
-    fn text_calls() {
-        let text = b"#define F(x) G(x)\nint a = F(1) + H (2);\nCALL\n  (3);\nvoid f(int x);\n";
+    fn text_names() {
+        // Not the directives': every name of text, called or not (given to
+        // a macro that calls it: `CALL(DO_PRAGMA, x)`).
+        let text = b"#define F(x) G(x)\nint a = F(1) + H (2);\nCALL\n  (3);\nvoid f(int x); // y\n";
         let fd = lex(text);
-        let mut names: Vec<u64> = ["F", "H", "CALL", "f"].iter().map(|n| name_hash(n.as_bytes())).collect();
+        let mut names: Vec<u64> = ["int", "a", "F", "H", "CALL", "void", "f", "x", "y"].iter().map(|n| name_hash(n.as_bytes())).collect();
         names.sort_unstable();
-        assert_eq!(&*fd.calls, &names[..]);
+        assert_eq!(&*fd.names, &names[..]);
         let toks: Vec<&str> = text_tokens(text).iter().map(|t| t.sym.as_str()).collect();
         assert_eq!(toks.join(" "), "int a = F ( 1 ) + H ( 2 ) ; CALL ( 3 ) ; void f ( int x ) ;");
     }

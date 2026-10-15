@@ -38,3 +38,31 @@ pub(crate) fn test_compiler(var: &str) -> std::path::PathBuf {
     let path = std::path::PathBuf::from(std::env::var_os(var).unwrap_or_else(|| panic!("{var} names no compiler to test against")));
     if path.components().count() > 1 { std::path::absolute(&path).unwrap() } else { path }
 }
+
+/// A test's fake tool in `dir`: `name.cmd` running `batch` on Windows, a
+/// script `name` running `sh` elsewhere. The script is run once before it's
+/// returned: another test's thread forking while it was open for writing
+/// leaves a child holding it so, and running it fails (ETXTBSY) until that
+/// child has started its own program.
+#[cfg(test)]
+pub(crate) fn test_tool(dir: &std::path::Path, name: &str, batch: &str, sh: &str) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let tool = dir.join(format!("{name}.cmd"));
+        std::fs::write(&tool, batch).unwrap();
+        return tool;
+    }
+    let tool = dir.join(name);
+    std::fs::write(&tool, format!("#!/bin/sh\n[ \"$1\" = --cpp-deps-ready ] && exit 0\n{sh}")).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for _ in 0..1000 {
+        match std::process::Command::new(&tool).arg("--cpp-deps-ready").status() {
+            Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            r => {
+                assert!(r.unwrap().success());
+                return tool;
+            }
+        }
+    }
+    panic!("{} stays busy", tool.display());
+}

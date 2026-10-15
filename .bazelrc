@@ -18,10 +18,13 @@ build:stamp --workspace_status_command=tools/workspace_status
 
 # Clippy on every Rust target, as `cargo clippy --all-targets` with the
 # workspace's clippy.toml: `bazelisk build --config=clippy //...`. Warnings
-# are errors.
+# are errors, every target's reported. Run it on Windows and on Linux: each
+# lints only the code its own system builds (`cfg(windows)`, `cfg(unix)`),
+# with the module's Rust, which cargo's may not be.
 build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
 build:clippy --output_groups=+clippy_checks
 build:clippy --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
+build:clippy --keep_going
 
 # --- Windows host -----------------------------------------------------------
 # The MSVC ABI (x86_64-pc-windows-msvc) for both the target and the exec

@@ -131,8 +131,8 @@ build() {  # $1 = checkout, $2 = log name, rest = flags
   local dir=$1 log=$WORK/$2.log
   shift 2
   "$NINJA_RS" -C "$dir/build" "$@" > "$log" 2>&1 || { tail -40 "$log"; exit 1; }
-  echo "  executed remotely: $(grep -c 'ninja-rs: executed remotely' "$log" || true)," \
-    "remote cache hits: $(grep -c 'ninja-rs: remote cache hit' "$log" || true)"
+  echo "  executed remotely: $(grep -c 'ninja: executed remotely' "$log" || true)," \
+    "remote cache hits: $(grep -c 'ninja: remote cache hit' "$log" || true)"
 }
 count() { grep -c "$1" "$WORK/$2.log" || true; }
 
@@ -161,29 +161,29 @@ no_checkout_paths() {  # $1 = checkout
 
 echo "=== 1. checkout 1 executes remotely"
 build "$A" exec1 "${EXEC[@]}"
-executed=$(count 'ninja-rs: executed remotely' exec1)
+executed=$(count 'ninja: executed remotely' exec1)
 [[ $executed -gt 0 ]]
 "$A/build/hello_c" > /dev/null
 "$A/build/hello_cxx" > /dev/null
 
 echo "=== 2. checkout 2, remote cache only: every action is a hit"
 build "$B" cache1 "${CACHE[@]}"
-[[ $(count 'ninja-rs: remote cache hit' cache1) -eq $executed ]]
+[[ $(count 'ninja: remote cache hit' cache1) -eq $executed ]]
 "$B/build/hello_c" > /dev/null
 same_outputs
 
 echo "=== 3. a change in checkout 2 misses, runs locally, and is stored"
 echo 'const char* ninja_rs_rbe_change = "changed";' >> "$B/hello.c"
 build "$B" cache2 "${CACHE[@]}"
-[[ $(count 'ninja-rs: remote cache hit' cache2) -eq 0 ]]
+[[ $(count 'ninja: remote cache hit' cache2) -eq 0 ]]
 "$B/build/hello_c" > /dev/null
 no_checkout_paths "$B"
 
 echo "=== 4. the same change in checkout 1, executing remotely: all hits"
 cp "$B/hello.c" "$A/hello.c"
 build "$A" exec2 "${EXEC[@]}"
-[[ $(count 'ninja-rs: executed remotely' exec2) -eq 0 ]]
-[[ $(count 'ninja-rs: remote cache hit' exec2) -gt 0 ]]
+[[ $(count 'ninja: executed remotely' exec2) -eq 0 ]]
+[[ $(count 'ninja: remote cache hit' exec2) -gt 0 ]]
 same_outputs
 
 echo "=== 5. racing in checkout 1, local runs starting at once: outputs still identical"

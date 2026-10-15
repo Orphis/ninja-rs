@@ -35,6 +35,88 @@ impl BlobSource {
             ),
         }
     }
+
+    /// The bytes of the blob `d`, for an upload: a file's checked to still
+    /// be them (see `SourceChanged`).
+    pub fn load_checked(&self, d: &re::Digest) -> Result<Vec<u8>> {
+        let data = self.load()?;
+        if let BlobSource::File(p) = self
+            && crate::verify(d, &data).is_err()
+        {
+            return Err(SourceChanged(p.clone()).into());
+        }
+        Ok(data)
+    }
+}
+
+/// The error of an upload whose file no longer holds the blob it was hashed
+/// as (a build step or an editor changed it since): its path. Nothing of it
+/// is sent as the blob: a server that doesn't check digests would keep
+/// other bytes under it, and run them.
+#[derive(Debug)]
+pub struct SourceChanged(pub PathBuf);
+
+impl std::fmt::Display for SourceChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} changed since it was hashed", self.0.display())
+    }
+}
+
+impl std::error::Error for SourceChanged {}
+
+impl SourceChanged {
+    /// The file whose change failed an upload, if one did (also through the
+    /// I/O error of a stream reading it, see `Checked`).
+    pub fn of(e: &anyhow::Error) -> Option<&Path> {
+        e.chain()
+            .find_map(|c| c.downcast_ref::<SourceChanged>().or_else(|| c.downcast_ref::<std::io::Error>()?.get_ref()?.downcast_ref::<SourceChanged>()))
+            .map(|s| s.0.as_path())
+    }
+}
+
+/// A file read as the blob `d` it was hashed as, checked as it's read: the
+/// read that would complete the blob fails instead when its bytes aren't
+/// the blob's, as does one past its size, or its end before then
+/// (`SourceChanged`). A stream sending what it reads never sends all of a
+/// blob that isn't `d`.
+pub(crate) struct Checked {
+    file: fs::File,
+    path: PathBuf,
+    d: re::Digest,
+    hasher: sha2::Sha256,
+    read: u64,
+    /// Whether the file was found changed.
+    pub(crate) changed: bool,
+}
+
+impl Checked {
+    /// The file `path` holding `d`, from `offset` on (the bytes before are
+    /// read, for the check).
+    pub(crate) fn open(path: &Path, d: &re::Digest, offset: u64) -> Result<Self> {
+        use sha2::Digest as _;
+        let context = || format!("reading {}", path.display());
+        let file = fs::File::open(path).with_context(context)?;
+        let mut checked = Checked { file, path: path.to_path_buf(), d: d.clone(), hasher: sha2::Sha256::new(), read: 0, changed: false };
+        std::io::copy(&mut std::io::Read::take(&mut checked, offset), &mut std::io::sink()).with_context(context)?;
+        Ok(checked)
+    }
+}
+
+impl std::io::Read for Checked {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+        let n = self.file.read(buf)?;
+        let size = self.d.size_bytes.max(0) as u64;
+        let before = self.read;
+        self.read += n as u64;
+        self.hasher.update(&buf[..n]);
+        let completed = before < size && self.read == size;
+        if self.read > size || (n == 0 && self.read < size) || (completed && hex::encode(self.hasher.clone().finalize()) != self.d.hash) {
+            self.changed = true;
+            return Err(std::io::Error::other(SourceChanged(self.path.clone())));
+        }
+        Ok(n)
+    }
 }
 
 /// Blobs keyed by hash; what `Client::upload_blobs` consumes.
@@ -476,86 +558,104 @@ const MAX_TREE_ENTRIES: usize = 1 << 20;
 /// 255-byte names, 366 MiB of paths from a 650 KiB tree).
 const MAX_TREE_PATH_BYTES: usize = 128 << 20;
 
+/// The most directories deep an output `Tree` may be: deeper than any
+/// build's outputs, and 16 of 255-byte names already make a path longer
+/// than Linux takes.
+const MAX_TREE_DEPTH: usize = 256;
+
+/// What an output tree's walk may come to (see `walk`).
+struct Limits {
+    entries: usize,
+    bytes: usize,
+    depth: usize,
+}
+
+const LIMITS: Limits = Limits { entries: MAX_TREE_ENTRIES, bytes: MAX_TREE_PATH_BYTES, depth: MAX_TREE_DEPTH };
+
 /// What an output tree being expanded came to: its entries, and the bytes
 /// of their paths.
-#[derive(Default)]
-struct Expansion {
+struct Expansion<'a> {
+    limits: &'a Limits,
     entries: usize,
     bytes: usize,
 }
 
-impl Expansion {
+impl Expansion<'_> {
     /// Counts an entry at `path`.
     fn add(&mut self, path: &Path) -> Result<()> {
         self.entries += 1;
         self.bytes += path.as_os_str().len();
-        if self.entries > MAX_TREE_ENTRIES {
-            bail!("output tree expands to more than {MAX_TREE_ENTRIES} files and directories");
+        if self.entries > self.limits.entries {
+            bail!("output tree expands to more than {} files and directories", self.limits.entries);
         }
-        if self.bytes > MAX_TREE_PATH_BYTES {
-            bail!("output tree's paths take more than {} MiB", MAX_TREE_PATH_BYTES >> 20);
+        if self.bytes > self.limits.bytes {
+            bail!("output tree's paths take more than {} MiB", self.limits.bytes >> 20);
         }
         Ok(())
     }
 }
 
-/// Lists every file of an output `Tree` with its path relative to the root.
-pub fn tree_files(tree: &re::Tree) -> Result<Vec<(PathBuf, re::FileNode)>> {
+/// Walks an output `Tree` from its root, depth first: `file` gets each of
+/// its files, `dir` each of its directories but the root, with their paths
+/// relative to the root. Its directories may share children (each listed
+/// once), so that a small tree can stand for a huge one: every path is
+/// counted (see `Limits`) as it's made, before it's held (a level of wide
+/// directories all the next would hold all but one of each level's paths
+/// uncounted otherwise), and the tree's depth is bounded. A server's names
+/// must be single components (see `valid_name`); symlinks aren't supported.
+fn walk(tree: &re::Tree, limits: &Limits, mut file: impl FnMut(PathBuf, &re::FileNode), mut dir: impl FnMut(&Path)) -> Result<()> {
     let by_digest: HashMap<String, &re::Directory> = tree
         .children
         .iter()
         .map(|d| (crate::digest_of_message(d).0.hash, d))
         .collect();
     let root = tree.root.as_ref().context("output tree without root")?;
-    let mut files = Vec::new();
-    let mut stack = vec![(PathBuf::new(), root)];
-    let mut expansion = Expansion::default();
-    while let Some((rel, dir)) = stack.pop() {
-        expansion.add(&rel)?;
-        for f in &dir.files {
+    let mut expansion = Expansion { limits, entries: 0, bytes: 0 };
+    expansion.add(Path::new(""))?;
+    let mut stack = vec![(PathBuf::new(), root, 0)];
+    while let Some((rel, d, depth)) = stack.pop() {
+        for f in &d.files {
             if !valid_name(&f.name) {
                 bail!("output tree names a file {:?}", f.name);
             }
             let path = rel.join(&f.name);
             expansion.add(&path)?;
-            files.push((path, f.clone()));
+            file(path, f);
         }
-        if let Some(l) = dir.symlinks.first() {
+        if let Some(l) = d.symlinks.first() {
             bail!("output tree holds a symlink ({:?}), which isn't supported", l.name);
         }
-        for sub in &dir.directories {
+        if !d.directories.is_empty() && depth == limits.depth {
+            bail!("output tree is more than {} directories deep", limits.depth);
+        }
+        for sub in &d.directories {
             if !valid_name(&sub.name) {
                 bail!("output tree names a directory {:?}", sub.name);
             }
             let h = sub.digest.as_ref().map(|d| d.hash.clone()).unwrap_or_default();
             let child = by_digest.get(&h).with_context(|| format!("tree is missing directory {h}"))?;
-            stack.push((rel.join(&sub.name), child));
+            let path = rel.join(&sub.name);
+            expansion.add(&path)?;
+            dir(&path);
+            stack.push((path, child, depth + 1));
         }
     }
+    Ok(())
+}
+
+/// Lists every file of an output `Tree` with its path relative to the root
+/// (see `walk`).
+pub fn tree_files(tree: &re::Tree) -> Result<Vec<(PathBuf, re::FileNode)>> {
+    let mut files = Vec::new();
+    walk(tree, &LIMITS, |path, f| files.push((path, f.clone())), |_| {})?;
     Ok(files)
 }
 
 /// Lists every directory of an output `Tree` (including empty ones),
-/// relative to the root.
+/// relative to the root (see `walk`).
 pub fn tree_dirs(tree: &re::Tree) -> Result<Vec<PathBuf>> {
-    let by_digest: HashMap<String, &re::Directory> = tree
-        .children
-        .iter()
-        .map(|d| (crate::digest_of_message(d).0.hash, d))
-        .collect();
-    let root = tree.root.as_ref().context("output tree without root")?;
     let mut dirs = Vec::new();
-    let mut stack = vec![(PathBuf::new(), root)];
-    let mut expansion = Expansion::default();
-    while let Some((rel, dir)) = stack.pop() {
-        expansion.add(&rel)?;
-        for sub in &dir.directories {
-            let h = sub.digest.as_ref().map(|d| d.hash.clone()).unwrap_or_default();
-            let child = by_digest.get(&h).with_context(|| format!("tree is missing directory {h}"))?;
-            dirs.push(rel.join(&sub.name));
-            stack.push((rel.join(&sub.name), child));
-        }
-    }
+    walk(tree, &LIMITS, |_, _| {}, |path| dirs.push(path.to_path_buf()))?;
     Ok(dirs)
 }
 
@@ -592,6 +692,57 @@ mod tests {
     #[test]
     fn digest_of_empty_is_the_sha256_of_nothing() {
         assert_eq!(crate::digest_of(b"").hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    /// A file uploaded as the blob it was hashed as, changed since (the
+    /// same size, larger, smaller): loading it fails, and so does reading
+    /// it as a stream, before the read giving its last bytes (from an
+    /// offset too, a write resumed). Unchanged, it reads whole.
+    #[test]
+    fn changed_sources() {
+        use std::io::Read as _;
+        let dir = test_dirs::TestDir::new("rbe-client-changed-source");
+        let path = dir.join("input");
+        let blob: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let d = crate::digest_of(&blob);
+        // What a stream reading it gets before it fails, a buffer at a time.
+        let streamed = |offset: u64| -> (usize, Result<(), String>) {
+            let mut r = match Checked::open(&path, &d, offset) {
+                Ok(r) => r,
+                Err(e) => return (0, Err(format!("{e:#}"))),
+            };
+            let (mut got, mut buf) = (0, vec![0u8; 4096]);
+            loop {
+                match r.read(&mut buf) {
+                    Ok(0) => return (got, Ok(())),
+                    Ok(n) => got += n,
+                    Err(e) => {
+                        assert!(r.changed);
+                        let e = anyhow::Error::from(e);
+                        assert_eq!(SourceChanged::of(&e), Some(path.as_path()));
+                        return (got, Err(e.to_string()));
+                    }
+                }
+            }
+        };
+        fs::write(&path, &blob).unwrap();
+        assert_eq!(BlobSource::File(path.clone()).load_checked(&d).unwrap(), blob);
+        assert_eq!(streamed(0), (blob.len(), Ok(())));
+        assert_eq!(streamed(4000), (blob.len() - 4000, Ok(())));
+        let mut other = blob.clone();
+        *other.last_mut().unwrap() ^= 1;
+        let longer = [blob.as_slice(), b"signed"].concat();
+        for changed in [other, longer, blob[..blob.len() - 1].to_vec()] {
+            fs::write(&path, &changed).unwrap();
+            let e = BlobSource::File(path.clone()).load_checked(&d).unwrap_err();
+            assert_eq!(SourceChanged::of(&e), Some(path.as_path()));
+            for offset in [0, 4000] {
+                let (got, r) = streamed(offset);
+                assert!(r.is_err() && (got as u64) < d.size_bytes as u64 - offset, "{} bytes read from {offset}", got);
+            }
+        }
+        // Bytes are what they are.
+        assert!(BlobSource::Bytes(b"x".to_vec()).load_checked(&d).is_ok());
     }
 
     #[test]
@@ -664,23 +815,82 @@ mod tests {
 
     #[test]
     fn trees_of_long_paths_are_bounded() {
-        // 520 levels of 255-byte names, 1000 files at the bottom: their
-        // paths take 133 MiB, from a tree of 360 KiB.
+        // 250 levels of 255-byte names, 2100 files at the bottom: their
+        // paths take 134 MiB, from a tree of 600 KiB.
         let name = |i: usize| format!("{i:0>255}");
         let mut dir = re::Directory {
-            files: (0..1000).map(|i| re::FileNode { name: name(i), digest: Some(crate::digest_of(b"x")), ..Default::default() }).collect(),
+            files: (0..2100).map(|i| re::FileNode { name: name(i), digest: Some(crate::digest_of(b"x")), ..Default::default() }).collect(),
             ..Default::default()
         };
         let mut children = Vec::new();
-        for _ in 0..520 {
+        for _ in 0..250 {
             let d = crate::digest_of_message(&dir).0;
             children.push(dir);
             dir = re::Directory { directories: vec![re::DirectoryNode { name: name(0), digest: Some(d) }], ..Default::default() };
         }
         let tree = re::Tree { root: Some(dir), children };
         assert!(format!("{:#}", tree_files(&tree).unwrap_err()).contains("paths take more than 128 MiB"));
-        // Its directories alone are fine.
-        assert_eq!(tree_dirs(&tree).unwrap().len(), 520);
+        // Its directories are listed only of a tree that can be had whole.
+        assert!(tree_dirs(&tree).is_err());
+        let tree = wide_tree(250, 1);
+        assert_eq!((tree_files(&tree).unwrap().len(), tree_dirs(&tree).unwrap().len()), (1, 250));
+    }
+
+    /// `depth` levels, each listing `width` directories (255-byte names)
+    /// that are all the next level, the last holding a file.
+    fn wide_tree(depth: usize, width: usize) -> re::Tree {
+        let name = |i: usize| format!("{i:0>255}");
+        let mut dir = re::Directory { files: vec![re::FileNode { name: name(0), digest: Some(crate::digest_of(b"x")), ..Default::default() }], ..Default::default() };
+        let mut children = Vec::new();
+        for _ in 0..depth {
+            let d = crate::digest_of_message(&dir).0;
+            children.push(dir);
+            dir = re::Directory { directories: (0..width).map(|i| re::DirectoryNode { name: name(i), digest: Some(d.clone()) }).collect(), ..Default::default() };
+        }
+        re::Tree { root: Some(dir), children }
+    }
+
+    /// Paths are counted as they're made, before they're held: a level of
+    /// wide directories is counted whole before the walk goes down one of
+    /// them (it would hold the others uncounted).
+    #[test]
+    fn wide_trees_are_counted_as_they_are_walked() {
+        let tree = wide_tree(1, 50);
+        let limits = Limits { entries: MAX_TREE_ENTRIES, bytes: 50 * 255 - 1, depth: MAX_TREE_DEPTH };
+        let mut files = 0;
+        let err = walk(&tree, &limits, |_, _| files += 1, |_| {}).unwrap_err();
+        assert!(format!("{err:#}").contains("paths take more than"), "{err:#}");
+        assert_eq!(files, 0);
+        // Within the limits, every file.
+        let limits = Limits { bytes: 50 * (255 + 512), ..limits };
+        let mut files = 0;
+        walk(&tree, &limits, |_, _| files += 1, |_| {}).unwrap();
+        assert_eq!(files, 50);
+    }
+
+    /// A deep tree of wide levels (2.8 MiB, standing for 8^1100 paths of
+    /// up to 280 KB) is refused for its depth, before its paths take much.
+    #[test]
+    fn deep_trees_are_bounded() {
+        let tree = wide_tree(1100, 8);
+        for err in [tree_files(&tree).err(), tree_dirs(&tree).err()] {
+            let err = format!("{:#}", err.expect("a tree 1100 directories deep"));
+            assert!(err.contains("more than 256 directories deep"), "{err}");
+        }
+        assert!(tree_files(&wide_tree(256, 1)).is_ok() && tree_files(&wide_tree(257, 1)).is_err());
+    }
+
+    /// A tree's directories are listed as its files are: a server's names
+    /// must be single components.
+    #[test]
+    fn tree_directories_are_checked() {
+        for name in ["..", "a/b", ""] {
+            let tree = re::Tree {
+                root: Some(re::Directory { directories: vec![re::DirectoryNode { name: name.into(), digest: Some(crate::digest_of_message(&re::Directory::default()).0) }], ..Default::default() }),
+                children: vec![re::Directory::default()],
+            };
+            assert!(tree_dirs(&tree).is_err(), "{name:?}");
+        }
     }
 
     /// A digest whose file was read within its time granularity of its

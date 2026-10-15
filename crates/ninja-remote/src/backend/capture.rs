@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
 use ninja_core::depfile::parse_depfile;
 use ninja_core::runner::{LocalCapture, Task, TaskResult};
@@ -31,10 +31,13 @@ impl LocalCapture for Capture {
         if !result.status.success() {
             return;
         }
-        if let Err(e) = self.store(&result.output)
-            && self.inner.config.verbose
-        {
-            message(&format!("not cached: {e:#}"));
+        // Counted for the end of the build, by what the reason is (its
+        // details name files); said of each with --remote_verbose.
+        if let Err(e) = self.store(&result.output) {
+            self.inner.uncached.add(&format!("{e:#}"));
+            if self.inner.config.verbose {
+                message(&format!("not cached: {e:#}"));
+            }
         }
     }
 }
@@ -109,13 +112,13 @@ impl Capture {
             None
         };
         if let Some(dep) = read.as_ref().and_then(|read| undeclared(&mut self.prepared, read.iter().map(String::as_str))) {
-            bail!("{dep} isn't among the action's inputs");
+            bail!("a file it read isn't among the action's inputs: {dep}");
         }
         // As Bazel guards against concurrent changes: an input edited after
         // the key was computed, while the command waited or ran (even when
         // edited back).
         if let Some(changed) = changed_input(&self.prepared, read.as_deref()) {
-            bail!("{changed} changed while the command ran");
+            bail!("an input changed while the command ran: {changed}");
         }
         // A depfile the command didn't write lists nothing.
         let refusal = remote_refusal.or(read.is_none().then_some("what the command read can't be checked (the depfile is missing)"));
@@ -123,24 +126,25 @@ impl Capture {
         if let (None, Some(why)) = (&disk, refusal) {
             bail!("{why}");
         }
-        // What's stored and sent is what was read once, which nothing
-        // changes afterwards (a step rewriting an output in place: signing,
-        // stripping): small outputs in memory (within what uploads may hold),
-        // others copied for an upload, else stored as they're read.
+        // Each output is read once, on the build's path: what's stored and
+        // sent is those bytes, whatever happens to the file afterwards (a
+        // step rewriting it in place: signing, stripping). Small outputs are
+        // read into memory (within what uploads may hold); others are stored
+        // in the disk cache as they're read, and sent from there, where
+        // nothing changes them; without one, they're hashed, and sent from
+        // the file, checked as it's read: an output changed since isn't
+        // (the upload is given up).
         let store = &self.inner.shared.store;
         let mut blobs = rbe_client::BlobSet::default();
-        let (mut permits, mut copies) = (Vec::new(), Vec::new());
+        let (mut permits, mut from_disk) = (Vec::new(), Vec::new());
         let mut put_file = |local: &PathBuf| -> Result<re::Digest> {
+            let read_at = std::time::SystemTime::now();
             let (_, stamp) = ninja_os::stat(local)?;
             let kib = stamp.len.div_ceil(1024).max(1);
             let permit = if uploading && stamp.len <= IN_MEMORY_MAX { self.inner.upload_budget.clone().try_acquire_many_owned(kib as u32).ok() } else { None };
-            if stamp.len <= IN_MEMORY_MAX && (!uploading || permit.is_some()) {
+            let digest = if stamp.len <= IN_MEMORY_MAX && (!uploading || permit.is_some()) {
                 let data = std::fs::read(local)?;
                 let digest = rbe_client::digest_of(&data);
-                // The file as it was hashed: other actions reading it use it.
-                if ninja_os::stat(local).is_ok_and(|(_, now)| now == stamp) {
-                    store.digests.put(local, stamp, digest.clone());
-                }
                 if let Some(disk) = &disk {
                     disk.put_bytes(&digest, &data)?;
                 }
@@ -148,27 +152,31 @@ impl Capture {
                     blobs.insert(digest.clone(), rbe_client::BlobSource::Bytes(data));
                     permits.extend(permit);
                 }
-                return Ok(digest);
-            }
-            if uploading {
-                let (copy, digest) = super::download::snapshot(local)?;
-                if let Some(disk) = &disk {
-                    disk.put_file_with_digest(copy.path(), &digest)?;
+                digest
+            } else {
+                let digest = match &disk {
+                    Some(disk) => disk.put_file_hashed(local)?,
+                    None => rbe_client::tree::hash_file(local)?,
+                };
+                if uploading {
+                    match &disk {
+                        _ if digest.size_bytes == 0 => blobs.insert(digest.clone(), rbe_client::BlobSource::Bytes(Vec::new())),
+                        Some(_) => from_disk.push(digest.clone()),
+                        None => blobs.insert(digest.clone(), rbe_client::BlobSource::File(local.clone())),
+                    }
                 }
-                blobs.insert(digest.clone(), rbe_client::BlobSource::File(copy.path().to_path_buf()));
-                copies.push(copy);
-                return Ok(digest);
+                digest
+            };
+            // The file as it was hashed: other actions reading it use it.
+            if ninja_os::stat(local).is_ok_and(|(_, now)| now == stamp) {
+                store.digests.put_read_at(local, stamp, digest.clone(), read_at);
             }
-            match &disk {
-                // Checked against its digest as it's stored.
-                Some(disk) => Ok(disk.put_file(local, Some(&store.digests))?),
-                None => bail!("nowhere to store {}", local.display()),
-            }
+            Ok(digest)
         };
         let mut files = Vec::new();
         for (rel, local) in &self.prepared.outputs {
             if !local.is_file() {
-                bail!("{} was not produced", local.display());
+                bail!("an output wasn't produced: {}", local.display());
             }
             let digest = put_file(local)?;
             files.push(re::OutputFile {
@@ -234,21 +242,38 @@ impl Capture {
         // background, while the build goes on.
         let inner = self.inner.clone();
         let action = self.prepared.action_digest.clone();
-        let to_upload = inner.shared.store.filter_unknown(blobs);
-        // What the outputs' bytes take in memory, and their copies, until
-        // the upload ends (or is given up).
-        let held = (permits, copies);
         let uploaded = async move {
             let stored = async {
+                // Outputs in the disk cache go from there (those it holds as
+                // chunks put together for the upload, unless the remote has
+                // them), held until the upload ends.
+                let mut held = Vec::new();
+                let store = &inner.shared.store;
+                let wanted: Vec<re::Digest> = from_disk.into_iter().filter(|d| !store.is_uploaded(&d.hash)).collect();
+                let missing: HashSet<String> =
+                    if wanted.is_empty() { HashSet::new() } else { client.find_missing(wanted.clone()).await?.into_iter().map(|d| d.hash).collect() };
+                for d in wanted.into_iter().filter(|d| missing.contains(&d.hash)) {
+                    let disk = inner.disk.clone().expect("outputs in the disk cache");
+                    let read = d.clone();
+                    let file = tokio::task::spawn_blocking(move || disk.blob_as_file(&read)).await?;
+                    let file = file.with_context(|| format!("blob {} left the disk cache", rbe_client::digest_str(&d)))?;
+                    blobs.insert(d, rbe_client::BlobSource::File(file.path().to_path_buf()));
+                    held.push(file);
+                }
+                let to_upload = store.filter_unknown(blobs);
                 client.upload_blobs(&to_upload).await?;
-                client.update_action_result(&action, result).await
+                client.update_action_result(&action, result).await?;
+                store.mark_uploaded(to_upload.0.keys());
+                anyhow::Ok(())
             };
-            match stored.await {
-                Ok(()) => inner.shared.store.mark_uploaded(to_upload.0.keys()),
-                Err(e) if inner.config.verbose => message(&format!("not in the remote cache: {e:#}")),
-                Err(_) => {}
+            if let Err(e) = stored.await
+                && inner.config.verbose
+            {
+                message(&format!("not in the remote cache: {e:#}"));
             }
-            drop(held);
+            // What the outputs' bytes took in memory, until the upload ended
+            // (or was given up).
+            drop(permits);
         };
         self.inner.uploads.lock().unwrap().spawn_on(uploaded, &tokio::runtime::Handle::current());
         Ok(())

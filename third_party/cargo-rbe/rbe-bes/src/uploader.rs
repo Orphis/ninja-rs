@@ -20,9 +20,10 @@
 //! Events are queued without blocking and sent by a background task, which
 //! connects first, so a slow or unavailable backend never slows the build
 //! down. Every call has a deadline (`BesConfig::rpc_timeout`), and a
-//! backend that never answered anything isn't called again (but for a
-//! connection that broke once made, once: see `rbe_client::fault`): the
-//! upload fails instead of waiting for it.
+//! backend that never served anything isn't called again (but for a
+//! connection that broke once made, or a backend saying it can't serve now,
+//! once: see `rbe_client::fault`): the upload fails instead of waiting for
+//! it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -31,8 +32,9 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
-use rbe_client::HttpErrors;
-use rbe_client::fault::{FIRST_CONTACT_RETRIES, answered, broken_connection, certificate, describe, no_answer, status_words};
+use rbe_client::fault::ClientCertificateRefused;
+use rbe_client::{HttpErrors, Seen};
+use rbe_client::fault::{FIRST_CONTACT_RETRIES, answered, broken_connection, certificate, describe, no_answer, status_words, unavailable};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -143,6 +145,17 @@ impl BesUploader {
     where
         F: std::future::Future<Output = Result<Channel>> + Send + 'static,
     {
+        Self::connecting_watched(connect, None, config)
+    }
+
+    /// `connecting`, with what the connections came to (`seen`, see
+    /// `rbe_client::connect_watched`): a call failing for its connection
+    /// broken, once the last connection was refused for the client's
+    /// certificate, is that refusal (not made again).
+    pub fn connecting_watched<F>(connect: F, seen: Option<tokio::sync::watch::Receiver<Seen>>, config: BesConfig) -> Self
+    where
+        F: std::future::Future<Output = Result<Channel>> + Send + 'static,
+    {
         TRACE.store(config.trace, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let acked = Acked::default();
@@ -154,7 +167,7 @@ impl BesUploader {
                 let channel = connect.await?;
                 trace(format_args!("connected"));
                 let client = PublishBuildEventClient::new(HttpErrors(channel));
-                Upload { client, config, headers, answered: AtomicBool::new(false), acked }.run(&mut rx).await
+                Upload { client, config, headers, said: Said::default(), acked, seen }.run(&mut rx).await
             }
         });
         Self { tx, task, acked }
@@ -269,13 +282,33 @@ pub fn pack(event: &bep::BuildEvent) -> Event {
 /// fails remote calls).
 type Headers = Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>;
 
-/// Notes that the backend answered, when `status` is its answer (see
-/// `rbe_client::fault::answered`). Until the backend answered something,
-/// failures aren't retried (but for a connection that broke): it is gone,
-/// or isn't a BES.
-fn note_answer(heard: &AtomicBool, status: &tonic::Status) {
-    if answered(status) {
-        heard.store(true, Ordering::Relaxed);
+/// What the backend said so far: whether it answered anything, and whether
+/// that was more than that it can't serve now (`served`), or only that
+/// (`declined`; see `rbe_client::fault::unavailable`). Until it served
+/// anything, failures are retried once at most: it is gone, isn't a BES, or
+/// stands for none (a proxy without a healthy backend).
+#[derive(Default)]
+struct Said {
+    served: AtomicBool,
+    declined: AtomicBool,
+}
+
+impl Said {
+    fn answered(&self) -> bool {
+        self.served.load(Ordering::Relaxed) || self.declined.load(Ordering::Relaxed)
+    }
+
+    fn served(&self) {
+        self.served.store(true, Ordering::Relaxed);
+    }
+
+    /// Notes what `status` says the backend answered, if anything (see
+    /// `rbe_client::fault::answered`).
+    fn heard(&self, status: &tonic::Status) {
+        if answered(status) {
+            let now = if unavailable(status) { &self.declined } else { &self.served };
+            now.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -297,10 +330,12 @@ struct Upload {
     client: PublishBuildEventClient<HttpErrors<Channel>>,
     config: BesConfig,
     headers: Headers,
-    /// Whether the backend answered anything yet (see `note_answer`).
-    answered: AtomicBool,
+    /// What the backend said so far.
+    said: Said,
     /// Set once every build event was acked.
     acked: Acked,
+    /// What the connections came to (see `BesUploader::connecting_watched`).
+    seen: Option<tokio::sync::watch::Receiver<Seen>>,
 }
 
 impl Upload {
@@ -311,9 +346,10 @@ impl Upload {
         let mut started = false;
         if config.lifecycle_events {
             // Before the stream, as Bazel sends them, but made again once
-            // at most (until the service answered, only for a connection
-            // that broke): the build's events don't wait long for a slow
-            // or failing lifecycle service.
+            // at most (until the service served anything, only for a
+            // connection that broke, or the service saying it can't serve
+            // now): the build's events don't wait long for a slow or
+            // failing lifecycle service.
             let requests = lifecycle_requests(config, None, SystemTime::now());
             match self.publish_lifecycle(requests, FIRST_CONTACT_RETRIES).await {
                 Ok(()) => started = true,
@@ -351,11 +387,11 @@ impl Upload {
         loop {
             let e = match tokio::time::timeout_at(deadline, f()).await {
                 Ok(Ok(v)) => {
-                    self.answered.store(true, Ordering::Relaxed);
+                    self.said.served();
                     return Ok(v);
                 }
                 Ok(Err(e)) => {
-                    note_answer(&self.answered, &e);
+                    self.said.heard(&e);
                     e
                 }
                 Err(_) => no_answer(format!("no answer within {:?}", self.lifecycle_timeout())),
@@ -370,20 +406,28 @@ impl Upload {
     }
 
     /// How many times a call failing with `e` is made again, of `retries`:
-    /// until the backend answered something, none, but once for a
-    /// connection that broke once made (a call left unanswered would cost a
-    /// deadline each time, one refused as much again). A certificate
-    /// refused, none: it would be again.
+    /// until the backend served something, none, but once for a connection
+    /// that broke once made, or a backend that only said it can't serve now
+    /// (a call left unanswered would cost a deadline each time, one refused
+    /// as much again, and a proxy without a healthy backend would hold the
+    /// end of every build back for each). A certificate refused, none: it
+    /// would be again.
     fn budget(&self, e: &tonic::Status, retries: u32) -> u32 {
-        if certificate(e).is_some() {
+        if certificate(e).is_some() || self.refused(e) {
             0
-        } else if self.answered.load(Ordering::Relaxed) {
+        } else if self.said.served.load(Ordering::Relaxed) {
             retries
-        } else if broken_connection(e) {
+        } else if broken_connection(e) || self.said.declined.load(Ordering::Relaxed) {
             FIRST_CONTACT_RETRIES.min(retries)
         } else {
             0
         }
+    }
+
+    /// Whether `e`, a connection broken without saying why, was the client's
+    /// certificate refused (see `rbe_client::Seen`).
+    fn refused(&self, e: &tonic::Status) -> bool {
+        broken_connection(e) && self.seen.as_ref().is_some_and(|s| matches!(*s.borrow(), Seen::Refused(_)))
     }
 
     /// How long the lifecycle events before the stream, or after it, may
@@ -397,6 +441,7 @@ impl Upload {
     async fn publish_lifecycle(&self, requests: Vec<bes::PublishLifecycleEventRequest>, retries: u32) -> Result<()> {
         let deadline = tokio::time::Instant::now() + self.lifecycle_timeout();
         for r in requests {
+            // The event (the caller says they're lifecycle events).
             let what = r.build_event.as_ref().and_then(|e| e.event.as_ref()).and_then(|e| e.event.as_ref()).map(|e| match e {
                 Event::BuildEnqueued(_) => "BuildEnqueued",
                 Event::InvocationAttemptStarted(_) => "InvocationAttemptStarted",
@@ -404,7 +449,7 @@ impl Upload {
                 Event::BuildFinished(_) => "BuildFinished",
                 _ => "other",
             });
-            self.with_retries(&format!("BES lifecycle event {}", what.unwrap_or_default()), retries, deadline, || {
+            self.with_retries(what.unwrap_or_default(), retries, deadline, || {
                 let (r, mut c) = (r.clone(), self.client.clone());
                 async move { c.publish_lifecycle_event(self.request(r)).await }
             })
@@ -428,7 +473,7 @@ impl Upload {
     /// needed (also when events wait for an ack longer than `rpc_timeout`).
     async fn stream_events(&self, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<(UploadSummary, BuildOutcome)> {
         let config = &self.config;
-        let answered = &self.answered;
+        let said = &self.said;
         let mut client = self.client.clone();
         let mut pending: VecDeque<bes::PublishBuildToolEventStreamRequest> = VecDeque::new();
         let mut next_seq = 1i64;
@@ -470,12 +515,12 @@ impl Upload {
                     r = &mut call, if responses.is_none() => match r {
                         Ok(resp) => {
                             trace(format_args!("stream open"));
-                            answered.store(true, Ordering::Relaxed);
+                            said.served();
                             waiting = tokio::time::Instant::now();
                             responses = Some(resp.into_inner());
                         }
                         Err(e) => {
-                            note_answer(answered, &e);
+                            said.heard(&e);
                             break e;
                         }
                     },
@@ -487,7 +532,7 @@ impl Upload {
                     }
                     ack = next_ack(&mut responses), if responses.is_some() => match ack {
                         Some(Ok(ack)) => {
-                            answered.store(true, Ordering::Relaxed);
+                            said.served();
                             waiting = tokio::time::Instant::now();
                             let before = pending.len();
                             while pending.front().is_some_and(|r| seq_of(r) <= ack.sequence_number) {
@@ -503,7 +548,7 @@ impl Upload {
                             }
                         }
                         Some(Err(e)) => {
-                            note_answer(answered, &e);
+                            said.heard(&e);
                             break e;
                         }
                         None => match (outcome, pending.is_empty()) {
@@ -536,11 +581,13 @@ impl Upload {
             failures += 1;
             trace(format_args!("stream failed ({} pending): {}", pending.len(), describe(&err)));
             if failures > self.budget(&err, config.max_retries) || !retryable(&err) {
-                let answered = answered.load(Ordering::Relaxed);
+                let answered = said.answered();
                 let never = if answered { "" } else { " (the backend never answered)" };
+                let attempts = if failures == 1 { "attempt" } else { "attempts" };
                 // Its causes are the status's (see `Failed`).
-                let message = format!("BES upload failed after {failures} attempts{never}: {}", status_words(&err));
-                return Err(Failed { message, status: err, answered }.into());
+                let message = format!("after {failures} {attempts}{never}: {}", status_words(&err));
+                let refused = self.refused(&err).then(|| ClientCertificateRefused(Box::new(err.clone())));
+                return Err(Failed { message, status: err, answered, refused }.into());
             }
             summary.reconnects += 1;
             tokio::time::sleep(backoff).await;
@@ -549,14 +596,17 @@ impl Upload {
     }
 }
 
-/// An upload whose stream failed for good: what it says (the status in
-/// words), with the status's causes as its own, for what they say about the
-/// connection (`rbe_client::fault`): a certificate refused, say.
+/// An upload whose stream failed for good: what it says (after how many
+/// attempts, and the status in words: "the upload failed" is the caller's
+/// to say), with the status's causes as its own, for what they say about
+/// the connection (`rbe_client::fault`): a certificate refused, say.
 #[derive(Debug)]
 pub struct Failed {
     message: String,
     status: tonic::Status,
     answered: bool,
+    /// The client's certificate refused, which the status doesn't say.
+    refused: Option<ClientCertificateRefused>,
 }
 
 impl Failed {
@@ -575,7 +625,10 @@ impl std::fmt::Display for Failed {
 
 impl std::error::Error for Failed {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        std::error::Error::source(&self.status)
+        match &self.refused {
+            Some(refused) => Some(refused),
+            None => std::error::Error::source(&self.status),
+        }
     }
 }
 

@@ -396,9 +396,9 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("out"), &link).unwrap();
         #[cfg(windows)]
         {
-            // mklink reads a slash as a switch's (Bazel's TEST_TMPDIR has them).
-            let native = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\");
-            let mklink = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(native(&link)).arg(native(&dir.join("out"))).output().unwrap();
+            // (mklink reads a slash as a switch's: test directories are
+            // spelled natively.)
+            let mklink = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(dir.join("out")).output().unwrap();
             assert!(mklink.status.success(), "{mklink:?}");
         }
         std::fs::write(build.join("lib/linked.a"), thin(&["../lnk/x.o"])).unwrap();

@@ -14,8 +14,11 @@ h2 = { workspace = true }
 hex = { workspace = true }
 prost = { workspace = true }
 rbe-bes = { path = "../../third_party/cargo-rbe/rbe-bes" }
+# A TLS server closing connections once its handshake is done (misbehaving).
+rustls = { workspace = true, features = ["ring", "std"] }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["net", "signal", "io-util"] }
+tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["router", "server"] }
 

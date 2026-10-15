@@ -1342,7 +1342,8 @@ fn records_are_written_before_more_commands_start() {
 /// starts a task only when a slot of its kind is free, the others waiting
 /// in the plan meanwhile, so that those of the other kind start. It started
 /// the best ones up to the runner's room, a local task then waiting in the
-/// runner (counted as started) while a remote one could have run.
+/// runner (counted as started) while a remote one could have run. Each
+/// edge's kind is asked for once, and the task started tells it.
 #[test]
 fn tasks_wait_in_the_plan_for_their_kind_of_slots() {
     let mut t = BuildTest::empty();
@@ -1352,6 +1353,7 @@ fn tasks_wait_in_the_plan_for_their_kind_of_slots() {
         inner: FakeRunner<'a>,
         running: Arc<Mutex<crate::hash::HashMap<EdgeId, usize>>>,
         started: Vec<(String, [usize; 2])>,
+        asked: std::sync::atomic::AtomicUsize,
     }
     const JOBS: [usize; 2] = [1, 2];
     impl CommandRunner for Kinds<'_> {
@@ -1359,7 +1361,8 @@ fn tasks_wait_in_the_plan_for_their_kind_of_slots() {
             (JOBS[0] + JOBS[1]).saturating_sub(self.running.lock().unwrap().len())
         }
         fn start_command(&mut self, mut task: Task) -> Result<(), String> {
-            let kind = self.slots_of(&task);
+            let kind = task.slots;
+            assert_eq!(kind, usize::from(task.rule == "remote"), "{}", task.outputs[0]);
             let mut running = self.running.lock().unwrap();
             running.insert(task.edge, kind);
             let counts = [0, 1].map(|k| running.values().filter(|&&r| r == k).count());
@@ -1388,6 +1391,7 @@ fn tasks_wait_in_the_plan_for_their_kind_of_slots() {
             2
         }
         fn slots_of(&self, task: &Task) -> usize {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             usize::from(task.rule == "remote")
         }
         fn has_free_slot(&self, kind: usize) -> bool {
@@ -1398,13 +1402,14 @@ fn tasks_wait_in_the_plan_for_their_kind_of_slots() {
     let mut b = Builder::new(&mut t.state, &t.fs, None, None, &t.config, &mut status);
     b.add_target_by_name("all").unwrap();
     let inner = FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 10, lost: Vec::new() };
-    let mut runner = Kinds { inner, running: Arc::default(), started: Vec::new() };
+    let mut runner = Kinds { inner, running: Arc::default(), started: Vec::new(), asked: Default::default() };
     let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     rt.block_on(b.build(&mut runner)).unwrap();
     let order: Vec<&str> = runner.started.iter().map(|(o, _)| o.as_str()).collect();
     assert!(runner.started.iter().all(|(_, counts)| counts[0] <= JOBS[0] && counts[1] <= JOBS[1]), "{:?}", runner.started);
     assert_eq!(order.len(), 4);
     assert_eq!(&order[..3], ["l1", "r1", "r2"]);
+    assert_eq!(runner.asked.into_inner(), 4);
 }
 
 #[test]

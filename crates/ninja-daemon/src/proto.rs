@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Changes with the messages: a client and a daemon must agree.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// Larger frames are refused (a corrupt length).
 const MAX_FRAME: usize = 1 << 30;
@@ -25,14 +25,24 @@ pub enum Request {
         session: u64,
         argv: Vec<String>,
         cwd: PathBuf,
+        /// See `Files`.
+        #[serde(default)]
+        wrote: bool,
     },
     /// The digests of files.
     Files {
         paths: Vec<PathBuf>,
+        /// A command ran on the host since the client last said so: what
+        /// it wrote is seen first (see `Watcher::fence`).
+        #[serde(default)]
+        wrote: bool,
     },
     /// The files under a directory, with their digests (a toolchain input).
     Tree {
         dir: PathBuf,
+        /// See `Files`.
+        #[serde(default)]
+        wrote: bool,
     },
     Status,
     Stop,
@@ -194,10 +204,10 @@ mod tests {
     #[test]
     fn frames() {
         let mut buf = Vec::new();
-        write(&mut buf, &Request::Files { paths: vec!["a/b.h".into()] }).unwrap();
+        write(&mut buf, &Request::Files { paths: vec!["a/b.h".into()], wrote: true }).unwrap();
         write(&mut buf, &Request::Status).unwrap();
         let mut r = buf.as_slice();
-        assert!(matches!(read::<Request>(&mut r).unwrap(), Some(Request::Files { paths }) if paths == vec![PathBuf::from("a/b.h")]));
+        assert!(matches!(read::<Request>(&mut r).unwrap(), Some(Request::Files { paths, wrote: true }) if paths == vec![PathBuf::from("a/b.h")]));
         assert!(matches!(read::<Request>(&mut r).unwrap(), Some(Request::Status)));
         assert!(read::<Request>(&mut r).unwrap().is_none());
         let mut bad = &[0xff, 0xff, 0xff, 0xff][..];

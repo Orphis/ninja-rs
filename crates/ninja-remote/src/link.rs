@@ -9,9 +9,9 @@
 //! it adds: its dry run (`-###`) prints the linker's command line, which is
 //! read instead of the driver's. An MSVC linker also takes options from
 //! `LINK` and `_LINK_`, and searches `LIB`'s directories, unless lld-link
-//! is told to ignore the environment: those of `LIB` it finds a file in
-//! first are sent (see `env_dirs_read`), not the others, which a
-//! developer prompt fills with Visual Studio's and the SDK's.
+//! is told to ignore the environment: the files it reads there are sent
+//! (see `env_files_read`), not the others, which a developer prompt fills
+//! with Visual Studio's and the SDK's.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ pub fn driver_compiles(argv: &[String]) -> bool {
 /// them (response files expanded, with what `LINK` and `_LINK_` add, see
 /// `env::env_options`). Run from `cwd` with the variables `vars` gives;
 /// `directives` gives those of objects and libraries (see
-/// `env_dirs_read`).
+/// `env_files_read`).
 pub fn analyze(
     exe: &Path,
     argv: &[String],
@@ -97,9 +97,14 @@ pub fn analyze(
     if flavor == Flavor::Msvc && !ignores_environment(&name, &args, false) {
         let env: Vec<PathBuf> = var("LIB").iter().flat_map(|v| v.split(';')).filter(|d| !d.is_empty()).map(|d| abs(d, cwd)).collect();
         if !env.is_empty() {
-            info.lib_dirs.extend(env_dirs_read(&args, cwd, &env, directives));
+            match env_files_read(&args, cwd, &env, directives) {
+                Some(files) => info.files.extend(files),
+                None => info.lib_dirs.extend(env),
+            }
         }
     }
+    info.files.sort();
+    info.files.dedup();
     info.lib_dirs.dedup();
     info.linker = linker;
     Ok(info)
@@ -122,17 +127,18 @@ fn lib_file(name: &str) -> String {
     if name.contains('.') { name.to_string() } else { format!("{name}.lib") }
 }
 
-/// The directories of `LIB` (`env`, in order) an MSVC link reads files
-/// from, given its arguments `args` (run from `cwd`): it looks for each
-/// input its command line names, each library `/defaultlib:` names, and
-/// each its inputs' and libraries' directives ask for (see `directives`;
-/// but those `/nodefaultlib` leaves out), in the working directory, then in
-/// `/libpath:`'s, then in `LIB`'s, as lld-link and link.exe do: those of
-/// `LIB` where one is found first are read. All of them when that can't be
-/// told: a file whose directives can't be read (LTO bitcode, an output
-/// left in the remote CAS), or one not found. (Directives' own
+/// The files of `LIB`'s directories (`env`, in order) an MSVC link reads,
+/// given its arguments `args` (run from `cwd`): it looks for each input its
+/// command line names, each library `/defaultlib:` names, and each its
+/// inputs' and libraries' directives ask for (see `directives`; but those
+/// `/nodefaultlib` leaves out), in the working directory, then in
+/// `/libpath:`'s, then in `LIB`'s, as lld-link and link.exe do: those found
+/// first in `LIB`'s are read, not the others there (a developer prompt's
+/// `LIB` names hundreds of MB of libraries). None (all of them, whole) when
+/// that can't be told: a file whose directives can't be read (LTO bitcode,
+/// an output left in the remote CAS), or one not found. (Directives' own
 /// `/nodefaultlib` is ignored: more is sent, never less.)
-fn env_dirs_read(args: &[String], cwd: &Path, env: &[PathBuf], directives: &dyn Fn(&Path) -> Option<Arc<Vec<String>>>) -> Vec<PathBuf> {
+fn env_files_read(args: &[String], cwd: &Path, env: &[PathBuf], directives: &dyn Fn(&Path) -> Option<Arc<Vec<String>>>) -> Option<Vec<PathBuf>> {
     let mut dirs = vec![cwd.to_path_buf()];
     let mut no_default_all = false;
     let mut no_default = std::collections::HashSet::new();
@@ -156,7 +162,7 @@ fn env_dirs_read(args: &[String], cwd: &Path, env: &[PathBuf], directives: &dyn 
             _ => {}
         }
     }
-    let mut read = vec![false; env.len()];
+    let mut read = Vec::new();
     let mut seen = std::collections::HashSet::new();
     while let Some((name, lib)) = queue.pop() {
         let name = if lib { lib_file(&name) } else { name };
@@ -168,16 +174,16 @@ fn env_dirs_read(args: &[String], cwd: &Path, env: &[PathBuf], directives: &dyn 
         }
         // An input named without an extension may be an object.
         let names = std::iter::once(name.clone()).chain((!lib && !name.contains('.')).then(|| format!("{name}.obj"))).collect::<Vec<_>>();
-        let searched = dirs.iter().map(|d| (None, d)).chain(env.iter().enumerate().map(|(i, d)| (Some(i), d)));
-        let found = searched.into_iter().find_map(|(i, d)| names.iter().map(|n| d.join(n)).find(|p| p.is_file()).map(|p| (i, p)));
-        let Some((in_env, path)) = found else { return env.to_vec() };
-        if let Some(i) = in_env {
-            read[i] = true;
+        let searched = dirs.iter().map(|d| (false, d)).chain(env.iter().map(|d| (true, d)));
+        let (in_env, path) = searched.into_iter().find_map(|(in_env, d)| names.iter().map(|n| d.join(n)).find(|p| p.is_file()).map(|p| (in_env, p)))?;
+        let options = directives(&path)?;
+        if in_env {
+            read.push(path);
         }
-        let Some(options) = directives(&path) else { return env.to_vec() };
         queue.extend(crate::directives::default_libs(&options).map(|l| (l.to_string(), true)));
     }
-    env.iter().zip(read).filter(|(_, r)| *r).map(|(d, _)| d.clone()).collect()
+    read.sort();
+    Some(read)
 }
 
 /// Runs the driver's dry run and returns the last job it prints: the link.
@@ -381,14 +387,15 @@ mod tests {
         assert_eq!((info.files, info.lib_dirs), (vec![dir.join("a.obj")], vec![]));
     }
 
-    /// Of `LIB`'s directories, those a link finds a library in first: one
-    /// its command line names, or the directives of its objects and
-    /// libraries ask for (transitively), unless `/nodefaultlib` leaves it
-    /// out; after the working directory and `/libpath:`. All of them when
+    /// Of the files of `LIB`'s directories, those a link finds first: a
+    /// library its command line names, or the directives of its objects and
+    /// libraries ask for (transitively, those of objects for any machine
+    /// too, as `msvcrt.lib` holds), unless `/nodefaultlib` leaves it out;
+    /// after the working directory and `/libpath:`. All the directories when
     /// an input's directives can't be read, or a library isn't found.
     #[test]
     fn libraries_read_from_lib() {
-        use crate::directives::tests::{archive, coff};
+        use crate::directives::tests::{archive, coff, coff_for};
         let dir = test_dirs::TestDir::new("ninja-rs-link-lib");
         let put = |path: &str, data: &[u8]| {
             std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
@@ -400,29 +407,38 @@ mod tests {
         put("lto.obj", b"BC\xc0\xde\x35\x14\x00\x00\x05\x00\x00\x00\x62\x0c\x30\x24");
         put("tc/lib/oldnames.lib", &archive(&[]));
         put("vc/dup/oldnames.lib", &archive(&[]));
-        put("vc/lib/msvcrt.lib", &archive(&[("crt.obj/", &coff(&[(".drectve", b"-defaultlib:vcruntime.lib")]))]));
+        let crt = coff_for(0, &[(".drectve", b"-defaultlib:vcruntime.lib")]);
+        put("vc/lib/msvcrt.lib", &archive(&[("msvcrt.dll/", &import), ("crt.obj/", &crt)]));
+        put("vc/lib/unused.lib", &archive(&[]));
         put("vc/dup/msvcrt.lib", &archive(&[]));
         put("vc/rt/vcruntime.lib", &archive(&[]));
         put("sdk/um/kernel32.lib", &archive(&[("KERNEL32.dll/", &import)]));
         put("sdk/net/mscoree.lib", &archive(&[]));
         let env: Vec<PathBuf> = ["vc/dup2", "sdk/net", "vc/lib", "vc/rt", "sdk/um", "vc/dup"].iter().map(|d| dir.join(d)).collect();
+        let rel = |p: &PathBuf| p.strip_prefix(&*dir).unwrap().to_string_lossy().replace('\\', "/");
         let read = |line: &str| {
             let args: Vec<String> = line.split(' ').map(str::to_string).collect();
-            let found = env_dirs_read(&args, &dir, &env, &read_directives);
-            found.iter().map(|d| d.strip_prefix(&*dir).unwrap().to_string_lossy().replace('\\', "/")).collect::<Vec<_>>()
+            env_files_read(&args, &dir, &env, &read_directives).map(|files| files.iter().map(rel).collect::<Vec<_>>())
         };
-        assert_eq!(read("main.obj kernel32.lib /LIBPATH:tc/lib /OUT:app.exe"), ["vc/lib", "vc/rt", "sdk/um"]);
-        assert_eq!(read("main /LIBPATH:tc/lib kernel32.lib /NODEFAULTLIB:msvcrt"), ["sdk/um"]);
-        assert_eq!(read("main.obj /NODEFAULTLIB /DEFAULTLIB:kernel32"), Vec::<String>::new());
-        assert_eq!(read("main.obj /NODEFAULTLIB:MSVCRT.lib"), ["vc/dup"]);
+        let files = |f: &[&str]| Some(f.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(read("main.obj kernel32.lib /LIBPATH:tc/lib /OUT:app.exe"), files(&["sdk/um/kernel32.lib", "vc/lib/msvcrt.lib", "vc/rt/vcruntime.lib"]));
+        assert_eq!(read("main /LIBPATH:tc/lib kernel32.lib /NODEFAULTLIB:msvcrt"), files(&["sdk/um/kernel32.lib"]));
+        assert_eq!(read("main.obj /NODEFAULTLIB /DEFAULTLIB:kernel32"), files(&[]));
+        assert_eq!(read("main.obj /NODEFAULTLIB:MSVCRT.lib"), files(&["vc/dup/oldnames.lib"]));
         // What can't be told.
-        assert_eq!(read("lto.obj /LIBPATH:tc/lib"), ["vc/dup2", "sdk/net", "vc/lib", "vc/rt", "sdk/um", "vc/dup"]);
-        assert_eq!(read("main.obj missing.lib /LIBPATH:tc/lib"), read("lto.obj"));
-        // Through `analyze`, after `/libpath:`'s.
+        assert_eq!(read("lto.obj /LIBPATH:tc/lib"), None);
+        assert_eq!(read("main.obj missing.lib /LIBPATH:tc/lib"), None);
+        // Through `analyze`: those files, after `/libpath:`'s directory; all
+        // of `LIB`'s directories, whole, when it can't be told.
         let vars = |n: &str| (n == "LIB").then(|| OsString::from(env.iter().map(|d| d.to_string_lossy()).collect::<Vec<_>>().join(";")));
         let line: Vec<String> = "link.exe main.obj kernel32.lib /LIBPATH:tc/lib".split(' ').map(str::to_string).collect();
         let info = analyze(&dir.join("link.exe"), &line, &dir, false, &vars, &read_directives).unwrap();
-        assert_eq!(info.lib_dirs, [dir.join("tc").join("lib"), dir.join("vc").join("lib"), dir.join("vc").join("rt"), dir.join("sdk").join("um")]);
+        assert_eq!(info.lib_dirs, [dir.join("tc").join("lib")]);
+        assert_eq!(info.files.iter().map(rel).collect::<Vec<_>>(), ["main.obj", "sdk/um/kernel32.lib", "vc/lib/msvcrt.lib", "vc/rt/vcruntime.lib"]);
+        let line: Vec<String> = "link.exe lto.obj kernel32.lib /LIBPATH:tc/lib".split(' ').map(str::to_string).collect();
+        let info = analyze(&dir.join("link.exe"), &line, &dir, false, &vars, &read_directives).unwrap();
+        assert_eq!(info.lib_dirs.len(), 1 + env.len());
+        assert_eq!(info.files.iter().map(rel).collect::<Vec<_>>(), ["lto.obj"]);
     }
 
     #[test]

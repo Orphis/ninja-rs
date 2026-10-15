@@ -8,6 +8,10 @@
 //! __VA_ARGS__` drops the comma when there are no variadic arguments; C++20's
 //! `__VA_OPT__(...)` keeps its contents only when there are.
 //!
+//! cl's traditional preprocessor (without `/Zc:preprocessor`: see
+//! `Expander::expand_traditional`) expands otherwise, in ways Boost's
+//! MSVC configuration relies on.
+//!
 //! Expansion only runs on `#if`/`#elif` expressions and `#include`
 //! operands. In `#if` mode, `defined`, `__has_include` and the compiler's
 //! queries (`__has_builtin` and the like) are evaluated as they appear,
@@ -69,10 +73,23 @@ impl Pragmas {
     }
 }
 
-/// The string literal's contents (`"a\"b"` is `a"b`).
+/// The string literal's contents (`"a\"b"` is `a"b`), as `_Pragma` reads
+/// them: the prefix and the quotes gone, `\"` and `\\` unescaped.
 pub(crate) fn destringize(lit: &str) -> String {
-    let body = lit.trim_start_matches(|c| c != '"').trim_matches('"');
-    body.replace("\\\"", "\"").replace("\\\\", "\\")
+    let body = lit.trim_start_matches(|c| c != '"');
+    let body = body.strip_prefix('"').unwrap_or(body);
+    let mut chars = body.strip_suffix('"').unwrap_or(body).chars().peekable();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\\', Some(&e @ ('"' | '\\'))) => {
+                out.push(e);
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The pragmas that change macros or inclusion.
@@ -88,8 +105,16 @@ fn pragma_words(p: &[Token], names: &mut Vec<Sym>, other: &mut bool) {
             names.push(intern::intern(&destringize(s.sym.as_str())));
         }
         [w, ..] if PRAGMAS.contains(&w.sym) => *other = true,
+        // `#pragma GCC dependency`: a file, found from where it runs.
+        [g, d, ..] if g.sym == intern::GCC && d.sym == intern::DEPENDENCY => *other = true,
         _ => {}
     }
+}
+
+/// Whether a pragma's words are `GCC dependency` (a file the compile reads:
+/// see `scan`).
+pub(crate) fn dependency_words(p: &[Token]) -> bool {
+    matches!(p, [g, d, ..] if g.sym == intern::GCC && d.sym == intern::DEPENDENCY)
 }
 
 /// What `pragmas` finds in tokens.
@@ -261,7 +286,7 @@ fn unexpanded(toks: &[Token], own: Option<Sym>, params: &[Sym]) -> Option<Vec<XT
         if t.is(P::HashHash) || t.sym == intern::VA_OPT {
             return None;
         }
-        input.push(XTok { t, hide: Some(Rc::new(param(&t).into_iter().chain(own).collect())) });
+        input.push(XTok { hide: Some(Rc::new(param(&t).into_iter().chain(own).collect())), ..XTok::new(t) });
         i += 1;
     }
     Some(input)
@@ -292,6 +317,36 @@ pub fn operand_pragmas(operand: &[Token], own: Option<Sym>, params: &[Sym], ctx:
         _ => Pragmas::None,
     };
     (pragmas, looked_up, arg)
+}
+
+/// The words of the pragma a `_Pragma` operand that macros make runs (see
+/// `operand_pragmas`), expanded with the macros `ctx` has; None unless
+/// it's a string literal.
+pub(crate) fn operand_words(operand: &[Token], ctx: &mut dyn Context) -> Option<Vec<Token>> {
+    let input = unexpanded(operand, None, &[])?;
+    let mut recording = Recording { ctx, looked_up: Default::default() };
+    let mut x = Expander::new(&mut recording, false);
+    let out = x.expand(input);
+    match &out[..] {
+        [s] if x.error.is_none() && s.t.kind == Kind::Str => Some(lex::tokens(destringize(s.t.sym.as_str()).as_bytes())),
+        _ => None,
+    }
+}
+
+/// Whether text calling a macro (`call`: its name, and its arguments) may
+/// run a pragma that changes macros or inclusion (`CAT(DO_, PRAGMA)(x)`,
+/// whose name pastes one whose pragma is its argument's): its expansion
+/// with the macros `ctx` has runs one, or names a macro whose pragmas its
+/// arguments make (see `Context::arg_pragma`); or it fails.
+pub(crate) fn call_runs_pragma(call: &[Token], ctx: &mut dyn Context) -> bool {
+    let mut recording = Recording { ctx, looked_up: Default::default() };
+    let (out, failed) = {
+        let mut x = Expander::new(&mut recording, false);
+        let out = x.expand_tokens(call);
+        (out, x.error.is_some())
+    };
+    let found = pragmas(&out, true, &[]);
+    failed || found.pragmas != Pragmas::None || !found.operands.is_empty() || out.iter().any(|t| t.kind == Kind::Ident && recording.ctx.arg_pragma(t.sym))
 }
 
 /// What a body that names macros whose pragmas their arguments make does
@@ -409,6 +464,12 @@ impl Context for Recording<'_> {
     }
     fn arg_pragma(&self, name: Sym) -> bool {
         self.ctx.arg_pragma(name)
+    }
+    fn traditional(&self) -> bool {
+        self.ctx.traditional()
+    }
+    fn va_comma(&self) -> VaComma {
+        self.ctx.va_comma()
     }
     fn has_include(&mut self, _name: &str, _angled: bool, _next: bool) -> bool {
         false
@@ -532,11 +593,21 @@ fn hide_intersection(a: &Hide, b: &Hide) -> Hide {
 pub struct XTok {
     pub t: Token,
     hide: Hide,
+    /// cl's traditional preprocessor: a comma of an argument substituted
+    /// into the replacement being expanded, outside the argument's
+    /// parentheses, which separates no arguments of a call there.
+    glued: bool,
+    /// cl's traditional preprocessor: a function-like macro's name seen
+    /// followed by something else than `(` (see `expand_traditional`).
+    rejected: bool,
+    /// cl's traditional preprocessor: a comma before an empty
+    /// `__VA_ARGS__`, gone at the end of its macro's expansion.
+    elided: bool,
 }
 
 impl XTok {
     pub fn new(t: Token) -> Self {
-        XTok { t, hide: None }
+        XTok { t, hide: None, glued: false, rejected: false, elided: false }
     }
 }
 
@@ -568,6 +639,29 @@ pub trait Context {
     fn arg_pragma(&self, _name: Sym) -> bool {
         false
     }
+    /// Whether macros expand as cl's traditional preprocessor expands them
+    /// (`_MSVC_TRADITIONAL` is 1: see `Expander::expand_traditional`).
+    fn traditional(&self) -> bool {
+        false
+    }
+    /// When a comma before `__VA_ARGS__` left out goes.
+    fn va_comma(&self) -> VaComma {
+        VaComma::default()
+    }
+}
+
+/// When the compiler drops the comma before `__VA_ARGS__` (with `##`
+/// before it: `, ## __VA_ARGS__`) when a call leaves the variadic arguments
+/// out (`F(a)` for `F(a, ...)`, not `F(a,)`). cl's traditional
+/// preprocessor drops it before an empty one whatever (see
+/// `Expander::expand_traditional`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaComma {
+    /// Only when the macro has another parameter: GCC's strict modes
+    /// (`-std=c11`, `-std=c++17`), and Clang's in C (C99 and later).
+    pub needs_named: bool,
+    /// Without `##` too: Clang's MSVC compatibility.
+    pub bare: bool,
 }
 
 /// A number token (0 and 1, the usual results, without interning).
@@ -626,6 +720,19 @@ enum Item {
     },
 }
 
+/// The arguments of a call, as cl's traditional preprocessor takes them:
+/// one per parameter (empty when missing), and how many were given (`#x`
+/// of a missing one is nothing).
+struct Args {
+    toks: Vec<Vec<XTok>>,
+    given: usize,
+}
+
+/// How deep cl's traditional preprocessor's expansions may nest (each
+/// replacement is expanded by itself, see `expand_traditional`): deeper,
+/// the expansion fails rather than take the stack.
+const MAX_NESTING: usize = 200;
+
 pub struct Expander<'c> {
     pub ctx: &'c mut dyn Context,
     /// `#if` mode: `defined` and the operators are evaluated.
@@ -633,11 +740,19 @@ pub struct Expander<'c> {
     /// Set on malformed input (the expansion is then not trustworthy).
     pub error: Option<String>,
     budget: usize,
+    /// Macros expand as cl's traditional preprocessor expands them.
+    traditional: bool,
+    /// When a comma before `__VA_ARGS__` left out goes (the standard's
+    /// expansion).
+    va_comma: VaComma,
+    /// The replacements being expanded, nested (traditional only).
+    nesting: usize,
 }
 
 impl<'c> Expander<'c> {
     pub fn new(ctx: &'c mut dyn Context, if_mode: bool) -> Self {
-        Expander { ctx, if_mode, error: None, budget: 1_000_000 }
+        let (traditional, va_comma) = (ctx.traditional(), ctx.va_comma());
+        Expander { ctx, if_mode, error: None, budget: 1_000_000, traditional, va_comma, nesting: 0 }
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
@@ -771,58 +886,81 @@ impl<'c> Expander<'c> {
         None
     }
 
+    /// Expands tokens (a line, or an operand) as the preprocessor does.
     pub fn expand(&mut self, input: Vec<XTok>) -> Vec<XTok> {
+        if self.traditional { self.expand_traditional(input, true) } else { self.expand_standard(input) }
+    }
+
+    /// Takes the next token, unless the budget is spent.
+    fn spend(&mut self) -> bool {
+        if self.budget == 0 {
+            self.fail("expansion too large");
+            return false;
+        }
+        self.budget -= 1;
+        true
+    }
+
+    /// The macro an identifier of the input names, after the operators of
+    /// `#if` mode and the dynamic macros (whose values go to `out`); None
+    /// when it names none or is hidden.
+    fn macro_at(&mut self, t: &XTok, input: &mut VecDeque<XTok>, out: &mut Vec<XTok>) -> Option<Arc<Macro>> {
+        let name = t.t.sym;
+        if self.if_mode
+            && let Some(mut v) = self.if_operator(name, input)
+        {
+            v.space = t.t.space;
+            out.push(XTok::new(v));
+            return None;
+        }
+        if hidden(&t.hide, name) || t.rejected {
+            out.push(t.clone());
+            return None;
+        }
+        let m = self.ctx.lookup(name);
+        if m.is_none() {
+            match self.ctx.dynamic(name) {
+                Some(mut d) => {
+                    d.space = t.t.space;
+                    out.push(XTok::new(d));
+                }
+                None => out.push(t.clone()),
+            }
+        }
+        m
+    }
+
+    fn expand_standard(&mut self, input: Vec<XTok>) -> Vec<XTok> {
         let mut input: VecDeque<XTok> = input.into();
         let mut out = Vec::new();
         while let Some(t) = input.pop_front() {
-            if self.budget == 0 {
-                self.fail("expansion too large");
+            if !self.spend() {
                 break;
             }
-            self.budget -= 1;
             if t.t.kind != Kind::Ident {
                 out.push(t);
                 continue;
             }
             let name = t.t.sym;
-            if self.if_mode
-                && let Some(mut v) = self.if_operator(name, &mut input)
-            {
-                v.space = t.t.space;
-                out.push(XTok::new(v));
-                continue;
-            }
-            if hidden(&t.hide, name) {
-                out.push(t);
-                continue;
-            }
-            let Some(m) = self.ctx.lookup(name) else {
-                match self.ctx.dynamic(name) {
-                    Some(mut d) => {
-                        d.space = t.t.space;
-                        out.push(XTok::new(d));
-                    }
-                    None => out.push(t),
-                }
-                continue;
-            };
+            let Some(m) = self.macro_at(&t, &mut input, &mut out) else { continue };
             let replacement = match &m.params {
                 None => {
                     let hs = hide_union(&t.hide, &Some(Rc::new(vec![name])));
-                    self.substitute(&m, &[], hs, t.t.space)
+                    self.substitute(&m, &[], hs, t.t.space, false)
                 }
                 Some(params) => {
                     if !input.front().is_some_and(|n| n.t.is(P::LParen)) {
                         out.push(t);
                         continue;
                     }
-                    let Some((args, rparen)) = self.arguments(&mut input, params.len(), m.variadic) else {
+                    let Some((args, rparen, elided)) = self.arguments(&mut input, params.len(), m.variadic) else {
                         self.fail(format!("bad arguments for {}", name.as_str()));
                         out.push(t);
                         continue;
                     };
                     let hs = hide_union(&hide_intersection(&t.hide, &rparen), &Some(Rc::new(vec![name])));
-                    self.substitute(&m, &args, hs, t.t.space)
+                    let drop_comma = elided && (!self.va_comma.needs_named || params.len() > 1);
+                    self.substitute(&m, &args, hs, t.t.space, drop_comma)
                 }
             };
             for r in replacement.into_iter().rev() {
@@ -832,8 +970,10 @@ impl<'c> Expander<'c> {
         out
     }
 
-    /// `( args )` of a function-like macro, and the hide set of `)`.
-    fn arguments(&mut self, input: &mut VecDeque<XTok>, nparams: usize, variadic: bool) -> Option<(Vec<Vec<XTok>>, Hide)> {
+    /// `( args )` of a function-like macro, the hide set of `)`, and
+    /// whether the variadic arguments were left out (`F(a)` for `F(a,
+    /// ...)`, `G()` for `G(...)`).
+    fn arguments(&mut self, input: &mut VecDeque<XTok>, nparams: usize, variadic: bool) -> Option<(Vec<Vec<XTok>>, Hide, bool)> {
         input.pop_front();
         let mut args: Vec<Vec<XTok>> = Vec::new();
         let mut cur = Vec::new();
@@ -859,66 +999,24 @@ impl<'c> Expander<'c> {
         if nparams == 0 && args.len() == 1 && args[0].is_empty() {
             args.clear();
         }
+        let mut elided = variadic && nparams == 1 && args.len() == 1 && args[0].is_empty();
         if variadic && args.len() + 1 == nparams {
             args.push(Vec::new());
+            elided = true;
         }
-        (args.len() == nparams).then_some((args, rparen))
+        (args.len() == nparams).then_some((args, rparen, elided))
     }
 
-    fn substitute(&mut self, m: &Macro, args: &[Vec<XTok>], hs: Hide, space: bool) -> Vec<XTok> {
+    /// The replacement of a macro: `drop_comma`, a comma before
+    /// `__VA_ARGS__` left out goes (see `VaComma`).
+    fn substitute(&mut self, m: &Macro, args: &[Vec<XTok>], hs: Hide, space: bool, drop_comma: bool) -> Vec<XTok> {
         let params: &[Sym] = m.params.as_deref().unwrap_or(&[]);
         let mut items = Vec::new();
-        self.substitute_into(m, params, args, &m.body, &mut items);
-        // `##` pasting.
-        let mut pasted: Vec<Item> = Vec::new();
-        let mut items = items.into_iter().peekable();
-        while let Some(item) = items.next() {
-            if !matches!(item, Item::Paste) {
-                pasted.push(item);
-                continue;
-            }
-            let Some(right) = items.next() else { break };
-            let left = pasted.pop();
-            match (left, right) {
-                (None, r) => pasted.push(r),
-                (Some(Item::Placemarker { .. }), r) => pasted.push(r),
-                // GNU: `, ## __VA_ARGS__` without variadic arguments.
-                (Some(Item::Tok(l)), Item::Placemarker { va: true }) if l.t.is(P::Comma) => {}
-                (Some(l), Item::Placemarker { .. }) => pasted.push(l),
-                (Some(Item::Tok(l)), Item::Tok(r)) => {
-                    let text = format!("{}{}", l.t.sym.as_str(), r.t.sym.as_str());
-                    let toks = lex::tokens(text.as_bytes());
-                    if let [mut t] = toks[..] {
-                        t.space = l.t.space;
-                        pasted.push(Item::Tok(XTok::new(t)));
-                    } else {
-                        pasted.push(Item::Tok(l));
-                        pasted.push(Item::Tok(r));
-                    }
-                }
-                (Some(l), r) => {
-                    pasted.push(l);
-                    pasted.push(r);
-                }
-            }
-        }
-        let mut out: Vec<XTok> = pasted
-            .into_iter()
-            .filter_map(|i| match i {
-                Item::Tok(mut t) => {
-                    t.hide = hide_union(&t.hide, &hs);
-                    Some(t)
-                }
-                _ => None,
-            })
-            .collect();
-        if let Some(first) = out.first_mut() {
-            first.t.space = space;
-        }
-        out
+        self.substitute_into(m, params, args, &m.body, &mut items, drop_comma);
+        paste(items, hs, space)
     }
 
-    fn substitute_into(&mut self, m: &Macro, params: &[Sym], args: &[Vec<XTok>], body: &[Token], items: &mut Vec<Item>) {
+    fn substitute_into(&mut self, m: &Macro, params: &[Sym], args: &[Vec<XTok>], body: &[Token], items: &mut Vec<Item>, drop_comma: bool) {
         let param = |t: &Token| if m.params.is_some() { t.ident().and_then(|s| params.iter().position(|p| *p == s)) } else { None };
         let mut i = 0;
         while i < body.len() {
@@ -952,17 +1050,22 @@ impl<'c> Expander<'c> {
                 }
                 let va = args.last().is_some_and(|a| !a.is_empty());
                 if va {
-                    self.substitute_into(m, params, args, &body[i + 2..j.min(body.len())], items);
+                    self.substitute_into(m, params, args, &body[i + 2..j.min(body.len())], items, drop_comma);
                 } else {
                     items.push(Item::Placemarker { va: false });
                 }
                 i = j + 1;
                 continue;
             }
+            // Clang's MSVC compatibility: `, __VA_ARGS__` too.
+            if tok.is(P::Comma) && drop_comma && self.va_comma.bare && body.get(i + 1).and_then(param) == Some(params.len() - 1) {
+                i += 1;
+                continue;
+            }
             if let Some(pi) = param(&tok) {
                 let pasted = matches!(items.last(), Some(Item::Paste)) || body.get(i + 1).is_some_and(|t| t.is(P::HashHash));
                 let arg = &args[pi];
-                let va = m.variadic && pi + 1 == params.len();
+                let va = drop_comma && m.variadic && pi + 1 == params.len();
                 if pasted {
                     if arg.is_empty() {
                         items.push(Item::Placemarker { va });
@@ -970,7 +1073,7 @@ impl<'c> Expander<'c> {
                         items.extend(arg.iter().cloned().map(Item::Tok));
                     }
                 } else {
-                    let mut x = self.expand(arg.clone());
+                    let mut x = self.expand_standard(arg.clone());
                     if let Some(first) = x.first_mut() {
                         first.t.space = tok.space;
                     }
@@ -983,6 +1086,242 @@ impl<'c> Expander<'c> {
             i += 1;
         }
     }
+
+    /// Expansion as cl's traditional preprocessor does it, as `cl /E` shows
+    /// (see the tests against it):
+    /// - A macro's replacement is expanded by itself, its arguments
+    ///   substituted, before what follows it is seen: a function-like
+    ///   macro's name followed there by anything but `(` is rejected, never
+    ///   called (`#define D(m) m EMPTY()`); one ending it is called by a `(`
+    ///   following it.
+    /// - The commas of an argument substituted into the replacement, outside
+    ///   its parentheses, separate no arguments of the calls there
+    ///   (`#define F(...) G(__VA_ARGS__)` gives G one argument: Boost's
+    ///   `BOOST_PP_EXPAND` takes them apart again, as an argument).
+    /// - At the `top` (the `#if` line or `#include` operand), a replacement's
+    ///   expansion is scanned again with what follows, rejected names
+    ///   included: `#define A F ECHO((1, 2))` calls F there (and not in an
+    ///   argument).
+    /// - A comma before an empty `__VA_ARGS__` (`##` between them or not)
+    ///   goes at the end of the macro's expansion, unless a call in it took
+    ///   it as an argument (`f(x, __VA_ARGS__)` is `f(x )`, `ECHO(x,
+    ///   __VA_ARGS__)` is `x,`); `()` is no argument (`#x` of a missing one
+    ///   is nothing); `__VA_OPT__` is no operator.
+    ///
+    /// cl takes missing arguments as empty and drops extra ones (with a
+    /// warning): those fail here, which tells this model's mistakes.
+    fn expand_traditional(&mut self, input: Vec<XTok>, top: bool) -> Vec<XTok> {
+        let mut input: VecDeque<XTok> = input.into();
+        let mut out = Vec::new();
+        while let Some(mut t) = input.pop_front() {
+            if !self.spend() {
+                break;
+            }
+            if t.t.kind != Kind::Ident {
+                out.push(t);
+                continue;
+            }
+            let name = t.t.sym;
+            let Some(m) = self.macro_at(&t, &mut input, &mut out) else { continue };
+            let one = Some(Rc::new(vec![name]));
+            let (args, hs) = match &m.params {
+                None => (Args { toks: Vec::new(), given: 0 }, hide_union(&t.hide, &one)),
+                Some(params) => match input.front() {
+                    Some(n) if n.t.is(P::LParen) => {
+                        let Some((args, rparen)) = traditional_arguments(&mut input, params.len(), m.variadic) else {
+                            self.fail(format!("bad arguments for {}", name.as_str()));
+                            out.push(t);
+                            continue;
+                        };
+                        (args, hide_union(&hide_intersection(&t.hide, &rparen), &one))
+                    }
+                    Some(_) => {
+                        t.rejected = !top;
+                        out.push(t);
+                        continue;
+                    }
+                    // Called, or rejected, by what follows the replacement.
+                    None => {
+                        out.push(t);
+                        continue;
+                    }
+                },
+            };
+            if self.nesting == MAX_NESTING {
+                self.fail("macro expansions nested too deeply");
+                out.push(t);
+                continue;
+            }
+            self.nesting += 1;
+            let replacement = self.substitute_traditional(&m, &args, hs, t.t.space);
+            let expanded = self.expand_traditional(replacement, false);
+            self.nesting -= 1;
+            for mut r in expanded.into_iter().rev().filter(|r| !r.elided) {
+                r.glued = false;
+                r.rejected &= !top;
+                input.push_front(r);
+            }
+        }
+        out
+    }
+
+    /// `substitute`, by cl's traditional preprocessor (see
+    /// `expand_traditional`).
+    fn substitute_traditional(&mut self, m: &Macro, args: &Args, hs: Hide, space: bool) -> Vec<XTok> {
+        let params: &[Sym] = m.params.as_deref().unwrap_or(&[]);
+        let param = |t: &Token| if m.params.is_some() { t.ident().and_then(|s| params.iter().position(|p| *p == s)) } else { None };
+        let body = &m.body;
+        let va_empty = m.variadic && args.toks.last().is_some_and(Vec::is_empty);
+        let mut items = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            let tok = body[i];
+            if tok.is(P::Hash)
+                && let Some(pi) = body.get(i + 1).and_then(param)
+            {
+                if pi < args.given {
+                    items.push(Item::Tok(XTok::new(Token { space: tok.space, ..stringize(&args.toks[pi]) })));
+                }
+                i += 2;
+                continue;
+            }
+            if tok.is(P::HashHash) {
+                items.push(Item::Paste);
+                i += 1;
+                continue;
+            }
+            // A comma before an empty `__VA_ARGS__` (`##` between them or
+            // not): gone from the expansion, unless a call in it takes it.
+            let va_next = |at: usize| body.get(at).and_then(param) == Some(params.len().wrapping_sub(1));
+            if tok.is(P::Comma) && va_empty && (va_next(i + 1) || (body.get(i + 1).is_some_and(|t| t.is(P::HashHash)) && va_next(i + 2))) {
+                items.push(Item::Tok(XTok { elided: true, ..XTok::new(tok) }));
+                i += 1;
+                continue;
+            }
+            if let Some(pi) = param(&tok) {
+                let pasted = matches!(items.last(), Some(Item::Paste)) || body.get(i + 1).is_some_and(|t| t.is(P::HashHash));
+                let arg = &args.toks[pi];
+                if pasted && arg.is_empty() {
+                    items.push(Item::Placemarker { va: false });
+                } else {
+                    let mut x = if pasted { arg.clone() } else { self.expand_traditional(arg.clone(), false) };
+                    let mut depth = 0usize;
+                    for t in &mut x {
+                        if t.t.is(P::LParen) {
+                            depth += 1;
+                        } else if t.t.is(P::RParen) {
+                            depth = depth.saturating_sub(1);
+                        }
+                        t.glued = depth == 0 && t.t.is(P::Comma);
+                    }
+                    if let Some(first) = x.first_mut().filter(|_| !pasted) {
+                        first.t.space = tok.space;
+                    }
+                    items.extend(x.into_iter().map(Item::Tok));
+                }
+                i += 1;
+                continue;
+            }
+            items.push(Item::Tok(XTok::new(tok)));
+            i += 1;
+        }
+        paste(items, hs, space)
+    }
+}
+
+/// `( args )` of a function-like macro, as cl's traditional preprocessor
+/// takes them (see `Expander::expand_traditional`): commas glued separate
+/// none; and the hide set of `)`. The arguments are glued and rejected
+/// nowhere. None for another number of arguments than the macro takes
+/// (`()` is none, and one missing is fine).
+fn traditional_arguments(input: &mut VecDeque<XTok>, nparams: usize, variadic: bool) -> Option<(Args, Hide)> {
+    input.pop_front();
+    let mut toks: Vec<Vec<XTok>> = Vec::new();
+    let mut cur = Vec::new();
+    let mut depth = 1;
+    let rparen;
+    loop {
+        let mut t = input.pop_front()?;
+        if t.t.is(P::LParen) {
+            depth += 1;
+        } else if t.t.is(P::RParen) {
+            depth -= 1;
+            if depth == 0 {
+                rparen = t.hide.clone();
+                toks.push(cur);
+                break;
+            }
+        } else if t.t.is(P::Comma) && depth == 1 && !t.glued && !(variadic && toks.len() + 1 == nparams) {
+            toks.push(std::mem::take(&mut cur));
+            continue;
+        }
+        t.glued = false;
+        t.rejected = false;
+        t.elided = false;
+        cur.push(t);
+    }
+    if toks.len() == 1 && toks[0].is_empty() {
+        toks.clear();
+    }
+    let given = toks.len();
+    // The variadic arguments may be left out, as may the only argument.
+    let fine = given == nparams || (given == 0 && nparams == 1) || (variadic && given + 1 == nparams);
+    if !fine {
+        return None;
+    }
+    toks.resize_with(nparams, Vec::new);
+    Some((Args { toks, given }, rparen))
+}
+
+/// The tokens of a substitution, `##` pasted, with the hide set `hs`; the
+/// first spaced as the macro's name was.
+fn paste(items: Vec<Item>, hs: Hide, space: bool) -> Vec<XTok> {
+    let mut pasted: Vec<Item> = Vec::new();
+    let mut items = items.into_iter().peekable();
+    while let Some(item) = items.next() {
+        if !matches!(item, Item::Paste) {
+            pasted.push(item);
+            continue;
+        }
+        let Some(right) = items.next() else { break };
+        let left = pasted.pop();
+        match (left, right) {
+            (None, r) => pasted.push(r),
+            (Some(Item::Placemarker { .. }), r) => pasted.push(r),
+            // GNU: `, ## __VA_ARGS__` without variadic arguments.
+            (Some(Item::Tok(l)), Item::Placemarker { va: true }) if l.t.is(P::Comma) => {}
+            (Some(l), Item::Placemarker { .. }) => pasted.push(l),
+            (Some(Item::Tok(l)), Item::Tok(r)) => {
+                let text = format!("{}{}", l.t.sym.as_str(), r.t.sym.as_str());
+                let toks = lex::tokens(text.as_bytes());
+                if let [mut t] = toks[..] {
+                    t.space = l.t.space;
+                    pasted.push(Item::Tok(XTok::new(t)));
+                } else {
+                    pasted.push(Item::Tok(l));
+                    pasted.push(Item::Tok(r));
+                }
+            }
+            (Some(l), r) => {
+                pasted.push(l);
+                pasted.push(r);
+            }
+        }
+    }
+    let mut out: Vec<XTok> = pasted
+        .into_iter()
+        .filter_map(|i| match i {
+            Item::Tok(mut t) => {
+                t.hide = hide_union(&t.hide, &hs);
+                Some(t)
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some(first) = out.first_mut() {
+        first.t.space = space;
+    }
+    out
 }
 
 fn unknown() -> Token {
@@ -1011,13 +1350,15 @@ impl Macro {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
 
     #[derive(Default)]
     struct Ctx {
         macros: HashMap<Sym, Arc<Macro>>,
+        traditional: bool,
+        va_comma: VaComma,
     }
 
     impl Context for Ctx {
@@ -1050,6 +1391,12 @@ mod tests {
                 _ => Some(0),
             }
         }
+        fn traditional(&self) -> bool {
+            self.traditional
+        }
+        fn va_comma(&self) -> VaComma {
+            self.va_comma
+        }
     }
 
     fn ctx(defs: &str) -> Ctx {
@@ -1068,6 +1415,135 @@ mod tests {
         assert!(x.error.is_none(), "{:?}", x.error);
         let xt: Vec<XTok> = out.into_iter().map(XTok::new).collect();
         spelling(&xt)
+    }
+
+    /// Tokens as one string, single spaces between them and none in string
+    /// literals (whose spaces stringizing the expansion of an argument puts
+    /// otherwise than cl).
+    pub(crate) fn spelled(toks: &[Token]) -> String {
+        toks.iter().map(|t| if t.kind == Kind::Str { t.sym.as_str().replace(' ', "") } else { t.sym.as_str().to_string() }).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The tokens text expands to, by cl's traditional preprocessor or the
+    /// standard's (see `spelled`), or the error.
+    pub(crate) fn expanded(defs: &str, text: &str, traditional: bool, if_mode: bool) -> Result<String, String> {
+        let mut c = Ctx { traditional, ..ctx(defs) };
+        let mut x = Expander::new(&mut c, if_mode);
+        let out = x.expand_tokens(&lex::tokens(text.as_bytes()));
+        x.error.take().map_or_else(|| Ok(spelled(&out)), Err)
+    }
+
+    fn traditional(defs: &str, text: &str, if_mode: bool) -> Result<String, String> {
+        expanded(defs, text, true, if_mode)
+    }
+
+    /// Cases of cl's traditional preprocessor, as `cl /E` expands them
+    /// (cl 19.51; `driver::tests::real_cl_traditional` checks them against
+    /// cl): macros (after `TRADITIONAL_DEFS`), text, its expansion.
+    pub(crate) const TRADITIONAL_DEFS: &str = "#define F(x, y) [x|y]\n#define ECHO(...) __VA_ARGS__\n#define EXPAND(x) x\n#define PAIR 1, 2\n#define NIL\n#define EMPTYF()\n\
+        #define STR(x) #x\n#define XSTR(x) STR(x)\n#define DEFER(m) m EMPTYF()\n#define CAT(a, b) CAT_I(a, b)\n#define CAT_I(a, b) a ## b\n";
+    pub(crate) const TRADITIONAL_CASES: &[(&str, &str, &str)] = &[
+        // An argument's commas separate no arguments where it's
+        // substituted: any argument, `__VA_ARGS__` or not.
+        ("#define G(x) F(x, 3)\n", "G(PAIR)", "[1, 2|3]"),
+        ("#define V(...) F(__VA_ARGS__, 3)\n", "V(1, 2)", "[1, 2|3]"),
+        ("#define V(a, ...) F(__VA_ARGS__, a)\n", "V(0, 1, 2)", "[1, 2|0]"),
+        ("#define H(m, x) m(x, 0)\n", "H(F, PAIR)", "[1, 2|0]"),
+        ("#define V(...) F(__VA_ARGS__ ## x, y)\n", "V(1, 2)", "[1, 2x|y]"),
+        // But inside its parentheses they do; and taken as an argument
+        // again, they do.
+        ("#define K(x) F x\n", "K((11, 12))", "[11|12]"),
+        ("#define H(m, x) m x\n", "H(F, (1, 2))", "[1|2]"),
+        ("#define V(...) EXPAND(F(__VA_ARGS__))\n", "V(1, 2)", "[1|2]"),
+        ("#define V(...) CAT(F(__VA_ARGS__),)\n", "V(1, 2)", "[1|2]"),
+        ("#define V(...) ECHO(F(__VA_ARGS__))\n", "V(1, 2)", "[1|2]"),
+        ("#define CNT(...) CNT_I(__VA_ARGS__, 3, 2, 1, 0)\n#define CNT_I(a, b, c, n, ...) n\n", "CNT(a, b) CNT(a) CNT()", "1 1 1"),
+        ("#define CNT(...) ECHO(CNT_I(__VA_ARGS__, 3, 2, 1, 0))\n#define CNT_I(a, b, c, n, ...) n\n", "CNT(a, b) CNT(a) CNT()", "2 1 1"),
+        // A name ending a replacement is called by what follows it,
+        // with the commas of that replacement's arguments glued.
+        ("#define V(...) ECHO(F)(__VA_ARGS__, 3)\n", "V(1, 2)", "[1, 2|3]"),
+        ("#define OBJ F\n#define V(x) OBJ(x, 3)\n", "V(PAIR)", "[1, 2|3]"),
+        ("#define V(x) ECHO(ECHO(F))(x, 3)\n", "V(PAIR)", "[1, 2|3]"),
+        // One followed by anything else is rejected, but where it's
+        // scanned again at the top (where they're not glued).
+        ("#define V(x) DEFER(F)(x)\n", "V(PAIR)", "[1|2]"),
+        ("#define V(x) OBJ NIL (x)\n#define OBJ F\n", "V(PAIR)", "[1|2]"),
+        ("#define V(x) ECHO(F NIL)(x)\n", "V(PAIR)", "[1|2]"),
+        ("#define A F ECHO((1, 2))\n", "A", "[1|2]"),
+        ("#define A F NIL (1, 2)\n", "A", "[1|2]"),
+        ("#define LP (\n#define A F LP 1, 2)\n", "A XSTR(A)", "[1|2] \"F ( 1, 2)\""),
+        ("#define IMPL1(p, v) one(p, v)\n#define DO(s, b) CAT(IMPL, s) ECHO((\"Hello\", b))\n", "DO(1, \"World\")", "one(\"Hello\", \"World\")"),
+        ("", "DEFER(F)(1, 2) F NIL (1, 2) XSTR(DEFER(F)(1, 2))", "[1|2] F (1, 2) \"F (1, 2)\""),
+        ("#define T5 F EMPTYF NIL () (1, 2)\n", "XSTR(T5) T5", "\"F EMPTYF () (1, 2)\" F (1, 2)"),
+        ("#define J F ECHO\n", "J((1, 2))", "F (1, 2)"),
+        // Rejected in an argument: in what it's substituted into too,
+        // unless taken as an argument again.
+        ("#define AP(x) x(1, 2)\n", "XSTR(AP(F NIL))", "\"F (1, 2)\""),
+        ("#define AQ(x) ECHO(x)(1, 2)\n", "XSTR(AQ(F NIL))", "\"[1|2]\""),
+        // A comma before an empty `__VA_ARGS__` goes at the end of the
+        // expansion: not one a call there takes.
+        ("#define E(fmt, ...) f(fmt, __VA_ARGS__)\n", "E(x) E(x,) E(x, y)", "f(x) f(x) f(x, y)"),
+        ("#define E(a, ...) g(a, __VA_ARGS__, __VA_ARGS__) h(a,, __VA_ARGS__) k(a, (__VA_ARGS__))\n", "E(x)", "g(x) h(x,) k(x, ())"),
+        ("#define E(...) g(__VA_ARGS__, end)\n", "E()", "g(, end)"),
+        ("#define E(fmt, ...) f(fmt, ## __VA_ARGS__)\n", "E(x) E(x, y)", "f(x) f(x,y)"),
+        (
+            "#define SHOW(...) [__VA_ARGS__]\n#define A1(...) SHOW(x, ## __VA_ARGS__, 3)\n#define A2(...) SHOW(x, __VA_ARGS__, 3)\n#define A3(...) SHOW(x, __VA_ARGS__)\n",
+            "A1() A2() A3()",
+            "[x,, 3] [x, , 3] [x,]",
+        ),
+        (
+            "#define SHOW(...) [__VA_ARGS__]\n#define A12(...) DEFER(SHOW)(x, __VA_ARGS__)\n#define A13(...) x, __VA_ARGS__\n#define A14(...) ECHO(x, __VA_ARGS__)\n\
+             #define A15(...) EXPAND(f(x, __VA_ARGS__))\n#define A16(...) (x, __VA_ARGS__)\n#define A17(...) SHOW A16(__VA_ARGS__)\n#define A18(...) x, ## __VA_ARGS__\n",
+            "A12() SHOW(A13()) A13() A14() A15() A17() SHOW(A18()) A18()",
+            "[x] [x] x x, f(x, ) [x] [x] x",
+        ),
+        (
+            "#define ARGC_I(a, b, c, d, n, ...) n\n#define ARGC(...) ARGC_I(x, ## __VA_ARGS__, 3, 2, 1, 0)\n#define BARE(...) ARGC_I(x, __VA_ARGS__, 3, 2, 1, 0)\n",
+            "ARGC() BARE() ARGC(y) BARE(y)",
+            "1 1 1 1",
+        ),
+        // `()` is no argument: `#x` is then nothing.
+        ("#define S1(...) #__VA_ARGS__\n#define S2(x, y) #x #y\n#define S3(x) #x\n", "S1() S1(,) S2(,) S2(a,) S3()", "\",\" \"\" \"\" \"a\" \"\""),
+        ("#define V(a, ...) <a #__VA_ARGS__>\n", "V(x) V(x,) V(x, y)", "<x> <x \"\"> <x \"y\">"),
+        ("#define V(...) [__VA_ARGS__]\n", "V() V(,)", "[] [,]"),
+        // No `__VA_OPT__`.
+        ("#define VO(a, ...) f(a __VA_OPT__(,) __VA_ARGS__)\n", "VO(x, y)", "f(x __VA_OPT__(,) y)"),
+        // As the standard's otherwise.
+        ("#define f(x) x f\n#define foo foo\n", "f(1)(2) foo", "1 f(2) foo"),
+        (
+            "#define BOOST_PP_CAT(a, b) BOOST_PP_CAT_I(a, b)\n#define BOOST_PP_CAT_I(a, b) BOOST_PP_CAT_II(~, a ## b)\n#define BOOST_PP_CAT_II(p, res) res\n#define AB(x) <ab x>\n",
+            "BOOST_PP_CAT(A, B)(3) BOOST_PP_CAT(F, (1, 2))",
+            "<ab 3> [1|2]",
+        ),
+    ];
+
+    /// Calls cl warns about (it takes missing arguments as empty and drops
+    /// extra ones: `G(PAIR)` is `[1, 2|]`), which fail here: the macros
+    /// (after `TRADITIONAL_DEFS`) and the calls.
+    pub(crate) const TRADITIONAL_REFUSED: (&str, &[&str]) = (
+        "#define G(x) F(x)\n#define V(...) F(__VA_ARGS__)\n#define W(x, y) F(x y)\n#define COMMA ,\n",
+        &["F(1)", "F(1, 2, 3)", "F()", "EXPAND(1, 2)", "G(PAIR)", "V(1, 2)", "W(1 COMMA, 2)"],
+    );
+
+    /// cl's traditional preprocessor, as `cl /E` expands these (cl 19.51;
+    /// `driver::tests::real_cl_traditional` checks them against cl).
+    #[test]
+    fn traditional_preprocessor() {
+        let spaced = |s: &str| spelled(&lex::tokens(s.as_bytes()));
+        for (more, text, want) in TRADITIONAL_CASES {
+            assert_eq!(traditional(&format!("{TRADITIONAL_DEFS}{more}"), text, false), Ok(spaced(want)), "{more}{text}");
+        }
+        let (more, refused) = TRADITIONAL_REFUSED;
+        for text in refused {
+            assert!(traditional(&format!("{TRADITIONAL_DEFS}{more}"), text, false).is_err(), "{text}");
+        }
+        // In `#if`.
+        let defs = "#define G(x, y) x + y\n#define ECHO(...) __VA_ARGS__\n#define EMPTYF()\n#define DEFER(m) m EMPTYF()\n#define PAIR 1, 2\n";
+        assert_eq!(traditional(&format!("{defs}#define G1 G ECHO((1, 2))\n"), "G1 == 3", true), Ok(spaced("1 + 2 == 3")));
+        assert_eq!(traditional(&format!("{defs}#define Q(x) DEFER(G)(x)\n"), "Q(PAIR) == 3", true), Ok(spaced("1 + 2 == 3")));
+        // Nested too deeply: an error, not the stack.
+        let deep: String = (0..300).map(|i| format!("#define D{i}(x) D{}(x)\n", i + 1)).collect();
+        assert!(traditional(&deep, "D0(1)", false).unwrap_err().contains("nested"));
     }
 
     #[test]
@@ -1111,6 +1587,46 @@ mod tests {
         assert_eq!(expand(defs, "F(1) F(1, 2, 3)", false), "f(1) f(1, 2, 3)");
         assert_eq!(expand(defs, "G(x) G(x, y)", false), "g(x) g(x, y)");
         assert_eq!(expand(defs, "H(x) H(x, y, z)", false), "h(x) h(x, y, z)");
+    }
+
+    /// `_Pragma`'s operand (C11 6.10.9): one quote off each end (and the
+    /// prefix), then `\"` and `\\` unescaped; a quote escaped at the end
+    /// stays.
+    #[test]
+    fn destringized() {
+        for (lit, text) in [
+            (r#""a\"b""#, r#"a"b"#),
+            (r#""GCC dependency \"f\"""#, r#"GCC dependency "f""#),
+            (r#"L"push_macro(\"M\")""#, r#"push_macro("M")"#),
+            (r#"u8"x\\""#, r"x\"),
+            (r#""\\\"""#, r#"\""#),
+            (r#""a\nb""#, r"a\nb"),
+            (r#""""#, ""),
+        ] {
+            assert_eq!(destringize(lit), text, "{lit}");
+        }
+    }
+
+    /// The comma before `__VA_ARGS__` left out, as GCC, Clang and cl drop
+    /// it (GCC 13, Clang 19 and 22, cl 19.51; the differential cases
+    /// `va_comma*` check them): not before one given empty (`G(a,)`).
+    #[test]
+    fn va_comma_rules() {
+        let defs = "#define E(...) g(x, __VA_ARGS__)\n#define F(a, ...) g(a, __VA_ARGS__)\n#define G(a, ...) g(a, ## __VA_ARGS__)\n#define H(...) g(x, ## __VA_ARGS__)\n";
+        let text = "E() F(a) F(a,) G(a) G(a,) H() H(y)";
+        let with = |va_comma: VaComma| {
+            let mut c = Ctx { va_comma, ..ctx(defs) };
+            let mut x = Expander::new(&mut c, false);
+            spelled(&x.expand_tokens(&lex::tokens(text.as_bytes())))
+        };
+        let spaced = |s: &str| spelled(&lex::tokens(s.as_bytes()));
+        // GCC's and Clang's GNU modes, cl's conforming preprocessor.
+        assert_eq!(with(VaComma::default()), spaced("g(x,) g(a,) g(a,) g(a) g(a,) g(x) g(x,y)"));
+        // GCC's strict modes, Clang's for C.
+        assert_eq!(with(VaComma { needs_named: true, bare: false }), spaced("g(x,) g(a,) g(a,) g(a) g(a,) g(x,) g(x,y)"));
+        // Clang's MSVC compatibility (clang-cl).
+        assert_eq!(with(VaComma { needs_named: false, bare: true }), spaced("g(x) g(a) g(a,) g(a) g(a,) g(x) g(x,y)"));
+        assert_eq!(with(VaComma { needs_named: true, bare: true }), spaced("g(x,) g(a) g(a,) g(a) g(a,) g(x,) g(x,y)"));
     }
 
     #[test]

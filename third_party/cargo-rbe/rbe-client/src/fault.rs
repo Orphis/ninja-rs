@@ -8,14 +8,54 @@ use std::error::Error;
 use std::sync::Arc;
 
 /// Calls (and connections) a service that never answered anything gets
-/// again when the connection broke after the other end said something over
-/// TLS (a server restarting, or one refusing the client's certificate
-/// without a word: see `Link::unheard`). One broken before (a load
-/// balancer restarting) gets as many as other calls, within the connect
-/// timeout; one there was no connection to, or that left a call
-/// unanswered, gets none: each would cost as much again (a refused
-/// connection takes Windows 2 s).
+/// again when the connection broke after something came from it over TLS
+/// (a server restarting), or when it only said it can't serve now (see
+/// `unavailable`). One broken before (a load balancer restarting; see
+/// `Contact::unheard`) gets as many as other calls, within the connect
+/// timeout; one there was no connection to, that left a call unanswered,
+/// or that refused the client's certificate, gets none: each would cost
+/// as much again (a refused connection takes Windows 2 s), or be refused
+/// the same way.
 pub const FIRST_CONTACT_RETRIES: u32 = 1;
+
+/// What a `ClientCertificateRefused` says, first: all that is left of it
+/// once the connection was made (h2 keeps an `io::Error`'s kind and words
+/// only).
+pub const CLIENT_CERTIFICATE_REFUSED: &str = "the connection broke once the server had asked for the client's certificate, before anything came from it";
+
+/// A connection over TLS that broke after the server asked for the
+/// client's certificate, and before anything came from the service (its
+/// HTTP/2 SETTINGS come at once otherwise): the server refused the
+/// certificate, and its alert saying why was lost (Windows resets the
+/// connection the server closed before the client read it), or never sent.
+/// Its cause is how it broke: the connection's error, or a call's on it.
+#[derive(Debug)]
+pub struct ClientCertificateRefused(pub Box<dyn Error + Send + Sync>);
+
+impl std::fmt::Display for ClientCertificateRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{CLIENT_CERTIFICATE_REFUSED}: it refused the certificate")
+    }
+}
+
+impl Error for ClientCertificateRefused {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// The CA that verified the server's certificate, refused by the client's
+/// check of it (see `crate::CaCheck`): why, in its words.
+#[derive(Clone, Debug)]
+pub struct CaRefused(pub String);
+
+impl std::fmt::Display for CaRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for CaRefused {}
 
 /// What a call left unanswered fails with (see `no_answer`), and a
 /// connection that couldn't be made in time: what tells them apart from
@@ -229,26 +269,37 @@ const CLIENT_CERTIFICATE_ALERTS: [rustls::AlertDescription; 8] = {
 /// Whether `e`, with its causes, is a certificate refused, and whose: a
 /// `Fault::Refused` that no other server, nor calling again, would fix.
 /// Told from rustls's error, which tokio-rustls wraps in an `io::Error`
-/// (reached with `get_ref`: that error's `source` skips it), or from its
-/// words, all that is left of it once the connection was made (h2 keeps
-/// an `io::Error`'s kind and words only). Not every refusal says so: a
-/// server may close the connection right after its alert, which Windows
-/// then resets before the client read it, or close it without one; that is
-/// a connection that broke (`Fault::Broke`).
+/// (reached with `get_ref`: that error's `source` skips it), from the
+/// client's own (`ClientCertificateRefused`, `CaRefused`), or from their
+/// words, all that is left of them once the connection was made (h2 keeps
+/// an `io::Error`'s kind and words only).
 pub fn certificate(e: &(dyn Error + 'static)) -> Option<Certificate> {
     let mut cause = Some(e);
     while let Some(c) = cause {
         if let Some(tls) = c.downcast_ref::<rustls::Error>() {
             return whose(tls);
         }
+        if c.is::<ClientCertificateRefused>() {
+            return Some(Certificate::Client);
+        }
+        if c.is::<CaRefused>() {
+            return Some(Certificate::Server);
+        }
         if let Some(io) = c.downcast_ref::<std::io::Error>()
-            && io.kind() == std::io::ErrorKind::InvalidData
             && let Some(inner) = io.get_ref()
         {
-            return match inner.downcast_ref::<rustls::Error>() {
-                Some(tls) => whose(tls),
-                None => whose_words(&inner.to_string()),
-            };
+            if let Some(tls) = inner.downcast_ref::<rustls::Error>() {
+                return whose(tls);
+            }
+            if inner.is::<ClientCertificateRefused>() || inner.to_string().starts_with(CLIENT_CERTIFICATE_REFUSED) {
+                return Some(Certificate::Client);
+            }
+            if inner.is::<CaRefused>() {
+                return Some(Certificate::Server);
+            }
+            if io.kind() == std::io::ErrorKind::InvalidData {
+                return whose_words(&inner.to_string());
+            }
         }
         cause = c.source();
     }
@@ -274,19 +325,21 @@ fn whose_words(text: &str) -> Option<Certificate> {
     (text.starts_with("invalid peer certificate: ") || text == "peer sent no certificates").then_some(Certificate::Server)
 }
 
-/// Whether `e` is the service saying it can't serve now: UNAVAILABLE from
-/// the server itself (a proxy without a healthy backend, a service
-/// shedding load), or as HTTP/2 says it (see `h2_answer`), and connections
-/// that broke after that (`Declined`). After the retries, as good as
-/// unreachable to a build that may do without it.
+/// Whether `e` is the service saying it can't serve now: UNAVAILABLE or
+/// RESOURCE_EXHAUSTED from the server itself (a proxy without a healthy
+/// backend, a service shedding load, out of quota: what ENHANCE_YOUR_CALM
+/// says in HTTP/2), or as HTTP/2 says it (see `h2_answer`), and
+/// connections that broke after that (`Declined`). After the retries, as
+/// good as unreachable to a build that may do without it.
 pub fn unavailable(e: &(dyn Error + 'static)) -> bool {
+    use tonic::Code::*;
     let mut cause = Some(e);
     while let Some(c) = cause {
         if c.is::<Declined>() {
             return true;
         }
         if let Some(s) = c.downcast_ref::<tonic::Status>() {
-            return (from_server(s) && s.code() == tonic::Code::Unavailable) || h2_answer(s) == Some(true);
+            return (from_server(s) && matches!(s.code(), Unavailable | ResourceExhausted)) || h2_answer(s) == Some(true);
         }
         cause = c.source();
     }
@@ -295,9 +348,10 @@ pub fn unavailable(e: &(dyn Error + 'static)) -> bool {
 
 /// `e` and its causes in words, for people: a gRPC status as its code and
 /// message (tonic's own words for one add the debug form of its causes,
-/// which follow anyway), and no cause saying what the level above it said
+/// which follow anyway), and no cause saying what a level above it said
 /// already (tonic's and hyper's connect errors both say "tcp connect
-/// error").
+/// error", hyper's and h2's "http2 error"), nor tonic's transport error
+/// saying only that, below what said more.
 pub fn describe(e: &(dyn Error + 'static)) -> String {
     let mut said: Vec<String> = Vec::new();
     let mut cause = Some(e);
@@ -306,7 +360,8 @@ pub fn describe(e: &(dyn Error + 'static)) -> String {
             Some(s) => status_words(s),
             None => c.to_string(),
         };
-        if !text.is_empty() && !said.last().is_some_and(|last| last.contains(&text)) {
+        let boilerplate = text == "transport error" && !said.is_empty();
+        if !text.is_empty() && !boilerplate && !said.iter().any(|above| above.contains(&text)) {
             said.push(text);
         }
         cause = c.source();
@@ -387,6 +442,8 @@ mod tests {
         assert!(unavailable(e.as_ref()));
         assert!(!unavailable(&status(io(std::io::ErrorKind::ConnectionReset))));
         assert!(!unavailable(&tonic::Status::permission_denied("no")));
+        // Out of quota, or shedding load, as ENHANCE_YOUR_CALM says it.
+        assert!(unavailable(&tonic::Status::resource_exhausted("quota exceeded")));
     }
 
     /// An error saying `text`, caused by `source`: a level of a chain.
@@ -478,6 +535,22 @@ mod tests {
         assert_eq!(describe(e.as_ref()), "GetCapabilities: DEADLINE_EXCEEDED: no answer within 3s (--remote_timeout)");
         assert_eq!(describe(&tonic::Status::unavailable("no healthy upstream")), "UNAVAILABLE: no healthy upstream");
         assert_eq!(describe(&tonic::Status::failed_precondition("")), "FAILED_PRECONDITION");
+        // Words said two levels up, or more, aren't said again, nor tonic's
+        // "transport error" below what said more.
+        let reset = level("tcp connect error", Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
+        let mut s = tonic::Status::unavailable("tcp connect error");
+        s.set_source(Arc::from(level("transport error", reset)));
+        let said = describe(&s);
+        assert_eq!(said.matches("tcp connect error").count(), 1, "{said}");
+        assert!(said.starts_with("UNAVAILABLE: tcp connect error: ") && !said.contains("transport error"), "{said}");
+        // Two levels apart, something else between them.
+        let mut s = tonic::Status::unknown("tcp connect error");
+        s.set_source(Arc::from(level("connection error", level("tcp connect error", Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))))));
+        let said = describe(&s);
+        assert_eq!(said.matches("tcp connect error").count(), 1, "{said}");
+        let mut s = tonic::Status::unknown("h2 protocol error: http2 error");
+        s.set_source(Arc::from(level("transport error", level("http2 error", "connection error detected: frame with invalid size".into()))));
+        assert_eq!(describe(&s), "UNKNOWN: h2 protocol error: http2 error: connection error detected: frame with invalid size");
     }
 
     /// Certificates refused are told from rustls's errors, wrapped in an
@@ -522,6 +595,19 @@ mod tests {
         let mut s = tonic::Status::unknown("transport error");
         s.set_source(Arc::new(Said("tls handshake timeout of rbe-timeouts.corp", "x".into())));
         assert_eq!(fault(&s), Fault::Broke);
+        // A connection broken once the server asked for the client's
+        // certificate, before anything came from it: refused, typed or (once
+        // the connection was made) in words.
+        let broken = std::io::Error::new(std::io::ErrorKind::ConnectionReset, ClientCertificateRefused(Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))));
+        let words = std::io::Error::new(std::io::ErrorKind::ConnectionReset, broken.get_ref().unwrap().to_string());
+        for e in [broken, words] {
+            let mut s = tonic::Status::unknown("transport error");
+            s.set_source(Arc::new(Said("connection error", Box::new(e))));
+            assert_eq!((certificate(&s), fault(&s)), (Some(Certificate::Client), Fault::Refused), "{}", describe(&s));
+        }
+        // The CA that verified the server's certificate, refused.
+        let ca = std::io::Error::new(std::io::ErrorKind::InvalidData, CaRefused("the CA expired".into()));
+        assert_eq!((certificate(&ca), fault(&ca)), (Some(Certificate::Server), Fault::Refused));
         // A connection reset carries no rustls error, nor does the server's
         // own answer.
         let mut reset = tonic::Status::unknown("transport error");

@@ -43,6 +43,9 @@ pub struct Task {
     /// (e.g. `rbe_local`, `rbe_mnemonic`, `rbe_target`), evaluated; empty values
     /// are omitted.
     pub bindings: Vec<(String, String)>,
+    /// The kind of slots the engine started it in, as
+    /// `CommandRunner::slots_of` told (0 for a runner of one kind).
+    pub slots: usize,
 }
 
 impl Task {
@@ -320,6 +323,12 @@ pub trait RemoteBackend: Send + Sync {
     fn execute(&self, task: Task) -> RemoteFuture;
     /// How many remote actions may be in flight.
     fn max_jobs(&self) -> usize;
+    /// Whether it runs tasks remotely. A cache alone (a disk cache, a
+    /// remote cache without remote execution) doesn't: it looks results up,
+    /// and a miss runs on the host, in a local slot.
+    fn executes(&self) -> bool {
+        true
+    }
     /// Before a task runs on the host: downloads its inputs that only exist
     /// remotely (outputs of remote actions that weren't downloaded).
     fn materialize(&self, _task: &Task) -> MaterializeFuture {
@@ -358,14 +367,18 @@ pub trait CommandRunner: Send {
     }
     /// Which kind of slots `task` would take, below `slot_kinds`, from its
     /// edge's bindings (its inputs aren't gathered yet), for
-    /// `has_free_slot`.
+    /// `has_free_slot`. Asked once per edge: the task started gets it as
+    /// `Task::slots`.
     fn slots_of(&self, _task: &Task) -> usize {
         0
     }
     /// Whether a task taking slots of `kind` may start now. One whose slots
     /// are all taken waits in the plan, other kinds starting meanwhile,
     /// rather than in the runner, where it would count as started (and its
-    /// wait in its times) and take room tasks of other kinds could use.
+    /// wait in its times) and take room tasks of other kinds could use. A
+    /// task waiting in the runner for slots of another kind than it started
+    /// in (one sent remotely running locally after all) counts as taking
+    /// those.
     fn has_free_slot(&self, _kind: usize) -> bool {
         true
     }

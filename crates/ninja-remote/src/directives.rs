@@ -1,7 +1,7 @@
 //! The linker directives of COFF objects and libraries: the options in
 //! their `.drectve` sections (`/DEFAULTLIB:msvcrt` from `/MD`, what
 //! `#pragma comment(lib, ...)` asks for), with which an MSVC link pulls in
-//! libraries its command line doesn't name (see `link::env_dirs_read`).
+//! libraries its command line doesn't name (see `link::env_files_read`).
 //!
 //! Objects are COFF files (regular or `/bigobj`); libraries are archives of
 //! them and of import objects, which have no directives, and resource files
@@ -17,8 +17,10 @@ const MEMBER_HEADER: usize = 60;
 /// The class of `/bigobj` objects' header.
 const BIGOBJ_CLASS: [u8; 16] = [0xc7, 0xa1, 0xba, 0xd1, 0xee, 0xba, 0xa9, 0x4b, 0xaf, 0x20, 0xfa, 0xf6, 0x6a, 0xa4, 0xdc, 0xb8];
 /// The machines of COFF objects (x86, x64, ARM, ARM64 and its EC and X
-/// kinds): other first bytes aren't one.
-const MACHINES: &[u16] = &[0x014c, 0x8664, 0x01c4, 0xaa64, 0xa641, 0xa64e];
+/// kinds), and none (`IMAGE_FILE_MACHINE_UNKNOWN`: an object for any, as
+/// MSVC's runtime libraries hold, `msvcrt.lib`'s and `oldnames.lib`'s
+/// among them): other first bytes aren't one.
+const MACHINES: &[u16] = &[0x014c, 0x8664, 0x01c4, 0xaa64, 0xa641, 0xa64e, 0];
 /// A resource file starts with an empty resource.
 const RES_HEADER: [u8; 16] = [0, 0, 0, 0, 0x20, 0, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0];
 
@@ -108,7 +110,8 @@ fn object<R: Read + Seek>(f: &mut R, start: u64, len: u64) -> std::io::Result<Op
             _ => return Ok(None),
         }
     } else {
-        // Objects have no optional header.
+        // Objects have no optional header. (Machine 0 with 0xffff sections
+        // is the header above.)
         if !MACHINES.contains(&u16_at(head, 0)) || u16_at(head, 16) != 0 {
             return Ok(None);
         }
@@ -161,8 +164,13 @@ pub(crate) mod tests {
 
     /// A COFF object (x64) with these sections: (name, contents).
     pub(crate) fn coff(sections: &[(&str, &[u8])]) -> Vec<u8> {
+        coff_for(0x8664, sections)
+    }
+
+    /// A COFF object for `machine` with these sections.
+    pub(crate) fn coff_for(machine: u16, sections: &[(&str, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend(0x8664u16.to_le_bytes());
+        out.extend(machine.to_le_bytes());
         out.extend((sections.len() as u16).to_le_bytes());
         out.extend([0u8; 12]);
         out.extend(0u16.to_le_bytes());
@@ -216,6 +224,13 @@ pub(crate) mod tests {
         let lib = archive(&[("kernel32.dll/", &import), ("a.obj/", &obj), ("p.obj/", &pragma)]);
         let options = read_bytes("x.lib", &lib).unwrap();
         assert_eq!(default_libs(&options).collect::<Vec<_>>(), ["MSVCRT", "OLDNAMES", "ws2_32.lib"]);
+        // Objects for any machine (Machine 0), as msvcrt.lib's: their
+        // directives too.
+        let any = coff_for(0, &[(".drectve", b" /DEFAULTLIB:\"vcruntime\""), (".data", b"\0\0\0\0")]);
+        let lib = archive(&[("msvcrt.dll/", &import), ("any.obj/", &any), ("a.obj/", &obj)]);
+        let options = read_bytes("msvcrt.lib", &lib).unwrap();
+        assert_eq!(default_libs(&options).collect::<Vec<_>>(), ["vcruntime", "MSVCRT", "OLDNAMES"]);
+        assert_eq!(read_bytes("any.obj", &coff_for(0, &[(".data", b"\0")])), Some(vec![]));
         // Resources have none.
         assert_eq!(read_bytes("a.res", &[RES_HEADER.as_slice(), &[0u8; 16]].concat()), Some(vec![]));
         // What can't be read: LTO bitcode, other files, a broken object.

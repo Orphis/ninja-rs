@@ -13,25 +13,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
-use harness::{ninja_exe, test_dir};
+use harness::{hermetic, ninja_exe, test_dir};
 use ninja_rs::jobserver;
 
 struct Run {
     code: i32,
     stdout: String,
     stderr: String,
-}
-
-/// Leaves out of `c`'s environment what would change how ninja-rs runs
-/// (`MAKEFLAGS`, `NINJA_STATUS`, an outer invocation's, the daemon's).
-fn hermetic(c: &mut Command) -> &mut Command {
-    c.env_remove("MAKEFLAGS").env_remove("NINJA_STATUS");
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("NINJA_RS_") {
-            c.env_remove(name);
-        }
-    }
-    c
 }
 
 /// ninja-rs in `dir`, hermetic, without the settings files of the machine
@@ -218,7 +206,7 @@ fn test_concurrent_builds() -> Result<(), String> {
     manifest("ha.h", "hb.h");
     let start = |target: &str| {
         let mut c = command(&dir);
-        c.arg(target).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()
+        harness::spawn(c.arg(target).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())).unwrap()
     };
     let (a, b) = (start("a"), start("b"));
     let (a, b) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
@@ -394,6 +382,7 @@ fn fake_gen(args: &[String]) -> i32 {
         if scrub {
             c.env_remove(ninja_rs::nested::LOGS_LOCK_ENV);
         }
+        // A tool's child, not a test's process.
         match c.args(tool).status() {
             Ok(s) if s.success() => {}
             Ok(s) => return s.code().unwrap_or(1),
@@ -469,7 +458,7 @@ fn test_restat_waits_on_stderr() -> Result<(), String> {
         harness::wait_for("the build's command", || dir.join("held.started").exists())?;
         let mut restat = command(&dir);
         restat.args(["-t", "restat", "held"]).stdout(std::fs::File::create(dir.join("restat.out")).unwrap());
-        let mut restat = restat.stderr(std::fs::File::create(dir.join("restat.err")).unwrap()).spawn().map_err(|e| e.to_string())?;
+        let mut restat = harness::spawn(restat.stderr(std::fs::File::create(dir.join("restat.err")).unwrap())).map_err(|e| e.to_string())?;
         let said = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
         let waiting = || said("restat.err").contains("waiting for") || said("restat.out").contains("waiting for");
         let waited = harness::wait_for("-t restat waiting", || waiting() || restat.try_wait().is_ok_and(|s| s.is_some()));
@@ -484,6 +473,85 @@ fn test_restat_waits_on_stderr() -> Result<(), String> {
     let status = wait_exit(&mut holder, "the build")?;
     result?;
     check(status.success(), &format!("the build: {status}"))
+}
+
+/// The lock file names an ancestor of a build by its id, but as another
+/// process (a lock file left behind, the id reused since; the id in another
+/// pid namespace, a container sharing the directory): the build waits for
+/// the lock as for any other build. (It took the ancestor for the holder,
+/// and ran at once, beside the build holding the lock.)
+fn test_holder_with_an_ancestors_id() -> Result<(), String> {
+    let dir = test_dir("holder_ancestors_id");
+    let (wait, cl) = (tool(&dir, "fake-wait"), tool(&dir, "fake-cl"));
+    std::fs::write(
+        dir.join("build.ninja"),
+        format!("rule wait\n  command = {wait} $out\nbuild held: wait\nrule touch\n  command = {cl} gen $out\nbuild other: touch\n"),
+    )
+    .unwrap();
+    let mut holder = start_ninja(&dir, "holder", &["held"]);
+    let mut second = None;
+    let result = (|| {
+        harness::wait_for("the build's command", || dir.join("held.started").exists())?;
+        // This process, the next build's parent, started at another time.
+        std::fs::write(dir.join(".ninja_rs_lock"), format!("{} 0 1 0\n", std::process::id())).unwrap();
+        let second = second.insert(start_ninja(&dir, "second", &["other"]));
+        let said = || std::fs::read_to_string(dir.join("second.txt")).unwrap_or_default();
+        harness::wait_for("the second build waiting", || said().contains("waiting for") || second.try_wait().is_ok_and(|s| s.is_some()))?;
+        check(!dir.join("other").exists(), &format!("the second build ran beside the one holding the lock: {}", said()))?;
+        check(said().contains(&format!("waiting for the build running in this directory (pid {}, ", std::process::id())), &said())
+    })();
+    std::fs::write(dir.join("release"), "").unwrap();
+    let status = wait_exit(&mut holder, "the build")?;
+    let second = second.map(|mut s| wait_exit(&mut s, "the second build")).transpose()?;
+    result?;
+    check(status.success() && second.is_some_and(|s| s.success()) && dir.join("other").exists(), "a build failed")
+}
+
+/// Two builds in one directory, each in a pid namespace of its own (two
+/// containers sharing a workspace): the second waits for the first, though
+/// the pid the lock file names is, in its namespace, its parent's. (It took
+/// its parent for the holder, and ran at once.) Needs pid namespaces an
+/// unprivileged user may make (`unshare -r`).
+#[cfg(target_os = "linux")]
+fn test_holder_in_another_pid_namespace() -> Result<(), String> {
+    let dir = test_dir("holder_pid_namespace");
+    let unshare = |dir: &Path, script: &str, out: &str| {
+        let mut c = Command::new("unshare");
+        hermetic(&mut c).current_dir(dir).args(["-r", "--pid", "--fork", "--mount-proc", "sh", "-c", script]);
+        let file = std::fs::File::create(dir.join(out)).unwrap();
+        c.stdout(file.try_clone().unwrap()).stderr(file);
+        harness::spawn(&mut c)
+    };
+    let probe = unshare(&dir, "true", "probe.txt").and_then(|mut c| c.wait());
+    if !probe.is_ok_and(|s| s.success()) {
+        harness::not_tested(&format!("no pid namespace: {}", std::fs::read_to_string(dir.join("probe.txt")).unwrap_or_default().trim()));
+        return Ok(());
+    }
+    let (wait, cl) = (tool(&dir, "fake-wait"), tool(&dir, "fake-cl"));
+    std::fs::write(
+        dir.join("build.ninja"),
+        format!("rule wait\n  command = {wait} $out\nbuild held: wait\nrule touch\n  command = {cl} gen $out\nbuild other: touch\n"),
+    )
+    .unwrap();
+    let ninja = format!("{} --ignore_all_rc_files", ninja_command());
+    // In the first namespace, the shell is 1 and the build 2; in the
+    // second, the shells are 1 and 2, and the build 3.
+    let mut first = unshare(&dir, &format!("{ninja} held; true"), "first.txt").map_err(|e| e.to_string())?;
+    let mut second = None;
+    let result = (|| {
+        harness::wait_for("the first build's command", || dir.join("held.started").exists())?;
+        let lock = std::fs::read_to_string(dir.join(".ninja_rs_lock")).unwrap_or_default();
+        check(lock.starts_with("2 "), &format!("the lock file: {lock}"))?;
+        let second = second.insert(unshare(&dir, &format!("sh -c '{ninja} other; true'; true"), "second.txt").map_err(|e| e.to_string())?);
+        let said = || std::fs::read_to_string(dir.join("second.txt")).unwrap_or_default();
+        harness::wait_for("the second build waiting", || said().contains("waiting for") || second.try_wait().is_ok_and(|s| s.is_some()))?;
+        check(!dir.join("other").exists(), &format!("the second build ran beside the first: {}", said()))
+    })();
+    std::fs::write(dir.join("release"), "").unwrap();
+    let status = wait_exit(&mut first, "the first build")?;
+    let second = second.map(|mut s| wait_exit(&mut s, "the second build")).transpose()?;
+    result?;
+    check(status.success() && second.is_some_and(|s| s.success()) && dir.join("other").exists(), "a build failed")
 }
 
 /// `fake-wait OUT`: says it runs (`OUT.started`), waits for a `release`
@@ -539,7 +607,7 @@ fn test_interrupt_while_waiting_for_the_lock() -> Result<(), String> {
                 .stdin(std::process::Stdio::piped());
             let out = std::fs::File::create(dir.join("waiter.txt")).unwrap();
             c.stdout(out.try_clone().unwrap()).stderr(out);
-            c.spawn().map_err(|e| e.to_string())?
+            harness::spawn(&mut c).map_err(|e| e.to_string())?
         };
         let said = || std::fs::read_to_string(dir.join("waiter.txt")).unwrap_or_default().replace("\r\n", "\n");
         let waiting = format!("waiting for the build running in this directory (pid {}, started ", holder.id());
@@ -646,7 +714,7 @@ fn test_write_errors() -> Result<(), String> {
     let closed = |dir: &Path, args: &[&str]| -> Result<(std::process::ExitStatus, String), String> {
         let mut c = command(dir);
         c.args(args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-        let mut child = c.spawn().map_err(|e| e.to_string())?;
+        let mut child = harness::spawn(&mut c).map_err(|e| e.to_string())?;
         // Closed before anything is read.
         drop(child.stdout.take());
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
@@ -686,7 +754,7 @@ fn test_messages_to_a_closed_stderr() -> Result<(), String> {
     c.args(["--disk_cache=cache", "--remote_verbose", "-j2"])
         .stdout(std::fs::File::create(dir.join("stdout.txt")).unwrap())
         .stderr(std::process::Stdio::piped());
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let mut child = harness::spawn(&mut c).map_err(|e| e.to_string())?;
     // Closed before anything is read.
     drop(child.stderr.take());
     let status = wait_exit(&mut child, "the build")?;
@@ -706,7 +774,7 @@ fn test_answers_without_settings() -> Result<(), String> {
     let run = |args: &[&str]| {
         let mut c = Command::new(ninja_exe());
         hermetic(&mut c).current_dir(&dir).args(["--nosystem_rc", "--nohome_rc"]).args(args);
-        let out = c.output().unwrap();
+        let out = harness::output(&mut c).unwrap();
         Run { code: out.status.code().unwrap_or(-1), stdout: String::from_utf8_lossy(&out.stdout).into(), stderr: String::from_utf8_lossy(&out.stderr).into() }
     };
     std::fs::write(dir.join(".ninjars"), "build --verbose\n").unwrap();
@@ -830,7 +898,7 @@ fn test_interrupt_outside_the_build() -> Result<(), String> {
     c.args([format!("--remote_executor=grpc://127.0.0.1:{port}").as_str(), "--remote_header=x=y", "--build_event_binary_file=events.bin"]);
     c.env("NINJA_RS_DAEMON_DIR", &private);
     c.stdout(std::fs::File::create(dir.join("stdout.txt")).unwrap()).stderr(std::fs::File::create(dir.join("stderr.txt")).unwrap());
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let mut child = harness::spawn(&mut c).map_err(|e| e.to_string())?;
     if connecting.recv_timeout(harness::PATIENCE).is_err() {
         let _ = child.kill();
         return Err("ninja-rs didn't connect".into());
@@ -868,7 +936,7 @@ fn test_exec_forwards_signals() -> Result<(), String> {
     let script = "trap 'echo > got-term; exit 7' TERM; echo > ready; while :; do sleep 0.1; done";
     let mut c = command(&dir);
     c.args(["-t", "exec", "sh", "-c", script]);
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let mut child = harness::spawn(&mut c).map_err(|e| e.to_string())?;
     harness::wait_for("the command running", || dir.join("ready").exists() || child.try_wait().is_ok_and(|s| s.is_some()))?;
     // SAFETY: plain system call.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
@@ -907,7 +975,7 @@ fn test_exec_forwards_sigint_from_processes() -> Result<(), String> {
                 Ok(())
             });
         }
-        let mut child = c.spawn().map_err(|e| e.to_string())?;
+        let mut child = harness::spawn_leader(&mut c).map_err(|e| e.to_string())?;
         harness::wait_for("the command running", || dir.join("ready").exists() || child.try_wait().is_ok_and(|s| s.is_some()))?;
         // SAFETY: plain system call.
         unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
@@ -979,10 +1047,9 @@ fn test_daemon_pipes() -> Result<(), String> {
     std::fs::write(dir.join("build.ninja"), "rbe_version = 1\nbuild all: phony\n").unwrap();
     let daemon_dir = dir.join("daemon");
     let env = [("NINJA_RS_DAEMON_DIR", daemon_dir.to_str().unwrap()), ("NINJA_RS_DAEMON_IDLE", "600")];
-    let mut c = Command::new(ninja_exe());
-    c.current_dir(&dir).args(["--ignore_all_rc_files", "--daemon", "--disk_cache=cache"]).envs(env);
-    c.env_remove("MAKEFLAGS").env_remove("NINJA_STATUS").env_remove(ninja_rs::nested::ENV);
-    let mut child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+    let mut c = command(&dir);
+    c.args(["--daemon", "--disk_cache=cache"]).envs(env);
+    let mut child = harness::spawn(c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())).map_err(|e| e.to_string())?;
     let (tx, rx) = std::sync::mpsc::channel();
     let pipes: [Box<dyn Read + Send>; 2] = [Box::new(child.stdout.take().unwrap()), Box::new(child.stderr.take().unwrap())];
     for mut pipe in pipes {
@@ -1213,7 +1280,7 @@ fn test_terminal_status() -> Result<(), String> {
             Some(t) => c.env("TERM", t),
             None => c.env_remove("TERM"),
         };
-        let status = c.status().map_err(|e| e.to_string())?;
+        let status = harness::status(&mut c).map_err(|e| e.to_string())?;
         // The terminal closed (the end of the output, then EIO).
         drop(c);
         let mut out = Vec::new();
@@ -1251,6 +1318,7 @@ fn console_screen(args: &[String]) -> i32 {
         SetConsoleMode(handle, mode & !ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     }
     let (Ok(stdout), Ok(stderr)) = (console.try_clone(), console.try_clone()) else { return 1 };
+    // A tool's child, not a test's process.
     let code = Command::new(&args[0]).args(&args[1..]).stdout(stdout).stderr(stderr).status().map_or(1, |s| s.code().unwrap_or(1));
     let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
     // SAFETY: as above.
@@ -1284,7 +1352,7 @@ fn test_console_status() -> Result<(), String> {
     for var in ["TERM", "NO_COLOR", "CLICOLOR_FORCE", "FORCE_COLOR"] {
         c.env_remove(var);
     }
-    let out = c.output().map_err(|e| e.to_string())?;
+    let out = harness::output(&mut c).map_err(|e| e.to_string())?;
     let screen = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
     let width = screen.lines().next().and_then(|l| l.strip_prefix("escapes true width ")?.parse::<usize>().ok());
     let width = width.ok_or_else(|| format!("escape sequences not turned on:\n{screen}"))?;
@@ -1389,23 +1457,32 @@ fn fake_sleep(args: &[String]) -> i32 {
 }
 
 /// The harness: a test still running at the end of `TEST_TIMEOUT` fails,
-/// and what it started through the harness (`fake-sleep`, for longer than
-/// the tests wait) doesn't outlive the tests' binary.
+/// and what it started through the harness doesn't outlive the tests'
+/// binary: `fake-sleep` (for longer than the tests wait), and a ninja-rs
+/// with its command (`fake-sleep` again), which killing ninja-rs alone
+/// leaves running.
 fn test_watchdog_kills_what_tests_start() -> Result<(), String> {
+    let sleeper = if cfg!(windows) { "fake-sleep.exe" } else { "fake-sleep" };
     // This test again, in the binary that times out.
     if let Some(out) = std::env::var_os("HARNESS_TIMES_OUT") {
-        let sleep = Path::new(&out).with_file_name(if cfg!(windows) { "fake-sleep.exe" } else { "fake-sleep" });
-        harness::spawn(Command::new(sleep).arg(&out)).map_err(|e| e.to_string())?;
+        let dir = Path::new(&out).parent().unwrap();
+        harness::spawn(Command::new(dir.join(sleeper)).arg(&out)).map_err(|e| e.to_string())?;
+        let build = dir.join("build");
+        let said = std::fs::File::create(build.join("out.txt")).unwrap();
+        harness::spawn(command(&build).stdout(said.try_clone().unwrap()).stderr(said)).map_err(|e| e.to_string())?;
         std::thread::sleep(2 * harness::PATIENCE);
         return Err("not stopped".into());
     }
     let dir = test_dir("watchdog");
-    harness::link_self(&dir.join(if cfg!(windows) { "fake-sleep.exe" } else { "fake-sleep" }));
+    harness::link_self(&dir.join(sleeper));
     std::fs::create_dir_all(dir.join("tmp")).unwrap();
+    std::fs::create_dir_all(dir.join("build")).unwrap();
+    let manifest = format!("rule slow\n  command = \"{}\" $out\nbuild cmd: slow\n", dir.join(sleeper).display());
+    std::fs::write(dir.join("build/build.ninja"), manifest).unwrap();
     let out = dir.join("sleep");
     let mut c = Command::new(std::env::current_exe().unwrap());
-    // Its own directories in this test's; a deadline 5 s after it starts.
-    c.args(["--exact", "watchdog_kills_what_tests_start"]).env("HARNESS_TIMES_OUT", &out).env("TEST_TMPDIR", dir.join("tmp")).env("TEST_TIMEOUT", "10");
+    // Its own directories in this test's; a deadline 15 s after it starts.
+    c.args(["--exact", "watchdog_kills_what_tests_start"]).env("HARNESS_TIMES_OUT", &out).env("TEST_TMPDIR", dir.join("tmp")).env("TEST_TIMEOUT", "20");
     for name in ["XML_OUTPUT_FILE", "TESTBRIDGE_TEST_ONLY", "TEST_TOTAL_SHARDS", "TEST_SHARD_INDEX", "TEST_SHARD_STATUS_FILE"] {
         c.env_remove(name);
     }
@@ -1415,12 +1492,15 @@ fn test_watchdog_kills_what_tests_start() -> Result<(), String> {
     let code = harness::status(&mut c).map_err(|e| e.to_string())?.code();
     let said = std::fs::read_to_string(dir.join("said.txt")).unwrap_or_default();
     check(code == Some(1) && said.contains("watchdog_kills_what_tests_start ... FAILED: still running"), &format!("not failed in time: {said}"))?;
-    let Ok(pid) = std::fs::read_to_string(dir.join("sleep.pid")) else {
-        harness::not_tested("fake-sleep didn't start before the deadline");
-        return Ok(());
-    };
-    let pid: u32 = pid.trim().parse().map_err(|e| format!("sleep.pid: {e}"))?;
-    harness::wait_for("fake-sleep killed", || !harness::alive(pid))
+    for (pid, what) in [("sleep.pid", "fake-sleep"), ("build/cmd.pid", "ninja-rs's command")] {
+        let Ok(pid) = std::fs::read_to_string(dir.join(pid)) else {
+            harness::not_tested(&format!("{what} didn't start before the deadline"));
+            continue;
+        };
+        let pid: u32 = pid.trim().parse().map_err(|e| format!("{what}: {e}"))?;
+        harness::wait_for(&format!("{what} killed"), || !harness::alive(pid))?;
+    }
+    Ok(())
 }
 
 /// Starts (with `launch`, given the test's directory) a build of two
@@ -1448,7 +1528,7 @@ fn interrupted_build(
     let captured = stdout.is_none();
     c.stdout(stdout.unwrap_or_else(|| std::fs::File::create(dir.join("stdout.txt")).unwrap()));
     c.stderr(std::fs::File::create(dir.join("stderr.txt")).unwrap());
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let mut child = harness::spawn(&mut c).map_err(|e| e.to_string())?;
     let started = || dir.join("a.pid").exists() && dir.join("b.pid").exists();
     let running = harness::wait_for("the commands running", || started() || child.try_wait().is_ok_and(|s| s.is_some()))
         .and_then(|()| if started() { Ok(()) } else { Err("ninja-rs exited before its commands ran".into()) });
@@ -1530,6 +1610,7 @@ fn console_host(args: &[String]) -> i32 {
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
     use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+    // A tool's child, not a test's process.
     let mut child = match Command::new(&args[0]).args(&args[1..]).stdin(std::process::Stdio::null()).creation_flags(CREATE_NEW_PROCESS_GROUP).spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1615,6 +1696,7 @@ fn main() -> ExitCode {
         ("jobserver_client", test_jobserver_client),
         ("ninjars", test_ninjars),
         ("watchdog_kills_what_tests_start", test_watchdog_kills_what_tests_start),
+        ("launches_through_the_harness", || harness::launches_through_the_harness(include_str!("cli_e2e.rs"))),
         ("build_event_digests", test_build_event_digests),
         ("concurrent_builds", test_concurrent_builds),
         ("nested_build_appends_only", test_nested_build_appends_only),
@@ -1623,6 +1705,7 @@ fn main() -> ExitCode {
         ("generator_under_the_lock", test_generator_under_the_lock),
         ("generator_without_the_lock_variable", test_generator_without_the_lock_variable),
         ("restat_waits_on_stderr", test_restat_waits_on_stderr),
+        ("holder_with_an_ancestors_id", test_holder_with_an_ancestors_id),
         ("interrupt_while_waiting_for_the_lock", test_interrupt_while_waiting_for_the_lock),
         ("clean_keeps_other_remote_records", test_clean_keeps_other_remote_records),
         ("recompaction_keeps_other_manifests_records", test_recompaction_keeps_other_manifests_records),
@@ -1646,6 +1729,8 @@ fn main() -> ExitCode {
     tests.push(("exec_forwards_signals", test_exec_forwards_signals));
     #[cfg(target_os = "linux")]
     tests.push(("exec_forwards_sigint_from_processes", test_exec_forwards_sigint_from_processes));
+    #[cfg(target_os = "linux")]
+    tests.push(("holder_in_another_pid_namespace", test_holder_in_another_pid_namespace));
     #[cfg(windows)]
     tests.push(("msvc_deps_relative", test_msvc_deps_relative));
     #[cfg(windows)]

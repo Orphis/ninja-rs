@@ -161,7 +161,13 @@ pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> 
     let mut cmd = Command::new(program);
     cmd.args(&args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
     let out = run(cmd, program)?;
-    Ok(absolute(make_deps(&String::from_utf8_lossy(&out.stdout)), cwd))
+    let deps = absolute(make_deps(&String::from_utf8_lossy(&out.stdout)), cwd);
+    // (A compile reads its source at least: one that lists nothing didn't
+    // run as asked.)
+    if deps.is_empty() {
+        return Err(format!("{program} listed no dependencies"));
+    }
+    Ok(deps)
 }
 
 /// Splits a Windows command line into arguments following the
@@ -383,23 +389,24 @@ mod tests {
     #[test]
     fn cl_dependency_file_flags() {
         let dir = test_dirs::TestDir::new("cpp_deps_external_cl_flags");
-        let compiler = if cfg!(windows) {
-            let c = dir.join("clang-cl.cmd");
-            std::fs::write(&c, "@echo %*> \"%~dp0args.txt\"\r\n").unwrap();
-            c
-        } else {
-            let c = dir.join("clang-cl");
-            std::fs::write(&c, "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/args.txt\"\n").unwrap();
-            #[cfg(unix)]
-            std::fs::set_permissions(&c, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-            c
-        };
+        let compiler = crate::test_tool(&dir, "clang-cl", "@echo %*> \"%~dp0args.txt\"\r\n", "echo \"$@\" > \"$(dirname \"$0\")/args.txt\"\n");
         std::fs::write(dir.join("main.cc"), "").unwrap();
         let argv =
             s(&[&compiler.to_string_lossy(), "/nologo", "-clang:-MD", "-clang:-MTx.obj", "/clang:-MF", "/clang:x.obj.d", "/Fox.obj", "-c", "--", "main.cc"]);
         assert_eq!(compiler_deps(&argv, &dir, None).unwrap(), vec![dir.join("main.cc")]);
         let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
         assert_eq!(args.split_whitespace().collect::<Vec<_>>(), ["/nologo", "/E", "/showIncludes", "--", "main.cc"]);
+    }
+
+    /// A compiler that runs fine but lists nothing (one that ignores `-M`):
+    /// no list, rather than one without the compile's headers.
+    #[test]
+    fn nothing_listed() {
+        let dir = test_dirs::TestDir::new("cpp_deps_external_nothing");
+        let compiler = crate::test_tool(&dir, "cc", "@exit /b 0\r\n", "exit 0\n");
+        std::fs::write(dir.join("main.c"), "#include \"a.h\"\n").unwrap();
+        let e = compiler_deps(&s(&[&compiler.to_string_lossy(), "-c", "main.c"]), &dir, None).unwrap_err();
+        assert!(e.contains("listed no dependencies"), "{e}");
     }
 
     /// Against real compilers: `CPP_DEPS_TEST_CXX`, a GCC or Clang (with

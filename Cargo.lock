@@ -209,9 +209,11 @@ dependencies = [
  "hex",
  "prost",
  "rbe-bes",
+ "rustls",
  "sha2",
  "test-dirs",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "zstd",
@@ -963,8 +965,10 @@ dependencies = [
  "sha2",
  "test-dirs",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
+ "webpki-roots",
  "zstd",
 ]
 

@@ -715,7 +715,7 @@ impl ProcessTree {
         #[cfg(windows)]
         {
             let process = child.raw_handle().ok_or_else(|| std::io::Error::other("no process handle"))?;
-            Ok(Self { job: job::Job::start(process)?, group: child.id() })
+            Ok(Self { job: Some(job::Job::start(process)?), group: child.id() })
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -773,9 +773,11 @@ impl ProcessTree {
             // SAFETY: plain system call; signal 0 only checks the group.
             return unsafe { libc::killpg(g, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
         }
+        // One that can't be asked may run: the stop waits for it as long
+        // as for one running.
         #[cfg(windows)]
         if let Some(job) = &self.job {
-            return job.active_processes() > 0;
+            return job.active_processes().is_none_or(|n| n > 0);
         }
         false
     }
@@ -915,22 +917,23 @@ mod job {
     pub struct Job(OwnedHandle);
 
     impl Job {
-        /// Puts `process`, created suspended, in a new job (when it can),
-        /// then resumes it.
-        pub fn start(process: RawHandle) -> std::io::Result<Option<Job>> {
-            let job = Self::with_process(process);
+        /// Puts `process`, created suspended, in a new job, then resumes
+        /// it. One that can't join a job isn't resumed: stopping it
+        /// couldn't reach what it starts, nor tell when they're gone.
+        pub fn start(process: RawHandle) -> std::io::Result<Job> {
+            let job = Self::with_process(process).map_err(|e| std::io::Error::new(e.kind(), format!("putting the command in a job: {e}")))?;
             // SAFETY: a valid process handle, with all access rights.
             unsafe { ninja_os::process::resume(process) }?;
             Ok(job)
         }
 
-        fn with_process(process: RawHandle) -> Option<Job> {
+        fn with_process(process: RawHandle) -> std::io::Result<Job> {
             // SAFETY: a new anonymous job, owned from then on, and a valid
             // process handle.
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if job.is_null() {
-                    return None;
+                    return Err(std::io::Error::last_os_error());
                 }
                 let job = OwnedHandle::from_raw_handle(job);
                 // A process asking to leave the job (a server, as with
@@ -947,9 +950,9 @@ mod job {
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                 );
                 if AssignProcessToJobObject(job.as_raw_handle(), process) == 0 {
-                    return None;
+                    return Err(std::io::Error::last_os_error());
                 }
-                Some(Job(job))
+                Ok(Job(job))
             }
         }
 
@@ -958,7 +961,8 @@ mod job {
             unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
         }
 
-        pub fn active_processes(&self) -> u32 {
+        /// How many of its processes run, if it can be asked.
+        pub fn active_processes(&self) -> Option<u32> {
             let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
             // SAFETY: the handle is open; the buffer has the class's size.
             let ok = unsafe {
@@ -970,7 +974,7 @@ mod job {
                     std::ptr::null_mut(),
                 )
             };
-            if ok == 0 { 0 } else { info.ActiveProcesses }
+            (ok != 0).then_some(info.ActiveProcesses)
         }
     }
 
@@ -983,7 +987,7 @@ mod job {
         #[test]
         fn suspended_command_joins_a_job_that_allows_breakaway() {
             let mut child = std::process::Command::new("cmd").args(["/c", "exit 3"]).creation_flags(CREATION_FLAGS).spawn().unwrap();
-            let job = Job::start(child.as_raw_handle()).unwrap().expect("a job");
+            let job = Job::start(child.as_raw_handle()).unwrap();
             assert_eq!(child.wait().unwrap().code(), Some(3));
             let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             // SAFETY: the handle is open; the buffer has the class's size.
@@ -1110,29 +1114,7 @@ mod tests {
 
     /// Whether process `pid` still runs (a zombie doesn't).
     fn alive(pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            // SAFETY: signal 0 only checks that the process exists.
-            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
-                return false;
-            }
-            process_state(pid).is_none_or(|s| s != 'Z')
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
-            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
-            // SAFETY: plain system calls; the handle is owned (closed) below.
-            unsafe {
-                let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-                if h.is_null() {
-                    return false;
-                }
-                let h = OwnedHandle::from_raw_handle(h);
-                WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT
-            }
-        }
+        ninja_os::process_running(pid) == Some(true)
     }
 
     /// Whether process `pid` is gone once a stop returned: at once on POSIX
@@ -1381,8 +1363,12 @@ mod tests {
             let ran = tokio::spawn(async move { run_local_command_env(&sleeper_command(), false, &env, &s).await });
             until_exists(&pid_file).await;
             tokio::time::timeout(PATIENCE, stop.stop(None)).await.expect("the stop didn't end the command");
-            assert!(ran.is_finished());
+            // The sleeper noted Ctrl-Break before it ended, which the stop
+            // waited for. (The command's task may end a moment after: on
+            // this runtime, another thread completes it.)
             assert!(pid_file.with_extension("got").exists(), "the command didn't get Ctrl-Break");
+            assert!(gone(read_pid(&pid_file)).await, "the sleeper kept running");
+            assert_eq!(ran.await.unwrap().0, ExitStatus::Interrupted);
 
             // The command's own process going on after Ctrl-Break (`cmd`
             // waiting for the sleeper, which ignores it).

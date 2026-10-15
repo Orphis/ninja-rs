@@ -7,10 +7,13 @@ use std::fs::File;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_LOCK_VIOLATION, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, ERROR_LOCK_VIOLATION, FILETIME, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TokenUser,
@@ -24,7 +27,10 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE_TYPE,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    WaitForSingleObject,
+};
 
 /// The SID of everyone.
 pub const EVERYONE: &str = "S-1-1-0";
@@ -101,6 +107,48 @@ pub(crate) fn unlock(f: &File) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// See `crate::process_info`: the parent from `NtQueryInformationProcess` (a
+/// snapshot of every process, Toolhelp's, takes tens of milliseconds), the
+/// start from `GetProcessTimes`.
+pub(crate) fn process_info(pid: u32) -> Option<crate::ProcessInfo> {
+    // SAFETY: plain system calls; the handle is owned (closed) below, and
+    // the buffers are writable for the sizes given.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let h = OwnedHandle::from_raw_handle(h);
+        let mut info = PROCESS_BASIC_INFORMATION::default();
+        let size = size_of::<PROCESS_BASIC_INFORMATION>() as u32;
+        if NtQueryInformationProcess(h.as_raw_handle(), ProcessBasicInformation, (&raw mut info).cast(), size, &mut 0) < 0 {
+            return None;
+        }
+        let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+        if GetProcessTimes(h.as_raw_handle(), &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        let start = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        let parent = u32::try_from(info.InheritedFromUniqueProcessId).ok()?;
+        Some(crate::ProcessInfo { identity: crate::ProcessIdentity { start, namespace: 0 }, parent })
+    }
+}
+
+/// See `crate::process_running`.
+pub(crate) fn process_running(pid: u32) -> Option<bool> {
+    // SAFETY: plain system calls; the handle is owned (closed) below.
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if h.is_null() {
+            // No such process.
+            return (io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32)).then_some(false);
+        }
+        let h = OwnedHandle::from_raw_handle(h);
+        Some(WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT)
+    }
 }
 
 /// The SID of the user `process` runs as, as a string (`S-1-5-21-...`).

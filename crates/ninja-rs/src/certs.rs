@@ -216,25 +216,59 @@ pub fn check(kind: &str, source: &str, certs: &[Vec<u8>], now: SystemTime) -> Re
     let now = unix(now);
     let mut soonest: Option<(usize, i64)> = None;
     for (i, der) in certs.iter().enumerate() {
-        let v = validity(der).map_err(|e| format!("{} can't be read: {e}", name(i)))?;
-        if now > v.not_after {
-            return Err(format!("{} expired on {}", name(i), format_time(v.not_after)));
-        }
-        if now < v.not_before {
-            return Err(format!("{} is not valid until {} (is the clock right? it says {})", name(i), format_time(v.not_before), format_time(now)));
-        }
-        if v.not_after - now < EXPIRY_WARNING.as_secs() as i64 && soonest.is_none_or(|(_, t)| v.not_after < t) {
-            soonest = Some((i, v.not_after));
+        let not_after = dates(&name(i), der, now)?;
+        if soonest.is_none_or(|(_, t)| not_after < t) {
+            soonest = Some((i, not_after));
         }
     }
-    Ok(soonest.map(|(i, not_after)| {
-        let left = match (not_after - now) / 86400 {
-            0 => "in less than a day".to_string(),
-            1 => "in 1 day".to_string(),
-            n => format!("in {n} days"),
-        };
-        format!("{} expires on {}, {left}", name(i), format_time(not_after))
-    }))
+    Ok(soonest.and_then(|(i, not_after)| expiring(&name(i), not_after, now)))
+}
+
+/// Checks the CAs of a file holding several (`certs`, from `source`) that
+/// verified a server's certificate (`verified`, DER, known once connected)
+/// at `now`, as `check` does those of a file: the others don't count (an
+/// expired CA of a bundle, in no server's chain, fails nothing, nor warns).
+/// Of several (cross-signed ones), the one that's good is.
+pub fn check_verifying(source: &str, certs: &[Vec<u8>], verified: &[&[u8]], now: SystemTime) -> Result<Option<String>, String> {
+    let name = |der: &[u8]| match certs.iter().position(|c| c == der) {
+        Some(i) => format!("CA certificate {} of {} ({source}), which verified the server's certificate,", i + 1, certs.len()),
+        None => format!("a CA certificate of {source}, which verified the server's certificate,"),
+    };
+    let now = unix(now);
+    let judged: Vec<(String, Result<i64, String>)> = verified.iter().map(|der| (name(der), dates(&name(der), der, now))).collect();
+    let best = judged.iter().filter_map(|(name, r)| Some((name, *r.as_ref().ok()?))).max_by_key(|(_, not_after)| *not_after);
+    match (best, judged.first()) {
+        (Some((name, not_after)), _) => Ok(expiring(name, not_after, now)),
+        (None, Some((_, Err(e)))) => Err(e.clone()),
+        _ => Ok(None),
+    }
+}
+
+/// When the certificate `der` (`name`) expires, if it's valid at `now`:
+/// else why not (expired, not valid yet, unreadable).
+fn dates(name: &str, der: &[u8], now: i64) -> Result<i64, String> {
+    let v = validity(der).map_err(|e| format!("{name} can't be read: {e}"))?;
+    if now > v.not_after {
+        return Err(format!("{name} expired on {}", format_time(v.not_after)));
+    }
+    if now < v.not_before {
+        return Err(format!("{name} is not valid until {} (is the clock right? it says {})", format_time(v.not_before), format_time(now)));
+    }
+    Ok(v.not_after)
+}
+
+/// The warning about `name`, which expires at `not_after`, when that's
+/// within `EXPIRY_WARNING` of `now`.
+fn expiring(name: &str, not_after: i64, now: i64) -> Option<String> {
+    if not_after - now >= EXPIRY_WARNING.as_secs() as i64 {
+        return None;
+    }
+    let left = match (not_after - now) / 86400 {
+        0 => "in less than a day".to_string(),
+        1 => "in 1 day".to_string(),
+        n => format!("in {n} days"),
+    };
+    Some(format!("{name} expires on {}, {left}", format_time(not_after)))
 }
 
 #[cfg(test)]
@@ -362,5 +396,37 @@ mod tests {
         let exactly = SystemTime::UNIX_EPOCH + Duration::from_secs(at("2026-10-18 12:00:00") as u64) - EXPIRY_WARNING;
         assert_eq!(super::check("CA", "x", std::slice::from_ref(&soon), exactly), Ok(None));
         assert!(super::check("CA", "x", &[soon], exactly + Duration::from_secs(1)).unwrap().is_some());
+    }
+
+    /// Of a bundle, only the CAs that verified the server's certificate
+    /// count: of several, the best.
+    #[test]
+    fn checks_the_cas_that_verified() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(at("2026-10-15 10:00:00") as u64);
+        let cert = |from: &str, to: &str| certificate((GENERALIZED_TIME, from), (GENERALIZED_TIME, to), true);
+        let year = cert("20261001000000Z", "20271001000000Z");
+        let soon = cert("20261001000000Z", "20261018120000Z");
+        let expired = cert("20250101000000Z", "20261001120000Z");
+        let future = cert("20270101000000Z", "20280101000000Z");
+        let bundle = [year.clone(), soon.clone(), expired.clone(), future.clone()];
+        let check =
+            |verified: &[&Vec<u8>]| check_verifying("--tls_certificate=/b.pem", &bundle, &verified.iter().map(|c| c.as_slice()).collect::<Vec<_>>(), now);
+        assert_eq!(check(&[&year]), Ok(None));
+        assert_eq!(check(&[]), Ok(None));
+        assert_eq!(
+            check(&[&soon]),
+            Ok(Some(
+                "CA certificate 2 of 4 (--tls_certificate=/b.pem), which verified the server's certificate, expires on 2026-10-18 12:00 UTC, in 3 days".into()
+            ))
+        );
+        assert_eq!(
+            check(&[&expired]),
+            Err("CA certificate 3 of 4 (--tls_certificate=/b.pem), which verified the server's certificate, expired on 2026-10-01 12:00 UTC".into())
+        );
+        assert!(check(&[&future]).unwrap_err().contains("which verified the server's certificate, is not valid until 2027-01-01"));
+        // Cross-signed: the best of those that verified it.
+        assert_eq!(check(&[&expired, &year]), Ok(None));
+        assert_eq!(check(&[&soon, &year]), Ok(None));
+        assert!(check(&[&expired, &soon]).unwrap().is_some_and(|w| w.starts_with("CA certificate 2 of 4")));
     }
 }
