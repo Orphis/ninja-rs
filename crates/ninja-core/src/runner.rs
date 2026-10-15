@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::graph::EdgeId;
+use crate::subprocess::Stop;
 
 /// Everything a runner needs to execute one edge.
 #[derive(Clone, Debug, Default)]
@@ -289,8 +290,28 @@ impl From<String> for MaterializeError {
 /// Completes once a task's inputs are on disk; an error fails the task.
 pub type MaterializeFuture = Pin<Box<dyn Future<Output = Result<(), MaterializeError>> + Send>>;
 
+tokio::task_local! {
+    static HOST_STOP: Arc<Stop>;
+}
+
+/// Runs `future`, a backend's (see [`RemoteBackend`]), for a runner whose
+/// local commands `stop` stops: the steps the backend runs on the host
+/// stop with them (see [`host_stop`]).
+pub async fn with_host_stop<F: Future>(stop: Arc<Stop>, future: F) -> F::Output {
+    HOST_STOP.scope(stop, future).await
+}
+
+/// What a backend runs commands on the host with (`subprocess::run_argv`),
+/// so that they are stopped and waited for as the runner's local commands
+/// are, when the build is interrupted or fails: the runner's stop, or
+/// outside one a stop of their own.
+pub fn host_stop() -> Arc<Stop> {
+    HOST_STOP.try_with(Arc::clone).unwrap_or_default()
+}
+
 /// A remote execution backend (REAPI). Lives in its own crate; the engine
-/// only knows this interface.
+/// only knows this interface. Its futures run under [`with_host_stop`]:
+/// commands it runs on the host use [`host_stop`].
 pub trait RemoteBackend: Send + Sync {
     /// Whether the execution policy sends this task to the remote backend.
     fn wants(&self, task: &Task) -> bool;

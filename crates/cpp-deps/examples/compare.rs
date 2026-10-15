@@ -1,6 +1,7 @@
 //! Compares the scanner with the compiler's own dependency list over a
-//! compilation database (`-M` for GCC and Clang, `/E /showIncludes` for
-//! `cl` and `clang-cl`), and times both.
+//! compilation database (`-E -MD` for GCC and Clang, `/E /showIncludes` for
+//! `cl` and `clang-cl`), and times both. A scan is exact as builds take it:
+//! nothing unknown, and every include found (else they scan otherwise).
 //!
 //! `compare <compile_commands.json>`
 
@@ -78,13 +79,17 @@ fn main() {
         files_total += reference.len();
         missing_total += missing.len();
         extra_total += extra.len();
-        if out.exact() {
+        let scan_exact = out.exact() && out.missing.is_empty();
+        if scan_exact {
             exact += 1;
         } else {
             inexact += 1;
         }
-        if !missing.is_empty() || !extra.is_empty() || !out.exact() {
-            println!("{file}: {} files, {} missing, {} extra, exact: {}", reference.len(), missing.len(), extra.len(), out.exact());
+        if !missing.is_empty() || !extra.is_empty() || !scan_exact {
+            println!("{file}: {} files, {} missing, {} extra, exact: {scan_exact}", reference.len(), missing.len(), extra.len());
+            for m in out.missing.iter().take(5) {
+                println!("  not found: {m}");
+            }
             for m in missing.iter().take(5) {
                 println!("  missing {m}");
             }

@@ -35,7 +35,7 @@ impl CommandRunner for FakeRunner<'_> {
                     fs.create(o, "");
                 }
             }
-            "true" | "fail" | "interrupt" | "console" => {}
+            "true" | "fail" | "fail7" | "interrupt" | "console" => {}
             "cp" => {
                 if let Some(c) = fs.read_file(&task.inputs[0]).unwrap() {
                     fs.write_file(&task.outputs[0], &c).unwrap();
@@ -55,6 +55,17 @@ impl CommandRunner for FakeRunner<'_> {
                 fs.tick();
                 fs.create(&dep, "");
                 fs.tick();
+                for o in &task.outputs {
+                    fs.create(o, "");
+                }
+            }
+            // A generator running `-t restat`: replaces the build log (the
+            // file `test_dependency` names), as a recompaction does.
+            "regen" => {
+                let log = task.binding("test_dependency").unwrap_or_default().to_string();
+                let tmp = format!("{log}.new");
+                std::fs::copy(&log, &tmp).unwrap();
+                std::fs::rename(&tmp, &log).unwrap();
                 for o in &task.outputs {
                     fs.create(o, "");
                 }
@@ -124,6 +135,7 @@ impl CommandRunner for FakeRunner<'_> {
                     }
                 }
                 "fail" => ExitStatus::Failure(1),
+                "fail7" => ExitStatus::Failure(7),
                 "cp_multi_msvc" => {
                     for i in &task.inputs {
                         output.extend_from_slice(format!("{}{}\n", task.msvc_deps_prefix, i).as_bytes());
@@ -226,17 +238,22 @@ impl BuildTest {
 
     /// AddTarget + Build, like ninja's tests do.
     fn build(&mut self, targets: &[&str]) -> Result<(), String> {
+        self.build_with_code(targets).map_err(|(e, _)| e)
+    }
+
+    /// `build`, with the exit code of a failed build.
+    fn build_with_code(&mut self, targets: &[&str]) -> Result<(), (String, i32)> {
         let mut status = NullStatus::default();
         let mut b = Builder::new(&mut self.state, &self.fs, self.build_log.as_mut(), self.deps_log.as_mut(), &self.config, &mut status);
         for t in targets {
-            b.add_target_by_name(t)?;
+            b.add_target_by_name(t).map_err(|e| (e, 1))?;
         }
         if b.already_up_to_date() {
             return Ok(());
         }
         let mut runner = FakeRunner { fs: &self.fs, commands_ran: self.commands_ran.clone(), active: Vec::new(), max_active: 1, lost: Vec::new() };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-        rt.block_on(b.build(&mut runner)).map_err(|e| e.message)
+        rt.block_on(b.build(&mut runner)).map_err(|e| (e.message, e.exit_code))
     }
 }
 
@@ -525,6 +542,34 @@ fn fail() {
     t.parse("rule fail\n  command = fail\nbuild out1: fail\n");
     assert_eq!(t.build(&["out1"]).unwrap_err(), "subcommand failed");
     assert_eq!(t.commands().len(), 1);
+}
+
+/// As in ninja 1.13, a failed build exits with the code of the last command
+/// that failed.
+#[test]
+fn exit_code_of_the_last_failure() {
+    let mut t = BuildTest::new();
+    t.parse(
+        "rule fail
+  command = fail
+rule fail7
+  command = fail7
+build a: fail
+build b: fail7
+build all: phony a b
+",
+    );
+    t.config.failures_allowed = 10;
+    assert_eq!(t.build_with_code(&["all"]).unwrap_err(), ("cannot make progress due to previous errors".to_string(), 7));
+    t.clear();
+    assert_eq!(t.build_with_code(&["a"]).unwrap_err(), ("cannot make progress due to previous errors".to_string(), 1));
+    // Not a command's: 1.
+    t.clear();
+    t.parse(
+        "build loop: cat loop
+",
+    );
+    assert_eq!(t.build_with_code(&["loop"]).unwrap_err().1, 1);
 }
 
 #[test]
@@ -1198,6 +1243,33 @@ fn generator_command_change_does_not_rebuild() {
     t.clear();
     t.parse("build out2: touch in\n  extra = changed\n");
     assert!(t.add(&["out"]).unwrap());
+}
+
+/// The build log is closed before a generator edge, as in ninja: CMake runs
+/// `-t restat` then, which replaces the log, and later records must go to
+/// the new one.
+#[test]
+fn records_follow_a_build_log_replaced_by_a_generator() {
+    let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-regen-log", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("log").to_string_lossy().into_owned();
+    let mut t = BuildTest::new();
+    let mut log = BuildLog::new();
+    log.open_for_write(&path, &|_| true).unwrap();
+    t.build_log = Some(log);
+    t.parse(&format!(
+        "rule regen\n  command = regen\n  generator = 1\nbuild first: cat in1\nbuild out: regen first\n  test_dependency = {}\nbuild after: cat out\n",
+        path.replace('\\', "/").replace(':', "$:")
+    ));
+    t.build(&["after"]).unwrap();
+    t.build_log.as_mut().unwrap().close();
+    let mut log = BuildLog::new();
+    log.load(&path).unwrap();
+    for o in ["first", "out", "after"] {
+        assert!(log.lookup_by_output(o).is_some(), "{o} isn't in the log");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -10,3 +10,4 @@ publish = false
 
 [dev-dependencies]
 serde_json = { workspace = true }
+test-dirs = { path = "../test-dirs" }

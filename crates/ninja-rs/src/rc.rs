@@ -12,7 +12,8 @@
 //! takes the `build` ones too). `common` skips the options ninja-rs doesn't
 //! have, and with a note those whose values it can't take, so that one
 //! file can serve Bazel and ninja-rs; so do all the lines of Bazel's own
-//! files (named `*bazelrc`, imported). Those lines are read as Bazel reads
+//! files (named `*bazelrc`, and those they import, whatever their names:
+//! `.bazelrc.user`, `tools/bazel.rc`). Those lines are read as Bazel reads
 //! them: short options are Bazel's (`-c opt`), and a separate value is the
 //! option's whatever it starts with (`--copt -fPIC`). Bazel's other
 //! commands (`test`, `query`, `startup`...) are skipped. Lines with a
@@ -170,9 +171,17 @@ struct Line {
     /// `file:line`, for messages.
     origin: String,
     file: PathBuf,
+    /// Of Bazel's files (see `is_bazel_file`): shared with Bazel.
+    bazel: bool,
     command: String,
     config: Option<String>,
     args: Vec<String>,
+}
+
+/// Whether `file` is one of Bazel's, read as Bazel reads it: named
+/// `*bazelrc`, or imported by one (`bazel_import`).
+fn is_bazel_file(file: &Path, bazel_import: bool) -> bool {
+    bazel_import || file.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("bazelrc"))
 }
 
 /// The lines of the files read.
@@ -199,7 +208,7 @@ fn system_file(warnings: &mut Vec<String>) -> Option<PathBuf> {
         return None;
     }
     if !trusted_file(&f) {
-        warnings.push(format!("{} skipped: other users can change it", f.display()));
+        warnings.push(format!("{} skipped: other users can change it{}", f.display(), CHANGE_HINT));
         return None;
     }
     Some(f)
@@ -215,12 +224,19 @@ const REPOSITORY_MARKERS: &[&str] = &[".git", ".hg", ".jj", ".sl", ".svn"];
 /// could have put there is skipped, with a warning: one in or above a
 /// directory others can write to (`/tmp`), or one others can change.
 pub fn workspace_file(dir: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
-    let home = options::home_dir();
+    workspace_file_below(dir, options::home_dir().as_deref(), warnings)
+}
+
+/// `workspace_file`, with `home` the home directory.
+fn workspace_file_below(dir: &Path, home: Option<&Path>, warnings: &mut Vec<String>) -> Option<PathBuf> {
+    // Also spelt otherwise: another case on Windows, through a link.
+    let home_real = home.and_then(|h| std::fs::canonicalize(h).ok());
+    let is_home = |d: &Path| home == Some(d) || home_real.as_ref().is_some_and(|h| std::fs::canonicalize(d).is_ok_and(|r| r == *h));
     // Past a directory others can write to, files are only looked for to
     // say why they're skipped.
     let mut shared = None;
     for d in dir.ancestors() {
-        if home.as_deref() == Some(d) || d.parent().is_none() {
+        if d.parent().is_none() || is_home(d) {
             break;
         }
         shared = shared.or_else(|| writable_by_others(d).then_some(d));
@@ -228,11 +244,11 @@ pub fn workspace_file(dir: &Path, warnings: &mut Vec<String>) -> Option<PathBuf>
         if f.is_file() {
             match shared {
                 Some(s) => {
-                    warnings.push(format!("{} skipped: other users can write to {}", f.display(), s.display()));
+                    warnings.push(format!("{} skipped: other users can write to {}{}", f.display(), s.display(), SHARED_HINT));
                     return None;
                 }
                 None if trusted_file(&f) => return Some(f),
-                None => warnings.push(format!("{} skipped: other users can change it", f.display())),
+                None => warnings.push(format!("{} skipped: other users can change it{}", f.display(), CHANGE_HINT)),
             }
         }
         if REPOSITORY_MARKERS.iter().any(|m| d.join(m).exists()) {
@@ -241,6 +257,21 @@ pub fn workspace_file(dir: &Path, warnings: &mut Vec<String>) -> Option<PathBuf>
     }
     None
 }
+
+/// What to do about a workspace file skipped in a directory others can
+/// write to.
+#[cfg(unix)]
+const SHARED_HINT: &str = ": move the workspace out of it, or give the file with --ninjars=FILE";
+#[cfg(windows)]
+const SHARED_HINT: &str = " (below a drive's root, Authenticated Users may modify directories): \
+     keep the workspace under your profile, take their write access away (icacls), \
+     or give the file with --ninjars=FILE";
+
+/// What to do about a settings file others can change.
+#[cfg(unix)]
+const CHANGE_HINT: &str = ": make it yours and not writable by others (chmod go-w), or give it with --ninjars=FILE";
+#[cfg(windows)]
+const CHANGE_HINT: &str = ": take others' write access away (icacls), or give it with --ninjars=FILE";
 
 /// A directory shared by every user, as `/tmp` is: writable by all, with
 /// the sticky bit. (Writable by all alone is how WSL shows Windows drives,
@@ -251,13 +282,19 @@ fn writable_by_others(dir: &Path) -> bool {
     std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o1002 == 0o1002)
 }
 
-/// A file only the user and root can change: owned by either.
+/// A file only the user and root can change: owned by either, not writable
+/// by its group or others. Unless the permissions are those of every file
+/// in a directory writable by all without the sticky bit, as WSL shows
+/// Windows drives (which keep no Unix permissions): anyone who can write to
+/// the file could replace it there anyway.
 #[cfg(unix)]
 fn trusted_file(file: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
-    std::fs::metadata(file).is_ok_and(|m| m.uid() == uid || m.uid() == 0)
+    let Ok(m) = std::fs::metadata(file) else { return false };
+    let open_dir = || file.parent().and_then(|d| std::fs::metadata(d).ok()).is_some_and(|d| d.permissions().mode() & 0o1002 == 0o0002);
+    (m.uid() == uid || m.uid() == 0) && (m.mode() & 0o022 == 0 || open_dir())
 }
 
 /// A directory in which someone other than the user and the administrators
@@ -560,7 +597,7 @@ impl RcFiles {
                 }
                 continue;
             }
-            rc.read(&f, &mut Vec::new())?;
+            rc.read(&f, &mut Vec::new(), false)?;
             rc.files.push(f);
         }
         Ok(rc)
@@ -573,15 +610,17 @@ impl RcFiles {
         for f in files {
             let f = PathBuf::from(f);
             if f.is_file() {
-                rc.read(&f, &mut Vec::new())?;
+                rc.read(&f, &mut Vec::new(), false)?;
                 rc.files.push(f);
             }
         }
         Ok(rc)
     }
 
-    /// Reads one file and what it imports. `stack`: the files importing it.
-    fn read(&mut self, file: &Path, stack: &mut Vec<PathBuf>) -> Result<(), String> {
+    /// Reads one file and what it imports. `stack`: the files importing it;
+    /// `bazel_import`: one of them is Bazel's.
+    fn read(&mut self, file: &Path, stack: &mut Vec<PathBuf>, bazel_import: bool) -> Result<(), String> {
+        let bazel = is_bazel_file(file, bazel_import);
         let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
         if stack.contains(&key) {
             let chain: Vec<String> = stack.iter().chain([&key]).map(|f| f.display().to_string()).collect();
@@ -604,7 +643,7 @@ impl RcFiles {
                     if head == "try-import" && !path.is_file() {
                         continue;
                     }
-                    self.read(&path, stack).map_err(|e| format!("{origin}: {e}"))?;
+                    self.read(&path, stack, bazel).map_err(|e| format!("{origin}: {e}"))?;
                 }
                 _ => {
                     let (command, config) = match head.split_once(':') {
@@ -618,10 +657,10 @@ impl RcFiles {
                             self.warnings.push(format!("{origin}: unknown command '{command}', line skipped"));
                         }
                         // A config only Bazel uses is still defined.
-                        self.lines.push(Line { origin, file: file.to_path_buf(), command: command.to_string(), config, args: Vec::new() });
+                        self.lines.push(Line { origin, file: file.to_path_buf(), bazel, command: command.to_string(), config, args: Vec::new() });
                         continue;
                     }
-                    self.lines.push(Line { origin, file: file.to_path_buf(), command: command.to_string(), config, args: args.to_vec() });
+                    self.lines.push(Line { origin, file: file.to_path_buf(), bazel, command: command.to_string(), config, args: args.to_vec() });
                 }
             }
         }
@@ -722,6 +761,9 @@ pub struct Expanded {
     pub announcements: Vec<String>,
     /// Options skipped because ninja-rs can't take their values: printed.
     pub notes: Vec<String>,
+    /// Options of lines shared with Bazel skipped as Bazel's, with where:
+    /// `--announce_rc` prints them (a misspelt option of ninja-rs's is one).
+    pub skipped: Vec<String>,
     /// `--announce_rc` was given (last value).
     pub announce: bool,
 }
@@ -823,11 +865,15 @@ pub fn expand(rc: &RcFiles, levels: &[&[&str]], cmdline: &[String], end: usize, 
         expand_config(rc, levels, platform_config(), &mut stack, &mut platform)?;
         out.announcements.extend(platform.announcements);
         out.notes.extend(platform.notes);
+        out.skipped.extend(platform.skipped);
         out.args.splice(files_end..files_end, platform.args);
         out.explicit.splice(files_end..files_end, platform.explicit);
     }
     let options_end = out.args.len() - (cmdline.len() - end.min(cmdline.len()));
     out.announce = last_bool(&out.args[..options_end], "announce_rc") == Some(true);
+    for s in &out.skipped {
+        out.announcements.push(format!("skipped, not an option of ninja-rs (Bazel's?): {s}"));
+    }
     Ok(out)
 }
 
@@ -861,7 +907,7 @@ fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<St
     let args = &line.args;
     // `common` lines, and Bazel's own files, are shared with Bazel: its
     // options are skipped, and values only Bazel takes.
-    let shared = line.command == "common" || line.file.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("bazelrc"));
+    let shared = line.command == "common" || line.bazel;
     let mut i = 0;
     while i < args.len() {
         if let Some((name, n)) = config_at(args, i) {
@@ -889,7 +935,12 @@ fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<St
                     out.push(a, false);
                 }
             }
-            Err(RcOptionError::Unknown(_)) if shared => {}
+            Err(RcOptionError::Unknown(_)) if shared => {
+                let skipped = format!("{}: '{}'", line.origin, options::redact_args(group).join(" "));
+                if !out.skipped.contains(&skipped) {
+                    out.skipped.push(skipped);
+                }
+            }
             Err(RcOptionError::Invalid(e)) if shared => {
                 let note = format!("{}: '{}' skipped: {e}", line.origin, options::redact_args(group).join(" "));
                 if !out.notes.contains(&note) {
@@ -946,9 +997,8 @@ mod tests {
     }
 
     /// Writes files in a fresh directory: `(relative path, content)`.
-    fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-rc-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn tree(name: &str, files: &[(&str, &str)]) -> test_dirs::TestDir {
+        let dir = test_dirs::TestDir::new(&format!("ninja-rs-rc-{name}"));
         for (path, content) in files {
             let p = dir.join(path);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1175,6 +1225,130 @@ mod tests {
         assert!(!e.announce);
     }
 
+    /// The files a `.bazelrc` imports are Bazel's too, whatever their names
+    /// (`.bazelrc.user`, `tools/bazel.rc`): read as Bazel reads them. Those
+    /// a `.ninjars` file imports stay strict.
+    #[test]
+    fn bazel_imports() {
+        let dir = tree(
+            "bazel_imports",
+            &[
+                (
+                    ".ninjars",
+                    "import %workspace%/.bazelrc
+try-import %workspace%/local.rc
+",
+                ),
+                (
+                    ".bazelrc",
+                    "build --copt -fPIC
+try-import %workspace%/.bazelrc.user
+import %workspace%/tools/bazel.rc
+",
+                ),
+                (
+                    ".bazelrc.user",
+                    "build --copt=-O2 --remote_jobs=4
+",
+                ),
+                (
+                    "tools/bazel.rc",
+                    "build --cxxopt=-std=c++17 --linkopt -v
+",
+                ),
+                (
+                    "local.rc",
+                    "build --remote_jobs=5
+",
+                ),
+            ],
+        );
+        let e = expand_in(&dir, "", &[]).unwrap();
+        assert_eq!(e.args, strings(&["--remote_jobs=4", "--remote_jobs=5"]));
+        std::fs::write(
+            dir.join("local.rc"),
+            "build --copt=-O2
+",
+        )
+        .unwrap();
+        assert!(expand_in(&dir, "", &[]).unwrap_err().contains("local.rc:1: unrecognized option '--copt'"));
+    }
+
+    /// Options of shared lines skipped as Bazel's are announced: a misspelt
+    /// option of ninja-rs's is one.
+    #[test]
+    fn skipped_options_are_announced() {
+        let dir = tree(
+            "announce_skipped",
+            &[(
+                ".ninjars",
+                "common --remote_jbos=4 --remote_jobs=3
+",
+            )],
+        );
+        let e = expand_in(&dir, "", &["--announce_rc"]).unwrap();
+        assert_eq!(e.args, strings(&["--remote_jobs=3", "--announce_rc"]));
+        assert_eq!(e.skipped.len(), 1);
+        assert!(e.announcements.iter().any(|a| a.contains(".ninjars:1: '--remote_jbos=4'")), "{:?}", e.announcements);
+    }
+
+    /// The search stops at the home directory however its path is spelt:
+    /// its file is the user's (`--nohome_rc` leaves it out).
+    #[test]
+    fn workspace_search_stops_at_home() {
+        let dir = tree(
+            "home",
+            &[
+                (
+                    ".ninjars",
+                    "build --remote_jobs=1
+",
+                ),
+                ("builds/proj/x", ""),
+            ],
+        );
+        let build = dir.join("builds/proj");
+        let mut warnings = Vec::new();
+        assert_eq!(workspace_file_below(&build, Some(&dir), &mut warnings), None);
+        assert_eq!(workspace_file_below(&build, None, &mut warnings), Some(dir.join(FILE_NAME)));
+        #[cfg(windows)]
+        {
+            let other_case = PathBuf::from(dir.to_string_lossy().to_uppercase());
+            assert_eq!(workspace_file_below(&build, Some(&other_case), &mut warnings), None);
+        }
+        #[cfg(unix)]
+        {
+            let link = dir.with_file_name(format!("{}-link", dir.file_name().unwrap().to_string_lossy()));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&dir, &link).unwrap();
+            assert_eq!(workspace_file_below(&build, Some(&link), &mut warnings), None);
+            let _ = std::fs::remove_file(&link);
+        }
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// On Unix, a file the user owns that others can write to isn't read;
+    /// unless every file of its directory looks so (writable by all, no
+    /// sticky bit: WSL's view of Windows drives).
+    #[cfg(unix)]
+    #[test]
+    fn writable_files_are_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tree("writable", &[(".ninjars", ""), ("build/x", "")]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut warnings = Vec::new();
+        assert_eq!(workspace_file(&dir.join("build"), &mut warnings), Some(dir.join(FILE_NAME)));
+        for mode in [0o664, 0o646] {
+            std::fs::set_permissions(dir.join(FILE_NAME), std::fs::Permissions::from_mode(mode)).unwrap();
+            warnings.clear();
+            assert_eq!(workspace_file(&dir.join("build"), &mut warnings), None, "{mode:o}");
+            assert!(warnings[0].contains("skipped: other users can change it"), "{warnings:?}");
+        }
+        std::fs::set_permissions(dir.join(FILE_NAME), std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(workspace_file(&dir.join("build"), &mut warnings), Some(dir.join(FILE_NAME)));
+    }
+
     #[test]
     fn workspace_search_bounds() {
         // The repository's root ends the search: a file above it isn't the
@@ -1219,13 +1393,13 @@ mod tests {
         // Others can write to the directories (inherited by what they hold).
         grant(&dir, AUTHENTICATED_USERS, "(OI)(CI)(M)");
         assert_eq!(workspace_file(&dir.join("build"), &mut warnings), None);
-        assert_eq!(warnings, vec![format!("{} skipped: other users can write to {}", dir.join(FILE_NAME).display(), dir.join("build").display())]);
+        assert_eq!(warnings, vec![format!("{} skipped: other users can write to {}{SHARED_HINT}", dir.join(FILE_NAME).display(), dir.join("build").display())]);
         // Others can change the file only.
         let dir = tree("acl_file", &[(".ninjars", ""), ("build/x", "")]);
         grant(&dir.join(FILE_NAME), USERS, "(W)");
         warnings.clear();
         assert_eq!(workspace_file(&dir.join("build"), &mut warnings), None);
-        assert!(warnings[0].ends_with(".ninjars skipped: other users can change it"), "{warnings:?}");
+        assert!(warnings[0].ends_with(&format!(".ninjars skipped: other users can change it{CHANGE_HINT}")), "{warnings:?}");
         // Rights for what a directory will hold (inherit-only) don't count.
         let dir = tree("acl_inherit", &[(".ninjars", "")]);
         grant(&dir, AUTHENTICATED_USERS, "(CI)(IO)(M)");
@@ -1260,7 +1434,7 @@ mod tests {
         let old = std::env::var_os("ProgramData");
         let discover = || {
             // SAFETY: always safe on Windows; no other test reads it.
-            unsafe { std::env::set_var("ProgramData", &dir) };
+            unsafe { std::env::set_var("ProgramData", dir.path()) };
             let rc = RcFiles::discover(&Prescan { workspace: false, home: false, ..prescan(&[]) }, &dir);
             match &old {
                 // SAFETY: as above.
@@ -1275,7 +1449,7 @@ mod tests {
         grant(&dir.join("ninjars"), USERS, "(M)");
         let rc = discover();
         assert!(rc.files.is_empty());
-        assert_eq!(rc.warnings, vec![format!("{} skipped: other users can change it", dir.join("ninjars").display())]);
+        assert_eq!(rc.warnings, vec![format!("{} skipped: other users can change it{CHANGE_HINT}", dir.join("ninjars").display())]);
     }
 
     /// On Windows, who may own and change a file: the user, the

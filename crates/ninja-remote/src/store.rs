@@ -31,16 +31,13 @@ pub struct ToolchainTree {
     pub files: Arc<Vec<String>>,
 }
 
-/// Whether a file is a daemon's sync file (`ninja_daemon::watch::COOKIE_PREFIX`),
-/// which a walk skips: it is there for a moment, during a sync.
-fn is_cookie(name: &std::ffi::OsStr) -> bool {
-    name.to_string_lossy().starts_with(ninja_daemon::watch::COOKIE_PREFIX)
-}
-
-/// Lists the files under `dir` (following symlinks), relative to it.
+/// Lists the files under `dir` (following symlinks), relative to it. Walks
+/// skip what the daemon's do (`ninja_daemon::watch::walk_skips`): its sync
+/// files, there for a moment, and repositories' own directories, whose
+/// changes it doesn't follow.
 pub fn walk_files(dir: &Path, rel: &str, out: &mut Vec<String>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut entries: Vec<_> = rd.flatten().filter(|e| !is_cookie(&e.file_name())).collect();
+    let mut entries: Vec<_> = rd.flatten().filter(|e| !ninja_daemon::watch::walk_skips(&e.file_name())).collect();
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -73,7 +70,7 @@ impl ToolchainTree {
     }
 }
 
-type TreeCell = Arc<Mutex<Option<Arc<ToolchainTree>>>>;
+type TreeCell = Arc<Mutex<Option<Result<Arc<ToolchainTree>, String>>>>;
 
 /// The members of a file if it's a thin archive, for its size and mtime.
 type ThinEntry = (u64, SystemTime, Option<Arc<Vec<String>>>);
@@ -100,29 +97,32 @@ impl Store {
     /// The Merkle tree of a toolchain input directory (cached; concurrent
     /// callers for the same directory wait for the first one): from the
     /// files `daemon` lists (None: no daemon), or read here (also when the
-    /// daemon couldn't list them). A failure isn't kept: the next action
-    /// tries again.
+    /// daemon couldn't list them). A failure is kept too: actions don't
+    /// each walk the directory again.
     pub fn toolchain_tree(&self, dir: &Path, daemon: &dyn Fn(&Path) -> Option<Result<TreeInfo, String>>) -> Result<Arc<ToolchainTree>, String> {
         let cell = self.toolchain_trees.lock().unwrap().entry(dir.to_path_buf()).or_default().clone();
         let mut kept = cell.lock().unwrap();
         if let Some(t) = &*kept {
-            return Ok(t.clone());
+            return t.clone();
         }
         let listed = daemon(dir).and_then(Result::ok).and_then(|listed| ToolchainTree::from_listing(dir, listed).ok());
-        let t = Arc::new(match listed {
-            Some(t) => t,
+        let t = match listed {
+            Some(t) => Ok(Arc::new(t)),
             None => {
                 let mut tree = InputTree::new();
-                tree.add_dir_cached("", dir, &|p| p.file_name().is_some_and(is_cookie), Some(&self.digests)).map_err(|e| format!("{e:#}"))?;
-                let mut blobs = BlobSet::default();
-                let digest = tree.build(&mut blobs);
-                let mut files = Vec::new();
-                walk_files(dir, "", &mut files);
-                ToolchainTree { digest, blobs: Arc::new(blobs), files: Arc::new(files) }
+                tree.add_dir_cached("", dir, &|p| p.file_name().is_some_and(ninja_daemon::watch::walk_skips), Some(&self.digests))
+                    .map_err(|e| format!("{e:#}"))
+                    .map(|()| {
+                        let mut blobs = BlobSet::default();
+                        let digest = tree.build(&mut blobs);
+                        let mut files = Vec::new();
+                        walk_files(dir, "", &mut files);
+                        Arc::new(ToolchainTree { digest, blobs: Arc::new(blobs), files: Arc::new(files) })
+                    })
             }
-        });
+        };
         *kept = Some(t.clone());
-        Ok(t)
+        t
     }
 
     /// The members of `path` if it's a thin archive (see `archive`), read
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn digests_round_trip() {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_store_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_rs_store_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.txt");
         std::fs::write(&f, "hello").unwrap();
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn toolchain_tree_is_built_once() {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_tc_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_rs_tc_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/cc"), "x").unwrap();
         let s = Store::default();
@@ -290,17 +290,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A tree that couldn't be built isn't kept: the next action tries
-    /// again. One the daemon couldn't list is read here.
+    /// A tree that couldn't be built is kept for the invocation: actions
+    /// don't each walk it again. One the daemon couldn't list is read here.
     #[test]
-    fn toolchain_tree_errors_are_not_kept() {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_tc_err_{}", std::process::id()));
+    fn toolchain_tree_errors() {
+        let dir = test_dirs::base().join(format!("ninja_rs_tc_err_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let s = Store::default();
         assert!(s.toolchain_tree(&dir, &|_| None).is_err());
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/cc"), "x").unwrap();
-        let a = s.toolchain_tree(&dir, &|_| None).unwrap();
+        assert!(s.toolchain_tree(&dir, &|_| None).is_err());
+        let a = Store::default().toolchain_tree(&dir, &|_| None).unwrap();
         assert_eq!(*a.files, vec!["bin/cc".to_string()]);
         let b = Store::default().toolchain_tree(&dir, &|_| Some(Err("stat bin/.ninja-rs-cookie-1-2: not found".into()))).unwrap();
         assert_eq!(b.digest, a.digest);
@@ -308,6 +309,29 @@ mod tests {
         std::fs::write(dir.join(format!("{}1-2", ninja_daemon::watch::COOKIE_PREFIX)), "").unwrap();
         let c = Store::default().toolchain_tree(&dir, &|_| None).unwrap();
         assert_eq!((c.digest.clone(), c.files.clone()), (a.digest.clone(), a.files.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repositories' own directories aren't part of toolchain trees (a
+    /// sysroot that is a checkout), as the daemon lists them: the same keys
+    /// with and without it.
+    #[test]
+    fn toolchain_trees_skip_repositories() {
+        let dir = std::env::temp_dir().join(format!("ninja_rs_tc_vcs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
+        std::fs::create_dir_all(dir.join("bin/.svn")).unwrap();
+        std::fs::write(dir.join("bin/cc"), "x").unwrap();
+        std::fs::write(dir.join(".git/refs/main"), "1").unwrap();
+        std::fs::write(dir.join("bin/.svn/entries"), "e").unwrap();
+        let a = Store::default().toolchain_tree(&dir, &|_| None).unwrap();
+        assert_eq!(*a.files, vec!["bin/cc".to_string()]);
+        let info = ninja_daemon::proto::FileInfo { hash: rbe_client::digest_of(b"x").hash, size: 1, executable: false, mtime_ns: 0, change: 0, inode: 0 };
+        let listed = TreeInfo { dirs: vec!["bin".into()], files: vec![("bin/cc".into(), info)] };
+        assert_eq!(Store::default().toolchain_tree(&dir, &|_| Some(Ok(listed.clone()))).unwrap().digest, a.digest);
+        let mut files = Vec::new();
+        walk_files(&dir, "", &mut files);
+        assert_eq!(files, vec!["bin/cc".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

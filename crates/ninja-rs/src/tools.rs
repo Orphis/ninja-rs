@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 
-use ninja_core::build_log::BuildLog;
+use ninja_core::build_log::{BuildLog, LOCK_FILE, LogLock};
 use ninja_core::canon::canonicalize_path;
 use ninja_core::deps_log::DepsLog;
 use ninja_core::disk::{Disk, RealDisk};
@@ -1108,6 +1108,17 @@ pub fn tool_restat_after_flags(args: &[String]) -> i32 {
         // Nothing to restat, ignore this.
         return 0;
     }
+    // A build writing the log is waited for, unless it runs this (a
+    // generator): see `Service::lock_logs`.
+    let lock_file = if build_dir.is_empty() { LOCK_FILE.to_string() } else { format!("{build_dir}/{LOCK_FILE}") };
+    let _lock = match crate::try_lock_logs(&lock_file) {
+        Ok(crate::LogsAccess::Locked(lock)) => Some(lock),
+        Ok(crate::LogsAccess::Busy) => {
+            println!("ninja: waiting for the build running in this directory to finish...");
+            LogLock::acquire(&lock_file).ok()
+        }
+        Ok(crate::LogsAccess::Inherited) | Err(_) => None,
+    };
     let mut log = BuildLog::new();
     match log.load(&path) {
         Ok(Some(w)) => eprintln!("ninja: warning: {w}"),

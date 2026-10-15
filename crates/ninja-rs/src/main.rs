@@ -2,7 +2,7 @@
 
 use ninja_core::subprocess::Interrupt;
 use ninja_rs::Service;
-use ninja_rs::options::{ParseOutcome, parse_args};
+use ninja_rs::options::{ParseOutcome, parse_args, usage};
 use ninja_rs::rc;
 
 fn main() {
@@ -10,11 +10,12 @@ fn main() {
     // A nested invocation takes the outer one's settings first: they
     // include the options of the .ninjars files it read.
     let parent = ninja_rs::nested::parent();
+    // Errors exit with 1, as ninja's `Fatal`.
     let (rc, expanded) = match settings(&cmdline, parent.as_ref()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("ninja: fatal: {e}");
-            std::process::exit(2);
+            std::process::exit(1);
         }
     };
     let mut args: Vec<String> = parent.iter().flat_map(|p| p.flags.iter().cloned()).collect();
@@ -31,9 +32,18 @@ fn main() {
             }
             std::process::exit(code);
         }
+        // As getopt reports them, then the usage, as in ninja.
+        Err(e) if e.starts_with("unrecognized option") => {
+            eprint!("ninja: {e}\n{}", usage());
+            std::process::exit(1);
+        }
+        Err(e) if e.starts_with("invalid option") => {
+            eprint!("ninja: {e}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("ninja: fatal: {e}");
-            std::process::exit(2);
+            std::process::exit(1);
         }
     };
     opts.argv = std::iter::once("ninja-rs".to_string()).chain(cmdline).collect();
@@ -70,19 +80,42 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let code = runtime.block_on(async move {
-        // SIGINT, SIGTERM and SIGHUP (Ctrl-C and Ctrl-Break) interrupt a
-        // build, which stops its commands, ends its build events and
-        // returns; a second one kills the commands.
-        let interrupt = Interrupt::new();
+    // SIGINT, SIGTERM and SIGHUP (Ctrl-C and Ctrl-Break) interrupt a build,
+    // which stops its commands, ends its build events and returns; a second
+    // one kills the commands.
+    let interrupt = Interrupt::new();
+    {
+        let _runtime = runtime.enter();
         interrupt.install_handlers();
-        let mut service = Service::new(interrupt.clone());
-        service.skip_teardown = true;
-        service.relay = relay;
+    }
+    let mut service = Service::new(interrupt.clone());
+    service.skip_teardown = true;
+    service.relay = relay;
+    // The invocation runs on a thread of its own (with the main thread's
+    // stack), so that an interrupt ends it even while it doesn't yield
+    // (loading the manifest, a tool).
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let handle = runtime.handle().clone();
+    let invocation = std::thread::Builder::new().stack_size(8 << 20).spawn(move || {
+        let _ = done.send(handle.block_on(service.run(&opts)));
+    });
+    let code = runtime.block_on(async {
         tokio::select! {
-            code = service.run(&opts) => code,
+            code = finished => code.ok(),
+            // Outside a build's loop, one exits at once, as ninja dies of
+            // the signal there.
+            signal = interrupt.unhandled() => Some(128 + signal),
             // A third one exits at once, whatever ninja-rs waits for.
-            _ = interrupt.wait_beyond(2) => ninja_rs::EXIT_INTERRUPTED,
+            _ = interrupt.wait_beyond(2) => Some(ninja_rs::EXIT_INTERRUPTED),
+        }
+    });
+    // None: the invocation panicked (or couldn't start).
+    let code = code.unwrap_or_else(|| match invocation.map(|t| t.join()) {
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Ok(Ok(())) => ninja_rs::EXIT_FAILURE,
+        Err(e) => {
+            eprintln!("ninja: fatal: starting a thread: {e}");
+            ninja_rs::EXIT_FAILURE
         }
     });
     // Don't wait for lingering blocking tasks (e.g. pipes held open by

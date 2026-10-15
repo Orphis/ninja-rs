@@ -9,6 +9,7 @@
 //! - [`link`] finds what a link reads, and [`archive`] the members of thin
 //!   archives.
 //! - [`paths`] maps local paths into the remote input root and back.
+//! - [`env`] chooses the environment variables an action gets.
 //! - [`toolchains`] reads the `rbe_toolchains` file.
 //! - [`targets`] reads the `rbe_targets` file.
 //! - [`store::Store`] holds the caches shared across actions and builds.
@@ -20,6 +21,7 @@ pub mod backend;
 pub mod cmdline;
 pub mod compile_outputs;
 pub mod disk_cache;
+pub mod env;
 pub mod link;
 pub mod paths;
 pub mod remote_outputs;

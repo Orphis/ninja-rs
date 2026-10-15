@@ -58,10 +58,11 @@ pub(crate) fn destringize(lit: &str) -> String {
 const PRAGMAS: [Sym; 4] = [intern::ONCE, intern::PUSH_MACRO, intern::POP_MACRO, intern::INCLUDE_ALIAS];
 
 /// What tokens do through pragmas: `__pragma(...)`, the words of a pragma
-/// given to a macro (`DO_PRAGMA(once)`, `PRAGMA("once")`), and
-/// `_Pragma("...")` (which text runs where it's written: only `literal`
-/// ones count).
-pub(crate) fn pragmas(toks: &[Token], literal: bool) -> Pragmas {
+/// given to a macro (`DO_PRAGMA(once)`, `PRAGMA("once")`), `_Pragma("...")`
+/// (which text runs where it's written: only `literal` ones count), and
+/// `_Pragma(M)` with a macro other than one of `params` (whose arguments
+/// are seen where the macro is used).
+pub(crate) fn pragmas(toks: &[Token], literal: bool, params: &[Sym]) -> Pragmas {
     let (mut names, mut other) = (Vec::new(), false);
     // One pragma's tokens (after `#pragma`).
     fn pragma(p: &[Token], names: &mut Vec<Sym>, other: &mut bool) {
@@ -77,12 +78,19 @@ pub(crate) fn pragmas(toks: &[Token], literal: bool) -> Pragmas {
     while i < toks.len() {
         let t = toks[i];
         let call = toks.get(i + 1).is_some_and(|p| p.is(P::LParen));
-        if call && t.sym == intern::PRAGMA_OPERATOR && toks.get(i + 2).is_some_and(|s| s.kind == Kind::Str) {
-            if literal {
-                pragma(&lex::tokens(destringize(toks[i + 2].sym.as_str()).as_bytes()), &mut names, &mut other);
+        if call && t.sym == intern::PRAGMA_OPERATOR {
+            match toks.get(i + 2) {
+                Some(s) if s.kind == Kind::Str => {
+                    if literal {
+                        pragma(&lex::tokens(destringize(s.sym.as_str()).as_bytes()), &mut names, &mut other);
+                    }
+                    i += 3;
+                    continue;
+                }
+                // A macro's string, unknown here.
+                Some(m) if m.kind == Kind::Ident && !params.contains(&m.sym) => other = true,
+                _ => {}
             }
-            i += 3;
-            continue;
         }
         if call && t.sym == intern::MS_PRAGMA_OPERATOR {
             let mut depth = 0;
@@ -158,14 +166,14 @@ pub fn parse_define(toks: &[Token]) -> Option<Macro> {
         if let Some(first) = body.first_mut() {
             first.space = false;
         }
-        let pragmas = pragmas(&body, true);
+        let pragmas = pragmas(&body, true, &params);
         Some(Macro { name, params: Some(params.into_boxed_slice()), variadic, body: body.into_boxed_slice(), pragmas })
     } else {
         let mut body: Vec<Token> = rest.to_vec();
         if let Some(first) = body.first_mut() {
             first.space = false;
         }
-        let pragmas = pragmas(&body, true);
+        let pragmas = pragmas(&body, true, &[]);
         Some(Macro { name, params: None, variadic: false, body: body.into_boxed_slice(), pragmas })
     }
 }
@@ -781,6 +789,7 @@ mod tests {
         assert_eq!(of("#define POP __pragma(pop_macro(\"min\")) __pragma(warning(pop))\n"), names(&["min"]));
         assert_eq!(of("#define D _Pragma(\"clang diagnostic push\") __pragma(warning(push))\n"), Pragmas::None);
         assert_eq!(of("#define STR(x) _Pragma(#x)\n"), Pragmas::None);
+        assert_eq!(of("#define PRAGMA(x) _Pragma(x)\n"), Pragmas::None);
         assert_eq!(of("#define VERSION \"1.2\" call_once(f)\n"), Pragmas::None);
         for other in [
             "#define ONCE _Pragma(\"once\")\n",
@@ -790,6 +799,8 @@ mod tests {
             "#define P DO_PRAGMA(once)\n",
             "#define P PRAGMA(\"once\")\n",
             "#define P(x) _Pragma(\"push_macro(\" #x \")\")\n",
+            // A macro's string (`#define ONCE_STR "once"`).
+            "#define P _Pragma(ONCE_STR)\n",
         ] {
             assert_eq!(of(other), Pragmas::Other, "{other}");
         }

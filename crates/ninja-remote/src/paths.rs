@@ -270,16 +270,26 @@ impl PathMapper {
 
     /// Rewrites a command's arguments (see `rewrite_arg`), except values
     /// the program built keeps rather than opens: macro definitions (`-D`,
-    /// `/D`) and run-time library paths (`-rpath`, `-R`, `-install_name`,
-    /// also through `-Wl,` and `-Xlinker`). Their absolute paths name this
-    /// machine's files on purpose (a data directory, where the program finds
-    /// its libraries); made relative, the program would differ from the one
-    /// ninja builds, and break when run from elsewhere.
-    pub fn rewrite_args(&mut self, args: &[String]) -> Vec<String> {
+    /// and `/D` on a cl-style command line, `cl`) and run-time library
+    /// paths (`-rpath`, `-R`, `-install_name`, also through `-Wl,` and
+    /// `-Xlinker`). Their absolute paths name this machine's files on
+    /// purpose (a data directory, where the program finds its libraries);
+    /// made relative, the program would differ from the one ninja builds,
+    /// and break when run from elsewhere. A prefix map
+    /// (`-ffile-prefix-map=OLD=NEW`) gets its old side rewritten, the
+    /// paths the compiler sees, and keeps its new one, what it writes
+    /// instead.
+    pub fn rewrite_args(&mut self, args: &[String], cl: bool) -> Vec<String> {
         let mut out = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             let before = |n: usize| i.checked_sub(n).and_then(|j| args.get(j)).map(String::as_str);
-            out.push(if kept_value(a, before(1), before(2), self.windows) { a.clone() } else { self.rewrite_arg(a) });
+            out.push(if kept_value(a, before(1), before(2), cl) {
+                a.clone()
+            } else if let Some((old, new)) = split_prefix_map(a) {
+                format!("{}={new}", self.rewrite_arg(old))
+            } else {
+                self.rewrite_arg(a)
+            });
         }
         out
     }
@@ -416,27 +426,60 @@ const CL_JOINED_OPTIONS: &[&str] = &[
 
 /// Whether `arg`, after `prev` (itself after `prev2`), is a value the
 /// program built keeps (see `PathMapper::rewrite_args`).
-fn kept_value(arg: &str, prev: Option<&str>, prev2: Option<&str>, windows: bool) -> bool {
-    let define = is_define(arg, windows);
-    let define_flag = |a: &str| a == "-D" || (windows && a == "/D");
+fn kept_value(arg: &str, prev: Option<&str>, prev2: Option<&str>, cl: bool) -> bool {
     let runtime_path_flag = |a: &str| matches!(a, "-rpath" | "--rpath" | "-R" | "-install_name");
-    define
-        || prev.is_some_and(define_flag)
+    defines(arg, prev, cl)
         || prev.is_some_and(runtime_path_flag)
         || (prev == Some("-Xlinker") && prev2.is_some_and(runtime_path_flag))
         || ["-Wl,-rpath,", "-Wl,-rpath=", "-Wl,--rpath,", "-Wl,--rpath=", "-Wl,-R", "-Wl,-install_name,"].iter().any(|p| arg.starts_with(p))
 }
 
-/// Whether `arg` defines a macro: `-D` (or `/D` on Windows), a name, then
-/// its end, the value's `=` (`#` for cl), or a function-like macro's
-/// parameters. Linker options spelled alike (`/DEF:x.def`,
-/// `/DEFAULTLIB:x.lib`, `-DELAYLOAD:x.dll`) aren't: their paths are
-/// opened, and rewritten.
-fn is_define(arg: &str, windows: bool) -> bool {
-    let Some(rest) = arg.strip_prefix("-D").or_else(|| arg.strip_prefix("/D").filter(|_| windows)) else { return false };
+/// Whether `arg`, after `prev`, defines a macro: glued to `-D` (see
+/// `is_define`), or after it.
+fn defines(arg: &str, prev: Option<&str>, cl: bool) -> bool {
+    is_define(arg, cl) || prev.is_some_and(|a| a == "-D" || (cl && a == "/D"))
+}
+
+/// Whether `arg` defines a macro: `-D` (or `/D` on a cl-style command
+/// line, whatever the host), a name, then its end, the value's `=` (`#`
+/// for cl), or a function-like macro's parameters. Linker options spelled
+/// alike (`/DEF:x.def`, `/DEFAULTLIB:x.lib`, `-DELAYLOAD:x.dll`) aren't:
+/// their paths are opened, and rewritten.
+fn is_define(arg: &str, cl: bool) -> bool {
+    let Some(rest) = arg.strip_prefix("-D").or_else(|| arg.strip_prefix("/D").filter(|_| cl)) else { return false };
     let b = rest.as_bytes();
     let end = b.iter().position(|&c| !(c.is_ascii_alphanumeric() || c == b'_')).unwrap_or(b.len());
     end > 0 && !b[0].is_ascii_digit() && matches!(b.get(end), None | Some(b'=' | b'#' | b'('))
+}
+
+/// The absolute paths in a command's macro definitions, which keep them
+/// (see `PathMapper::rewrite_args`), as written.
+pub fn defined_paths(args: &[String], cl: bool, windows: bool) -> Vec<&str> {
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        let prev = i.checked_sub(1).and_then(|j| args.get(j)).map(String::as_str);
+        if defines(a, prev, cl) {
+            // The definition, past its option (`/D` looks like a path).
+            let value = if is_define(a, cl) { &a[2..] } else { a.as_str() };
+            out.extend(find_abs_paths(value, windows).into_iter().map(|(s, e)| &value[s..e]));
+        }
+    }
+    out
+}
+
+/// Options mapping a path prefix the compiler sees to another it writes
+/// instead (in debug information, `__FILE__`, coverage data).
+const PREFIX_MAPS: &[&str] =
+    &["-ffile-prefix-map=", "-fdebug-prefix-map=", "-fmacro-prefix-map=", "-fprofile-prefix-map=", "-fcoverage-prefix-map=", "/pathmap:", "-pathmap:"];
+
+/// A prefix map, split before the `=` separating its sides: the option and
+/// the old side, and the new side. clang-cl's go through `/clang:`.
+fn split_prefix_map(arg: &str) -> Option<(&str, &str)> {
+    let inner = arg.strip_prefix("/clang:").or_else(|| arg.strip_prefix("-clang:")).unwrap_or(arg);
+    let option = PREFIX_MAPS.iter().find(|o| inner.starts_with(**o))?;
+    let start = arg.len() - inner.len() + option.len();
+    let eq = start + arg[start..].find('=')?;
+    Some((&arg[..eq], &arg[eq + 1..]))
 }
 
 /// Finds absolute paths embedded in a command line argument, e.g. in
@@ -613,12 +656,26 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let out = m.rewrite_args(&args);
+        let out = m.rewrite_args(&args, false);
         for i in [0, 2, 4, 8, 10] {
             assert_eq!(out[i], args[i], "argument {i}");
         }
         assert_eq!(out[3], "-I../src");
         assert_eq!(out[12], "a.out");
+        assert_eq!(defined_paths(&args, false, false), ["/home/u/proj/data", "/home/u/proj/x"]);
+        // clang-cl on a POSIX host: `/D` defines too.
+        let cl: Vec<String> = [r#"/DDATA_DIR="/home/u/proj/data""#, "/D", "X=/home/u/proj/x", "/I/home/u/proj/src"].iter().map(|s| s.to_string()).collect();
+        let out = m.rewrite_args(&cl, true);
+        assert_eq!(out[..3], cl[..3]);
+        assert_eq!(out[3], "/I../src");
+        assert_eq!(defined_paths(&cl, true, false), ["/home/u/proj/data", "/home/u/proj/x"]);
+        // Prefix maps: the old side is what the compiler sees, rewritten;
+        // the new side what it writes, kept.
+        let maps: Vec<String> = ["-ffile-prefix-map=/home/u/proj/src=/home/u/proj/build", "/clang:-fdebug-prefix-map=/home/u/proj=/usr/src/debug"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(m.rewrite_args(&maps, true), ["-ffile-prefix-map=../src=/home/u/proj/build", "/clang:-fdebug-prefix-map=..=/usr/src/debug"]);
         // Under a file system's root, only what's in the tree.
         let root = ExecRoot::common(&["/build".into(), "/src/a.c".into()], false);
         assert!(root.is_fs_root());
@@ -655,7 +712,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let out = m.rewrite_args(&args);
+        let out = m.rewrite_args(&args, true);
         for i in [0, 2, 3, 7, 8] {
             assert_eq!(out[i], args[i], "argument {i}");
         }
@@ -663,7 +720,10 @@ mod tests {
         assert_eq!(out[5], "-DEF:../SRC/exports.def");
         assert_eq!(out[6], "/DEFAULTLIB:x.lib");
         assert!(!is_define("-D", false) && !is_define("-D1X", false) && !is_define("/DX", false));
-        assert!(is_define("-DF(a)=a", false) && is_define("-DX", false));
+        assert!(is_define("-DF(a)=a", false) && is_define("-DX", false) && is_define("/DX", true));
+        // A GCC-style command line on a Windows host: `/D...` isn't a
+        // definition (nor, without a drive, a path).
+        assert_eq!(m.rewrite_args(&[r"/DX=C:\Users\x\proj\x".to_string()], false), [r"/DX=..\x"]);
     }
 
     #[test]

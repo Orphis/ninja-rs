@@ -174,18 +174,49 @@ pub fn member_path(archive: &str, name: &str) -> Result<String, String> {
     Ok(path)
 }
 
+/// What [`expand`] does with a member outside the build directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outside {
+    /// Refuse it, for an action's input tree: an archive from a result, or
+    /// its ranged reads, would otherwise make the action send any file the
+    /// user can read. Also when only a symlink or junction in the build
+    /// directory makes it look inside.
+    Refuse,
+    /// Skip it, for a local command: it reads the member where it is (a
+    /// prebuilt object of the source tree), and it's no remote-only output
+    /// to download. Archives that can't be read are skipped too: the
+    /// command reports them.
+    Skip,
+}
+
 /// The members of the thin archives among `inputs` (paths relative to the
 /// build directory, on disk or recorded as remote-only outputs), and of thin
 /// archives among those members, that aren't inputs already.
-pub fn expand(inputs: &[String], build_dir: &Path, remote: Option<&RemoteOutputs>, store: &Store) -> Result<Vec<String>, String> {
+pub fn expand(inputs: &[String], build_dir: &Path, remote: Option<&RemoteOutputs>, store: &Store, outside: Outside) -> Result<Vec<String>, String> {
     let mut seen: std::collections::HashSet<String> = inputs.iter().map(|i| crate::remote_outputs::key(i)).collect();
     let mut queue: Vec<String> = inputs.to_vec();
     let mut out = Vec::new();
+    let mut resolved = Resolved::default();
     while let Some(input) = queue.pop() {
         let local = build_dir.join(&input);
-        let names = if local.is_file() { store.thin_members(&local)? } else { remote.and_then(|r| r.get(&input)).and_then(|e| e.members) };
+        let names = if local.is_file() {
+            match store.thin_members(&local) {
+                Ok(names) => names,
+                Err(_) if outside == Outside::Skip => continue,
+                Err(e) => return Err(e),
+            }
+        } else {
+            remote.and_then(|r| r.get(&input)).and_then(|e| e.members)
+        };
         for name in names.iter().flat_map(|n| n.iter()) {
-            let m = member_path(&input, name)?;
+            let m = match member_path(&input, name) {
+                Ok(m) => m,
+                Err(_) if outside == Outside::Skip => continue,
+                Err(e) => return Err(e),
+            };
+            if outside == Outside::Refuse && !resolved.inside(&build_dir.join(&m), build_dir) {
+                return Err(format!("thin archive {input} names its member {name} through a link out of the build directory"));
+            }
             if seen.insert(crate::remote_outputs::key(&m)) {
                 out.push(m.clone());
                 queue.push(m);
@@ -193,6 +224,34 @@ pub fn expand(inputs: &[String], build_dir: &Path, remote: Option<&RemoteOutputs
         }
     }
     Ok(out)
+}
+
+/// Where files of the build directory really are, symlinks and junctions
+/// followed: the build directory's canonical path, and its directories'.
+#[derive(Default)]
+struct Resolved {
+    root: Option<Option<std::path::PathBuf>>,
+    dirs: std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>,
+}
+
+impl Resolved {
+    /// Whether `local`, a file of `build_dir` by its name, is in it once
+    /// links are followed. One that isn't there is: it can only be a
+    /// remote-only output, sent by its digest.
+    fn inside(&mut self, local: &Path, build_dir: &Path) -> bool {
+        let Ok(meta) = std::fs::symlink_metadata(local) else { return true };
+        let real = if meta.file_type().is_symlink() {
+            std::fs::canonicalize(local).ok()
+        } else {
+            let (Some(dir), Some(name)) = (local.parent(), local.file_name()) else { return false };
+            self.dirs.entry(dir.to_path_buf()).or_insert_with(|| std::fs::canonicalize(dir).ok()).as_ref().map(|d| d.join(name))
+        };
+        let root = self.root.get_or_insert_with(|| std::fs::canonicalize(build_dir).ok());
+        match (real, root.as_ref()) {
+            (Some(real), Some(root)) => real.starts_with(root),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -250,7 +309,7 @@ mod tests {
 
     #[test]
     fn reads_from_disk() {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_thin_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_rs_thin_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("t.a"), LLVM_GNU).unwrap();
         std::fs::write(dir.join("f.a"), FAT).unwrap();
@@ -289,7 +348,7 @@ mod tests {
 
     #[test]
     fn expands_nested_archives() {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_thin_expand_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_rs_thin_expand_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("lib")).unwrap();
         std::fs::create_dir_all(dir.join("obj")).unwrap();
         std::fs::write(dir.join("lib/llvm-gnu.a"), LLVM_GNU).unwrap();
@@ -298,9 +357,57 @@ mod tests {
         outer.extend_from_slice(format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", "llvm-gnu.a/", 0, 0, 0, 644, LLVM_GNU.len()).as_bytes());
         std::fs::write(dir.join("lib/outer.a"), outer).unwrap();
         let store = Store::default();
-        let mut got = expand(&v(&["lib/outer.a", "obj/a.o"]), &dir, None, &store).unwrap();
+        let mut got = expand(&v(&["lib/outer.a", "obj/a.o"]), &dir, None, &store, Outside::Refuse).unwrap();
         got.sort();
         assert_eq!(got, v(&["lib/llvm-gnu.a", "obj/a_member_with_a_long_name.o"]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A thin archive naming `names` (short names: 15 bytes at most).
+    fn thin(names: &[&str]) -> Vec<u8> {
+        let mut a = MAGIC.to_vec();
+        for n in names {
+            assert!(n.len() < 16, "{n} is too long for a short name");
+            a.extend_from_slice(format!("{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", format!("{n}/"), 0, 0, 0, 644, 10).as_bytes());
+        }
+        assert_eq!(members(&a).unwrap().unwrap(), v(names));
+        a
+    }
+
+    /// Members outside the build directory: refused for an input tree,
+    /// skipped for a local command. Also through a link in the build
+    /// directory (a symlink, or a junction on Windows).
+    #[test]
+    fn members_outside() {
+        let dir = std::env::temp_dir().join(format!("ninja_rs_thin_outside_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let build = dir.join("build");
+        std::fs::create_dir_all(build.join("lib")).unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("out/x.o"), "x").unwrap();
+        std::fs::write(build.join("lib/out.a"), thin(&["../../out/x.o"])).unwrap();
+        let store = Store::default();
+        let out = v(&["lib/out.a"]);
+        assert!(expand(&out, &build, None, &store, Outside::Refuse).is_err());
+        assert_eq!(expand(&out, &build, None, &store, Outside::Skip).unwrap(), Vec::<String>::new());
+        // An archive that can't be read: the local command reports it.
+        std::fs::write(build.join("lib/bad.a"), [MAGIC.as_slice(), b"short"].concat()).unwrap();
+        assert!(expand(&v(&["lib/bad.a"]), &build, None, &store, Outside::Refuse).is_err());
+        assert!(expand(&v(&["lib/bad.a"]), &build, None, &store, Outside::Skip).unwrap().is_empty());
+        // Inside by its name, outside through a link.
+        let link = build.join("lnk");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("out"), &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(&link).arg(dir.join("out")).output().unwrap().status.success());
+        std::fs::write(build.join("lib/linked.a"), thin(&["../lnk/x.o"])).unwrap();
+        let linked = v(&["lib/linked.a"]);
+        assert!(expand(&linked, &build, None, &store, Outside::Refuse).unwrap_err().contains("through a link"));
+        assert_eq!(expand(&linked, &build, None, &store, Outside::Skip).unwrap(), v(&["lnk/x.o"]));
+        // A member really inside, and one that isn't there (remote-only).
+        std::fs::write(build.join("lib/in.a"), thin(&["a.o", "gone.o"])).unwrap();
+        std::fs::write(build.join("lib/a.o"), "a").unwrap();
+        assert_eq!(expand(&v(&["lib/in.a"]), &build, None, &store, Outside::Refuse).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

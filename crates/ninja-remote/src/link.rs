@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn msvc_arguments() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-link-{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-link-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.obj"), "").unwrap();
         std::fs::write(dir.join("over.yaml"), "").unwrap();
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn gnu_arguments() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-link-gnu-{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-link-gnu-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("crt1.o"), "").unwrap();
         std::fs::write(dir.join("v.map"), "").unwrap();

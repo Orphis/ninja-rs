@@ -45,11 +45,32 @@ pub fn clang_scan_deps(argv: &[String], cwd: &Path) -> Result<Vec<PathBuf>, Stri
 }
 
 /// Flags with a separate argument that name outputs.
-const OUTPUTS: &[&str] = &["-o", "-MF", "-MT", "-MQ"];
+const OUTPUTS: &[&str] = &["-o", "-MF", "-MT", "-MQ", "-MJ"];
+
+/// A `-Wp,` flag without its dependency file options (Linux's
+/// `-Wp,-MMD,file`), which would write the dependencies there; None when
+/// nothing is left.
+fn without_wp_deps(a: &str) -> Option<String> {
+    let Some(opts) = a.strip_prefix("-Wp,") else { return Some(a.to_string()) };
+    let mut kept = Vec::new();
+    let mut opts = opts.split(',');
+    while let Some(o) = opts.next() {
+        match o {
+            "-MD" | "-MMD" | "-MF" | "-MT" | "-MQ" => {
+                opts.next();
+            }
+            "-M" | "-MM" | "-MP" | "-MG" => {}
+            o => kept.push(o),
+        }
+    }
+    (!kept.is_empty()).then(|| format!("-Wp,{}", kept.join(",")))
+}
 
 /// The files a compile reads, from the compiler's own preprocessor: the
-/// command without its outputs, with `-M` (GCC, Clang), or `/E
-/// /showIncludes` (`cl`, `clang-cl`; `deps_prefix` is the localized
+/// command without its outputs, preprocessing with its dependencies
+/// written as it goes (GCC and Clang: `-E -MD`; not `-M`, with which GCC
+/// expands no macros in text, so `__COUNTER__` counts differently), or
+/// `/E /showIncludes` (`cl`, `clang-cl`; `deps_prefix` is the localized
 /// prefix of its notes, `Note: including file:` by default). GCC doesn't
 /// list the files `__has_include` finds, which may then be missing.
 pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> Result<Vec<PathBuf>, String> {
@@ -80,17 +101,17 @@ pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> 
                 i += 1;
                 continue;
             }
-            if a == "-c"
-                || a == "-MD"
-                || a == "-MMD"
-                || a == "-MP"
+            if matches!(a.as_str(), "-c" | "-M" | "-MM" | "-MD" | "-MMD" | "-MP" | "-MG")
                 || a.starts_with("-MF")
                 || a.starts_with("-MT")
                 || a.starts_with("-MQ")
+                || a.starts_with("-MJ")
                 || (a.starts_with("-o") && a.len() > 2)
             {
                 continue;
             }
+            args.extend(without_wp_deps(a));
+            continue;
         }
         args.push(a.clone());
     }
@@ -118,7 +139,8 @@ pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> 
         deps.dedup();
         return Ok(deps);
     }
-    args.insert(options_end, "-M".into());
+    let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    args.splice(options_end..options_end, ["-E", "-MD", "-MF", "-", "-o", null].map(String::from));
     let out = run(Command::new(program).args(&args).current_dir(cwd), program)?;
     Ok(absolute(make_deps(&String::from_utf8_lossy(&out.stdout)), cwd))
 }
@@ -241,6 +263,13 @@ mod tests {
     }
 
     #[test]
+    fn preprocessor_dependency_options() {
+        assert_eq!(without_wp_deps("-Wp,-MD,x.d"), None);
+        assert_eq!(without_wp_deps("-Wp,-MMD,x.d,-DX,-MP"), Some("-Wp,-DX".to_string()));
+        assert_eq!(without_wp_deps("-O2"), Some("-O2".to_string()));
+    }
+
+    #[test]
     fn cl_style() {
         assert!(is_cl_style(&s(&["C:\\VC\\bin\\cl.exe", "/c", "a.cpp"])));
         assert!(is_cl_style(&s(&["clang-cl", "/c", "a.cpp"])));
@@ -253,17 +282,25 @@ mod tests {
     #[test]
     fn real_compiler() {
         let Some(cxx) = std::env::var_os("CPP_DEPS_TEST_CXX") else { return };
-        let dir = std::env::temp_dir().join(format!("cpp_deps_external_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("cpp_deps_external_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.h"), "#define A 1\n").unwrap();
         std::fs::write(dir.join("main.cc"), "#include \"a.h\"\nint main() { return A; }\n").unwrap();
         let argv = vec![cxx.to_string_lossy().into_owned(), "-MD".into(), "-MF".into(), "x.d".into(), "-c".into(), "main.cc".into(), "-o".into(), "x.o".into()];
         let want = vec![dir.join("main.cc"), dir.join("a.h")];
-        assert_eq!(compiler_deps(&argv, &dir, None).unwrap(), want);
+        // (Without what GCC reads first, `stdc-predef.h`.)
+        let deps = |argv: &[String]| compiler_deps(argv, &dir, None).unwrap().into_iter().filter(|f| f.starts_with(&dir)).collect::<Vec<_>>();
+        assert_eq!(deps(&argv), want);
         if Path::new(&cxx).with_file_name(if cfg!(windows) { "clang-scan-deps.exe" } else { "clang-scan-deps" }).exists() {
             assert_eq!(clang_scan_deps(&argv, &dir).unwrap(), want);
         }
         assert!(!dir.join("x.d").exists() && !dir.join("x.o").exists());
+        // Linux's dependency files; macros expanded in text as the compile
+        // does (`__COUNTER__`).
+        std::fs::write(dir.join("counter.cc"), "int x = __COUNTER__;\n#if __COUNTER__ == 1\n#include \"a.h\"\n#endif\n").unwrap();
+        let argv = vec![cxx.to_string_lossy().into_owned(), "-Wp,-MMD,y.d".into(), "-c".into(), "counter.cc".into(), "-o".into(), "y.o".into()];
+        assert_eq!(deps(&argv), vec![dir.join("counter.cc"), dir.join("a.h")]);
+        assert!(!dir.join("y.d").exists() && !dir.join("y.o").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -271,7 +308,7 @@ mod tests {
     #[test]
     fn real_cl() {
         let Some(cl) = std::env::var_os("CPP_DEPS_TEST_CL") else { return };
-        let dir = std::env::temp_dir().join(format!("cpp_deps_external_cl_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("cpp_deps_external_cl_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("inc")).unwrap();
         std::fs::write(dir.join("inc/a.h"), "#define A 1\n").unwrap();
         std::fs::write(dir.join("forced.h"), "#define F 1\n").unwrap();

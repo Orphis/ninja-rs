@@ -58,10 +58,12 @@ pub enum Family {
     /// the head of the `#include "..."` chain.
     #[default]
     Gcc,
-    /// `#include_next` from a file not found along the chains searches as
-    /// `#include` does.
+    /// A file found next to an includer has the includer's place in the
+    /// chains (`#include_next` goes on after it); one found otherwise
+    /// outside them searches as `#include` does.
     Clang,
-    /// cl: a lone carriage return doesn't end a line.
+    /// cl: a lone carriage return doesn't end a line; `#import` reads a
+    /// type library.
     Msvc,
 }
 
@@ -97,6 +99,10 @@ pub struct Config {
     pub forced: Vec<Forced>,
     /// The `__has_*` operators the compiler has, besides `__has_include`.
     pub operators: Arc<HashSet<Sym>>,
+    /// The command line names the source, a search directory or a forced
+    /// include by a relative path: `__FILE__` is then spelled relative,
+    /// unlike the scan's paths.
+    pub relative_paths: bool,
 }
 
 /// A file processed before the main one, and how the compiler finds it.
@@ -158,8 +164,38 @@ pub struct Stats {
 /// A directory's files (None: not a directory), and the session it's from.
 type Listing = (u64, Option<Arc<HashSet<String>>>);
 
-/// A file's key, size and modification time.
-type Version = (PathBuf, u64, Option<SystemTime>);
+/// What tells a file's versions apart: its size and modification time,
+/// and its change time and inode on Unix (a file replaced by one of the
+/// same size with its modification time restored, as `cp -p` or an
+/// archive extraction leaves it), its creation time on Windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Stamp {
+    len: u64,
+    mtime: Option<SystemTime>,
+    change: u64,
+    inode: u64,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Stamp {
+        #[cfg(unix)]
+        let (change, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            ((meta.ctime() as u64).wrapping_mul(1_000_000_000).wrapping_add(meta.ctime_nsec() as u64), meta.ino())
+        };
+        #[cfg(windows)]
+        let (change, inode) = {
+            use std::os::windows::fs::MetadataExt;
+            (meta.creation_time(), 0)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let (change, inode) = (0, 0);
+        Stamp { len: meta.len(), mtime: meta.modified().ok(), change, inode }
+    }
+}
+
+/// A file's key and stamp.
+type Version = (PathBuf, Stamp);
 type Lexing = Arc<OnceLock<Option<Arc<FileDirectives>>>>;
 
 /// The session of entries a watch vouches for: valid until it reports a
@@ -167,8 +203,7 @@ type Lexing = Arc<OnceLock<Option<Arc<FileDirectives>>>>;
 const WATCHED: u64 = u64::MAX;
 
 struct Entry {
-    len: u64,
-    mtime: Option<SystemTime>,
+    stamp: Stamp,
     /// The session it was last checked in, or `WATCHED`.
     session: AtomicU64,
     fd: Arc<FileDirectives>,
@@ -184,6 +219,11 @@ pub trait Watch: Send + Sync {
     /// Whether no change was seen since `token` was taken (a change seen
     /// meanwhile may have been missed by the check).
     fn unchanged_since(&self, token: u64) -> bool;
+    /// Whether `path` may change during a session (in a build directory
+    /// the watch knows): checked every time.
+    fn volatile(&self, _path: &Path) -> bool {
+        false
+    }
 }
 
 /// What a watcher saw change (see `Cache::changed`).
@@ -322,6 +362,9 @@ impl Cache {
     }
 
     fn is_volatile(&self, p: &Path) -> bool {
+        if self.watch.get().is_some_and(|w| w.volatile(p)) {
+            return true;
+        }
         let key = self.key(p);
         let volatile = self.volatile.read().unwrap();
         !volatile.is_empty() && key.ancestors().any(|a| volatile.contains_key(a))
@@ -340,11 +383,15 @@ impl Cache {
             return l.clone();
         }
         let token = self.token(dir);
+        let mut linked = false;
         let l = std::fs::read_dir(dir).ok().map(|rd| {
             Arc::new(
                 rd.flatten()
                     .filter(|e| match e.file_type() {
-                        Ok(t) if t.is_symlink() => e.path().is_file(),
+                        Ok(t) if t.is_symlink() => {
+                            linked = true;
+                            e.path().is_file()
+                        }
                         Ok(t) => t.is_file(),
                         Err(_) => false,
                     })
@@ -352,7 +399,11 @@ impl Cache {
                     .collect(),
             )
         });
-        self.dirs.write().unwrap().insert(key.into_owned(), (self.checked(token), l.clone()));
+        let mut dirs = self.dirs.write().unwrap();
+        // Where a link leads changes without its directory: a listing with
+        // one holds for the session.
+        let session = if linked { self.session() } else { self.checked(token) };
+        dirs.insert(key.into_owned(), (session, l.clone()));
         l
     }
 
@@ -378,16 +429,15 @@ impl Cache {
         }
         let token = if volatile { None } else { self.token(p) };
         let meta = std::fs::metadata(p).ok().filter(|m| m.is_file())?;
-        let (len, mtime) = (meta.len(), meta.modified().ok());
+        let stamp = Stamp::of(&meta);
         if let Some(e) = known
-            && e.len == len
-            && e.mtime == mtime
+            && e.stamp == stamp
         {
             e.session.store(self.checked(token), Ordering::Relaxed);
             self.files_reused.fetch_add(1, Ordering::Relaxed);
             return Some(e.fd.clone());
         }
-        let version = (key.into_owned(), len, mtime);
+        let version = (key.into_owned(), stamp);
         let cell = self.lexing.lock().unwrap().entry(version.clone()).or_default().clone();
         let mut lexed = false;
         let fd = cell
@@ -395,8 +445,10 @@ impl Cache {
                 lexed = true;
                 let fd = Arc::new(lex::lex(&std::fs::read(p).ok()?));
                 self.files_lexed.fetch_add(1, Ordering::Relaxed);
-                let entry = Entry { len, mtime, session: AtomicU64::new(self.checked(token)), fd: fd.clone() };
-                self.files.write().unwrap().insert(version.0.clone(), Arc::new(entry));
+                // The token compared under the lock: an event counted after
+                // it drops the entry once it's in.
+                let mut files = self.files.write().unwrap();
+                files.insert(version.0.clone(), Arc::new(Entry { stamp, session: AtomicU64::new(self.checked(token)), fd: fd.clone() }));
                 Some(fd)
             })
             .clone();
@@ -504,12 +556,16 @@ impl Context for State<'_> {
 
     fn dynamic(&mut self, name: Sym) -> Option<Token> {
         // `__COUNTER__` counts its uses in text too, which isn't expanded;
-        // `#line` changes `__LINE__` and `__FILE__`.
+        // `#line` changes `__LINE__` and `__FILE__`; compilers spell
+        // `__FILE__` as the command line spells its paths, which the scan
+        // makes absolute.
         let line_set = self.stack.last()?.line_set;
         let unknown = if name == intern::COUNTER {
             Some("__COUNTER__")
         } else if line_set && [intern::LINE, intern::FILE, intern::FILE_NAME].contains(&name) {
             Some("__LINE__ or __FILE__ after #line")
+        } else if self.cfg.relative_paths && [intern::FILE, intern::BASE_FILE].contains(&name) {
+            Some("__FILE__ with relative paths on the command line")
         } else {
             None
         };
@@ -628,7 +684,8 @@ impl State<'_> {
         // found in, `<...>` or not. From a file found otherwise, GCC starts
         // at the head of the chain when it was found next to its includer,
         // and searches as `#include` does when it's the main file or was
-        // found by its absolute path; Clang always searches as `#include`.
+        // found by its absolute path; Clang searches as `#include` (a file
+        // it found next to an includer has the includer's place).
         let after = match self.stack.last() {
             Some(f) if next => match f.found_at {
                 Some(i) => Some(i + 1),
@@ -643,8 +700,11 @@ impl State<'_> {
             } else {
                 self.stack.last().map(|f| &f.dir).into_iter().collect()
             };
+            // Clang's lookup leaves the includer's place as the found
+            // file's, wherever along the includers it was found.
+            let at = if self.cfg.family == Family::Clang { self.stack.last().and_then(|f| f.found_at) } else { None };
             for d in dirs {
-                if let Some(f) = self.candidate(normalize(&d.join(p)), None) {
+                if let Some(f) = self.candidate(normalize(&d.join(p)), at) {
                     return Some(Found { relative: true, ..f });
                 }
             }
@@ -709,6 +769,9 @@ impl State<'_> {
         if fd.lone_cr && self.cfg.family == Family::Msvc {
             self.inexact(format!("{}: cl doesn't end lines at a lone carriage return", real.display()));
         }
+        if fd.asm_include {
+            self.inexact(format!("{}: an assembler's .include or .incbin", real.display()));
+        }
         if let Some(g) = fd.guard
             && self.macros.contains_key(&g)
         {
@@ -760,6 +823,12 @@ impl State<'_> {
     }
 
     fn include(&mut self, d: &Directive) {
+        if d.kind == DirKind::Import && self.cfg.family == Family::Msvc {
+            // cl's reads a type library, and includes the headers it
+            // generates from it (and `comdef.h`).
+            self.inexact(format!("{}: #import of a type library", self.here()));
+            return;
+        }
         let next = d.kind == DirKind::IncludeNext;
         let target = match &d.toks[..] {
             [t] if t.kind == Kind::HeaderName => Some((t.sym.as_str().to_string(), true)),
@@ -1051,7 +1120,7 @@ mod tests {
 
     impl Dir {
         fn new(name: &str) -> Dir {
-            let d = std::env::temp_dir().join(format!("cpp_deps_{name}_{}", std::process::id()));
+            let d = test_dirs::base().join(format!("cpp_deps_{name}_{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
             Dir(d)
@@ -1164,6 +1233,28 @@ mod tests {
             c.family = family;
             assert_eq!(files(&c, &rel2), vec!["rel/main2.c", "rel/y2.h"]);
         }
+        // Found next to an includer that came from the chain: Clang goes on
+        // after the includer's directory, GCC starts at the head again.
+        let inherits = d.file("inherit.c", "#include \"a.h\"\n");
+        d.file("q1/a.h", "#include \"b.h\"\n");
+        d.file("q1/b.h", "#ifndef B\n#define B\n#include_next <b.h>\n#endif\n");
+        d.file("q2/b.h", "");
+        d.file("inc/b.h", "");
+        cache.new_session();
+        c.family = Family::Clang;
+        assert_eq!(files(&c, &inherits), vec!["inherit.c", "q1/a.h", "q1/b.h", "q2/b.h"]);
+        c.family = Family::Gcc;
+        assert_eq!(files(&c, &inherits), vec!["inherit.c", "q1/a.h", "q1/b.h"]);
+        // Through the MSVC lookup's includers too.
+        let stack = d.file("src/stack.cc", "#include <sub/s.h>\n");
+        d.file("inc/sub/s.h", "#include \"s2.h\"\n");
+        d.file("src/s2.h", "#include_next <s2.h>\n");
+        d.file("inc/s2.h", "");
+        d.file("sys/s2.h", "");
+        cache.new_session();
+        c.family = Family::Clang;
+        c.msvc_lookup = true;
+        assert_eq!(files(&c, &stack), vec!["src/stack.cc", "inc/sub/s.h", "src/s2.h", "sys/s2.h"]);
     }
 
     #[test]
@@ -1244,6 +1335,32 @@ mod tests {
     }
 
     #[test]
+    fn file_macro_and_import() {
+        let d = Dir::new("file_macro");
+        let main = d.file("sub/main.c", "#ifndef AGAIN\n#define AGAIN\n#include __FILE__\n#endif\n");
+        d.file("sub/sub/main.c", "");
+        let mut c = cfg(&d);
+        // Absolute paths on the command line: __FILE__ names the file itself.
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &main);
+        assert_eq!(d.rel(&out.files), vec!["sub/main.c"]);
+        assert!(out.exact(), "{:?}", out.inexact);
+        // Relative ones: compilers spell it `sub/main.c`, found next to the
+        // file (`sub/sub/main.c`).
+        c.relative_paths = true;
+        assert!(!scan(&Cache::new(vec![], false), &c, &NoOracle, &main).exact());
+        // cl's #import reads a type library, Objective-C's a header.
+        let import = d.file("import.cc", "#import \"x.tlb\"\n");
+        d.file("x.tlb", "");
+        let mut c = cfg(&d);
+        assert!(scan(&Cache::new(vec![], false), &c, &NoOracle, &import).exact());
+        c.family = Family::Msvc;
+        assert!(!scan(&Cache::new(vec![], false), &c, &NoOracle, &import).exact());
+        // An assembler's .include reads what the preprocessor doesn't.
+        let asm = d.file("blake3.S", "#include \"x.tlb\"\n.include \"macros.s\"\n");
+        assert!(!scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &asm).exact());
+    }
+
+    #[test]
     fn pragmas_the_scan_cant_see() {
         let d = Dir::new("pragmas");
         d.file("a.h", "");
@@ -1265,6 +1382,7 @@ mod tests {
         assert!(!exact("ms.c", "#define ONCE __pragma(once)\nONCE\n"));
         assert!(!exact("generic.c", "#define DO_PRAGMA(x) _Pragma(#x)\nDO_PRAGMA(push_macro(\"M\"))\n"));
         assert!(!exact("generic2.c", "#define PRAGMA(x) _Pragma(x)\nPRAGMA(\"once\")\n"));
+        assert!(!exact("operand.c", "#define ONCE_STR \"once\"\n_Pragma(ONCE_STR)\n"));
         assert!(exact("diagnostic.c", "#define DO_PRAGMA(x) _Pragma(#x)\n#define PUSH _Pragma(\"GCC diagnostic push\")\nDO_PRAGMA(GCC diagnostic pop)\n"));
     }
 
@@ -1545,6 +1663,87 @@ mod tests {
         cache.directives(&a).unwrap();
         cache.changed(&d.0, Change::Tree);
         assert!(cache.is_empty());
+    }
+
+    /// A change reported while a file is lexed, between the check of its
+    /// token and the entry's insertion: the entry doesn't outlive it.
+    #[test]
+    fn changed_while_lexed() {
+        struct Late {
+            cache: OnceLock<Arc<Cache>>,
+            path: PathBuf,
+            armed: std::sync::atomic::AtomicBool,
+            event: Mutex<Option<std::thread::JoinHandle<()>>>,
+        }
+        impl Watch for Late {
+            fn token(&self, _: &Path) -> Option<u64> {
+                Some(0)
+            }
+            fn unchanged_since(&self, _: u64) -> bool {
+                // The event is reported now, by the watcher's thread; the
+                // check saw none.
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    let mut event = self.event.lock().unwrap();
+                    let (cache, path) = (self.cache.get().unwrap().clone(), self.path.clone());
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    *event = Some(std::thread::spawn(move || {
+                        cache.changed(&path, Change::Content);
+                        let _ = tx.send(());
+                    }));
+                    let _ = rx.recv_timeout(std::time::Duration::from_millis(200));
+                }
+                true
+            }
+        }
+        let d = Dir::new("late");
+        let p = d.file("x.h", "#include \"a.h\"\n");
+        let cache = Arc::new(Cache::new(vec![], cfg!(windows)));
+        let late = Arc::new(Late { cache: OnceLock::new(), path: p.clone(), armed: true.into(), event: Mutex::default() });
+        let _ = late.cache.set(cache.clone());
+        cache.set_watch(late.clone());
+        let first = cache.directives(&p).unwrap();
+        late.event.lock().unwrap().take().unwrap().join().unwrap();
+        d.file("x.h", "#include \"bbbbbbbbbbbbbbbbbbbbbbbb.h\"\n");
+        cache.new_session();
+        assert!(!Arc::ptr_eq(&cache.directives(&p).unwrap(), &first));
+    }
+
+    /// A file replaced by one of the same size with its modification time
+    /// restored (`cp -p`, an archive extracted over it): lexed again.
+    #[cfg(unix)]
+    #[test]
+    fn same_size_and_time() {
+        let d = Dir::new("stamp");
+        let p = d.file("x.h", "#include \"a.h\"\n");
+        let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+        let cache = Cache::new(vec![], false);
+        let first = cache.directives(&p).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        d.file("x.h", "#include \"b.h\"\n");
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+        cache.new_session();
+        assert!(!Arc::ptr_eq(&cache.directives(&p).unwrap(), &first));
+    }
+
+    /// A listing with a symbolic link holds for a session only: whether the
+    /// link leads to a file changes without its directory changing (a
+    /// dangling link's target created elsewhere).
+    #[cfg(unix)]
+    #[test]
+    fn listings_with_links() {
+        let d = Dir::new("links");
+        std::fs::create_dir_all(d.0.join("inc")).unwrap();
+        std::fs::create_dir_all(d.0.join("gen")).unwrap();
+        std::os::unix::fs::symlink("../gen/foo.h", d.0.join("inc/foo.h")).unwrap();
+        let cache = Cache::new(vec![], false);
+        let watch = Arc::new(FakeWatch::default());
+        watch.covers.store(true, Ordering::Relaxed);
+        cache.set_watch(watch);
+        let link = d.0.join("inc/foo.h");
+        assert!(!cache.exists(&link));
+        d.file("gen/foo.h", "");
+        cache.new_session();
+        assert!(cache.exists(&link));
     }
 
     #[test]

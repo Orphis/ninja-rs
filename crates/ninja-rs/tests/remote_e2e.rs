@@ -8,11 +8,18 @@
 //! a tool declared local. Under the name `fake-ar` it writes thin archives
 //! (`qcT`), which `fake-clang --link` reads. This keeps the test hermetic on
 //! every host.
+//!
+//! Builds run the ninja-rs binary in the fixture (`-C`), with the
+//! environment the test gives it: the tests change neither this process's
+//! directory nor its environment, which the fake server's threads share.
+
+mod harness;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fake_reapi::FakeServer;
+use harness::ninja_exe;
 use ninja_core::subprocess::Interrupt;
 use ninja_rs::Service;
 use ninja_rs::options::{ParseOutcome, parse_args};
@@ -30,8 +37,10 @@ impl Counting {
     }
 }
 
+// SAFETY: the system allocator does the work; this only counts.
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's layout, as `GlobalAlloc::alloc` requires.
         let p = unsafe { std::alloc::System.alloc(layout) };
         if !p.is_null() {
             Self::grew(layout.size());
@@ -39,10 +48,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: `p` came from `alloc` or `realloc` with this layout.
         unsafe { std::alloc::System.dealloc(p, layout) };
         ALLOCATED.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
     }
     unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: as for `dealloc`, with the caller's new size.
         let q = unsafe { std::alloc::System.realloc(p, layout, new_size) };
         if !q.is_null() {
             if new_size > layout.size() {
@@ -168,9 +179,19 @@ fn fake_clang(args: &[String]) -> i32 {
     }
     let src = src.expect("-c");
     // Racing tests: files in the working directory, which only local runs
-    // see (remote ones run elsewhere), make them slow, or mark their outputs.
+    // see (remote ones run elsewhere), make them slow (saying who's
+    // sleeping), or mark their outputs.
     if let Ok(ms) = std::fs::read_to_string("race-local-sleep-ms") {
+        let _ = std::fs::create_dir_all("race-local-pids");
+        std::fs::write(Path::new("race-local-pids").join(std::process::id().to_string()), "").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(ms.trim().parse().unwrap_or(0)));
+    }
+    // A source edited after the build hashed it, before the compile reads
+    // it: the file names the source, then its new contents.
+    if let Ok(edit) = std::fs::read_to_string("local-edit-source")
+        && let Some((path, contents)) = edit.split_once('\n')
+    {
+        std::fs::write(path, contents).unwrap();
     }
     let mut deps = vec![src.clone()];
     let mut text = String::new();
@@ -309,20 +330,16 @@ fn write(p: &Path, s: &str) {
     std::fs::write(p, s).unwrap();
 }
 
+/// A checkout and its build directory, in the running test's directory.
 fn fixture(name: &str, rbe: bool) -> Fixture {
-    let base = std::env::var_os("TEST_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let root = base.join(format!("ninja-rs-e2e-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = harness::test_dir(name);
     let build = root.join("build");
-    let exe = std::env::current_exe().unwrap();
     let compiler = root.join("tc/bin").join(if cfg!(windows) { "fake-clang.exe" } else { "fake-clang" });
-    std::fs::create_dir_all(compiler.parent().unwrap()).unwrap();
-    std::fs::copy(&exe, &compiler).unwrap();
+    harness::link_self(&compiler);
     let ar = root.join("tc/bin").join(if cfg!(windows) { "fake-ar.exe" } else { "fake-ar" });
-    std::fs::copy(&exe, &ar).unwrap();
+    harness::link_self(&ar);
     let cmake = root.join("cmake/bin").join(if cfg!(windows) { "fake-cmake.exe" } else { "fake-cmake" });
-    std::fs::create_dir_all(cmake.parent().unwrap()).unwrap();
-    std::fs::copy(&exe, &cmake).unwrap();
+    harness::link_self(&cmake);
     write(&root.join("src/main.c"), "#include \"lib.h\"\nint main() { return lib(); }\n");
     write(&root.join("src/lib.c"), "#include \"lib.h\"\nint lib() { return DEEP; }\n");
     write(&root.join("include/lib.h"), "#include \"nested/deep.h\"\nint lib();\n");
@@ -399,17 +416,39 @@ fn ninja_escape_path(p: &str) -> String {
     p.replace('$', "$$").replace(' ', "$ ").replace(':', "$:")
 }
 
-fn run_ninja(f: &Fixture, endpoint: Option<&str>, extra: &[&str]) -> i32 {
+/// The options of a build of the fixture: the executor's, then `extra`.
+fn build_args(endpoint: Option<&str>, extra: &[&str]) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     if let Some(e) = endpoint {
         args.push(format!("--remote_executor={e}"));
         args.push("--remote_header=x-test=1".into());
     }
     args.extend(extra.iter().map(|s| s.to_string()));
-    let opts = match parse_args(&args).unwrap() {
+    args
+}
+
+/// Builds in the fixture (ninja-rs, `-C`, without `.ninjars` files).
+fn run_ninja(f: &Fixture, endpoint: Option<&str>, extra: &[&str]) -> i32 {
+    run_ninja_with(f, endpoint, extra, &[])
+}
+
+/// Like `run_ninja`, with variables set in the build's environment.
+fn run_ninja_with(f: &Fixture, endpoint: Option<&str>, extra: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> i32 {
+    let mut c = std::process::Command::new(ninja_exe());
+    c.arg("-C").arg(&f.build).arg("--ignore_all_rc_files").args(build_args(endpoint, extra));
+    c.env_remove(ninja_rs::nested::ENV).env_remove("MAKEFLAGS").env_remove("NINJA_STATUS").env_remove("NINJA_RS_DAEMON");
+    c.envs(env.iter().copied());
+    c.status().map_or(-1, |s| s.code().unwrap_or(-1))
+}
+
+/// Builds in the fixture in this process, for the tests measuring what a
+/// build allocates; back to the directory it was in after.
+fn run_ninja_in_process(f: &Fixture, endpoint: Option<&str>, extra: &[&str]) -> i32 {
+    let opts = match parse_args(&build_args(endpoint, extra)).unwrap() {
         ParseOutcome::Run(o) => o,
         ParseOutcome::Exit(..) => panic!("unexpected exit"),
     };
+    let before = std::env::current_dir().unwrap();
     std::env::set_current_dir(&f.build).unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
     let code = rt.block_on(async {
@@ -417,6 +456,7 @@ fn run_ninja(f: &Fixture, endpoint: Option<&str>, extra: &[&str]) -> i32 {
         s.run(&opts).await
     });
     rt.shutdown_background();
+    std::env::set_current_dir(before).unwrap();
     code
 }
 
@@ -626,7 +666,8 @@ fn test_compile_side_outputs() -> Result<(), String> {
 
 /// Local results the action's key doesn't describe aren't cached: when
 /// the command read a file the action's inputs lack, ran with a variable
-/// compilers read set, or ran steps on the host.
+/// set that the compiler reads and the action can't carry, or ran steps
+/// on the host.
 fn test_capture_guards() -> Result<(), String> {
     let f = fixture("captureguards", true);
     let disk = f.root.join("disk-cache");
@@ -642,12 +683,11 @@ fn test_capture_guards() -> Result<(), String> {
     check(entries() == 0, &format!("results reading an undeclared file were cached: {}", entries()))?;
     std::fs::remove_file(f.build.join("local-extra-dep")).map_err(|e| e.to_string())?;
     clean()?;
-    // 2. A variable compilers read. Tests run one at a time.
-    unsafe { std::env::set_var("CPATH", f.root.join("include")) };
-    let code = run_ninja(&f, None, &[&flag, objs[0], objs[1]]);
-    unsafe { std::env::remove_var("CPATH") };
-    check(code == 0, "build with CPATH set failed")?;
-    check(entries() == 0, &format!("results with CPATH set were cached: {}", entries()))?;
+    // 2. A variable the compiler reads that the action can't carry (it
+    //    writes a file the action doesn't return).
+    let deps = std::ffi::OsStr::new("deps.txt");
+    check(run_ninja_with(&f, None, &[&flag, objs[0], objs[1]], &[("DEPENDENCIES_OUTPUT", deps)]) == 0, "build with DEPENDENCIES_OUTPUT set failed")?;
+    check(entries() == 0, &format!("results with DEPENDENCIES_OUTPUT set were cached: {}", entries()))?;
     clean()?;
     // 3. Steps on the host (removing the archive before, a stamp after):
     //    only the compiles are cached.
@@ -670,11 +710,18 @@ fn test_remote_cache_only() -> Result<(), String> {
         check(st.executions == 0 && st.action_cache_updates == 2, &format!("expected 2 stored results and no executions, got {st:?}"))?;
 
         // 2. Another checkout of the same sources: the compiles are hits, and
-        //    the depfiles map back to its paths.
+        //    the depfiles map back to its paths. Local compiles would mark
+        //    their objects there: none ran.
         let g = fixture("cacheonly-other", true);
+        write(&g.build.join("race-local-mark"), "");
         check(run_ninja(&g, None, &[&flag]) == 0, "build in the other checkout failed")?;
         let st = server.stats();
         check(st.executions == 0 && st.action_cache_hits == 2 && st.action_cache_updates == 2, &format!("expected 2 remote cache hits, got {st:?}"))?;
+        for o in ["obj/main.o", "obj/lib.o"] {
+            let theirs = std::fs::read_to_string(g.build.join(o)).map_err(|e| format!("{o}: {e}"))?;
+            check(!theirs.contains("RACE-LOCAL"), &format!("{o} was compiled locally, not taken from the remote cache"))?;
+        }
+        std::fs::remove_file(g.build.join("race-local-mark")).map_err(|e| e.to_string())?;
         check(std::fs::read(g.build.join("obj/main.o")).ok() == std::fs::read(f.build.join("obj/main.o")).ok(), "obj/main.o differs")?;
         check(std::fs::read_to_string(g.build.join("app.bin")).is_ok_and(|s| s.starts_with("LINKED")), "app.bin")?;
         let deep = g.root.join("include/nested/deep.h").to_string_lossy().replace('\\', "/");
@@ -730,9 +777,11 @@ fn test_fallback_guards() -> Result<(), String> {
 
 /// --remote_racing: a slow remote execution loses to a local run when a
 /// local slot is free; a slow local run is stopped when the remote result
-/// arrives first, and the remote outputs are written.
+/// arrives first, and the remote outputs are written. "Slow" is a side held
+/// back until the other has won, or for far longer than a build takes:
+/// what happened is read from the server's counters and the outputs.
 fn test_racing() -> Result<(), String> {
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let f = fixture("racing", true);
     with_server(&f, |server| {
         let ep = server.endpoint.clone();
@@ -741,24 +790,34 @@ fn test_racing() -> Result<(), String> {
         let race = ["--remote_racing", "--remote_racing_delay=0", "-j4", objs[0], objs[1]];
         write(&f.build.join("race-local-mark"), "");
 
-        // 1. The remote side is slow: the local runs win.
-        server.state.set_execute_delay(Duration::from_secs(4));
-        let start = Instant::now();
+        // 1. The remote side doesn't answer before the test gives up: the
+        //    local runs win, and the build doesn't wait for it.
+        let deadline = Instant::now() + harness::PATIENCE;
+        server.state.set_execute_gate(Some(std::sync::Arc::new(move || Instant::now() > deadline)));
         check(run_ninja(&f, Some(&ep), &race) == 0, "racing build failed")?;
-        check(start.elapsed() < Duration::from_secs(4), &format!("waited for the remote side: {:?}", start.elapsed()))?;
+        check(server.stats().executions == 0, &format!("the build waited for the remote side: {:?}", server.stats()))?;
         check(objs.iter().all(|o| local_made(o)), "outputs not from the local runs")?;
 
-        // 2. The local side is slow: the remote results win, the local
-        //    commands are stopped and don't overwrite them.
-        server.state.set_execute_delay(Duration::ZERO);
+        // 2. The local side takes longer than the test would wait: the
+        //    remote results, held back until both local runs started, win;
+        //    the local commands are stopped and don't overwrite them.
         server.state.clear_action_cache();
         check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
-        write(&f.build.join("race-local-sleep-ms"), "4000");
-        let start = Instant::now();
+        let pids = f.build.join("race-local-pids");
+        let _ = std::fs::remove_dir_all(&pids);
+        write(&f.build.join("race-local-sleep-ms"), &(10 * harness::PATIENCE.as_millis()).to_string());
+        let (started, deadline) = (pids.clone(), Instant::now() + harness::PATIENCE);
+        server
+            .state
+            .set_execute_gate(Some(std::sync::Arc::new(move || std::fs::read_dir(&started).is_ok_and(|d| d.count() == 2) || Instant::now() > deadline)));
         check(run_ninja(&f, Some(&ep), &race) == 0, "racing build failed")?;
-        check(start.elapsed() < Duration::from_secs(4), &format!("waited for the local side: {:?}", start.elapsed()))?;
-        std::thread::sleep(Duration::from_secs(5));
+        let st = server.stats();
+        check(st.executions == 2, &format!("expected the 2 remote executions to run: {st:?}"))?;
+        let pids: Vec<u32> = std::fs::read_dir(&pids).map_err(|e| e.to_string())?.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
+        check(pids.len() == 2, &format!("expected 2 local runs, got {pids:?}"))?;
+        harness::wait_for("the local runs stopped", || !pids.iter().any(|&p| harness::alive(p)))?;
         check(objs.iter().all(|o| f.build.join(o).exists() && !local_made(o)), "outputs not from the remote side")?;
+        server.state.set_execute_gate(None);
         let _ = std::fs::remove_file(f.build.join("race-local-sleep-ms"));
         let _ = std::fs::remove_file(f.build.join("race-local-mark"));
         Ok(())
@@ -1392,28 +1451,6 @@ build obj/user.o: CC {main} | obj/pch.pch
     })
 }
 
-/// The ninja-rs binary, found once before the tests change directories.
-static NINJA_EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-fn ninja_exe() -> PathBuf {
-    NINJA_EXE.get_or_init(find_ninja_exe).clone()
-}
-
-/// The ninja-rs binary (`CARGO_BIN_EXE_ninja-rs`, a runfile under Bazel,
-/// relative to the directory the test starts in).
-fn find_ninja_exe() -> PathBuf {
-    let path = env!("CARGO_BIN_EXE_ninja-rs");
-    if Path::new(path).exists() {
-        return std::path::absolute(path).unwrap();
-    }
-    // Bazel on Windows: no runfiles tree, a manifest of them.
-    let manifest = std::env::var("RUNFILES_MANIFEST_FILE").expect("ninja-rs binary not found");
-    let key = format!("_main/{path} ");
-    let text = std::fs::read_to_string(manifest).unwrap();
-    let line = text.lines().find(|l| l.starts_with(&key)).expect("ninja-rs binary not in the runfiles");
-    PathBuf::from(&line[key.len()..])
-}
-
 /// A build command running ninja-rs again (LLVM's NATIVE tools,
 /// ExternalProject): the nested build runs remotely with the outer one's
 /// settings, under its invocation id, its events join the outer stream
@@ -1759,22 +1796,18 @@ fn test_include_scanner_fallback() -> Result<(), String> {
     Ok(())
 }
 
-/// Builds through the daemon (started by the first, running this test
-/// binary): an edited header, same size, must reach the remote actions
-/// although the daemon vouched for it after the second build.
+/// Builds through the daemon (started by the first): an edited header, same
+/// size, must reach the remote actions although the daemon vouched for it
+/// after the second build.
 fn test_daemon() -> Result<(), String> {
     let f = fixture("daemon", true);
     // A repository: watched.
     std::fs::create_dir_all(f.root.join(".git")).unwrap();
     let dir = f.root.join("daemon");
-    // SAFETY: the tests run one at a time; builds read these later.
-    unsafe {
-        std::env::set_var("NINJA_RS_DAEMON_DIR", &dir);
-        std::env::set_var("NINJA_RS_DAEMON_IDLE", "120");
-    }
+    let env = [("NINJA_RS_DAEMON_DIR", dir.as_os_str()), ("NINJA_RS_DAEMON_IDLE", std::ffi::OsStr::new("120"))];
     let r = with_server(&f, |server| {
         let ep = server.endpoint.clone();
-        let build = || run_ninja(&f, Some(&ep), &["--daemon", "--remote_include_scanner=preprocessor", "--remote_strict"]);
+        let build = || run_ninja_with(&f, Some(&ep), &["--daemon", "--remote_include_scanner=preprocessor", "--remote_strict"], &env);
         check(build() == 0, "first build failed")?;
         check(server.stats().executions == 2, &format!("expected 2 remote executions, got {:?}", server.stats()))?;
         let deep = f.root.join("include/nested/deep.h");
@@ -1791,7 +1824,10 @@ fn test_daemon() -> Result<(), String> {
             let expected = 4 + 2 * i as u64;
             check(server.stats().executions == expected, &format!("after editing deep.h: expected {expected} remote executions, got {:?}", server.stats()))?;
         }
-        let loc = ninja_daemon::Location::for_exe(&std::env::current_exe().unwrap()).unwrap();
+        // The binary's daemon, as it names its path (Bazel's runfile is a
+        // link on Unix).
+        let exe = if cfg!(unix) { std::fs::canonicalize(ninja_exe()).unwrap() } else { ninja_exe() };
+        let loc = ninja_daemon::Location { dir: dir.clone(), ..ninja_daemon::Location::for_exe(&exe).unwrap() };
         let status = ninja_daemon::Client::connect(&loc).and_then(|c| c.status()).map_err(|e| format!("daemon status: {e}"))?;
         check(status.builds == 3, &format!("expected 3 builds, got {status:?}"))?;
         check(status.digests > 0 && status.trees > 0, &format!("nothing kept: {status:?}"))?;
@@ -1800,11 +1836,7 @@ fn test_daemon() -> Result<(), String> {
         check(watched, &format!("the fixture isn't watched: {:?}", status.roots))?;
         Ok::<(), String>(())
     });
-    ninja_rs::daemon::tool(&["stop".to_string()]);
-    unsafe {
-        std::env::remove_var("NINJA_RS_DAEMON_DIR");
-        std::env::remove_var("NINJA_RS_DAEMON_IDLE");
-    }
+    let _ = std::process::Command::new(ninja_exe()).args(["-t", "daemon", "stop"]).envs(env).status();
     r
 }
 
@@ -1835,6 +1867,23 @@ fn test_transient_failures() -> Result<(), String> {
         check(run_ninja(&f, Some(&ep), &["--remote_strict", "--remote_retries=0", "obj/main.o"]) == 1, "the build should fail without retries")?;
         Ok(())
     })
+}
+
+/// A remote service nothing answers for at the start: with
+/// --remote_local_fallback (the default), the build runs locally; with
+/// --remote_strict or --noremote_local_fallback, it fails.
+fn test_unreachable_remote() -> Result<(), String> {
+    let f = fixture("unreachable", true);
+    // A port nothing listens on.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?.local_addr().map_err(|e| e.to_string())?.port();
+    let ep = format!("grpc://127.0.0.1:{port}");
+    for strict in ["--remote_strict", "--noremote_local_fallback"] {
+        check(run_ninja(&f, Some(&ep), &[strict]) == 1, &format!("a build with {strict} didn't fail"))?;
+    }
+    check(run_ninja(&f, Some(&ep), &[]) == 0, "the build didn't run locally")?;
+    let app = std::fs::read_to_string(f.build.join("app.bin")).map_err(|e| e.to_string())?;
+    check(app.starts_with("LINKED"), &format!("app.bin: {app}"))?;
+    Ok(())
 }
 
 /// Large blobs one call uploads go through ByteStream several at once.
@@ -1908,7 +1957,7 @@ fn test_large_outputs() -> Result<(), String> {
         // 3. From the disk cache alone, a chunk at a time.
         let size = std::fs::metadata(&big_o).map_or(0, |m| m.len()) as usize;
         clean()?;
-        let (code, peak) = peak_during(|| run_ninja(&f, None, &[&flag, "obj/big.o"]));
+        let (code, peak) = peak_during(|| run_ninja_in_process(&f, None, &[&flag, "obj/big.o"]));
         check(code == 0, "rebuild from the disk cache failed")?;
         eprintln!("large_outputs: {size} bytes restored, peak {peak} bytes allocated");
         check(peak < size / 2, &format!("obj/big.o ({size} bytes) was held in memory: {peak} bytes allocated at once"))?;
@@ -2046,6 +2095,309 @@ fn test_without_executor_runs_locally() -> Result<(), String> {
     Ok(())
 }
 
+/// A local link of many remote-only objects, each smaller than what is
+/// fetched into a file as it arrives: they're written a few at a time, not
+/// all held in memory at once.
+fn test_materialize_memory() -> Result<(), String> {
+    let f = fixture("materializememory", true);
+    let mut manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    let mut objs = Vec::new();
+    for i in 0..20 {
+        let src = f.root.join(format!("src/m{i}.c"));
+        write(&src, &format!("{}\n", noise_lines(2_000, 100 + i).join("\n")));
+        // About 3.3 MB each: under the 4 MiB fetched into files as they
+        // arrive.
+        manifest.push_str(&format!(
+            "build obj/m{i}.o: CC {}\n  DEP_FILE = obj/m{i}.o.d\n  FLAGS = -DREPEAT=32\n  rbe_mnemonic = CCompile\n",
+            ninja_escape_path(&src.to_string_lossy())
+        ));
+        objs.push(format!("obj/m{i}.o"));
+    }
+    manifest.push_str(&format!("build many.bin: LINK {}\n  rbe_mnemonic = CLink\n", objs.join(" ")));
+    write(&f.build.join("build.ninja"), &manifest);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Compile,Link", "many.bin"]) == 0, "first build failed")?;
+        check(!f.build.join("obj/m0.o").exists(), "the objects were downloaded")?;
+        std::fs::remove_file(f.build.join("many.bin")).map_err(|e| e.to_string())?;
+        let (code, peak) = peak_during(|| run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Compile", "many.bin"]));
+        check(code == 0, "the local link failed")?;
+        let sizes: Vec<u64> = objs.iter().map(|o| std::fs::metadata(f.build.join(o)).map_or(0, |m| m.len())).collect();
+        let total = sizes.iter().sum::<u64>() as usize;
+        eprintln!("materialize_memory: {} objects, {total} bytes, peak {peak} bytes allocated", objs.len());
+        check(sizes.iter().all(|&s| s > 3 << 20 && s < 4 << 20), &format!("object sizes {sizes:?}"))?;
+        check(peak < total / 2, &format!("the objects ({total} bytes) were held in memory: {peak} bytes allocated at once"))
+    })
+}
+
+/// A build with the disk cache alone drops the records of remote-only
+/// outputs: its local runs replace them, and a later remote build mustn't
+/// bring the old outputs back.
+fn test_disk_only_build_drops_records() -> Result<(), String> {
+    let f = fixture("diskonlyrecords", true);
+    let disk = format!("--disk_cache={}", f.root.join("disk-cache").to_string_lossy());
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let flags = ["--remote_download_minimal", "--remote_mnemonics=Compile,Link"];
+        check(run_ninja(&f, Some(&ep), &flags) == 0, "first build failed")?;
+        check(remote_only(&f).contains(&"obj/main.o".to_string()), &format!("remote-only outputs: {:?}", remote_only(&f)))?;
+        // Another command for obj/main.o, built with the disk cache alone.
+        let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+        write(&f.build.join("build.ninja"), &manifest.replacen("DEP_FILE = obj/main.o.d\n", "DEP_FILE = obj/main.o.d\n  FLAGS = -DCHANGED\n", 1));
+        check(run_ninja(&f, None, &[&disk, "obj/main.o"]) == 0, "the disk-only build failed")?;
+        check(!f.build.join(".ninja_remote").exists(), &format!("records survived the disk-only build: {:?}", remote_only(&f)))?;
+        // Its output gone, the remote build runs the command again.
+        std::fs::remove_file(f.build.join("obj/main.o")).map_err(|e| e.to_string())?;
+        check(run_ninja(&f, Some(&ep), &[flags[0], flags[1], "obj/main.o"]) == 0, "the remote build failed")?;
+        check(server.stats().executions == 4, &format!("the old remote object came back: {:?}", server.stats()))
+    })
+}
+
+/// A local run of an action whose side outputs (split DWARF) were left
+/// remote drops their records with its outputs'.
+fn test_local_run_drops_side_output_records() -> Result<(), String> {
+    let f = fixture("siderecords", true);
+    let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    write(&f.build.join("build.ninja"), &manifest.replacen("DEP_FILE = obj/main.o.d\n", "DEP_FILE = obj/main.o.d\n  FLAGS = -gsplit-dwarf\n", 1));
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Compile,Link", "app.bin"]) == 0, "first build failed")?;
+        let recorded = remote_only(&f);
+        check(recorded.contains(&"obj/main.o".to_string()) && recorded.contains(&"obj/main.dwo".to_string()), &format!("remote-only outputs: {recorded:?}"))?;
+        // Another command for obj/main.o, run locally.
+        let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+        write(&f.build.join("build.ninja"), &manifest.replacen("FLAGS = -gsplit-dwarf\n", "FLAGS = -gsplit-dwarf -DCHANGED\n", 1));
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Link", "obj/main.o"]) == 0, "the local compile failed")?;
+        check(f.build.join("obj/main.dwo").exists(), "the local compile wrote no obj/main.dwo")?;
+        let recorded = remote_only(&f);
+        check(!recorded.iter().any(|r| r.starts_with("obj/main.")), &format!("records of the local run's outputs survived: {recorded:?}"))
+    })
+}
+
+/// A local command reading a thin archive whose member is outside the
+/// build directory (a prebuilt object of the source tree), with remote-only
+/// outputs recorded: the member is read where it is.
+fn test_thin_archive_member_outside() -> Result<(), String> {
+    let f = fixture("thinoutside", true);
+    write(&f.root.join("prebuilt/x.o"), "PREBUILT\n");
+    let mut manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    manifest.push_str("build lib/libout.a: THINAR ../prebuilt/x.o\n  rbe_mnemonic = CArchive\nbuild out.bin: LINK lib/libout.a\n  rbe_mnemonic = CLink\n");
+    write(&f.build.join("build.ninja"), &manifest);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Compile,Link", "app.bin"]) == 0, "first build failed")?;
+        check(!remote_only(&f).is_empty(), "nothing recorded")?;
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Compile", "out.bin"]) == 0, "the local link failed")?;
+        check(std::fs::read_to_string(f.build.join("out.bin")).is_ok_and(|s| s.contains("PREBUILT")), "out.bin")
+    })
+}
+
+/// A source edited after the build hashed it, before the compile read it:
+/// the result isn't what the key describes, and isn't stored.
+fn test_input_changed_during_local_run() -> Result<(), String> {
+    let f = fixture("concurrentchange", true);
+    let disk = f.root.join("disk-cache");
+    let flag = format!("--disk_cache={}", disk.to_string_lossy());
+    let lib_c = f.root.join("src/lib.c");
+    let original = std::fs::read_to_string(&lib_c).unwrap();
+    let edit = f.build.join("local-edit-source");
+    write(&edit, &format!("{}\n#include \"lib.h\"\nint lib() {{ return 2; }} /* EDITED */\n", lib_c.to_string_lossy()));
+    check(run_ninja(&f, None, &[&flag, "obj/lib.o"]) == 0, "first build failed")?;
+    std::fs::remove_file(&edit).map_err(|e| e.to_string())?;
+    check(std::fs::read_to_string(f.build.join("obj/lib.o")).is_ok_and(|s| s.contains("EDITED")), "the compile didn't read the edit")?;
+    check(disk_cache_entries(&disk) == 0, &format!("the result was stored: {} entries", disk_cache_entries(&disk)))?;
+    // The edit undone: compiled from the original again.
+    write(&lib_c, &original);
+    check(run_ninja(&f, None, &[&flag, "obj/lib.o"]) == 0, "second build failed")?;
+    check(!std::fs::read_to_string(f.build.join("obj/lib.o")).unwrap_or_default().contains("EDITED"), "the edited object came back for the original source")
+}
+
+/// Minimal downloads and a step on the host after the remote one reading
+/// its output (a post-build copy): the output is downloaded for it.
+fn test_host_step_reads_remote_output() -> Result<(), String> {
+    let f = fixture("hoststepoutput", true);
+    let cc = f.compiler.to_string_lossy().to_string();
+    let cm = f.root.join("cmake/bin").join(if cfg!(windows) { "fake-cmake.exe" } else { "fake-cmake" }).to_string_lossy().to_string();
+    let steps = [format!("{cc} --link $in -o $out"), format!("{cm} -E copy $out lib.copy")];
+    let chain = if cfg!(windows) { format!("cmd.exe /C \"{}\"", steps.join(" && ")) } else { steps.join(" && ") };
+    let mut manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    manifest.push_str(&format!(
+        "rule ARCOPY\n  command = {chain}\nbuild libc.a: ARCOPY obj/main.o obj/lib.o\n  rbe_mnemonic = CArchive\nbuild libc.stamp: TOUCH | libc.a\n"
+    ));
+    write(&f.build.join("build.ninja"), &manifest);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["--remote_download_minimal", "--remote_mnemonics=Compile,Archive", "libc.stamp"]) == 0, "the build failed")?;
+        check(server.stats().executions == 3, &format!("expected 3 remote executions, got {:?}", server.stats()))?;
+        check(std::fs::read_to_string(f.build.join("lib.copy")).is_ok_and(|s| s.starts_with("LINKED")), "lib.copy")
+    })
+}
+
+/// The environment variables a tool reads go into its action's
+/// environment, paths rewritten as in arguments: the key describes them,
+/// remote runs get them, and local results are stored under it. Those of
+/// other tools don't change the key. `--action_env` sets more.
+fn test_action_environment() -> Result<(), String> {
+    let f = fixture("actionenv", true);
+    let disk = f.root.join("disk-cache");
+    let flag = format!("--disk_cache={}", disk.to_string_lossy());
+    let log = f.root.join("actions.jsonl");
+    let log_flag = format!("--execution_log_file={}", log.to_string_lossy());
+    let objs = ["obj/main.o", "obj/lib.o"];
+    let clean = || check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed");
+    let entries = || disk_cache_entries(&disk);
+    // The values of `name` in the logged actions' environments.
+    let env_of = |name: &str| -> Vec<Option<String>> {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).map(|v| v["environment"][name].as_str().map(str::to_string)).collect()
+    };
+    let with_var = |name: &str, value: &str, args: &[&str]| run_ninja_with(&f, None, args, &[(name, std::ffi::OsStr::new(value))]);
+    // 1. LIB, which linkers read: the compiles are stored, under their keys.
+    check(with_var("LIB", &f.root.to_string_lossy(), &[&flag, &log_flag, objs[0], objs[1]]) == 0, "build with LIB set failed")?;
+    check(entries() == 2, &format!("expected the 2 compiles stored, got {}", entries()))?;
+    check(env_of("LIB") == [None, None], &format!("LIB in the actions: {:?}", env_of("LIB")))?;
+    // 2. CPATH, which GCC-style compilers read: in the actions, relative.
+    clean()?;
+    let cpath = f.root.join("include").to_string_lossy().into_owned();
+    check(with_var("CPATH", &cpath, &[&flag, &log_flag, objs[0], objs[1]]) == 0, "build with CPATH set failed")?;
+    check(entries() == 4, &format!("expected the 2 compiles stored under other keys, got {}", entries()))?;
+    let values = env_of("CPATH");
+    check(
+        values.len() == 2 && values.iter().all(|v| v.as_deref().map(|v| v.replace('\\', "/")).as_deref() == Some("../include")),
+        &format!("CPATH in the actions: {values:?}"),
+    )?;
+    // 3. A variable making the compiler write a file the action doesn't
+    //    return: not stored.
+    clean()?;
+    write(&f.root.join("src/lib.c"), "#include \"lib.h\"\nint lib() { return DEEP + 3; }\n");
+    check(with_var("DEPENDENCIES_OUTPUT", "deps.txt", &[&flag, &log_flag, objs[1]]) == 0, "build with DEPENDENCIES_OUTPUT set failed")?;
+    check(entries() == 4, &format!("a result with DEPENDENCIES_OUTPUT set was stored: {}", entries()))?;
+    // 4. Unless the action gets it (--action_env), with other variables.
+    clean()?;
+    let args = [flag.as_str(), log_flag.as_str(), "--action_env=DEPENDENCIES_OUTPUT", "--action_env=FOO=bar", objs[1]];
+    check(with_var("DEPENDENCIES_OUTPUT", "deps.txt", &args) == 0, "build with --action_env failed")?;
+    check(entries() == 5, &format!("expected the compile stored, got {}", entries()))?;
+    check(
+        env_of("FOO") == [Some("bar".to_string())] && env_of("DEPENDENCIES_OUTPUT") == [Some("deps.txt".to_string())],
+        &format!("FOO in the action: {:?}", env_of("FOO")),
+    )
+}
+
+/// A definition keeps its absolute path (the program keeps it): when it
+/// names one of the compile's inputs (a header included through the
+/// macro), which a remote worker has at another path, it runs locally.
+fn test_definition_naming_an_input() -> Result<(), String> {
+    let f = fixture("defineinput", true);
+    let header = f.root.join("include/lib.h").to_string_lossy().replace('\\', "/");
+    let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    write(
+        &f.build.join("build.ninja"),
+        &manifest.replacen("DEP_FILE = obj/main.o.d\n", &format!("DEP_FILE = obj/main.o.d\n  FLAGS = -DCONFIG_FILE={header}\n"), 1),
+    );
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["--remote_strict", "obj/main.o"]) != 0, "the compile ran remotely")?;
+        check(run_ninja(&f, Some(&ep), &["obj/main.o", "obj/lib.o"]) == 0, "the build failed")?;
+        check(server.stats().executions == 1, &format!("expected obj/lib.o alone remotely, got {:?}", server.stats()))
+    })
+}
+
+/// Results whose reads can't be checked (a link: no depfile lists what it
+/// read) are kept in the disk cache, not stored in the remote cache other
+/// machines read.
+fn test_unchecked_results_stay_local() -> Result<(), String> {
+    let f = fixture("uncheckedresults", true);
+    let disk = f.root.join("disk-cache");
+    with_server(&f, |server| {
+        let flags =
+            [format!("--remote_cache={}", server.endpoint), format!("--disk_cache={}", disk.to_string_lossy()), "--remote_mnemonics=Compile,Link".into()];
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        check(run_ninja(&f, None, &flags) == 0, "the build failed")?;
+        let st = server.stats();
+        check(st.action_cache_updates == 2, &format!("expected the 2 compiles stored remotely, got {st:?}"))?;
+        check(disk_cache_entries(&disk) == 3, &format!("expected the compiles and the link in the disk cache, got {}", disk_cache_entries(&disk)))
+    })
+}
+
+/// A disk cache hit whose blob can't be read is a miss: the action runs
+/// and its result replaces the entry (with --remote_strict too).
+fn test_unreadable_disk_hit() -> Result<(), String> {
+    let f = fixture("unreadabledisk", true);
+    let disk = f.root.join("disk-cache");
+    let flag = format!("--disk_cache={}", disk.to_string_lossy());
+    check(run_ninja(&f, None, &[&flag, "obj/main.o"]) == 0, "first build failed")?;
+    let main_o = std::fs::read(f.build.join("obj/main.o")).map_err(|e| e.to_string())?;
+    let blob = rbe_client::digest_of(&main_o);
+    let blob_path = disk.join("cas").join(&blob.hash[..2]).join(&blob.hash);
+    let mut altered = main_o.clone();
+    altered[0] ^= 0x20;
+    std::fs::write(&blob_path, &altered).map_err(|e| e.to_string())?;
+    check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+    check(run_ninja(&f, None, &[&flag, "--remote_strict", "obj/main.o"]) == 0, "the build after a corrupt blob failed")?;
+    check(std::fs::read(f.build.join("obj/main.o")).ok() == Some(main_o.clone()), "obj/main.o")?;
+    check(std::fs::read(&blob_path).ok() == Some(main_o), "the entry wasn't replaced")
+}
+
+/// A remote cache hit whose outputs the CAS evicted is a miss (full
+/// downloads): the action runs again.
+fn test_evicted_remote_hit() -> Result<(), String> {
+    let f = fixture("evictedhit", true);
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["obj/main.o"]) == 0, "first build failed")?;
+        check(run_ninja(&f, None, &["-t", "clean"]) == 0, "clean failed")?;
+        server.state.clear_cas();
+        check(run_ninja(&f, Some(&ep), &["--remote_strict", "obj/main.o"]) == 0, "the build after the eviction failed")?;
+        check(server.stats().executions == 2, &format!("expected the compile again, got {:?}", server.stats()))?;
+        check(std::fs::read_to_string(f.build.join("obj/main.o")).is_ok_and(|s| s.contains("int main()")), "obj/main.o")
+    })
+}
+
+/// A disk cache that can't store blobs (full, read only) doesn't fail the
+/// downloads that would have filled it.
+fn test_disk_cache_write_errors() -> Result<(), String> {
+    let f = fixture("diskwriteerrors", true);
+    let disk = f.root.join("disk-cache");
+    // Files where the blobs' directories go.
+    for i in 0..=255u8 {
+        write(&disk.join("cas").join(format!("{i:02x}")), "");
+    }
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        let flag = format!("--disk_cache={}", disk.to_string_lossy());
+        check(run_ninja(&f, Some(&ep), &[&flag, "--remote_strict", "obj/main.o"]) == 0, "the build failed")?;
+        check(server.stats().executions == 1, &format!("expected a remote execution, got {:?}", server.stats()))?;
+        check(std::fs::read_to_string(f.build.join("obj/main.o")).is_ok_and(|s| s.contains("int main()")), "obj/main.o")?;
+        check(disk_cache_entries(&disk) == 0, "a result was stored without its blobs")
+    })
+}
+
+/// `restat`: an output a remote action left as it was (same contents) keeps
+/// its time, so what depends on it doesn't run again.
+fn test_restat_unchanged_output() -> Result<(), String> {
+    let f = fixture("restatremote", true);
+    let manifest = std::fs::read_to_string(f.build.join("build.ninja")).unwrap();
+    let cc_rule = manifest.lines().skip_while(|l| !l.starts_with("rule CC")).take(5).collect::<Vec<_>>().join("\n");
+    let restat_rule = format!("{}\n  restat = 1\n", cc_rule.replacen("rule CC", "rule CCRESTAT", 1));
+    let manifest = manifest.replacen("rule LINK\n", &format!("{restat_rule}rule LINK\n"), 1).replacen("build obj/lib.o: CC ", "build obj/lib.o: CCRESTAT ", 1);
+    write(&f.build.join("build.ninja"), &format!("{manifest}build lib.copy: COPY obj/lib.o\n"));
+    // Runs of lib.copy, as the build log has them.
+    let copies = || {
+        let log = std::fs::read_to_string(f.build.join(ninja_core::build_log::BUILD_LOG_FILE)).unwrap_or_default();
+        log.lines().filter(|l| l.split('\t').nth(3) == Some("lib.copy")).count()
+    };
+    with_server(&f, |server| {
+        let ep = server.endpoint.clone();
+        check(run_ninja(&f, Some(&ep), &["lib.copy"]) == 0, "first build failed")?;
+        check(copies() == 1, &format!("lib.copy ran {} times", copies()))?;
+        // The header's line endings change: the same object.
+        write(&f.root.join("include/nested/deep.h"), "#define DEEP 0\r\n");
+        check(run_ninja(&f, Some(&ep), &["lib.copy"]) == 0, "second build failed")?;
+        check(server.stats().executions == 2, &format!("expected the compile again, got {:?}", server.stats()))?;
+        check(copies() == 1, "lib.copy ran again for an unchanged obj/lib.o")
+    })
+}
+
 fn main() -> ExitCode {
     let exe = std::env::current_exe().unwrap();
     let stem = exe.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2061,13 +2413,7 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ExitCode::from(fake_cmake(&args) as u8);
     }
-    // The daemon test_daemon's builds start.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() >= 3 && args[..3] == ["-t", "daemon", "run"] {
-        return ExitCode::from(ninja_rs::daemon::tool(&args[2..]) as u8);
-    }
-    ninja_exe();
-    let tests: Vec<(&str, fn() -> Result<(), String>)> = vec![
+    let tests: Vec<harness::Test> = vec![
         ("remote_build_and_cache", test_remote_build_and_cache),
         ("untrusted_results", test_untrusted_results),
         ("transient_failures", test_transient_failures),
@@ -2102,33 +2448,21 @@ fn main() -> ExitCode {
         ("daemon", test_daemon),
         ("split_and_splice_v2_12", || test_split_and_splice(12)),
         ("split_and_splice_v2_13", || test_split_and_splice(13)),
+        ("materialize_memory", test_materialize_memory),
+        ("disk_only_build_drops_records", test_disk_only_build_drops_records),
+        ("local_run_drops_side_output_records", test_local_run_drops_side_output_records),
+        ("thin_archive_member_outside", test_thin_archive_member_outside),
+        ("input_changed_during_local_run", test_input_changed_during_local_run),
+        ("host_step_reads_remote_output", test_host_step_reads_remote_output),
+        ("action_environment", test_action_environment),
+        ("definition_naming_an_input", test_definition_naming_an_input),
+        ("unchecked_results_stay_local", test_unchecked_results_stay_local),
+        ("unreadable_disk_hit", test_unreadable_disk_hit),
+        ("evicted_remote_hit", test_evicted_remote_hit),
+        ("disk_cache_write_errors", test_disk_cache_write_errors),
+        ("restat_unchanged_output", test_restat_unchanged_output),
+        ("unreachable_remote", test_unreachable_remote),
     ];
     // `cargo test --test remote_e2e -- NAME`: the tests whose name has NAME.
-    let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
-    let tests: Vec<_> = tests.into_iter().filter(|(name, _)| filter.is_empty() || filter.iter().any(|f| name.contains(f.as_str()))).collect();
-    let count = tests.len();
-    let mut failed = 0;
-    for (name, t) in tests {
-        match t() {
-            Ok(()) => println!("test {name} ... ok"),
-            Err(e) => {
-                println!("test {name} ... FAILED: {e}");
-                failed += 1;
-            }
-        }
-    }
-    println!("test result: {} passed; {failed} failed", count - failed);
-    if failed > 0 {
-        return ExitCode::FAILURE;
-    }
-    // The fixtures (copies of this binary, hundreds of MB each), kept
-    // after a failure to look into.
-    let base = std::env::var_os("TEST_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let prefix = format!("ninja-rs-e2e-{}-", std::process::id());
-    for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
-        if e.file_name().to_string_lossy().starts_with(&prefix) {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
-    ExitCode::SUCCESS
+    harness::run("e2e", tests)
 }

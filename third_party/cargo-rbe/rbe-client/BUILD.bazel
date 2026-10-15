@@ -13,7 +13,6 @@ rust_library(
         "@crates//:fastcdc",
         "@crates//:hex",
         "@crates//:prost",
-        "@crates//:prost-types",
         "@crates//:sha2",
         "@crates//:tokio",
         "@crates//:tokio-stream",
@@ -24,6 +23,10 @@ rust_library(
 
 rust_test(
     name = "rbe-client_test",
+    size = "small",
     crate = ":rbe-client",
-    deps = ["@crates//:tempfile"],
+    deps = [
+        "//crates/test-dirs",
+        "@crates//:tempfile",
+    ],
 )

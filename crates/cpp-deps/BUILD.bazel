@@ -11,5 +11,7 @@ rust_library(
 
 rust_test(
     name = "cpp-deps_test",
+    size = "small",
     crate = ":cpp-deps",
+    deps = ["//crates/test-dirs"],
 )

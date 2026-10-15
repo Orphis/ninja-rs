@@ -15,5 +15,7 @@ rust_library(
 
 rust_test(
     name = "ninja-core_test",
+    size = "small",
     crate = ":ninja-core",
+    deps = ["//crates/test-dirs"],
 )

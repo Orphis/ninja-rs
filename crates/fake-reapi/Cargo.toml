@@ -18,6 +18,9 @@ tokio = { workspace = true, features = ["net", "signal"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["router", "server"] }
 
+[dev-dependencies]
+test-dirs = { path = "../test-dirs" }
+
 [[bin]]
 name = "fake-reapi-server"
 path = "src/main.rs"

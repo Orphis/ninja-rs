@@ -1,5 +1,6 @@
 load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
 load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -19,6 +20,13 @@ rust_library(
         "@crates//:tonic",
         "@crates//:zstd",
     ],
+)
+
+rust_test(
+    name = "fake-reapi_test",
+    size = "small",
+    crate = ":fake-reapi",
+    deps = ["//crates/test-dirs"],
 )
 
 # Test certificates (see testdata/tls/README.md).

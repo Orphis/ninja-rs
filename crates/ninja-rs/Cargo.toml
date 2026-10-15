@@ -31,6 +31,7 @@ libc = "0.2"
 
 [dev-dependencies]
 fake-reapi = { path = "../fake-reapi" }
+test-dirs = { path = "../test-dirs" }
 
 [[test]]
 name = "remote_e2e"

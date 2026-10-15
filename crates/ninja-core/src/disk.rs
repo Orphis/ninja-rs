@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn stat_cache_matches_uncached_stats() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-statcache", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-statcache", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.txt"), "a").unwrap();
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn removes_empty_directories() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-remove", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-remove", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("empty")).unwrap();
         std::fs::create_dir_all(dir.join("full")).unwrap();
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn stat_follows_symlinks() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-symlink", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-symlink", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("target.txt");

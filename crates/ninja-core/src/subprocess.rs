@@ -9,22 +9,21 @@
 //! As in ninja, every other command runs in a process group of its own on
 //! POSIX, and in a job object on Windows: the terminal's Ctrl-C reaches
 //! ninja-rs only, and stopping a command (an interrupted or failed build, a
-//! raced command losing) reaches every process it started. `console`
-//! commands stay in the foreground and get the terminal's signals directly.
+//! raced command losing) reaches every process it started: the interrupt's
+//! signal first (Ctrl-Break on Windows, as ninja sends), then, after a
+//! grace, a kill. `console` commands stay in the foreground and get the
+//! terminal's signals directly.
 
-use std::collections::HashSet;
 use std::future::Future;
 use std::io::Read;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-use tokio::task::JoinSet;
 
-use crate::graph::EdgeId;
-use crate::runner::{AbortFuture, CommandRunner, ExecKind, ExitStatus, Task, TaskResult, WaitFuture};
+use crate::runner::ExitStatus;
 
 #[cfg(unix)]
 use libc::{SIGINT, SIGKILL, SIGTERM};
@@ -38,14 +37,33 @@ const SIGTERM: i32 = 15;
 
 /// Set when the user interrupts the build: SIGINT, SIGTERM or SIGHUP on
 /// POSIX, Ctrl-C or Ctrl-Break on Windows.
+///
+/// A build's loop acts on interrupts (see `handle`): the first one stops
+/// the build, the next one kills the commands still running. Anywhere else
+/// (loading the manifest, connecting, a tool, a build with nothing to do),
+/// one ends the invocation at once (see `unhandled`), as ninja dies of the
+/// signal there.
 #[derive(Default)]
 pub struct Interrupt {
-    /// How many interrupts arrived: the first one stops the build, the next
-    /// one kills the commands still running.
+    /// How many interrupts arrived.
     count: AtomicUsize,
     /// The first interrupt's signal, which commands get too.
     signal: AtomicI32,
+    /// The last interrupt's signal.
+    last: AtomicI32,
+    /// How many holders of `handle` act on interrupts, and the signal of an
+    /// interrupt that came while there was none.
+    handling: Mutex<(usize, Option<i32>)>,
     notify: Notify,
+}
+
+/// See [`Interrupt::handle`].
+pub struct Handling(Arc<Interrupt>);
+
+impl Drop for Handling {
+    fn drop(&mut self) {
+        self.0.handling.lock().unwrap_or_else(PoisonError::into_inner).0 -= 1;
+    }
 }
 
 impl Interrupt {
@@ -60,8 +78,42 @@ impl Interrupt {
 
     fn trigger_with(&self, signal: i32) {
         let _ = self.signal.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
-        self.count.fetch_add(1, Ordering::SeqCst);
+        self.last.store(signal, Ordering::SeqCst);
+        {
+            // Counted under the lock: a holder of `handle` sees it, or it is
+            // unhandled.
+            let mut handling = self.handling.lock().unwrap_or_else(PoisonError::into_inner);
+            if handling.0 == 0 {
+                handling.1.get_or_insert(signal);
+            }
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
         self.notify.notify_waiters();
+    }
+
+    /// The last interrupt's signal (`SIGINT` on Windows); 0 before any.
+    pub fn last_signal(&self) -> i32 {
+        self.last.load(Ordering::SeqCst)
+    }
+
+    /// Until the guard returned is dropped, its holder acts on interrupts
+    /// (a build stopping its commands, `-t exec` passing them on): they
+    /// don't end the invocation at once (see `unhandled`).
+    pub fn handle(self: &Arc<Self>) -> Handling {
+        self.handling.lock().unwrap_or_else(PoisonError::into_inner).0 += 1;
+        Handling(self.clone())
+    }
+
+    /// Completes once an interrupt came while nothing handled it, with its
+    /// signal: the invocation ends at once.
+    pub async fn unhandled(&self) -> i32 {
+        loop {
+            let n = self.notify.notified();
+            if let Some(signal) = self.handling.lock().unwrap_or_else(PoisonError::into_inner).1 {
+                return signal;
+            }
+            n.await;
+        }
     }
 
     pub fn is_set(&self) -> bool {
@@ -456,8 +508,11 @@ async fn run_piped<F: Future<Output = ()>>(spec: Spec<'_>, env: &[(String, Strin
         let mut cmd = match spec {
             Spec::Shell(command) => local_command(command, direct, env),
             Spec::Argv { argv, dir } => {
-                // Relative programs are relative to `dir`.
-                let program = dir.join(&argv[0]);
+                // Relative programs are relative to `dir`; a bare name that
+                // isn't there is looked up in `PATH` (a host step's `cmake`).
+                let local = dir.join(&argv[0]);
+                let is_path = argv[0].contains('/') || (cfg!(windows) && argv[0].contains('\\'));
+                let program = if is_path || local.is_file() { local } else { std::path::PathBuf::from(&argv[0]) };
                 let mut c = tokio::process::Command::new(program);
                 c.args(&argv[1..]).current_dir(dir).envs(env.iter().map(|(k, v)| (k, v))).kill_on_drop(true);
                 c
@@ -487,7 +542,7 @@ async fn run_piped<F: Future<Output = ()>>(spec: Spec<'_>, env: &[(String, Strin
             return Some((ExitStatus::Failure(1), format!("starting the command: {e}\n").into_bytes()));
         }
     };
-    let read = tokio::task::spawn_blocking(move || {
+    let mut read = tokio::task::spawn_blocking(move || {
         let mut buf = Vec::new();
         let _ = reader.read_to_end(&mut buf);
         buf
@@ -498,9 +553,10 @@ async fn run_piped<F: Future<Output = ()>>(spec: Spec<'_>, env: &[(String, Strin
             None => std::future::pending().await,
         }
     };
+    tokio::pin!(cancelled);
     let status = tokio::select! {
         st = child.wait() => st,
-        _ = cancelled => {
+        _ = &mut cancelled => {
             tree.stop(&mut child, SIGKILL, std::future::pending()).await;
             let _ = read.await;
             return None;
@@ -512,8 +568,21 @@ async fn run_piped<F: Future<Output = ()>>(spec: Spec<'_>, env: &[(String, Strin
             return Some(stopped());
         }
     };
+    // As in ninja, the command is done once its output ends: when the
+    // processes it left holding the pipe (one in the background) exit too.
+    // Meanwhile they are still in its tree, which a stop stops.
+    let output = tokio::select! {
+        out = &mut read => out.unwrap_or_default(),
+        _ = &mut cancelled => {
+            tree.stop(&mut child, SIGKILL, std::future::pending()).await;
+            return None;
+        }
+        _ = stop.until(|s| s.signal() != 0) => {
+            tree.stop(&mut child, stop.signal(), stop.until(Stop::killing)).await;
+            return Some(stopped());
+        }
+    };
     tree.finished();
-    let output = read.await.unwrap_or_default();
     Some(match status {
         Ok(st) => (exit_status(st), output),
         Err(e) => (ExitStatus::Failure(1), format!("waiting for command: {e}\n").into_bytes()),
@@ -535,6 +604,9 @@ struct ProcessTree {
     group: Option<i32>,
     #[cfg(windows)]
     job: Option<job::Job>,
+    /// The command's process group (its id), which Ctrl-Break reaches.
+    #[cfg(windows)]
+    group: Option<u32>,
 }
 
 impl ProcessTree {
@@ -557,7 +629,7 @@ impl ProcessTree {
         #[cfg(windows)]
         {
             let process = child.raw_handle().ok_or_else(|| std::io::Error::other("no process handle"))?;
-            Ok(Self { job: job::Job::start(process)? })
+            Ok(Self { job: job::Job::start(process)?, group: child.id() })
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -566,29 +638,51 @@ impl ProcessTree {
         }
     }
 
-    /// Sends `signal` to every process; on Windows, terminates them.
-    fn signal(&self, signal: i32) {
+    /// Sends `signal` to every process. On Windows, Ctrl-Break, which ninja
+    /// sends, reaches the command's process group, and `SIGKILL` terminates
+    /// its job. Returns whether that killed them: `SIGKILL`, or Windows
+    /// without a console to send Ctrl-Break through.
+    fn signal(&self, signal: i32) -> bool {
         #[cfg(unix)]
-        if let Some(g) = self.group {
-            // SAFETY: plain system call; the group is the command's own.
-            unsafe { libc::killpg(g, signal) };
+        {
+            if let Some(g) = self.group {
+                // SAFETY: plain system call; the group is the command's own.
+                unsafe { libc::killpg(g, signal) };
+            }
+            signal == SIGKILL
         }
         #[cfg(windows)]
-        if let Some(job) = &self.job {
-            job.terminate();
+        {
+            if signal != SIGKILL
+                && let Some(group) = self.group
+                && job::ctrl_break(group)
+            {
+                return false;
+            }
+            if let Some(job) = &self.job {
+                job.terminate();
+            }
+            true
         }
-        #[cfg(not(unix))]
-        let _ = signal;
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = signal;
+            true
+        }
     }
 
     /// Whether processes of the tree may still run.
     fn alive(&self) -> bool {
         #[cfg(unix)]
         if let Some(g) = self.group {
-            // As PID 1 (a container's init), orphans become our zombies and
-            // the group never empties.
-            if std::process::id() == 1 {
-                return false;
+            // Orphans become this process's children when it reaps them (PID 1
+            // in a container, a subreaper): reaped here, or the group never
+            // empties (zombies stay in it).
+            if reaps_orphans() {
+                let mut status = 0;
+                // SAFETY: plain system call; the command's own process was
+                // waited for already, the others are orphans.
+                while unsafe { libc::waitpid(-g, &mut status, libc::WNOHANG) } > 0 {}
             }
             // SAFETY: plain system call; signal 0 only checks the group.
             return unsafe { libc::killpg(g, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
@@ -605,8 +699,7 @@ impl ProcessTree {
     /// Processes left once the command exited get `STOP_GRACE`.
     async fn stop(&mut self, child: &mut tokio::process::Child, signal: i32, kill: impl Future<Output = ()>) {
         tokio::pin!(kill);
-        let mut killed = signal == SIGKILL || cfg!(windows);
-        self.signal(signal);
+        let mut killed = self.signal(signal);
         if killed {
             let _ = child.start_kill();
         }
@@ -646,6 +739,7 @@ impl ProcessTree {
         #[cfg(windows)]
         {
             self.job = None;
+            self.group = None;
         }
     }
 }
@@ -654,6 +748,24 @@ impl Drop for ProcessTree {
     fn drop(&mut self) {
         self.signal(SIGKILL);
     }
+}
+
+/// Whether orphaned processes become this process's children: as PID 1 (a
+/// container's init) or a subreaper (Linux).
+#[cfg(unix)]
+fn reaps_orphans() -> bool {
+    if std::process::id() == 1 {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut set: libc::c_int = 0;
+        // SAFETY: plain system call writing an int.
+        if unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut set as *mut libc::c_int) } == 0 && set != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(windows)]
@@ -706,6 +818,7 @@ mod job {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
         fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
         fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, length: u32) -> i32;
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
@@ -720,6 +833,16 @@ mod job {
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtResumeProcess(process: Handle) -> i32;
+    }
+
+    /// `CTRL_BREAK_EVENT`.
+    const CTRL_BREAK: u32 = 1;
+
+    /// Sends Ctrl-Break to the process group `group`, as ninja does to stop
+    /// a command. False without a console to send it through.
+    pub fn ctrl_break(group: u32) -> bool {
+        // SAFETY: plain system call.
+        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK, group) != 0 }
     }
 
     /// A job object holding a command's processes.
@@ -843,87 +966,6 @@ fn exit_status(st: std::process::ExitStatus) -> ExitStatus {
     ExitStatus::Failure(st.code().unwrap_or(1))
 }
 
-/// Runs commands as local subprocesses, at most `parallelism` at a time.
-pub struct LocalRunner {
-    parallelism: usize,
-    tasks: JoinSet<TaskResult>,
-    active: HashSet<EdgeId>,
-    interrupt: Option<Arc<Interrupt>>,
-    stop: Arc<Stop>,
-}
-
-impl LocalRunner {
-    pub fn new(parallelism: usize, interrupt: Option<Arc<Interrupt>>) -> Self {
-        Self { parallelism: parallelism.max(1), tasks: JoinSet::new(), active: HashSet::new(), interrupt, stop: Stop::new() }
-    }
-}
-
-impl CommandRunner for LocalRunner {
-    fn can_run_more(&self) -> usize {
-        self.parallelism.saturating_sub(self.active.len())
-    }
-
-    fn start_command(&mut self, task: Task) -> Result<(), String> {
-        self.active.insert(task.edge);
-        let stop = self.stop.clone();
-        self.tasks.spawn(async move {
-            let (status, output) = run_local_command_env(&task.command, task.use_console, &[], &stop).await;
-            TaskResult { edge: task.edge, status, output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() }
-        });
-        Ok(())
-    }
-
-    fn wait_for_command(&mut self) -> WaitFuture<'_> {
-        Box::pin(async move {
-            let interrupt = self.interrupt.clone();
-            let joined = match &interrupt {
-                Some(i) => {
-                    tokio::select! {
-                        r = self.tasks.join_next() => r,
-                        _ = i.wait() => {
-                            let edge = self.active.iter().next().copied().unwrap_or_default();
-                            return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
-                        }
-                    }
-                }
-                None => self.tasks.join_next().await,
-            };
-            match joined? {
-                Ok(r) => {
-                    self.active.remove(&r.edge);
-                    Some(r)
-                }
-                Err(e) => {
-                    // A panicking task: report it as a failure of some edge.
-                    let edge = self.active.iter().next().copied().unwrap_or_default();
-                    self.active.remove(&edge);
-                    Some(TaskResult {
-                        edge,
-                        status: ExitStatus::Failure(1),
-                        output: format!("internal error: {e}\n").into_bytes(),
-                        kind: ExecKind::Local,
-                        cas_outputs: Vec::new(),
-                        lost_inputs: Vec::new(),
-                    })
-                }
-            }
-        })
-    }
-
-    fn active_edges(&self) -> Vec<EdgeId> {
-        self.active.iter().copied().collect()
-    }
-
-    fn abort(&mut self) -> AbortFuture<'_> {
-        Box::pin(async move {
-            self.stop.stop(self.interrupt.as_deref()).await;
-            self.tasks.abort_all();
-            while self.tasks.join_next().await.is_some() {}
-            self.active.clear();
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_stops_every_process() {
         // A shell starting a child that would write a file later.
-        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-cancel", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-cancel", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("late.txt");
@@ -1005,17 +1047,25 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-{name}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
+    /// A name `waitfor` can wait for (on Windows), its own: only one waits
+    /// for a name at a time.
+    fn waitfor_name() -> String {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        format!("ninjarstest{}x{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// A command whose grandchild writes `marker` after about 2 s: stopping
-    /// only the command's own process doesn't stop it.
+    /// only the command's own process doesn't stop it. (On Windows, `waitfor`
+    /// stops on Ctrl-Break, and the marker is written only if it timed out.)
     fn late_writer(marker: &std::path::Path) -> String {
         if cfg!(windows) {
-            format!("cmd /c cmd /c \"ping -n 3 127.0.0.1 >nul & echo late> {}\"", marker.display())
+            format!("cmd /c cmd /v:on /c \"waitfor /t 2 {} >nul 2>&1 & if !errorlevel! == 1 echo late> {}\"", waitfor_name(), marker.display())
         } else {
             format!("sh -c 'sh -c \"sleep 2; echo late > {}\"; true'", marker.display())
         }
@@ -1070,6 +1120,136 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!marker.exists(), "a process of the command kept running");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An interrupt while something acts on interrupts is its own; one
+    /// while nothing does is unhandled: the invocation ends at once.
+    #[tokio::test]
+    async fn interrupts_nothing_handles() {
+        let interrupt = Interrupt::new();
+        let pending = |i: &Arc<Interrupt>| {
+            let i = i.clone();
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = i.unhandled() => false,
+                    _ = std::future::ready(()) => true,
+                }
+            }
+        };
+        let handling = interrupt.handle();
+        interrupt.trigger();
+        assert!(pending(&interrupt).await);
+        drop(handling);
+        assert!(pending(&interrupt).await, "an interrupt handled once stays handled");
+        interrupt.trigger();
+        assert_eq!(interrupt.unhandled().await, SIGINT);
+        assert_eq!((interrupt.count(), interrupt.last_signal()), (2, SIGINT));
+    }
+
+    /// A command leaving a process in the background that holds its output
+    /// is done when that process is, as in ninja; a stop meanwhile reaches it
+    /// too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_reaches_processes_holding_the_output() {
+        let dir = test_dir("stop-holder");
+        let started = dir.join("started");
+        let stop = Stop::new();
+        let s = stop.clone();
+        let cmd = format!("sleep 30 & echo > {}", started.display());
+        let ran = tokio::spawn(async move { run_local_command_env(&cmd, false, &[], &s).await });
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The shell exits; `sleep` holds the output.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!ran.is_finished());
+        tokio::time::timeout(Duration::from_secs(10), stop.stop(None)).await.expect("the stop didn't reach the background process");
+        assert_eq!(ran.await.unwrap().0, ExitStatus::Interrupted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On Windows, a stop sends Ctrl-Break to the command's process group
+    /// first, as ninja does, and waits for it to act on it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stopping_sends_ctrl_break_first() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
+        }
+        let mut list = [0u32; 4];
+        // SAFETY: a buffer of the size given.
+        if unsafe { GetConsoleProcessList(list.as_mut_ptr(), 4) } == 0 {
+            println!("not tested: no console");
+            return;
+        }
+        let dir = test_dir("ctrl-break");
+        let (started, marker) = (dir.join("started"), dir.join("break"));
+        // STATUS_CONTROL_C_EXIT: `waitfor` ended by Ctrl-Break.
+        let cmd = format!(
+            "cmd /v:on /c \"echo.> {} & waitfor /t 10 {} >nul 2>&1 & if !errorlevel! == -1073741510 echo.> {}\"",
+            started.display(),
+            waitfor_name(),
+            marker.display()
+        );
+        let stop = Stop::new();
+        let s = stop.clone();
+        let ran = tokio::spawn(async move { run_local_command_env(&cmd, false, &[], &s).await });
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.stop(None).await;
+        assert!(ran.is_finished());
+        assert!(marker.exists(), "the command didn't get Ctrl-Break");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// As a reaper of orphans (PID 1 in a container, a subreaper), a stop
+    /// reaps the processes a command left, escalates to a kill after the
+    /// grace, and leaves no zombie. Run in a process of its own (the setting
+    /// is the process's): see `reaper_helper`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopping_as_a_reaper_of_orphans() {
+        let dir = test_dir("reaper");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "subprocess::tests::reaper_helper", "--ignored", "--nocapture", "--test-threads=1"])
+            .env("NINJA_RS_TEST_REAPER", &dir)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run by stopping_as_a_reaper_of_orphans"]
+    fn reaper_helper() {
+        let Some(dir) = std::env::var_os("NINJA_RS_TEST_REAPER").map(std::path::PathBuf::from) else { return };
+        // SAFETY: plain system call.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let marker = dir.join("late.txt");
+        // A process ignoring the signal, orphaned when the shell dies.
+        let cmd = format!("(trap '' TERM; sleep 4; echo late > {}) & sleep 30", marker.display());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let stop = Stop::new();
+            let s = stop.clone();
+            let ran = tokio::spawn(async move { run_local_command_env(&cmd, false, &[], &s).await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.stop(None).await;
+            assert!(ran.await.is_ok());
+        });
+        let mut status = 0;
+        // SAFETY: plain system call.
+        let zombie = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        assert!(zombie <= 0, "a zombie was left: {zombie}");
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(!marker.exists(), "the process ignoring the signal wasn't killed");
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@
 //! with its whole key (the compiler's path, size and modification time, the
 //! flags and the variables that matter) checked when loading.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -71,6 +72,9 @@ pub struct Invocation {
     /// The flags that may change predefined macros, built-in include
     /// directories and the answers to queries (the probe's flags).
     pub probe_args: Vec<String>,
+    /// Some file or directory is named by a relative path (see
+    /// `Config::relative_paths`).
+    pub relative_paths: bool,
 }
 
 /// Whether a GCC or Clang driver compiles C sources as C++ (`g++`,
@@ -112,7 +116,15 @@ impl Environment {
     }
 
     fn compiler<'a>(&'a self, inv: &'a Invocation, cwd: &'a Path) -> probe::Compiler<'a> {
-        probe::Compiler { path: &inv.compiler, args: &inv.probe_args, style: inv.style, lang: &inv.lang, cwd, env: self.vars.as_ref().map(|v| v.as_slice()) }
+        probe::Compiler {
+            path: &inv.compiler,
+            args: &inv.probe_args,
+            style: inv.style,
+            lang: &inv.lang,
+            cwd,
+            env: self.vars.as_ref().map(|v| v.as_slice()),
+            timeout: probe::TIMEOUT,
+        }
     }
 }
 
@@ -172,6 +184,7 @@ fn new_invocation(argv: &[String], style: Style) -> Result<Invocation, String> {
         conforming: false,
         ms_compat: None,
         probe_args: Vec::new(),
+        relative_paths: false,
     })
 }
 
@@ -197,32 +210,51 @@ enum Merge {
 type DirId = (bool, PathBuf);
 
 /// The `-iquote`, `-I` and system lists as the compiler searches them (see
-/// `Merge`); `id` tells which directories are the same.
-fn search_lists(merge: Merge, quote: &[Dir], user: &[Dir], system: [&[Dir]; 3], id: impl Fn(&Dir) -> DirId) -> (Vec<Dir>, Vec<Dir>, Vec<Dir>) {
-    let ids = |dirs: &[Dir]| dirs.iter().map(|d| (d.clone(), id(d))).collect::<Vec<_>>();
-    // First places only, without the directories of `skip`.
-    let dedup = |dirs: Vec<(Dir, DirId)>, skip: &HashSet<DirId>| {
-        let mut seen = HashSet::new();
-        dirs.into_iter().filter(|(_, i)| !skip.contains(i) && seen.insert(i.clone())).collect::<Vec<_>>()
+/// `Merge`); `id` tells which directories are the same (None: not a
+/// directory, which GCC drops, and the others search in vain or read as a
+/// header map).
+fn search_lists(merge: Merge, quote: &[Dir], user: &[Dir], system: [&[Dir]; 3], id: impl Fn(&Dir) -> Option<DirId>) -> (Vec<Dir>, Vec<Dir>, Vec<Dir>) {
+    let ids = |dirs: &[Dir]| {
+        dirs.iter()
+            .map(|d| {
+                let spelled = || match d {
+                    Dir::Path(p) => (false, p.clone()),
+                    Dir::Framework(p) => (true, p.clone()),
+                };
+                (d.clone(), if merge == Merge::Gcc { id(d) } else { Some(id(d).unwrap_or_else(spelled)) })
+            })
+            .collect::<Vec<_>>()
     };
-    let all_system: Vec<(Dir, DirId)> = system.iter().flat_map(|s| ids(s)).collect();
+    // GCC's `remove_duplicates`: first places only, without the
+    // directories of `skip`, and without the list's last one (before
+    // anything is removed) when it's `join`.
+    let dedup = |dirs: Vec<(Dir, Option<DirId>)>, skip: &HashSet<DirId>, join: Option<&DirId>| {
+        let last = dirs.len().checked_sub(1);
+        let mut seen = HashSet::new();
+        dirs.into_iter()
+            .enumerate()
+            .filter_map(|(n, (d, i))| {
+                let i = i?;
+                let dropped = skip.contains(&i) || (Some(n) == last && join == Some(&i));
+                (!dropped && seen.insert(i.clone())).then_some((d, i))
+            })
+            .collect::<Vec<_>>()
+    };
+    let all_system: Vec<(Dir, Option<DirId>)> = system.iter().flat_map(|s| ids(s)).collect();
     let none = HashSet::new();
     let (system, sys_ids): (Vec<(Dir, DirId)>, HashSet<DirId>) = match merge {
-        Merge::Msvc => (all_system, ids(system[0]).into_iter().map(|(_, i)| i).collect()),
+        Merge::Msvc => (all_system.into_iter().filter_map(|(d, i)| Some((d, i?))).collect(), ids(system[0]).into_iter().filter_map(|(_, i)| i).collect()),
         Merge::Gcc | Merge::Clang => {
-            let system = dedup(all_system, &none);
+            let system = dedup(all_system, &none, None);
             let sys_ids = system.iter().map(|(_, i)| i.clone()).collect();
             (system, sys_ids)
         }
     };
-    let user = dedup(ids(user), &sys_ids);
-    let mut quote = dedup(ids(quote), if merge == Merge::Gcc { &sys_ids } else { &none });
-    if merge == Merge::Gcc
-        && let (Some((_, last)), Some((_, first))) = (quote.last(), user.first())
-        && last == first
-    {
-        quote.pop();
-    }
+    let user = dedup(ids(user), &sys_ids, None);
+    // GCC's last `-iquote` directory isn't searched when the chain it joins
+    // starts with it.
+    let join = if merge == Merge::Gcc { user.first().or(system.first()).map(|(_, i)| i) } else { None };
+    let quote = dedup(ids(quote), if merge == Merge::Gcc { &sys_ids } else { &none }, join);
     let dirs = |v: Vec<(Dir, DirId)>| v.into_iter().map(|(d, _)| d).collect();
     (dirs(quote), dirs(user), dirs(system))
 }
@@ -308,10 +340,83 @@ const WITH_ARG: &[(&str, Effect)] = &[
     ("-iwithprefix", Effect::Unsupported),
     ("-iwithprefixbefore", Effect::Unsupported),
     ("-iwithsysroot", Effect::Unsupported),
+    ("-iframeworkwithsysroot", Effect::Unsupported),
     ("-isystem-after", Effect::Unsupported),
     ("-cxx-isystem", Effect::Unsupported),
     ("-working-directory", Effect::Unsupported),
 ];
+
+/// cc1's flags with a separate argument, given through `-Xclang` (each
+/// part after its own `-Xclang`).
+const XCLANG_WITH_ARG: &[(&str, Effect)] = &[
+    ("-fdebug-compilation-dir", Effect::Drop),
+    ("-fcoverage-compilation-dir", Effect::Drop),
+    ("-main-file-name", Effect::Drop),
+    ("-dwarf-debug-flags", Effect::Drop),
+    ("-dwarf-debug-producer", Effect::Drop),
+    ("-split-dwarf-file", Effect::Drop),
+    ("-split-dwarf-output", Effect::Drop),
+    ("-coverage-notes-file", Effect::Drop),
+    ("-coverage-data-file", Effect::Drop),
+    ("-ferror-limit", Effect::Drop),
+    ("-fmessage-length", Effect::Drop),
+    ("-ftemplate-depth", Effect::Drop),
+    ("-fconstexpr-depth", Effect::Drop),
+    ("-mllvm", Effect::Probe),
+    ("-triple", Effect::Probe),
+    ("-target-cpu", Effect::Probe),
+    ("-tune-cpu", Effect::Probe),
+    ("-target-feature", Effect::Probe),
+    ("-target-abi", Effect::Probe),
+    ("-mrelocation-model", Effect::Probe),
+    ("-pic-level", Effect::Probe),
+    ("-mcode-model", Effect::Probe),
+    ("-stack-protector", Effect::Probe),
+    // Plugins may do anything (handle pragmas, watch the preprocessor).
+    ("-load", Effect::Unsupported),
+    ("-plugin", Effect::Unsupported),
+    ("-add-plugin", Effect::Unsupported),
+];
+
+/// cc1's flags (through `-Xclang`) with a joined value that change nothing
+/// the preprocessor does: libraries for the linker (CMake's
+/// `-Xclang --dependent-lib=msvcrt` for Clang targeting the MSVC ABI).
+const XCLANG_DROPPED_PREFIXES: &[&str] = &["--dependent-lib=", "--linker-option="];
+
+/// Flags naming a file or directory the compile reads besides its sources
+/// and headers (profiles, lists, plugins, configuration files), joined
+/// with `=`: inputs no scan finds (see `read_paths`), and what they do to
+/// a scan. A profile used defines `__LLVM_INSTR_PROFILE_USE`.
+const READS: &[(&str, Effect)] = &[
+    ("-fprofile-use=", Effect::Probe),
+    ("-fprofile-instr-use=", Effect::Probe),
+    ("-fprofile-sample-use=", Effect::Drop),
+    ("-fauto-profile=", Effect::Drop),
+    ("-fprofile-list=", Effect::Drop),
+    ("-fprofile-remapping-file=", Effect::Drop),
+    ("-fsanitize-ignorelist=", Effect::Drop),
+    ("-fsanitize-blacklist=", Effect::Drop),
+    ("-fsanitize-system-ignorelist=", Effect::Drop),
+    ("-fsanitize-coverage-allowlist=", Effect::Drop),
+    ("-fsanitize-coverage-ignorelist=", Effect::Drop),
+    ("-fsanitize-coverage-whitelist=", Effect::Drop),
+    ("-fsanitize-coverage-blacklist=", Effect::Drop),
+    ("-fxray-always-instrument=", Effect::Drop),
+    ("-fxray-never-instrument=", Effect::Drop),
+    ("-fxray-attr-list=", Effect::Drop),
+    ("-fpass-plugin=", Effect::Drop),
+    ("-fplugin=", Effect::Probe),
+    ("-specs=", Effect::Probe),
+    ("--specs=", Effect::Probe),
+    ("--config=", Effect::Probe),
+    // Parsed (see `parse_gcc`).
+    ("-fmodule-file=", Effect::Drop),
+    ("-ivfsoverlay=", Effect::Drop),
+];
+
+/// Flags with a separate argument naming a file the compile reads (see
+/// `READS`), also spelled joined without `=`.
+const READS_WITH_ARG: &[&str] = &["--config", "-include-pch", "-ivfsoverlay", "-vfsoverlay", "--vfsoverlay"];
 
 /// GCC and Clang flags (without a separate argument) the scan doesn't
 /// model: lexing (`-traditional-cpp`, charsets, `$`), lookups (`-I-`,
@@ -354,7 +459,8 @@ const UNSUPPORTED_PREFIXES: &[&str] = &[
     "--driver-mode=",
 ];
 
-/// Flags that change nothing the preprocessor does.
+/// Flags that change nothing the preprocessor does (`dropped_flags_keep_
+/// predefines` checks them against compilers).
 const DROPPED: &[&str] = &[
     "-c",
     "-S",
@@ -368,24 +474,18 @@ const DROPPED: &[&str] = &[
     "-###",
     "-pipe",
     "-w",
-    "-pedantic",
-    "-pedantic-errors",
-    "--pedantic",
-    "--pedantic-errors",
     "-Qunused-arguments",
     "-Qn",
     "-Qy",
     "-s",
     "-shared",
     "-shared-libgcc",
-    "-static",
     "-static-libgcc",
     "-static-libstdc++",
     "-static-pie",
     "-rdynamic",
     "-pie",
     "-no-pie",
-    "-nostdlib",
     "-nostdlib++",
     "-nodefaultlibs",
     "-nostartfiles",
@@ -394,6 +494,12 @@ const DROPPED: &[&str] = &[
     "-emit-llvm",
     "-integrated-as",
     "-no-integrated-as",
+    // What -E prints (macros, includes).
+    "-dM",
+    "-dD",
+    "-dN",
+    "-dI",
+    "-dU",
 ];
 const DROPPED_PREFIXES: &[&str] = &[
     // Outputs and dependency files.
@@ -404,7 +510,6 @@ const DROPPED_PREFIXES: &[&str] = &[
     "-print-",
     "--print-",
     "-dump",
-    "-d",
     "-frandom-seed=",
     "-ftime-trace",
     "-ftime-report",
@@ -457,38 +562,28 @@ const DROPPED_PREFIXES: &[&str] = &[
     "-fcoverage-prefix-map=",
     "-fworking-directory",
     "-fno-working-directory",
-    // Files the compile reads besides its sources, and precompiled
-    // headers (which stand for headers the scan reads).
-    "-fprofile-use=",
-    "-fprofile-instr-use=",
-    "-fprofile-sample-use=",
-    "-fprofile-generate=",
-    "-fprofile-instr-generate=",
+    // Where profiles go, which profiles say, and precompiled headers
+    // (which stand for headers the scan reads); files the compile reads
+    // are in `READS`.
     "-fprofile-dir=",
-    "-fprofile-list=",
-    "-fprofile-remapping-file=",
     "-fprofile-exclude-files=",
     "-fprofile-filter-files=",
     "-fprofile-note=",
     "-fprofile-prefix-path=",
     "-fprofile-prefix-map=",
     "-fprofile-update=",
-    "-fcs-profile-generate=",
-    "-fsanitize-ignorelist=",
-    "-fsanitize-blacklist=",
-    "-fsanitize-system-ignorelist=",
-    "-fsanitize-coverage-allowlist=",
-    "-fsanitize-coverage-ignorelist=",
-    "-fxray-always-instrument=",
-    "-fxray-never-instrument=",
-    "-fxray-attr-list=",
     "-fpch-",
     "-fno-pch-",
     // Linking and assembling.
+    "--param=",
     "-Wa,",
     "-Wl,",
     "-l",
     "-L",
+    "-dylib",
+    "-dylinker",
+    "-dynamiclib",
+    "-dead_strip",
     "-fuse-ld=",
     "-fuse-linker-plugin",
     "-fno-use-linker-plugin",
@@ -513,9 +608,18 @@ const DROPPED_PREFIXES: &[&str] = &[
 /// Flags that may change the predefined macros, the built-in directories or
 /// the answers to queries: the language and target (`-std`, `-m...`,
 /// `-target`, sysroots, toolchains), optimization, and code generation
-/// (`-f...`, which no list above names).
+/// (`-f...`, which no list above names). Some linking ones do: `-static`
+/// (`__STATIC__` for Apple targets), `-nostdlib` (Ubuntu's GCC then has no
+/// `__SSP_STRONG__`), and `-pedantic` (g++'s `__cpp_runtime_arrays`).
 const PROBED: &[&str] = &[
     "-ansi",
+    "-pedantic",
+    "-pedantic-errors",
+    "--pedantic",
+    "--pedantic-errors",
+    "-static",
+    "-dynamic",
+    "-nostdlib",
     "-pthread",
     "-pthreads",
     "-undef",
@@ -542,24 +646,34 @@ const PROBED_PREFIXES: &[&str] = &[
     "-O",
     "-m",
     "-f",
-    "-specs=",
-    "--specs=",
     "-B",
     "--target=",
     "--sysroot=",
     "--gcc-toolchain=",
     "--gcc-install-dir=",
-    "--config=",
     "-stdlib=",
+    "--stdlib=",
     "-isysroot",
     "-resource-dir=",
 ];
+
+/// Profiles made: their files don't change what the compiler predefines
+/// (`__LLVM_INSTR_PROFILE_GENERATE`), so the probe has them without (one
+/// profile for every object).
+const PROFILE_GENERATE: &[&str] = &["-fprofile-generate=", "-fprofile-instr-generate=", "-fcs-profile-generate="];
+
+/// The CPU flags whose `native` the compiler resolves on the machine it runs
+/// on: the probe's (here) and the remote compile's may differ.
+fn native_cpu(a: &str) -> bool {
+    ["-march=", "-mcpu=", "-mtune="].iter().any(|p| a.strip_prefix(p) == Some("native"))
+}
 
 /// What a GCC or Clang flag (without a separate argument) does to a scan.
 /// Flags no list names are unsupported.
 fn gcc_effect(a: &str) -> Effect {
     let starts = |prefixes: &[&str]| prefixes.iter().any(|p| a.starts_with(p));
-    if UNSUPPORTED.contains(&a) || starts(UNSUPPORTED_PREFIXES) {
+    // Options for the preprocessor itself: see `wp_options`.
+    if UNSUPPORTED.contains(&a) || starts(UNSUPPORTED_PREFIXES) || native_cpu(a) || a.starts_with("-Wp,") {
         return Effect::Unsupported;
     }
     if let Some(charset) = a.strip_prefix("-finput-charset=") {
@@ -571,6 +685,12 @@ fn gcc_effect(a: &str) -> Effect {
         // unit's does.
         return if module.contains('=') { Effect::Drop } else { Effect::Unsupported };
     }
+    if let Some(&(_, effect)) = READS.iter().find(|(p, _)| a.starts_with(p)) {
+        return effect;
+    }
+    if starts(PROFILE_GENERATE) {
+        return Effect::Probe;
+    }
     if DROPPED.contains(&a) || starts(DROPPED_PREFIXES) {
         return Effect::Drop;
     }
@@ -580,8 +700,76 @@ fn gcc_effect(a: &str) -> Effect {
     Effect::Unsupported
 }
 
+/// What `-Xclang <v>` does to a scan, and how many arguments it takes after
+/// `-Xclang`: cc1's flags with an argument take `-Xclang <operand>` too.
+fn xclang_effect(v: &str, operand: Option<&str>) -> (usize, Effect) {
+    // cc1 takes them without the driver knowing.
+    if ms_compat_flag(v) {
+        return (1, Effect::Unsupported);
+    }
+    if let (Some(&(_, effect)), Some(operand)) = (XCLANG_WITH_ARG.iter().find(|(f, _)| *f == v), operand) {
+        // See `native_cpu`.
+        return (3, if operand == "native" && v.ends_with("-cpu") { Effect::Unsupported } else { effect });
+    }
+    // (cc1's `-W` are all warnings: it takes `-Wp,-DX` as an unknown one.)
+    if XCLANG_DROPPED_PREFIXES.iter().any(|p| v.starts_with(p)) || v.starts_with("-W") {
+        return (1, Effect::Drop);
+    }
+    (1, gcc_effect(v))
+}
+
+/// `-Xclang` and what follows (see `xclang_effect`), as the probe has them.
+fn xclang_probe_args(args: &[String]) -> Vec<String> {
+    args.iter().enumerate().map(|(i, a)| if i == 1 { probe_arg(a) } else { a.clone() }).collect()
+}
+
+/// A flag as the probe has it: without the files of profiles made.
+fn probe_arg(a: &str) -> String {
+    match PROFILE_GENERATE.iter().find(|p| a.starts_with(*p)) {
+        Some(p) => p.trim_end_matches('=').to_string(),
+        None => a.to_string(),
+    }
+}
+
+/// What `-Wp,` options do, split at commas as GCC does: dependency files
+/// (Linux's `-Wp,-MMD,file`), which the probe mustn't write, and macros and
+/// directories, which GCC and Clang take after the command line's other
+/// `-D`, `-U` and `-I`. None for options the scan doesn't model.
+fn wp_options(opts: &str, commands: &mut Vec<CommandMacro>, dirs: &mut Vec<String>) -> Option<()> {
+    let mut opts = opts.split(',');
+    while let Some(o) = opts.next() {
+        // Joined (`-DX`), or the next option (`-D,X`).
+        let mut value = |flag: &str| -> Option<Option<String>> {
+            let v = o.strip_prefix(flag)?;
+            Some(if v.is_empty() { opts.next().map(str::to_string) } else { Some(v.to_string()) })
+        };
+        if let Some(v) = value("-D") {
+            commands.push(CommandMacro::Define(v?));
+        } else if let Some(v) = value("-U") {
+            commands.push(CommandMacro::Undef(v?));
+        } else if let Some(v) = value("-I") {
+            dirs.push(v.filter(|v| v != "-")?);
+        } else {
+            match o {
+                "-MD" | "-MMD" | "-MF" | "-MT" | "-MQ" => {
+                    opts.next();
+                }
+                "-M" | "-MM" | "-MP" | "-MG" => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(())
+}
+
 fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
-    let abs = |p: &str| -> PathBuf { scan::normalize(&cwd.join(p)) };
+    // Whether the command line names some file or directory by a relative
+    // path (see `Config::relative_paths`).
+    let relative = Cell::new(false);
+    let abs = |p: &str| -> PathBuf {
+        relative.set(relative.get() || Path::new(p).is_relative());
+        scan::normalize(&cwd.join(p))
+    };
     let forced = |p: &str| if Path::new(p).is_absolute() { Forced::Path(abs(p)) } else { Forced::Gcc { cwd: cwd.to_path_buf(), name: p.to_string() } };
     let unsupported = |a: &str| Err(format!("unsupported flag {a}"));
     let mut inv = new_invocation(argv, Style::Gcc)?;
@@ -593,6 +781,8 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
     // A precompiled header stands for the header it was made of, which
     // must be forced too: its macros and files are unknown otherwise.
     let mut include_pch = false;
+    // `-Wp,` macros and directories, which come after the others.
+    let (mut wp_commands, mut wp_dirs) = (Vec::new(), Vec::new());
     let mut i = 1;
     while i < argv.len() {
         let a = &argv[i];
@@ -630,16 +820,15 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
                     i += 3;
                 }
                 ("-emit-pch" | "-fno-pch-timestamp" | "-fno-validate-pch", _) => i += 1,
-                // cc1 takes them without the driver knowing.
-                (v, _) if ms_compat_flag(v) => return unsupported(&format!("-Xclang {v}")),
-                (v, _) => match gcc_effect(v) {
-                    Effect::Drop => i += 1,
-                    Effect::Probe => {
-                        inv.probe_args.extend([a.clone(), v.to_string()]);
-                        i += 1;
+                (v, operand) => {
+                    let (taken, effect) = xclang_effect(v, operand.map(String::as_str));
+                    match effect {
+                        Effect::Drop => {}
+                        Effect::Probe => inv.probe_args.extend(xclang_probe_args(&argv[i - 1..i + taken])),
+                        Effect::Unsupported => return unsupported(&format!("-Xclang {v}")),
                     }
-                    Effect::Unsupported => return unsupported(&format!("-Xclang {v}")),
-                },
+                    i += taken;
+                }
             }
             continue;
         }
@@ -683,6 +872,8 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
             inv.quote_dirs.push(Dir::Path(abs(v)));
         } else if let Some(v) = joined("-isystem") {
             inv.system_dirs.push(Dir::Path(abs(v)));
+        } else if a.starts_with("-iframeworkwithsysroot") {
+            return unsupported(a);
         } else if let Some(v) = joined("-iframework") {
             inv.system_dirs.push(Dir::Framework(abs(v)));
         } else if let Some(v) = joined("-idirafter") {
@@ -708,17 +899,8 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
         } else if let Some(mode) = a.strip_prefix("--driver-mode=").filter(|m| matches!(*m, "g++" | "gcc")) {
             cxx = mode == "g++";
         } else if let Some(opts) = a.strip_prefix("-Wp,") {
-            // Options for the preprocessor itself: dependency files only
-            // (Linux's `-Wp,-MMD,file`), which the probe mustn't write.
-            let mut opts = opts.split(',');
-            while let Some(o) = opts.next() {
-                match o {
-                    "-MD" | "-MMD" | "-MF" | "-MT" | "-MQ" => {
-                        opts.next();
-                    }
-                    "-M" | "-MM" | "-MP" | "-MG" => {}
-                    _ => return unsupported(a),
-                }
+            if wp_options(opts, &mut wp_commands, &mut wp_dirs).is_none() {
+                return unsupported(a);
             }
         } else if a.starts_with('-') {
             // Clang's MSVC compatibility changes lookups: the predefined
@@ -732,7 +914,7 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
             }
             match gcc_effect(a) {
                 Effect::Drop => {}
-                Effect::Probe => inv.probe_args.push(a.clone()),
+                Effect::Probe => inv.probe_args.push(probe_arg(a)),
                 Effect::Unsupported => return unsupported(a),
             }
         } else {
@@ -746,8 +928,11 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
     if include_pch && inv.forced.is_empty() {
         return Err("a precompiled header without the header it was made from".into());
     }
+    inv.commands.extend(wp_commands);
+    inv.user_dirs.extend(wp_dirs.iter().map(|d| Dir::Path(abs(d))));
     // Without `-fms-compatibility`, `-fno-ms-extensions` turns it off.
     inv.ms_compat = ms_compat.or(ms_ext.filter(|e| !e));
+    inv.relative_paths = relative.get() || inv.forced.iter().chain(&inv.imacros).any(|f| matches!(f, Forced::Gcc { .. }));
     finish(inv, lang, cxx)
 }
 
@@ -779,7 +964,6 @@ fn cl_dropped(f: &str) -> bool {
         "pathmap",
         "Brepro",
         "experimental:deterministic",
-        "external:W",
         "external:templates",
         "analyze:",
         "wd",
@@ -790,14 +974,12 @@ fn cl_dropped(f: &str) -> bool {
         "ftime-trace",
         "frandom-seed=",
     ];
-    // Warnings: /W0 to /W4, /Wall, /WX, /Wv:, /w, /w1 to /w4, clang-cl's
-    // -Wfoo and -Wno-foo (not /winsdkdir and the like).
-    let warning = f == "w"
-        || f.starts_with("WX")
-        || f.starts_with("Wv")
-        || f == "Wall"
-        || (f.len() == 2 && (f.starts_with('W') || f.starts_with('w')) && f.as_bytes()[1].is_ascii_digit())
-        || (f.starts_with('W') && f.as_bytes().get(1).is_some_and(u8::is_ascii_lowercase));
+    // Warnings: /WX, /Wv:, /w1 to /w4, clang-cl's -Wfoo and -Wno-foo (not
+    // /winsdkdir and the like). Not the warning level (/W0 to /W4, /Wall,
+    // /w, /external:W...): cl predefines it (`_MSVC_WARNING_LEVEL`).
+    let warning = f.starts_with("WX")
+        || (f.starts_with('w') && f.as_bytes().get(1).is_some_and(|c| (b'1'..=b'4').contains(c)))
+        || (f.starts_with('W') && f.as_bytes().get(1).is_some_and(u8::is_ascii_lowercase) && f != "Wall");
     // Preprocessing to a file or stdout (which the probe mustn't).
     let preprocess = matches!(f, "P" | "E" | "EP" | "C");
     warning || preprocess || f == "c" || f == "showIncludes" || f == "nologo" || f == "Gy" || f == "Gw" || PREFIXES.iter().any(|p| f.starts_with(p))
@@ -841,8 +1023,24 @@ fn ms_compat_flag(a: &str) -> bool {
     matches!(a, "-fms-compatibility" | "-fno-ms-compatibility" | "-fms-extensions" | "-fno-ms-extensions")
 }
 
+/// clang-cl's flags (without `/` or `-`) with a value joined or separate
+/// that the parser doesn't take: where the MSVC headers are (probed), and
+/// the object file.
+const CL_WITH_ARG: &[(&str, Effect)] = &[
+    ("winsysroot", Effect::Probe),
+    ("vctoolsdir", Effect::Probe),
+    ("vctoolsversion", Effect::Probe),
+    ("winsdkdir", Effect::Probe),
+    ("winsdkversion", Effect::Probe),
+    ("o", Effect::Drop),
+];
+
 fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation, String> {
-    let abs = |p: &str| -> PathBuf { scan::normalize(&cwd.join(p)) };
+    let relative = Cell::new(false);
+    let abs = |p: &str| -> PathBuf {
+        relative.set(relative.get() || Path::new(p).is_relative());
+        scan::normalize(&cwd.join(p))
+    };
     let unsupported = |a: &str| Err(format!("unsupported flag {a}"));
     // cl and clang-cl take flags from `CL` before the command's, and from
     // `_CL_` after: the probe sees them, the scan doesn't.
@@ -858,6 +1056,8 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
         if Path::new(&argv[0].replace('\\', "/")).file_stem().is_some_and(|s| s.eq_ignore_ascii_case("cl")) { Style::Msvc } else { Style::ClangCl },
     )?;
     let mut lang: Option<String> = None;
+    // `/clang:-Wp,` macros and directories, which come after the others.
+    let (mut wp_commands, mut wp_dirs) = (Vec::new(), Vec::new());
     let mut i = 1;
     // A flag's value, joined (`/Idir`) or separate (`/I dir`).
     let value = |f: &str, name: &str, i: &mut usize| -> Result<Option<String>, String> {
@@ -905,8 +1105,23 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
         if cl_dropped(f) {
             continue;
         }
-        if cl_unsupported(f) {
+        if inv.style == Style::Msvc && (f.starts_with("clang:") || f == "Xclang") {
+            // clang-cl's, which cl.exe ignores (taking what follows
+            // `-Xclang` as its own).
+            continue;
+        }
+        if cl_unsupported(f) || (inv.style == Style::Msvc && f.starts_with("imsvc")) {
+            // (cl.exe has no `-imsvc`.)
             return unsupported(&a);
+        }
+        if let Some(&(name, effect)) = CL_WITH_ARG.iter().find(|(name, _)| f == *name) {
+            // Separate (joined ones are probed as they are).
+            let v = argv.get(i).ok_or_else(|| format!("/{name} needs an argument"))?.clone();
+            i += 1;
+            if effect == Effect::Probe {
+                inv.probe_args.extend([a.clone(), v]);
+            }
+            continue;
         }
         if let Some(v) = value(f, "external:I", &mut i)? {
             inv.system_dirs.push(Dir::Path(abs(&v)));
@@ -961,32 +1176,41 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
                 }
                 continue;
             }
+            if let Some(opts) = g.strip_prefix("-Wp,") {
+                if wp_options(opts, &mut wp_commands, &mut wp_dirs).is_none() {
+                    return unsupported(&a);
+                }
+                continue;
+            }
             match gcc_effect(g) {
                 _ if ms_compat_flag(g) && g.starts_with("-fno-") => return unsupported(&a),
                 Effect::Drop => {}
-                Effect::Probe => inv.probe_args.push(a.clone()),
+                Effect::Probe => inv.probe_args.push(format!("/clang:{}", probe_arg(g))),
                 Effect::Unsupported => return unsupported(&a),
             }
         } else if f == "Xclang" || f == "target" {
             let v = argv.get(i).cloned().unwrap_or_default();
-            i += 1;
             // `-Xclang -ivfsoverlay -Xclang <file>`: an overlay too.
-            if f == "Xclang" && v == "-ivfsoverlay" && argv.get(i).is_some_and(|x| x == "-Xclang") {
-                if let Some(o) = argv.get(i + 1) {
+            if f == "Xclang" && v == "-ivfsoverlay" && argv.get(i + 1).is_some_and(|x| x == "-Xclang") {
+                if let Some(o) = argv.get(i + 2) {
                     inv.overlays.push(abs(o));
                 }
-                inv.probe_args.extend([a.clone(), v, argv[i].clone(), argv.get(i + 1).cloned().unwrap_or_default()]);
-                i += 2;
+                inv.probe_args.extend(argv[i - 1..(i + 3).min(argv.len())].iter().cloned());
+                i += 3;
                 continue;
             }
             if f == "Xclang" {
-                match gcc_effect(&v) {
-                    _ if ms_compat_flag(&v) => return unsupported(&format!("{a} {v}")),
-                    Effect::Drop => continue,
-                    Effect::Probe => {}
+                let operand = (argv.get(i + 1).map(String::as_str) == Some("-Xclang")).then(|| argv.get(i + 2)).flatten();
+                let (taken, effect) = xclang_effect(&v, operand.map(String::as_str));
+                match effect {
+                    Effect::Drop => {}
+                    Effect::Probe => inv.probe_args.extend(xclang_probe_args(&argv[i - 1..i + taken])),
                     Effect::Unsupported => return unsupported(&format!("{a} {v}")),
                 }
+                i += taken;
+                continue;
             }
+            i += 1;
             inv.probe_args.push(a.clone());
             inv.probe_args.push(v);
         } else {
@@ -999,10 +1223,65 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
             inv.probe_args.push(a.clone());
         }
     }
+    inv.commands.extend(wp_commands);
+    inv.user_dirs.extend(wp_dirs.iter().map(|d| Dir::Path(abs(d))));
+    inv.relative_paths = relative.get() || inv.forced.iter().any(|f| !matches!(f, Forced::Path(_)));
     let inv = finish(inv, lang, false)?;
     // C11 and later use the conforming preprocessor by default.
     let c_std = inv.probe_args.iter().any(|a| matches!(a.trim_start_matches(['/', '-']), "std:c11" | "std:c17" | "std:clatest"));
     Ok(Invocation { conforming: inv.conforming || (inv.lang == "c" && c_std), ..inv })
+}
+
+/// The files and directories a compile command's flags name that the
+/// compile reads besides its sources and headers (see `READS`), and the
+/// header maps it searches (`-I x.hmap`): inputs no scan finds, and those
+/// it reads without listing them. Paths that don't exist are left out, but
+/// precompiled headers and modules (which the build may have made
+/// elsewhere). Returns (files, directories).
+pub fn read_paths(argv: &[String], cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let cl = is_cl_style(argv);
+    let (mut files, mut dirs) = (Vec::new(), Vec::new());
+    let mut add = |v: &str, made: bool| {
+        let p = scan::normalize(&cwd.join(v));
+        match std::fs::metadata(&p) {
+            Ok(m) if m.is_dir() => dirs.push(p),
+            Ok(_) => files.push(p),
+            Err(_) if made => files.push(p),
+            Err(_) => {}
+        }
+    };
+    // clang-cl passes GCC-style flags on as `/clang:<flag>`.
+    let arg = |i: usize| argv.get(i).map(|a| if cl { a.strip_prefix("/clang:").unwrap_or(a) } else { a.as_str() });
+    let mut i = 1;
+    while let Some(a) = arg(i) {
+        i += 1;
+        if a == "-Xclang" && arg(i + 1) == Some("-Xclang") && matches!(arg(i), Some("-ivfsoverlay" | "-include-pch")) {
+            if let Some(v) = arg(i + 2) {
+                add(v, arg(i) == Some("-include-pch"));
+            }
+            i += 3;
+        } else if READS_WITH_ARG.contains(&a) || matches!(a, "-I" | "-iquote" | "/I") {
+            if let Some(v) = arg(i).filter(|v| !matches!(a, "-I" | "-iquote" | "/I") || v.ends_with(".hmap")) {
+                add(v, a == "-include-pch");
+            }
+            i += 1;
+        } else if let Some((p, _)) = READS.iter().find(|(p, _)| a.starts_with(p)) {
+            let v = &a[p.len()..];
+            // `-fmodule-file=[<name>=]<file>`.
+            match *p {
+                "-fmodule-file=" => add(v.split_once('=').map_or(v, |(_, f)| f), true),
+                _ => add(v, false),
+            }
+        } else if let Some(v) = a.strip_prefix("-ivfsoverlay").filter(|v| !v.is_empty()) {
+            add(v, false);
+        } else if let Some(v) = ["-I", "-iquote", "/I"].iter().find_map(|f| a.strip_prefix(f)).filter(|v| v.ends_with(".hmap")) {
+            add(v, false);
+        } else if matches!(a, "-fprofile-use" | "-fprofile-instr-use") {
+            // Clang's default profile.
+            add("default.profdata", false);
+        }
+    }
+    (files, dirs)
 }
 
 /// What a compiler predefines and searches, for a set of flags.
@@ -1207,27 +1486,56 @@ impl Oracle for ProfileOracle<'_> {
     }
 }
 
-/// Something loaded once (a profile, an overlay, a header map), or why it
-/// couldn't be (not tried again); concurrent users wait for the first.
-type Loaded<T> = Arc<OnceLock<Result<Arc<T>, String>>>;
+/// Something loaded (a profile, an overlay, a header map), or why it
+/// couldn't be, with the session it was loaded in; concurrent users wait
+/// for the first.
+type Loaded<T> = Arc<OnceLock<(u64, Result<Arc<T>, String>)>>;
 
-fn load_once<K: std::hash::Hash + Eq, T>(map: &Mutex<HashMap<K, Loaded<T>>>, key: K, load: impl FnOnce() -> Result<Arc<T>, String>) -> Result<Arc<T>, String> {
-    let cell = map.lock().unwrap().entry(key).or_default().clone();
-    cell.get_or_init(load).clone()
+/// What `key` names, loaded once, and again when `stale` says what was
+/// loaded (in the session it gives) is.
+fn load_once<K: std::hash::Hash + Eq, T>(
+    map: &Mutex<HashMap<K, Loaded<T>>>,
+    key: K,
+    session: u64,
+    stale: impl Fn(u64, &Result<Arc<T>, String>) -> bool,
+    load: impl FnOnce() -> Result<Arc<T>, String>,
+) -> Result<Arc<T>, String> {
+    let cell = {
+        let mut map = map.lock().unwrap();
+        let cell = map.entry(key).or_default();
+        if cell.get().is_some_and(|(s, loaded)| stale(*s, loaded)) {
+            *cell = Loaded::default();
+        }
+        cell.clone()
+    };
+    cell.get_or_init(|| (session, load())).1.clone()
+}
+
+/// What a search directory's path names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathKind {
+    Missing,
+    Dir,
+    HeaderMap,
+    /// Another file (which compilers ignore).
+    File,
 }
 
 /// Scans compile commands, with everything learned about compilers cached.
 pub struct Driver {
     pub cache: Cache,
+    /// Probed again after `PROFILE_LIFETIME`, however long the process
+    /// lives (the daemon's); one that failed, in the next session.
     profiles: Mutex<HashMap<String, Loaded<Profile>>>,
     /// Compilers' fingerprints (`probe::fingerprint`), by path, taken once
     /// per session (build).
     fingerprints: Mutex<HashMap<PathBuf, (u64, String)>>,
+    /// Read again every session.
     overlays: Mutex<HashMap<PathBuf, Loaded<Overlay>>>,
     header_maps: Mutex<HashMap<PathBuf, Loaded<HeaderMap>>>,
-    /// Search directories' real paths, and whether they're header maps, by
-    /// path, taken once per session (see `real_dir`).
-    real_dirs: RwLock<HashMap<PathBuf, (u64, PathBuf, bool)>>,
+    /// Search directories' real paths, and what they are, by path, taken
+    /// once per session (see `real_dir`).
+    real_dirs: RwLock<HashMap<PathBuf, (u64, PathBuf, PathKind)>>,
 }
 
 impl Driver {
@@ -1243,29 +1551,37 @@ impl Driver {
     }
 
     /// A search directory's real path (compilers tell directories apart by
-    /// what they are, not how they're spelled) and whether it's a header
-    /// map file, taken once per session; a path that doesn't exist is
-    /// looked at again.
-    fn real_dir(&self, p: &Path) -> (PathBuf, bool) {
+    /// what they are, not how they're spelled) and what it is, taken once
+    /// per session; a path that doesn't exist is looked at again.
+    fn real_dir(&self, p: &Path) -> (PathBuf, PathKind) {
         let session = self.cache.session();
-        if let Some((s, real, header_map)) = self.real_dirs.read().unwrap().get(p)
+        if let Some((s, real, kind)) = self.real_dirs.read().unwrap().get(p)
             && *s == session
         {
-            return (real.clone(), *header_map);
+            return (real.clone(), *kind);
         }
         let (Ok(meta), Ok(real)) = (std::fs::metadata(p), std::fs::canonicalize(p)) else {
-            return (p.to_path_buf(), false);
+            return (p.to_path_buf(), PathKind::Missing);
         };
-        let header_map = meta.is_file() && HeaderMap::is_header_map(p);
-        self.real_dirs.write().unwrap().insert(p.to_path_buf(), (session, real.clone(), header_map));
-        (real, header_map)
+        let kind = if meta.is_dir() {
+            PathKind::Dir
+        } else if HeaderMap::is_header_map(p) {
+            PathKind::HeaderMap
+        } else {
+            PathKind::File
+        };
+        self.real_dirs.write().unwrap().insert(p.to_path_buf(), (session, real.clone(), kind));
+        (real, kind)
     }
 
-    fn dir_id(&self, d: &Dir) -> DirId {
-        match d {
-            Dir::Path(p) => (false, self.real_dir(p).0),
-            Dir::Framework(p) => (true, self.real_dir(p).0),
-        }
+    /// A directory's identity; None when it isn't one.
+    fn dir_id(&self, d: &Dir) -> Option<DirId> {
+        let (framework, p) = match d {
+            Dir::Path(p) => (false, p),
+            Dir::Framework(p) => (true, p),
+        };
+        let (real, kind) = self.real_dir(p);
+        (kind == PathKind::Dir).then_some((framework, real))
     }
 
     /// A compiler's fingerprint, taken once per session.
@@ -1313,7 +1629,12 @@ impl Driver {
     /// or loaded from the profile directory.
     pub fn profile(&self, inv: &Invocation, cwd: &Path, env: &Environment) -> Result<Arc<Profile>, String> {
         let key = self.profile_key(inv, cwd, env);
-        load_once(&self.profiles, key.clone(), || {
+        let session = self.cache.session();
+        let stale = |s: u64, loaded: &Result<Arc<Profile>, String>| match loaded {
+            Ok(p) => unix_secs(SystemTime::now()).saturating_sub(p.probed) > PROFILE_LIFETIME.as_secs(),
+            Err(_) => s != session,
+        };
+        load_once(&self.profiles, key.clone(), session, stale, || {
             if let Some(p) = env.profile_dir.as_deref().and_then(|d| Profile::load(d, &key)) {
                 return Ok(Arc::new(p));
             }
@@ -1348,14 +1669,18 @@ impl Driver {
     }
 
     fn overlay(&self, path: &Path, cwd: &Path) -> Result<Arc<Overlay>, String> {
-        load_once(&self.overlays, path.to_path_buf(), || Overlay::load(path, cwd).map(Arc::new))
+        let session = self.cache.session();
+        load_once(&self.overlays, path.to_path_buf(), session, |s, _| s != session, || Overlay::load(path, cwd).map(Arc::new))
     }
 
     /// A search directory: a header map when the path is one.
     fn search_dir(&self, d: &Dir, cwd: &Path) -> Result<SearchDir, String> {
+        let session = self.cache.session();
         Ok(match d {
             Dir::Framework(p) => SearchDir::Framework(p.clone()),
-            Dir::Path(p) if self.real_dir(p).1 => SearchDir::HeaderMap(load_once(&self.header_maps, p.clone(), || HeaderMap::load(p, cwd).map(Arc::new))?),
+            Dir::Path(p) if self.real_dir(p).1 == PathKind::HeaderMap => {
+                SearchDir::HeaderMap(load_once(&self.header_maps, p.clone(), session, |s, _| s != session, || HeaderMap::load(p, cwd).map(Arc::new))?)
+            }
             Dir::Path(p) => SearchDir::Dir(p.clone()),
         })
     }
@@ -1399,6 +1724,7 @@ impl Driver {
             // compiler reads first (`stdc-predef.h`), then `-include`s.
             forced: inv.imacros.iter().cloned().chain(profile.implicit.iter().cloned().map(Forced::Path)).chain(inv.forced.iter().cloned()).collect(),
             operators: profile.operators.clone(),
+            relative_paths: inv.relative_paths,
         };
         // Each answer may reveal more queries; a few rounds of asking settle
         // them. Concurrent scans share the answers: a scan whose unknown
@@ -1464,9 +1790,11 @@ mod tests {
     #[test]
     fn search_list_rules() {
         let d = |s: &str| Dir::Path(p(s));
+        // Directories whose name has `missing` don't exist.
         let id = |d: &Dir| match d {
-            Dir::Path(p) => (false, p.clone()),
-            Dir::Framework(p) => (true, p.clone()),
+            Dir::Path(p) if p.to_string_lossy().contains("missing") => None,
+            Dir::Path(p) => Some((false, p.clone())),
+            Dir::Framework(p) => Some((true, p.clone())),
         };
         let quote = [d("/q"), d("/q"), d("/sys"), d("/u")];
         let user = [d("/u"), d("/builtin"), d("/u"), d("/v"), d("/after")];
@@ -1490,6 +1818,16 @@ mod tests {
         // A framework directory isn't the directory of the same path.
         let (_, u, _) = search_lists(Merge::Gcc, &[], &[Dir::Framework(p("/f"))], [&[d("/f")], &[], &[]], id);
         assert_eq!(u, vec![Dir::Framework(p("/f"))]);
+        // GCC's last -iquote rule looks at the list as given: its last
+        // directory, a duplicate, isn't the one dropped; nor is one followed
+        // by a missing directory; the -I one it joins comes after missing
+        // ones.
+        let gcc = |quote: &[Dir], user: &[Dir]| search_lists(Merge::Gcc, quote, user, [&[d("/sys")], &[], &[]], id).0;
+        assert_eq!(gcc(&[d("/a"), d("/a")], &[d("/a")]), vec![d("/a")]);
+        assert_eq!(gcc(&[d("/a"), d("/missing")], &[d("/a")]), vec![d("/a")]);
+        assert_eq!(gcc(&[d("/a")], &[d("/missing"), d("/a")]), Vec::<Dir>::new());
+        // Clang keeps missing ones (which find nothing).
+        assert_eq!(search_lists(Merge::Clang, &[], &[d("/missing"), d("/a")], [&[], &[], &[]], id).1, vec![d("/missing"), d("/a")]);
     }
 
     #[test]
@@ -1621,8 +1959,6 @@ mod tests {
                 "/external:I",
                 "C:/ext",
                 "/external:W0",
-                "-imsvc",
-                "C:/sdk",
                 "/DA=1",
                 "/DB#2",
                 "/D",
@@ -1651,15 +1987,16 @@ mod tests {
         // Drive paths are only absolute on Windows hosts.
         let abs = |d: &str| if cfg!(windows) { p(d) } else { p(&format!("C:/b/{d}")) };
         assert_eq!(inv.user_dirs, vec![Dir::Path(p("C:/b/inc")), Dir::Path(abs("C:/abs"))]);
-        assert_eq!(inv.system_dirs, vec![Dir::Path(abs("C:/ext")), Dir::Path(abs("C:/sdk"))]);
+        assert_eq!(inv.system_dirs, vec![Dir::Path(abs("C:/ext"))]);
         assert_eq!(
             inv.commands,
             vec![CommandMacro::Define("A=1".into()), CommandMacro::Define("B=2".into()), CommandMacro::Define("C".into()), CommandMacro::Undef("D".into())]
         );
         assert_eq!(inv.forced, vec![Forced::Msvc("pre.h".into())]);
         assert!(inv.no_include_env && inv.conforming);
-        // The probe passes the language itself.
-        assert_eq!(inv.probe_args, s(&["/std:c++20", "/EHsc", "/MDd", "/Zc:preprocessor"]));
+        // The probe passes the language itself. cl predefines the warning
+        // level.
+        assert_eq!(inv.probe_args, s(&["/external:W0", "/std:c++20", "/EHsc", "/MDd", "/Zc:preprocessor", "/W4"]));
         let clang_cl = parse(&s(&["clang-cl", "/clang:-ffile-prefix-map=/a=/b", "/vfsoverlay:o.yaml", "/std:c17", "/c", "--", "x.c"]), cwd).unwrap();
         assert_eq!(clang_cl.source, p("C:/b/x.c"));
         assert_eq!(clang_cl.style, Style::ClangCl);
@@ -1667,6 +2004,14 @@ mod tests {
         assert_eq!(clang_cl.overlays, vec![p("C:/b/o.yaml")]);
         assert!(clang_cl.conforming);
         assert_eq!(clang_cl.probe_args, s(&["/std:c17"]));
+        // clang-cl's -imsvc, which cl.exe doesn't have; its flags naming
+        // the MSVC headers, joined or separate.
+        let clang_cl =
+            parse(&s(&["clang-cl", "-imsvc", "C:/sdk", "/winsysroot", "C:/ws", "-vctoolsdir", "C:/vc", "/winsdkdirC:/sdk", "-o", "x.obj", "/c", "x.cc"]), cwd)
+                .unwrap();
+        assert_eq!(clang_cl.system_dirs, vec![Dir::Path(abs("C:/sdk"))]);
+        assert_eq!(clang_cl.probe_args, s(&["/winsysroot", "C:/ws", "-vctoolsdir", "C:/vc", "/winsdkdirC:/sdk"]));
+        assert!(parse(&s(&["cl.exe", "-imsvc", "C:/sdk", "/c", "x.cc"]), cwd).is_err());
     }
 
     /// The whole driver against cl.exe, when `CPP_DEPS_TEST_CL` names one
@@ -1674,7 +2019,7 @@ mod tests {
     #[test]
     fn real_cl() {
         let Some(cl) = std::env::var_os("CPP_DEPS_TEST_CL") else { return };
-        let dir = std::env::temp_dir().join(format!("cpp_deps_driver_cl_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("cpp_deps_driver_cl_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("inc")).unwrap();
         std::fs::write(
             dir.join("main.cc"),
@@ -1697,7 +2042,7 @@ mod tests {
 
     #[test]
     fn profiles_round_trip() {
-        let dir = std::env::temp_dir().join(format!("cpp_deps_profiles_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("cpp_deps_profiles_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let p = Profile::new(
             "#define __GNUC__ 13\n#define __cplusplus 201703L\n".into(),
@@ -1744,7 +2089,7 @@ mod tests {
 
     #[test]
     fn profiles_cleaned_daily() {
-        let dir = std::env::temp_dir().join(format!("cpp_deps_profiles_cleaned_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("cpp_deps_profiles_cleaned_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = Profile::new("#define __GNUC__ 13\n".into(), vec![], crate::expr::Dialect::default(), false, vec![], vec![]);
@@ -1771,6 +2116,45 @@ mod tests {
         p.save(&dir, "k").unwrap();
         assert!(!b.exists());
         assert!(Profile::load(&dir, "k").is_some());
+        // Loading one uses it: kept.
+        p.save(&dir, "used").unwrap();
+        let used = Profile::file(&dir, "used");
+        age(&used, 31);
+        assert!(Profile::load(&dir, "used").is_some());
+        age(&dir.join(CLEANED), 2);
+        p.save(&dir, "k").unwrap();
+        assert!(used.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profiles_expire_in_memory() {
+        let dir = std::env::temp_dir().join(format!("cpp_deps_profiles_expire_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv = s(&[if cfg!(windows) { "C:/no/such/clang++.exe" } else { "/no/such/clang++" }, "-c", "a.cc"]);
+        let (driver, env) = saved_profile(&argv, &dir, "#define __clang__ 1\n", vec![]);
+        let inv = parse_in(&argv, &dir, &env).unwrap();
+        let key = driver.profile_key(&inv, &dir, &env);
+        // What the process holds in memory (`known`), when the profile
+        // directory has a fresh profile.
+        let held = |known: (u64, Result<Arc<Profile>, String>)| {
+            let cell = Loaded::default();
+            let _ = cell.set(known);
+            driver.profiles.lock().unwrap().insert(key.clone(), cell);
+            driver.profile(&inv, &dir, &env)
+        };
+        let session = driver.cache.session();
+        // A profile probed over a day ago is probed again (here: loaded).
+        let mut old = Profile::new("#define OLD 1\n".into(), vec![], crate::expr::Dialect::default(), false, vec![], vec![]);
+        old.probed -= PROFILE_LIFETIME.as_secs() + 60;
+        let fresh = held((session, Ok(Arc::new(old)))).unwrap();
+        assert!(!fresh.predefined.contains_key(&intern::intern("OLD")));
+        let recent = Profile::new("#define RECENT 1\n".into(), vec![], crate::expr::Dialect::default(), false, vec![], vec![]);
+        assert!(held((session, Ok(Arc::new(recent)))).unwrap().predefined.contains_key(&intern::intern("RECENT")));
+        // A probe that failed is tried again in the next session only.
+        assert!(held((session, Err("failed".into()))).is_err());
+        assert!(held((session - 1, Err("failed".into()))).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1818,18 +2202,32 @@ mod tests {
             "-fdiagnostics-color=always",
             "-gsplit-dwarf",
             "-Werror",
-            "-pedantic",
             "-save-temps=obj",
-            "-fprofile-use=a.profdata",
             "-finput-charset=UTF-8",
             "-Xclang",
             "-fcolor-diagnostics",
+            "--param=ssp-buffer-size=4",
+            "--param",
+            "max-inline-insns-single=100",
+            "-fsanitize-ignorelist=ignore.txt",
+            // CMake's for Clang targeting the MSVC ABI.
+            "-Xclang",
+            "--dependent-lib=msvcrt",
+            "-Xclang",
+            "-gcodeview",
+            "-Xclang",
+            "-fdebug-compilation-dir",
+            "-Xclang",
+            ".",
+            "-Xclang",
+            "-Wp,-DX",
+            "-dM",
         ];
         assert_eq!(probe(&dropped), Vec::<String>::new());
         // What may change predefines, built-in directories or answers does.
         let probed = [
             "-O2",
-            "-march=native",
+            "-march=x86-64-v3",
             "-std=c++20",
             "-fno-exceptions",
             "-pthread",
@@ -1838,8 +2236,25 @@ mod tests {
             "/sdk",
             "-nostdinc++",
             "-fms-compatibility-version=19.40",
+            "--stdlib=libc++",
+            "-pedantic",
+            "-static",
+            "-nostdlib",
+            "-fprofile-use=a.profdata",
+            "-Xclang",
+            "-target-feature",
+            "-Xclang",
+            "+avx2",
+            "-Xclang",
+            "-flto-visibility-public-std",
+            "-disable-llvm-passes",
         ];
         assert_eq!(probe(&probed), s(&probed));
+        // Profiles made: their files don't make a profile per object.
+        assert_eq!(
+            probe(&["-fprofile-instr-generate=a.profraw", "-fprofile-generate=dir", "-fcs-profile-generate=dir"]),
+            s(&["-fprofile-instr-generate", "-fprofile-generate", "-fcs-profile-generate"])
+        );
         // What changes preprocessing otherwise falls back, as do flags no
         // list names.
         for bad in [
@@ -1849,20 +2264,50 @@ mod tests {
             &["-traditional-cpp"],
             &["-finput-charset=latin1"],
             &["-fno-dollars-in-identifiers"],
-            &["-Wp,-DX"],
+            &["-Wp,-include,a.h"],
+            &["-Wp,-I-"],
+            &["-Wp,-D"],
             &["-Xpreprocessor", "-DX"],
             &["-Xclang", "-I"],
             &["-Xclang", "-fms-compatibility"],
+            &["-Xclang", "-load", "-Xclang", "plugin.so"],
             &["-iwithprefix", "x"],
+            &["-iframeworkwithsysroot", "/fw"],
             &["-Apred=answer"],
             &["-fsycl"],
             &["--offload-arch=gfx90a"],
             &["-I-"],
             &["--unknown-flag"],
             &["-unknown"],
+            // Resolved where the compiler runs (here for the probe).
+            &["-march=native"],
+            &["-mtune=native"],
+            &["-mcpu=native"],
+            &["-Xclang", "-target-cpu", "-Xclang", "native"],
         ] {
             assert!(parsed(bad).is_err(), "{bad:?}");
         }
+        // -Wp, macros and directories, after the others (as GCC and Clang
+        // take them).
+        let inv = parsed(&["-Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3", "-DA=1", "-Wp,-DA=2", "-Iinc", "-Wp,-Iwp,-I,wp2", "-Ilast"]).unwrap();
+        assert_eq!(
+            inv.commands,
+            vec![
+                CommandMacro::Define("A=1".into()),
+                CommandMacro::Undef("_FORTIFY_SOURCE".into()),
+                CommandMacro::Define("_FORTIFY_SOURCE=3".into()),
+                CommandMacro::Define("A=2".into())
+            ]
+        );
+        assert_eq!(inv.user_dirs, ["inc", "last", "wp", "wp2"].map(|d| Dir::Path(scan::normalize(&cwd.join(d)))));
+        assert!(inv.probe_args.is_empty());
+        // Paths spelled relative, which `__FILE__` then is.
+        let root = if cfg!(windows) { "C:/s" } else { "/s" };
+        let relative = |argv: &[&str]| parse(&s(argv), cwd).unwrap().relative_paths;
+        assert!(!relative(&["clang++", "-I", &format!("{root}/inc"), "-include", &format!("{root}/p.h"), "-c", &format!("{root}/a.cc")]));
+        assert!(relative(&["clang++", "-c", "a.cc"]));
+        assert!(relative(&["clang++", "-iquote", "q", "-c", &format!("{root}/a.cc")]));
+        assert!(relative(&["clang++", "-include", "p.h", "-c", &format!("{root}/a.cc")]));
         // Clang's MSVC compatibility, as flags set it.
         let ms = |extra: &[&str]| parsed(extra).unwrap().ms_compat;
         assert_eq!(ms(&[]), None);
@@ -1874,6 +2319,331 @@ mod tests {
         let inv = parsed(&["-include", "a.h", "-imacros", "b.h", "-includec.h", "-imacrosd.h"]).unwrap();
         let gcc = |n: &str| Forced::Gcc { cwd: cwd.to_path_buf(), name: n.into() };
         assert_eq!((inv.forced, inv.imacros), (vec![gcc("a.h"), gcc("c.h")], vec![gcc("b.h"), gcc("d.h")]));
+    }
+
+    /// Real compile commands: CMake's (GCC and Clang on Linux, Clang's
+    /// GNU-style driver and clang-cl targeting the MSVC ABI, cl), the
+    /// default flags of distributions' packages (Fedora, Arch, Debian,
+    /// Ubuntu), Linux's, and hermetic-llvm's clang-cl. `{d}` is the source
+    /// tree; the source is `a.c` or `a.cpp`, the object `a.o` or `a.obj`.
+    const CORPUS: &[(&str, &str, &str)] = &[
+        (
+            "cmake-gcc",
+            "/usr/bin/c++",
+            "-DFOO=1 -I{d}/include -isystem {d}/third_party -O3 -DNDEBUG -std=gnu++17 -fPIC -fvisibility=hidden -fvisibility-inlines-hidden \
+             -fdiagnostics-color=always -Winvalid-pch -include {d}/cmake_pch.hxx -MD -MT CMakeFiles/x.dir/a.cpp.o -MF CMakeFiles/x.dir/a.cpp.o.d \
+             -o CMakeFiles/x.dir/a.cpp.o -c {d}/a.cpp",
+        ),
+        (
+            "cmake-clang",
+            "/usr/bin/clang++",
+            "--target=x86_64-linux-gnu -I{d}/include -O2 -g -DNDEBUG -std=c++20 -fcolor-diagnostics -flto=thin -fPIE -pthread \
+             -Xclang -include-pch -Xclang {d}/cmake_pch.hxx.pch -Xclang -include -Xclang {d}/cmake_pch.hxx \
+             -MD -MT a.cpp.o -MF a.cpp.o.d -o a.cpp.o -c {d}/a.cpp",
+        ),
+        (
+            "cmake-windows-clang",
+            "C:/LLVM/bin/clang++.exe",
+            "-DWIN32 -D_WINDOWS -I{d}/include -O0 -g -Xclang -gcodeview -D_DEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrtd -std=gnu++17 \
+             -MD -MT CMakeFiles/x.dir/a.cpp.obj -MF CMakeFiles/x.dir/a.cpp.obj.d -o CMakeFiles/x.dir/a.cpp.obj -c {d}/a.cpp",
+        ),
+        (
+            "cmake-windows-clang-static",
+            "C:/LLVM/bin/clang.exe",
+            "-I{d}/include -O3 -DNDEBUG -Xclang -flto-visibility-public-std -D_MT -Xclang --dependent-lib=libcmt -std=gnu11 \
+             -MD -MT a.c.obj -MF a.c.obj.d -o a.c.obj -c {d}/a.c",
+        ),
+        (
+            "cmake-msvc",
+            "C:/VS/bin/cl.exe",
+            "/nologo /TP -DFOO -I{d}/include /external:I{d}/third_party /external:W0 /DWIN32 /D_WINDOWS /GR /EHsc /Zi /Ob0 /Od /RTC1 \
+             -std:c++17 -MDd /showIncludes /FoCMakeFiles/x.dir/a.cpp.obj /FdCMakeFiles/x.dir/ /FS -c {d}/a.cpp",
+        ),
+        (
+            "cmake-clang-cl",
+            "C:/LLVM/bin/clang-cl.exe",
+            "/nologo -TP -DFOO -I{d}/include -imsvc{d}/third_party /DWIN32 /D_WINDOWS /GR /EHsc /Zi /Ob0 /Od /RTC1 -std:c++17 -MDd \
+             /showIncludes /FoCMakeFiles/x.dir/a.cpp.obj /FdTARGET_COMPILE_PDB -c -- {d}/a.cpp",
+        ),
+        (
+            "hermetic-clang-cl",
+            "C:/hermetic/bin/clang-cl.exe",
+            "-resource-dir={d}/resource /D_CRT_STDIO_ISO_WIDE_SPECIFIERS -fms-compatibility-version=19.44 /vctoolsdir{d}/vc /winsdkdir{d}/sdk \
+             /winsdkversion10.0.26100.0 -Xclang -ivfsoverlay -Xclang {d}/overlay.yaml /Brepro /clang:-gno-codeview-command-line /nologo -TP \
+             -I{d}/include /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++17 -MD /showIncludes /Foa.cpp.obj /Fdx.pdb -c -- {d}/a.cpp",
+        ),
+        (
+            "fedora",
+            "/usr/bin/g++",
+            "-O2 -flto=auto -ffat-lto-objects -fexceptions -g -grecord-gcc-switches -pipe -Wall -Werror=format-security \
+             -Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3 -Wp,-D_GLIBCXX_ASSERTIONS -specs=/usr/lib/rpm/redhat/redhat-hardened-cc1 \
+             -fstack-protector-strong -specs=/usr/lib/rpm/redhat/redhat-annobin-cc1 -m64 -march=x86-64 -mtune=generic \
+             -fasynchronous-unwind-tables -fstack-clash-protection -fcf-protection -mtls-dialect=gnu2 -fno-omit-frame-pointer \
+             -mno-omit-leaf-frame-pointer -I{d}/include -c {d}/a.cpp -o a.o",
+        ),
+        (
+            "arch",
+            "/usr/bin/g++",
+            "-march=x86-64 -mtune=generic -O2 -pipe -fno-plt -fexceptions -Wp,-D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security \
+             -fstack-clash-protection -fcf-protection -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -Wp,-D_GLIBCXX_ASSERTIONS -g \
+             -ffile-prefix-map=/build/pkg/src=/usr/src/debug/pkg -flto=auto -I{d}/include -c {d}/a.cpp -o a.o",
+        ),
+        (
+            "debian",
+            "/usr/bin/gcc",
+            "-g -O2 -ffile-prefix-map=/build/pkg-1.0=. -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security \
+             -fcf-protection -Wdate-time -D_FORTIFY_SOURCE=2 -I{d}/include -c {d}/a.c -o a.o",
+        ),
+        (
+            "ubuntu",
+            "/usr/bin/gcc",
+            "-g -O2 -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer -ffile-prefix-map=/build/pkg-1.0=. -flto=auto -ffat-lto-objects \
+             -fstack-protector-strong -fstack-clash-protection -Wformat -Werror=format-security -fcf-protection \
+             -fdebug-prefix-map=/build/pkg-1.0=/usr/src/pkg-1.0 -Wdate-time -D_FORTIFY_SOURCE=3 -I{d}/include -c {d}/a.c -o a.o",
+        ),
+        (
+            "linux",
+            "/usr/bin/gcc",
+            "-Wp,-MMD,dir/.a.o.d -nostdinc -I{d}/include -include {d}/include/kconfig.h -D__KERNEL__ -fmacro-prefix-map=./= -std=gnu11 \
+             -fshort-wchar -funsigned-char -fno-common -fno-PIE -fno-strict-aliasing -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx \
+             -fcf-protection=branch -fno-jump-tables -m64 -falign-jumps=1 -falign-loops=1 -mno-80387 -mno-fp-ret-in-387 \
+             -mpreferred-stack-boundary=3 -mskip-rax-setup -mtune=generic -mno-red-zone -mcmodel=kernel -Wno-sign-compare \
+             -fno-asynchronous-unwind-tables -mindirect-branch=thunk-extern -mindirect-branch-register -mfunction-return=thunk-extern \
+             -fpatchable-function-entry=16,16 -fno-delete-null-pointer-checks -O2 -fno-allow-store-data-races -fstack-protector-strong \
+             -fno-omit-frame-pointer -fno-optimize-sibling-calls -ftrivial-auto-var-init=zero -fno-stack-clash-protection -pg -mrecord-mcount \
+             -mfentry -DCC_USING_FENTRY -falign-functions=16 -fno-strict-overflow -fno-stack-check -fconserve-stack -Wall \
+             -DKBUILD_MODFILE=\"dir/a\" -DKBUILD_BASENAME=\"a\" -DKBUILD_MODNAME=\"a\" -D__KBUILD_MODNAME=kmod_a -c -o dir/a.o {d}/a.c",
+        ),
+    ];
+
+    /// What the probe doesn't have doesn't change what compilers predefine:
+    /// `DROPPED` and samples of the prefixes', against `CPP_DEPS_TEST_CXX`
+    /// (a Clang for a few targets too) and `CPP_DEPS_TEST_CL`.
+    #[test]
+    fn dropped_flags_keep_predefines() {
+        let cwd = std::env::temp_dir().join(format!("cpp_deps_dropped_{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let predefines = |compiler: &Path, style: Style, lang: &str, args: &[&str], extra: &[&str]| -> Option<Vec<String>> {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let c = probe::Compiler { path: compiler, args: &args, style, lang, cwd: &cwd, env: None, timeout: probe::TIMEOUT };
+            let mut lines: Vec<String> = probe::run(&c, extra, "").ok()?.stdout.lines().filter(|l| l.starts_with("#define")).map(String::from).collect();
+            lines.sort();
+            Some(lines)
+        };
+        if let Some(cxx) = std::env::var_os("CPP_DEPS_TEST_CXX") {
+            let cxx = PathBuf::from(cxx);
+            // What -E prints and how is the probe's business.
+            let printing = ["-###", "-E", "-P", "-C", "-CC", "-H", "-v", "--verbose", "-time", "-dM", "-dD", "-dN", "-dI", "-dU"];
+            let samples = [
+                "-Werror",
+                "-Wall",
+                "-Wextra",
+                "-g",
+                "-g3",
+                "-ggdb",
+                "-gline-tables-only",
+                "-fdebug-prefix-map=/a=/b",
+                "-ffile-prefix-map=/a=/b",
+                "-fmacro-prefix-map=/a=/b",
+                "-fdiagnostics-color=always",
+                "-fmessage-length=0",
+                "-ferror-limit=5",
+                "-fmax-errors=5",
+                "-ftemplate-depth=100",
+                "-fconstexpr-depth=100",
+                "-fbracket-depth=300",
+                "-fuse-ld=lld",
+                "-rtlib=compiler-rt",
+                "-L/x",
+                "-lm",
+                "-Wl,-x",
+                "-Wa,-x",
+                "-frandom-seed=x",
+                "--param=ssp-buffer-size=4",
+                "-fprofile-update=atomic",
+                "-fprofile-exclude-files=x",
+                "-fprofile-dir=x",
+                "-fpch-preprocess",
+                "-ftime-report",
+                "-fno-crash-diagnostics",
+            ];
+            let flags: Vec<&str> = DROPPED.iter().copied().filter(|f| !printing.contains(f)).chain(samples).collect();
+            assert!(flags.iter().all(|f| gcc_effect(f) == Effect::Drop));
+            let clang =
+                probe::fingerprint(&probe::Compiler { path: &cxx, args: &[], style: Style::Gcc, lang: "c", cwd: &cwd, env: None, timeout: probe::TIMEOUT })
+                    .contains("clang");
+            let targets: &[&[&str]] = if clang { &[&[], &["--target=x86_64-linux-gnu"], &["--target=arm64-apple-macos14"]] } else { &[&[]] };
+            for lang in ["c", "c++"] {
+                for target in targets {
+                    let base = predefines(&cxx, Style::Gcc, lang, target, &["-dM", "-E"]).unwrap();
+                    for f in &flags {
+                        let args: Vec<&str> = target.iter().copied().chain([*f]).collect();
+                        if let Some(with) = predefines(&cxx, Style::Gcc, lang, &args, &["-dM", "-E"]) {
+                            assert_eq!(with, base, "{f} changes what {} predefines ({lang}, {target:?})", cxx.display());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(cl) = std::env::var_os("CPP_DEPS_TEST_CL") {
+            let cl = PathBuf::from(cl);
+            let flags = [
+                "/Zi",
+                "/Z7",
+                "/FS",
+                "/MP",
+                "/WX",
+                "/Wv:19",
+                "/wd4996",
+                "/we4996",
+                "/w14996",
+                "/Gy",
+                "/Gw",
+                "/Brepro",
+                "/diagnostics:caret",
+                "/external:templates-",
+                "/errorReport:none",
+                "/FoC:/x.obj",
+                "/FdC:/x.pdb",
+                "/c",
+                "/showIncludes",
+            ];
+            assert!(flags.iter().all(|f| cl_dropped(&f[1..])));
+            let pd = ["/EP", "/Zc:preprocessor", "/PD"];
+            let base = predefines(&cl, Style::Msvc, "c++", &[], &pd).unwrap();
+            for f in flags {
+                if let Some(with) = predefines(&cl, Style::Msvc, "c++", &[f], &pd) {
+                    assert_eq!(with, base, "{f} changes what cl predefines");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    /// Every command of `CORPUS` scans exactly (with a profile saved
+    /// beforehand: no compiler runs), and its object's name doesn't reach
+    /// the probe (one profile for every object).
+    #[test]
+    fn real_command_lines() {
+        let dir = std::env::temp_dir().join(format!("cpp_deps_corpus_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = [
+            ("a.cpp", "#include <x.h>\n#include \"y.h\"\n"),
+            ("a.c", "#include <x.h>\n#include \"y.h\"\n"),
+            ("y.h", ""),
+            ("include/x.h", ""),
+            ("include/kconfig.h", ""),
+            ("cmake_pch.hxx", ""),
+            ("overlay.yaml", "{ 'version': 0, 'roots': [] }\n"),
+        ];
+        for (f, text) in files {
+            std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(f), text).unwrap();
+        }
+        let d = dir.to_string_lossy().replace('\\', "/");
+        for &(name, compiler, args) in CORPUS {
+            let argv = |object: &str| -> Vec<String> {
+                std::iter::once(compiler.to_string())
+                    .chain(
+                        args.split_whitespace()
+                            .map(|a| a.replace("{d}", &d).replace("a.o", &format!("{object}.o")).replace("a.cpp.o", &format!("{object}.cpp.o"))),
+                    )
+                    .collect()
+            };
+            let inv = parse_in(&argv("a"), &dir, &Environment::default()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let other = parse_in(&argv("b"), &dir, &Environment::default()).unwrap();
+            assert_eq!(inv.probe_args, other.probe_args, "{name}");
+            let (driver, env) = saved_profile(&argv("a"), &dir, "#define __GNUC__ 13\n", vec![]);
+            let out = driver.scan_in(&argv("a"), &dir, &env).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(out.exact() && out.missing.is_empty(), "{name}: {:?} {:?}", out.inexact, out.missing);
+            assert!(out.files.iter().any(|f| f.ends_with("x.h")) && out.files.iter().any(|f| f.ends_with("y.h")), "{name}: {:?}", out.files);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_flags_read() {
+        let dir = std::env::temp_dir().join(format!("cpp_deps_read_paths_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = [
+            "prof.afdo",
+            "use.profdata",
+            "cfg.cfg",
+            "allow.txt",
+            "ignore.txt",
+            "list.txt",
+            "xray.txt",
+            "remap.txt",
+            "o.yaml",
+            "o2.yaml",
+            "pch.pch",
+            "m.pcm",
+            "x.hmap",
+            "spec.specs",
+            "gcda/a.gcda",
+        ];
+        for f in files {
+            std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let read = |argv: &[&str]| {
+            let (files, dirs) = read_paths(&s(argv), &dir);
+            let rel = |v: Vec<PathBuf>| v.iter().map(|f| f.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect::<Vec<_>>();
+            (rel(files), rel(dirs))
+        };
+        let (files, dirs) = read(&[
+            "clang++",
+            "-fprofile-sample-use=prof.afdo",
+            "-fprofile-instr-use=use.profdata",
+            "--config=cfg.cfg",
+            "-fsanitize-coverage-allowlist=allow.txt",
+            "-fsanitize-ignorelist=ignore.txt",
+            "-fprofile-list=list.txt",
+            "-fxray-always-instrument=xray.txt",
+            "-fprofile-remapping-file=remap.txt",
+            "-ivfsoverlay=o.yaml",
+            "-Xclang",
+            "-ivfsoverlay",
+            "-Xclang",
+            "o2.yaml",
+            "-Xclang",
+            "-include-pch",
+            "-Xclang",
+            "pch.pch",
+            "-fmodule-file=m=m.pcm",
+            "-I",
+            "x.hmap",
+            "-Iinc",
+            "-specs=spec.specs",
+            "-fprofile-use=gcda",
+            "-fprofile-list=missing.txt",
+            "-c",
+            "a.cc",
+        ]);
+        assert_eq!(
+            files,
+            vec![
+                "prof.afdo",
+                "use.profdata",
+                "cfg.cfg",
+                "allow.txt",
+                "ignore.txt",
+                "list.txt",
+                "xray.txt",
+                "remap.txt",
+                "o.yaml",
+                "o2.yaml",
+                "pch.pch",
+                "m.pcm",
+                "x.hmap",
+                "spec.specs"
+            ]
+        );
+        assert_eq!(dirs, vec!["gcda"]);
+        // clang-cl's, through /clang: or not.
+        let (files, _) = read(&["clang-cl", "/clang:-fprofile-use=use.profdata", "-fsanitize-ignorelist=ignore.txt", "/c", "a.cc"]);
+        assert_eq!(files, vec!["use.profdata", "ignore.txt"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1900,6 +2670,8 @@ mod tests {
             &["/clang:-fmodules"],
             &["/clang:-fno-ms-extensions"],
             &["-Xclang", "-include"],
+            &["/clang:-march=native"],
+            &["/clang:-Wp,-include,a.h"],
         ] {
             let mut argv = vec!["clang-cl"];
             argv.extend(bad);
@@ -1927,6 +2699,16 @@ mod tests {
             "x.cc",
         ];
         assert_eq!(parsed(&argv, &env(&[])).unwrap().probe_args, s(&["/utf-8", "/source-charset:utf-8", "/clang:-O2"]));
+        // The driver's -Wp, through /clang: (clang-cl's own -Wp... is a
+        // warning flag).
+        let inv = parsed(&["clang-cl", "/clang:-Wp,-DFOO", "-Wp,-DBAR", "/DA", "/c", "x.cc"], &env(&[])).unwrap();
+        assert_eq!(inv.commands, vec![CommandMacro::Define("A".into()), CommandMacro::Define("FOO".into())]);
+        // cl.exe ignores clang-cl's /clang: and -Xclang (not what follows).
+        let inv = parsed(&["cl.exe", "/clang:-DFOO", "/clang:-Iinc", "-Xclang", "-DBAR", "/c", "x.cc"], &env(&[])).unwrap();
+        assert_eq!(inv.commands, vec![CommandMacro::Define("BAR".into())]);
+        // Profiles made, without their files.
+        let inv = parsed(&["clang-cl", "/clang:-fprofile-instr-generate=x.profraw", "/c", "x.cc"], &env(&[])).unwrap();
+        assert_eq!(inv.probe_args, s(&["/clang:-fprofile-instr-generate"]));
     }
 
     /// A driver scanning `argv` with a profile saved beforehand (no
@@ -1943,7 +2725,7 @@ mod tests {
 
     #[test]
     fn profiles_decide_lookups() {
-        let dir = std::env::temp_dir().join(format!("cpp_deps_driver_lookups_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("cpp_deps_driver_lookups_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let files = [
             ("src/main.cc", "#include <sub/a.h>\n#include \"x.h\"\n"),
@@ -1985,27 +2767,41 @@ mod tests {
         // Every -imacros before any -include.
         let files = scanned(&["-Iinc", "-Iother", "-include", "forced.h", "-imacros", "macros.h"], gcc).unwrap();
         assert_eq!(files[..3], ["macros.h", "forced.h", "yes.h"]);
+        // clang-cl merges as Clang does: an /I directory that's a built-in
+        // one (INCLUDE's) is searched there, after the others; cl searches
+        // it first.
+        std::fs::write(dir.join("cl.cc"), "#include <x.h>\n").unwrap();
+        std::fs::write(dir.join("other/x.h"), "").unwrap();
+        let cl_scanned = |compiler: &str, predefines: &str| {
+            let compiler = if cfg!(windows) { format!("C:/no/such/{compiler}.exe") } else { format!("/no/such/{compiler}") };
+            let argv = s(&[&compiler, "/Isys", "/Iother", "/c", "cl.cc"]);
+            let (driver, env) = saved_profile(&argv, &dir, predefines, vec![Dir::Path(dir.join("sys"))]);
+            let out = driver.scan_in(&argv, &dir, &env).unwrap();
+            out.files.iter().map(|f| f.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect::<Vec<_>>()
+        };
+        assert_eq!(cl_scanned("clang-cl", clang_msvc), vec!["cl.cc", "other/x.h"]);
+        assert_eq!(cl_scanned("cl", "#define _MSC_VER 1944\n"), vec!["cl.cc", "sys/x.h"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn real_dirs_once_per_session() {
-        let dir = std::env::temp_dir().join(format!("cpp_deps_real_dirs_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("cpp_deps_real_dirs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).unwrap();
         let driver = Driver::new(Cache::new(vec![], false));
         let real_a = std::fs::canonicalize(&a).unwrap();
-        assert_eq!(driver.real_dir(&a), (real_a.clone(), false));
+        assert_eq!(driver.real_dir(&a), (real_a.clone(), PathKind::Dir));
         // Taken once per session (scans don't canonicalize every pair).
         std::fs::remove_dir(&a).unwrap();
-        assert_eq!(driver.real_dir(&a), (real_a, false));
+        assert_eq!(driver.real_dir(&a), (real_a, PathKind::Dir));
         driver.cache.new_session();
-        assert_eq!(driver.real_dir(&a), (a, false));
+        assert_eq!(driver.real_dir(&a), (a, PathKind::Missing));
         // A directory that doesn't exist is looked at again.
-        assert_eq!(driver.real_dir(&b), (b.clone(), false));
+        assert_eq!(driver.real_dir(&b), (b.clone(), PathKind::Missing));
         std::fs::create_dir_all(&b).unwrap();
-        assert_eq!(driver.real_dir(&b), (std::fs::canonicalize(&b).unwrap(), false));
+        assert_eq!(driver.real_dir(&b), (std::fs::canonicalize(&b).unwrap(), PathKind::Dir));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2019,7 +2815,7 @@ mod tests {
     /// the cases scanned exactly.
     fn differential(compiler: &str, cases: &[Case]) -> Vec<&'static str> {
         use std::collections::BTreeSet;
-        let root = std::env::temp_dir().join(format!("cpp_deps_differential_{}_{}", cases[0].0, std::process::id()));
+        let root = test_dirs::base().join(format!("cpp_deps_differential_{}_{}", cases[0].0, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let driver = Driver::new(Cache::new(vec![], cfg!(windows)));
         let key = |p: &PathBuf| {
@@ -2154,6 +2950,97 @@ mod tests {
             &[("main.c", "#include \"a.h\"\n"), ("a.h", "")],
             &["-frandom-seed=main.o", "-MD", "-MF", "main.d", "-c", "main.c", "-o", "main.o"],
         ),
+        // The third review's.
+        (
+            "next_relative_inherits",
+            &[("main.c", "#include <a.h>\n"), ("inc1/a.h", "#include \"b.h\"\n"), ("inc1/b.h", "#pragma once\n#include_next <b.h>\n"), ("inc2/b.h", "")],
+            &["-I", "inc1", "-I", "inc2", "-c", "main.c"],
+        ),
+        (
+            "next_relative_inherits_quote",
+            &[
+                ("main.c", "#include \"a.h\"\n"),
+                ("q/a.h", "#include \"b.h\"\n"),
+                ("q/b.h", "#ifndef B\n#define B\n#include_next <b.h>\n#endif\n"),
+                ("inc/b.h", ""),
+                ("q2/b.h", ""),
+            ],
+            &["-iquote", "q", "-iquote", "q2", "-I", "inc", "-c", "main.c"],
+        ),
+        (
+            "wp_undef_define",
+            &[("main.c", "#if _FORTIFY_SOURCE == 3\n#include \"f3.h\"\n#else\n#include \"fother.h\"\n#endif\n"), ("f3.h", ""), ("fother.h", "")],
+            &["-D_FORTIFY_SOURCE=2", "-Wp,-U_FORTIFY_SOURCE,-D_FORTIFY_SOURCE=3", "-Wp,-Iwp", "-c", "main.c"],
+        ),
+        ("param_joined", &[("main.c", "#include \"a.h\"\n"), ("a.h", "")], &["--param=ssp-buffer-size=4", "-c", "main.c"]),
+        (
+            "iquote_dup_join",
+            &[
+                ("main.c", "#include \"x.h\"\n"),
+                ("a/x.h", "#ifdef SECOND\n#include \"second.h\"\n#endif\n#define SECOND\n#include_next <x.h>\n"),
+                ("a/second.h", ""),
+                ("sys/x.h", ""),
+            ],
+            &["-iquote", "a", "-iquote", "a", "-I", "a", "-isystem", "sys", "-c", "main.c"],
+        ),
+        (
+            "nonexistent_join",
+            &[
+                ("main.c", "#include \"x.h\"\n"),
+                ("a/x.h", "#ifdef SECOND\n#include \"second.h\"\n#endif\n#define SECOND\n#include_next <x.h>\n"),
+                ("a/second.h", ""),
+                ("sys/x.h", ""),
+            ],
+            &["-iquote", "a", "-I", "missing", "-I", "a", "-isystem", "sys", "-c", "main.c"],
+        ),
+        ("pedantic_cxx", &[("main.cc", "#ifdef __cpp_runtime_arrays\n#include \"vla.h\"\n#endif\n"), ("vla.h", "")], &["-pedantic", "-c", "main.cc"]),
+        ("nostdlib_ssp", &[("main.c", "#ifdef __SSP_STRONG__\n#include \"ssp.h\"\n#endif\n"), ("ssp.h", "")], &["-nostdlib", "-c", "main.c"]),
+        (
+            "include_file_macro_relative",
+            &[("sub/main.c", "#ifndef AGAIN\n#define AGAIN\n#include __FILE__\n#endif\n"), ("sub/sub/main.c", "")],
+            &["-c", "sub/main.c"],
+        ),
+        (
+            "include_file_macro_absolute",
+            &[("sub/main.c", "#ifndef AGAIN\n#define AGAIN\n#include __FILE__\n#endif\n"), ("sub/sub/main.c", "")],
+            &["-c", "{d}/sub/main.c"],
+        ),
+        (
+            "pragma_once_macro_operand",
+            &[
+                ("main.c", "#include \"h.h\"\n#define FEATURE\n#include \"h.h\"\n#ifdef FEATURE\n#include \"f.h\"\n#endif\n"),
+                ("h.h", "#define ONCE_STR \"once\"\n_Pragma(ONCE_STR)\n#undef FEATURE\n"),
+                ("f.h", ""),
+            ],
+            &["-c", "main.c"],
+        ),
+    ];
+
+    /// Clang's (`-Xclang`, its profiles, MSVC compatibility).
+    const CLANG_CASES: &[Case] = &[
+        ("xclang_dependent_lib", &[("main.c", "#include \"a.h\"\n"), ("a.h", "")], &["-Xclang", "--dependent-lib=msvcrt", "-c", "main.c"]),
+        ("xclang_debug_dir", &[("main.c", "#include \"a.h\"\n"), ("a.h", "")], &["-Xclang", "-fdebug-compilation-dir", "-Xclang", ".", "-c", "main.c"]),
+        (
+            "profile_generate",
+            &[("main.c", "#ifdef __LLVM_INSTR_PROFILE_GENERATE\n#include \"pg.h\"\n#endif\n"), ("pg.h", "")],
+            &["-fprofile-instr-generate=x.profraw", "-c", "main.c"],
+        ),
+        (
+            "static_darwin",
+            &[("main.c", "#ifdef __STATIC__\n#include \"static.h\"\n#else\n#include \"dynamic.h\"\n#endif\n"), ("static.h", ""), ("dynamic.h", "")],
+            &["--target=arm64-apple-macos14", "-static", "-c", "main.c"],
+        ),
+        (
+            "next_from_includer_stack",
+            &[
+                ("src/main.cc", "#include <sub/a.h>\n"),
+                ("inc/sub/a.h", "#include \"x.h\"\n"),
+                ("src/x.h", "#include_next <x.h>\n"),
+                ("inc/x.h", ""),
+                ("other/x.h", ""),
+            ],
+            &["--target=x86_64-pc-windows-msvc", "-Iinc", "-Iother", "-c", "src/main.cc"],
+        ),
     ];
 
     /// cl-style differential cases.
@@ -2190,15 +3077,55 @@ mod tests {
         ),
         ("cr_only_cl", &[("main.cc", "#include \"a.h\"\r#include \"b.h\"\rint x;\r"), ("a.h", ""), ("b.h", "")], &["/nologo", "/c", "main.cc"]),
         ("trigraphs_cl", &[("main.cc", "??=include \"t.h\"\n#include \"a.h\"\n"), ("t.h", ""), ("a.h", "")], &["/nologo", "/Zc:trigraphs", "/c", "main.cc"]),
+        (
+            "warning_level_cl",
+            &[("main.cc", "#if defined(_MSVC_WARNING_LEVEL) && _MSVC_WARNING_LEVEL >= 4\n#include \"w4.h\"\n#endif\n"), ("w4.h", "")],
+            &["/nologo", "/W4", "/c", "main.cc"],
+        ),
+        ("clang_wp_define_cl", &[("main.cc", "#ifdef FOO\n#include \"foo.h\"\n#endif\n"), ("foo.h", "")], &["/nologo", "/clang:-Wp,-DFOO", "/c", "main.cc"]),
+        ("o_separate_cl", &[("main.cc", "#include \"a.h\"\n"), ("a.h", "")], &["/nologo", "-o", "x.obj", "/c", "main.cc"]),
     ];
 
     /// The cases against GCC or Clang, when `CPP_DEPS_TEST_CXX` names one.
     #[test]
     fn real_differential() {
         let Some(cxx) = std::env::var_os("CPP_DEPS_TEST_CXX") else { return };
-        let exact = differential(&cxx.to_string_lossy(), GCC_CASES);
-        for name in ["plain", "cr_only_line_endings", "include_next_from_iquote", "imacros_after_include_order", "per_object_flags"] {
+        let cxx = cxx.to_string_lossy();
+        let exact = differential(&cxx, GCC_CASES);
+        for name in [
+            "plain",
+            "cr_only_line_endings",
+            "include_next_from_iquote",
+            "imacros_after_include_order",
+            "per_object_flags",
+            "next_relative_inherits",
+            "next_relative_inherits_quote",
+            "wp_undef_define",
+            "param_joined",
+            "iquote_dup_join",
+            "nonexistent_join",
+            "pedantic_cxx",
+            "nostdlib_ssp",
+            "include_file_macro_absolute",
+        ] {
             assert!(exact.contains(&name), "{name} isn't exact: {exact:?}");
+        }
+        let cwd = std::env::temp_dir();
+        if probe::fingerprint(&probe::Compiler {
+            path: Path::new(&*cxx),
+            args: &[],
+            style: Style::Gcc,
+            lang: "c",
+            cwd: &cwd,
+            env: None,
+            timeout: probe::TIMEOUT,
+        })
+        .contains("clang")
+        {
+            let exact = differential(&cxx, CLANG_CASES);
+            for &(name, _, _) in CLANG_CASES {
+                assert!(exact.contains(&name), "{name} isn't exact: {exact:?}");
+            }
         }
     }
 
@@ -2209,7 +3136,7 @@ mod tests {
         for var in ["CPP_DEPS_TEST_CL", "CPP_DEPS_TEST_CLANG_CL"] {
             let Some(cl) = std::env::var_os(var) else { continue };
             let exact = differential(&cl.to_string_lossy(), CL_CASES);
-            for name in ["plain_cl", "external_i_after_i", "forced_include_includer_stack"] {
+            for name in ["plain_cl", "external_i_after_i", "forced_include_includer_stack", "warning_level_cl", "clang_wp_define_cl", "o_separate_cl"] {
                 assert!(exact.contains(&name), "{var}: {name} isn't exact: {exact:?}");
             }
         }

@@ -11,6 +11,10 @@
 //!
 //! Only complete lines count: a torn last line (a crash, a kill, a full
 //! disk) is ignored, as ninja does, and cut off before the next append.
+//!
+//! A build writes the logs holding the build directory's lock
+//! ([`LogLock`]), which ninja doesn't have: two builds appending to the deps
+//! log at once would give their new paths the same ids.
 
 use crate::hash::HashMap;
 use std::fs::{File, OpenOptions};
@@ -19,6 +23,55 @@ use std::io::Write;
 use crate::graph::TimeStamp;
 
 pub const BUILD_LOG_FILE: &str = ".ninja_rs_log";
+/// The lock file of a build directory's logs (see [`LogLock`]).
+pub const LOCK_FILE: &str = ".ninja_rs_lock";
+
+/// An exclusive OS lock on a build directory's logs, held by the process
+/// writing them, and released when dropped or when the process ends,
+/// however it ends.
+pub struct LogLock {
+    _file: File,
+}
+
+impl LogLock {
+    /// Takes the lock file `path`, unless another process holds it (`None`).
+    pub fn try_acquire(path: &str) -> std::io::Result<Option<LogLock>> {
+        let file = OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(LogLock { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// Takes the lock file `path`, waiting for the process holding it.
+    pub fn acquire(path: &str) -> std::io::Result<LogLock> {
+        let file = OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+        file.lock()?;
+        Ok(LogLock { _file: file })
+    }
+}
+
+/// The length of the file `path`, if there is one.
+pub(crate) fn file_len(path: &str) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// Replaces the file `path` with `data`, through a temporary file renamed
+/// into place, named for this process and moment: another one recompacting
+/// at once, or one that died doing it, has its own.
+pub(crate) fn replace_file(path: &str, data: &[u8]) -> Result<(), String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let tmp = format!("{path}.{}-{nanos}-{n}.tmp", std::process::id());
+    let written = OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(data));
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("writing {path}: {e}"));
+    }
+    Ok(())
+}
 // v2: command hashes are ninja's rapidhash (v1 used FNV-1a).
 const SIGNATURE: &str = "# ninja-rs log v2\n";
 
@@ -109,6 +162,8 @@ pub struct BuildLog {
     needs_recompaction: bool,
     /// The length of the file's complete lines, when it ends with a torn one.
     truncate_to: Option<u64>,
+    /// The file's length when loaded (`None`: there was none).
+    loaded_len: Option<u64>,
 }
 
 impl BuildLog {
@@ -133,6 +188,7 @@ impl BuildLog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("loading build log {path}: {e}")),
         };
+        self.loaded_len = Some(data.len() as u64);
         // A torn last line may still parse (a shorter hash), and the next
         // append would extend it.
         let complete = data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
@@ -167,6 +223,12 @@ impl BuildLog {
     /// whether an output still exists in the manifest.
     pub fn open_for_write(&mut self, path: &str, is_live: &dyn Fn(&str) -> bool) -> Result<(), String> {
         self.path = path.to_string();
+        // Written to since it was loaded (by a process that doesn't take the
+        // build directory's lock): its end may not be the torn line read.
+        // It is rewritten from what was read.
+        if file_len(path) != self.loaded_len {
+            self.needs_recompaction = true;
+        }
         if self.needs_recompaction {
             self.recompact(path, is_live)?;
         }
@@ -174,10 +236,14 @@ impl BuildLog {
     }
 
     /// Cuts off a torn last line found by `load`, so that appends start on
-    /// a line of their own.
+    /// a line of their own; only if the file is still the one read.
     fn cut_torn_line(&mut self) -> Result<(), String> {
         if let Some(len) = self.truncate_to.take() {
+            if file_len(&self.path) != self.loaded_len {
+                return Err(format!("build log {} changed since it was read: is another build writing to it?", self.path));
+            }
             OpenOptions::new().write(true).open(&self.path).and_then(|f| f.set_len(len)).map_err(|e| format!("truncating build log {}: {e}", self.path))?;
+            self.loaded_len = Some(len);
         }
         Ok(())
     }
@@ -224,11 +290,10 @@ impl BuildLog {
         for k in keys {
             out.push_str(&format_entry(&self.entries[k]));
         }
-        let tmp = format!("{path}.recompact");
-        std::fs::write(&tmp, out).map_err(|e| format!("writing {tmp}: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("renaming {tmp}: {e}"))?;
+        replace_file(path, out.as_bytes())?;
         self.needs_recompaction = false;
         self.truncate_to = None;
+        self.loaded_len = Some(out.len() as u64);
         Ok(())
     }
 
@@ -261,7 +326,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> String {
-        let d = std::env::temp_dir().join(format!("ninja-rs-test-{}-{name}", std::process::id()));
+        let d = test_dirs::base().join(format!("ninja-rs-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_file(&d);
         d.to_string_lossy().into_owned()
     }

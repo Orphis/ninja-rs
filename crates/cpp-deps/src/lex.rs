@@ -146,6 +146,9 @@ pub struct FileDirectives {
     /// The file has a trigraph (`??=`, `??/`...), which this lexer doesn't
     /// replace: its directives are unknown when trigraphs are on.
     pub trigraphs: bool,
+    /// A line of text is an assembler's `.include` or `.incbin` (in `.S`
+    /// files), which reads a file the preprocessor doesn't see.
+    pub asm_include: bool,
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -630,6 +633,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
     // and after the last one: for include guards.
     let mut text_first = false;
     let mut text_last = false;
+    let mut asm_include = false;
     loop {
         lx.skip_space();
         let Some(c) = lx.peek() else { break };
@@ -646,6 +650,9 @@ pub fn lex(content: &[u8]) -> FileDirectives {
             let start = lx.pos;
             lx.skip_text_line();
             let text = &content[start..lx.pos];
+            asm_include |= [&b".include"[..], b".incbin"]
+                .iter()
+                .any(|d| text.strip_prefix(*d).is_some_and(|rest| rest.first().is_some_and(|c| c.is_ascii_whitespace() || *c == b'"')));
             if may_run_pragma(text) {
                 let line = lx.line_at(start);
                 let toks = tokens(text);
@@ -657,7 +664,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
                 }));
                 // A pragma from a macro (`DO_PRAGMA(push_macro("M"))`,
                 // `__pragma(once)`): text isn't expanded, so it's marked.
-                if macros::pragmas(&toks, false) != macros::Pragmas::None {
+                if macros::pragmas(&toks, false, &[]) != macros::Pragmas::None {
                     let marker = Token { kind: Kind::Ident, sym: intern::PRAGMA_OPERATOR, space: false };
                     dirs.push(Directive { kind: DirKind::Pragma, toks: Box::new([marker]), line, mac: None });
                 }
@@ -686,7 +693,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
         dirs.push(Directive { kind, toks: toks.into_boxed_slice(), line, mac });
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
-    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs }
+    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs, asm_include }
 }
 
 /// Whether a line of text may run a pragma that changes macros or
@@ -838,6 +845,10 @@ mod tests {
             assert!(lex(t).trigraphs, "{:?}", String::from_utf8_lossy(t));
         }
         assert!(!lex(b"x ? y : z ?? w;\nint q = a ?: b;\n").trigraphs);
+        // An assembler's includes.
+        assert!(lex(b"#include \"a.h\"\n  .include \"macros.s\"\n").asm_include);
+        assert!(lex(b".incbin \"blob.bin\"\n").asm_include);
+        assert!(!lex(b".includes x\nint include;\n").asm_include);
     }
 
     #[test]

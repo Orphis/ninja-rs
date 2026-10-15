@@ -5,6 +5,14 @@
 //! It is deliberately simple (no output directories) but follows the
 //! protocol closely enough to exercise a real client.
 //!
+//! As a worker with a local cache does, it writes each input blob once
+//! (read-only, in `blobs/` under its work directory) and hard-links it into
+//! the exec roots: rewriting a toolchain of hundreds of MB for every action
+//! made the tests slow under load, and a new copy of an executable slower
+//! still where it is scanned before it runs. Actions run with a cleared
+//! environment: what the command sets, and what the OS needs to start a
+//! process, as on a worker that isn't the client's host.
+//!
 //! It is also a Build Event Service: it records the build events it
 //! receives (decoded) and acks each one.
 //!
@@ -41,6 +49,8 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 
 #[derive(Default, Debug, Clone)]
 pub struct Stats {
+    /// Execute calls received, and actions run to completion.
+    pub execute_calls: u64,
     pub executions: u64,
     pub action_cache_hits: u64,
     /// Results stored by clients (UpdateActionResult).
@@ -96,8 +106,10 @@ pub struct State {
     evict_on_execute: std::sync::atomic::AtomicBool,
     /// Execute fails with INTERNAL (a broken remote).
     fail_executions: std::sync::atomic::AtomicBool,
-    /// Milliseconds Execute waits first (a slow remote).
+    /// Milliseconds Execute waits first (a slow remote), and what it waits
+    /// for then.
     execute_delay_ms: AtomicU64,
+    execute_gate: Mutex<Option<Gate>>,
     /// Milliseconds a ByteStream write waits before it reads the blob,
     /// and a read before it answers.
     write_delay_ms: AtomicU64,
@@ -115,10 +127,15 @@ pub struct State {
     tamper: Mutex<Option<Tamper>>,
     base: PathBuf,
     counter: AtomicU64,
+    /// Held while a blob is written to the store (see `Svc::stored`).
+    store: Mutex<()>,
 }
 
 /// See `State::set_tamper`.
 pub type Tamper = Box<dyn Fn(&mut re::ActionResult) + Send + Sync>;
+
+/// See `State::set_execute_gate`.
+pub type Gate = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl State {
     /// Rewrites every action result the server returns (from the action
@@ -162,6 +179,12 @@ impl State {
     /// Makes every Execute wait first, as a slow or busy remote would.
     pub fn set_execute_delay(&self, delay: std::time::Duration) {
         self.execute_delay_ms.store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+    /// Makes every Execute wait, after its delay, until `gate` returns true
+    /// (polled), so that a test orders the remote side after something
+    /// else rather than guessing how long it takes; `None` opens it.
+    pub fn set_execute_gate(&self, gate: Option<Gate>) {
+        *self.execute_gate.lock().unwrap() = gate;
     }
     /// Makes the next `times` calls of `method` (`FindMissingBlobs`,
     /// `BatchUpdateBlobs`, `BatchReadBlobs`, `GetActionResult`,
@@ -299,6 +322,12 @@ pub fn digest_of(data: &[u8]) -> re::Digest {
 fn status(code: i32, message: impl Into<String>) -> RpcStatus {
     RpcStatus { code, message: message.into(), details: vec![] }
 }
+
+/// What actions get of the server's environment: on Windows, where the
+/// system is (without it, processes can't load some system libraries or
+/// use sockets). Nothing on Unix, where `PATH` unset means the system's
+/// default search path.
+const OS_VARIABLES: &[&str] = if cfg!(windows) { &["SystemRoot"] } else { &[] };
 
 #[derive(Clone)]
 struct Svc(Arc<State>);
@@ -562,17 +591,42 @@ impl bs::byte_stream_server::ByteStream for Svc {
 }
 
 impl Svc {
+    /// The store's read-only file holding a blob, written the first time an
+    /// action needs it. Executables have their own file on Unix, where the
+    /// links share its mode.
+    fn stored(&self, d: &re::Digest, executable: bool) -> Result<PathBuf, String> {
+        let executable = executable && cfg!(unix);
+        let path = self.0.base.join("blobs").join(if executable { format!("{}-x", d.hash) } else { d.hash.clone() });
+        let _writing = self.0.store.lock().unwrap();
+        if path.exists() {
+            return Ok(path);
+        }
+        let data = self.0.get(d).ok_or_else(|| format!("missing blob {}", d.hash))?;
+        let tmp = path.with_extension("tmp");
+        std::fs::create_dir_all(self.0.base.join("blobs")).map_err(|e| e.to_string())?;
+        std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        let permissions = std::os::unix::fs::PermissionsExt::from_mode(if executable { 0o555 } else { 0o444 });
+        #[cfg(not(unix))]
+        let permissions = {
+            let mut p = std::fs::metadata(&tmp).map_err(|e| e.to_string())?.permissions();
+            p.set_readonly(true);
+            p
+        };
+        std::fs::set_permissions(&tmp, permissions).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        Ok(path)
+    }
+
     fn materialize(&self, dir: &re::Directory, path: &Path) -> Result<(), String> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         for f in &dir.files {
             let d = f.digest.clone().unwrap_or_default();
-            let data = self.0.get(&d).ok_or_else(|| format!("missing blob {} for {}", d.hash, f.name))?;
             let p = path.join(&f.name);
-            std::fs::write(&p, data).map_err(|e| e.to_string())?;
-            #[cfg(unix)]
-            if f.is_executable {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+            let stored = self.stored(&d, f.is_executable).map_err(|e| format!("{}: {e}", f.name))?;
+            // A copy where links can't go (another file system).
+            if std::fs::hard_link(&stored, &p).is_err() {
+                std::fs::copy(&stored, &p).map_err(|e| e.to_string())?;
             }
         }
         for sub in &dir.directories {
@@ -610,6 +664,8 @@ impl Svc {
         let out = std::process::Command::new(&program)
             .args(&command.arguments[1..])
             .current_dir(&cwd)
+            .env_clear()
+            .envs(OS_VARIABLES.iter().filter_map(|v| Some((v, std::env::var_os(v)?))))
             .envs(command.environment_variables.iter().map(|e| (e.name.clone(), e.value.clone())))
             .stdin(std::process::Stdio::null())
             .output();
@@ -662,6 +718,7 @@ impl re::execution_server::Execution for Svc {
         if self.0.evict_on_execute.swap(false, Ordering::SeqCst) {
             self.0.clear_cas();
         }
+        self.0.stats.lock().unwrap().execute_calls += 1;
         if self.0.fail_executions.load(Ordering::SeqCst) {
             return Err(Status::internal("injected failure"));
         }
@@ -669,6 +726,13 @@ impl re::execution_server::Execution for Svc {
         let delay = self.0.execute_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        loop {
+            let gate = self.0.execute_gate.lock().unwrap().clone();
+            match gate {
+                Some(open) if !open() => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                _ => break,
+            }
         }
         let r = r.into_inner();
         let d = r.action_digest.unwrap_or_default();
@@ -848,5 +912,62 @@ impl Drop for FakeServer {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `argv` as an action, with `input.txt` holding "input" and the
+    /// environment `env`.
+    fn run(state: &Arc<State>, argv: &[&str], env: &[(&str, &str)]) -> re::ActionResult {
+        let input = state.put(b"input".to_vec());
+        let root = re::Directory { files: vec![re::FileNode { name: "input.txt".into(), digest: Some(input), ..Default::default() }], ..Default::default() };
+        let command = re::Command {
+            arguments: argv.iter().map(|a| a.to_string()).collect(),
+            environment_variables: env.iter().map(|(k, v)| re::command::EnvironmentVariable { name: k.to_string(), value: v.to_string() }).collect(),
+            ..Default::default()
+        };
+        let action = re::Action {
+            command_digest: Some(state.put(command.encode_to_vec())),
+            input_root_digest: Some(state.put(root.encode_to_vec())),
+            ..Default::default()
+        };
+        Svc(state.clone()).run_action(&state.put(action.encode_to_vec())).unwrap()
+    }
+
+    fn server(dir: &Path) -> Arc<State> {
+        Arc::new(State { base: dir.to_path_buf(), ..Default::default() })
+    }
+
+    #[test]
+    fn actions_get_only_their_environment() {
+        let dir = test_dirs::TestDir::new("fake-reapi-env");
+        let state = server(&dir);
+        let argv: &[&str] = if cfg!(windows) { &["cmd.exe", "/C", "set"] } else { &["/usr/bin/env"] };
+        let r = run(&state, argv, &[("ACTION_VAR", "1")]);
+        let out = String::from_utf8_lossy(&r.stdout_raw);
+        assert_eq!(r.exit_code, 0, "{out}");
+        assert!(out.lines().any(|l| l == "ACTION_VAR=1"), "{out}");
+        // The server's own, which any test process has.
+        assert!(!out.lines().any(|l| l.to_ascii_uppercase().starts_with("PATH=")), "{out}");
+    }
+
+    #[test]
+    fn inputs_are_shared_and_read_only() {
+        let dir = test_dirs::TestDir::new("fake-reapi-inputs");
+        let state = server(&dir);
+        let append: &[&str] = if cfg!(windows) { &["cmd.exe", "/C", "echo more>> input.txt"] } else { &["/bin/sh", "-c", "echo more >> input.txt"] };
+        for _ in 0..2 {
+            let r = run(&state, append, &[]);
+            assert_ne!(r.exit_code, 0, "an action changed its input: {}", String::from_utf8_lossy(&r.stderr_raw));
+        }
+        let stored = dir.join("blobs").join(digest_of(b"input").hash);
+        assert_eq!(std::fs::read(&stored).unwrap(), b"input");
+        assert!(std::fs::metadata(&stored).unwrap().permissions().readonly());
+        // Each action's exec root went.
+        let left: Vec<_> = std::fs::read_dir(&*dir).unwrap().flatten().map(|e| e.file_name()).filter(|n| n != "blobs").collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }

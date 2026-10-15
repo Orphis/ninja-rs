@@ -1,7 +1,7 @@
 //! The daemon: one per user and ninja-rs binary (`Location`), serving every
 //! build, one thread per connection, until it has been idle for a while.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +16,8 @@ use crate::ipc::{self, Location};
 use crate::proto::{self, Begin, PROTOCOL, Request, Response, Status};
 use crate::watch::{RootState, Watcher};
 
-/// Builds whose environments are kept (a scan names its build's).
+/// Builds whose environments are kept (a scan names its build's): those
+/// that used theirs last.
 const KEPT_SESSIONS: usize = 64;
 
 /// How long a build directory stays known after a build began in it
@@ -24,11 +25,28 @@ const KEPT_SESSIONS: usize = 64;
 /// next build there names it again.
 const BUILD_DIRS_KEPT: Duration = Duration::from_secs(24 * 3600);
 
+/// The ninja-rs version, which the daemon reports and ninja-rs too (this
+/// is the lowest crate reporting it): the package's, with the commit it
+/// was built from when the build knew it (`build.rs` asks git; Bazel
+/// stamps it with `--stamp`), as `0.1.0+1a2b3c4d5e6f`.
+pub fn version() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        // An unstamped Bazel build leaves the placeholder.
+        match option_env!("NINJA_RS_COMMIT").filter(|c| !c.is_empty() && !c.starts_with('{')) {
+            Some(commit) => format!("{}+{commit}", env!("CARGO_PKG_VERSION")),
+            None => env!("CARGO_PKG_VERSION").to_string(),
+        }
+    })
+}
+
 pub struct Daemon {
     pub driver: Arc<Driver>,
     pub files: Arc<Files>,
     pub watcher: Arc<Watcher>,
-    sessions: Mutex<VecDeque<(u64, Arc<Environment>)>>,
+    /// Builds' environments, and when each was last used (`uses`).
+    sessions: Mutex<HashMap<u64, (Arc<Environment>, u64)>>,
+    uses: AtomicU64,
     next_session: AtomicU64,
     /// Digest files read, and when a build last named each.
     seeded: Mutex<HashMap<PathBuf, Instant>>,
@@ -51,6 +69,7 @@ impl Daemon {
             files,
             watcher,
             sessions: Mutex::default(),
+            uses: AtomicU64::new(0),
             next_session: AtomicU64::new(1),
             seeded: Mutex::default(),
             started: Instant::now(),
@@ -67,13 +86,16 @@ impl Daemon {
         self.requests.fetch_add(1, Ordering::Relaxed);
         *self.last_active.lock().unwrap() = Instant::now();
         match req {
-            Request::Hello { .. } => Response::Hello { protocol: PROTOCOL, pid: std::process::id(), version: env!("CARGO_PKG_VERSION").to_string() },
+            Request::Hello { .. } => Response::Hello { protocol: PROTOCOL, pid: std::process::id(), version: version().to_string() },
             Request::Begin(b) => self.begin(b),
             Request::Scan { session, argv, cwd } => {
-                let env = self.sessions.lock().unwrap().iter().find(|(id, _)| *id == session).map(|(_, e)| e.clone());
+                let env = self.sessions.lock().unwrap().get_mut(&session).map(|(env, used)| {
+                    *used = self.uses.fetch_add(1, Ordering::Relaxed);
+                    env.clone()
+                });
                 match env {
                     Some(env) => Response::Scanned(self.driver.scan_in(&argv, &cwd, &env).map(Into::into)),
-                    None => Response::Error(format!("unknown build {session}")),
+                    None => Response::UnknownBuild,
                 }
             }
             Request::Files { paths } => Response::Files(paths.iter().map(|p| self.files.get(p)).collect()),
@@ -83,20 +105,18 @@ impl Daemon {
         }
     }
 
-    /// A build starts: its directory is never trusted, entries the watcher
-    /// doesn't vouch for are checked again, and roots are brought in sync.
+    /// A build starts: its directory, and the others it writes to, are
+    /// never trusted, entries the watcher doesn't vouch for are checked
+    /// again, and roots are brought in sync.
     fn begin(&self, b: Begin) -> Response {
         if let Some(before) = Instant::now().checked_sub(BUILD_DIRS_KEPT) {
             self.watcher.expire(before);
-            self.files.expire(before);
-            self.driver.cache.expire_volatile(before);
             self.seeded.lock().unwrap().retain(|_, named| *named >= before);
         }
+        // The one set the digests and the preprocessor's cache ask.
         for d in std::iter::once(&b.build_dir).chain(&b.volatile) {
-            self.driver.cache.add_volatile(d);
-            self.files.add_volatile(d);
+            self.watcher.ignore(d);
         }
-        self.watcher.ignore(&b.build_dir);
         self.driver.cache.new_session();
         self.files.new_session();
         // Read once: every build saves it again, from what the daemon
@@ -110,9 +130,11 @@ impl Daemon {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         let env = Environment { vars: Some(Arc::new(b.env)), profile_dir: b.profile_dir };
         let mut sessions = self.sessions.lock().unwrap();
-        sessions.push_back((id, Arc::new(env)));
-        while sessions.len() > KEPT_SESSIONS {
-            sessions.pop_front();
+        sessions.insert(id, (Arc::new(env), self.uses.fetch_add(1, Ordering::Relaxed)));
+        if sessions.len() > KEPT_SESSIONS
+            && let Some(lru) = sessions.iter().min_by_key(|(_, (_, used))| *used).map(|(id, _)| *id)
+        {
+            sessions.remove(&lru);
         }
         Response::Begun { session: id }
     }
@@ -123,7 +145,7 @@ impl Daemon {
         let stats = self.driver.cache.stats();
         Status {
             pid: std::process::id(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: version().to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
             builds: self.next_session.load(Ordering::Relaxed) - 1,
             requests: self.requests.load(Ordering::Relaxed),
@@ -193,7 +215,7 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
     let daemon = Daemon::new(Box::new(move |m| log2(m)));
     daemon.watcher.set_cookie_dir(&loc.cookie_dir());
     let mut listener = ipc::Listener::bind(loc)?;
-    log(&format!("started (ninja-rs {}), exiting after {idle:?} idle", env!("CARGO_PKG_VERSION")));
+    log(&format!("started (ninja-rs {}), exiting after {idle:?} idle", version()));
     {
         let (daemon, log, loc) = (daemon.clone(), log.clone(), loc.clone());
         std::thread::spawn(move || {
@@ -214,7 +236,16 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
         });
     }
     loop {
-        let stream = listener.accept()?;
+        // A connection that failed (a client gone, out of file
+        // descriptors) isn't the daemon's end.
+        let stream = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log(&format!("accepting a connection: {e}"));
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
         let (daemon, log) = (daemon.clone(), log.clone());
         std::thread::spawn(move || connection(&daemon, stream, &*log));
     }
@@ -249,7 +280,7 @@ mod tests {
     /// A rebuilt (or removed) binary supersedes its daemon.
     #[test]
     fn superseded_by_a_rebuilt_binary() {
-        let exe = std::env::temp_dir().join(format!("ninja_daemon_exe_{}", std::process::id()));
+        let exe = test_dirs::base().join(format!("ninja_daemon_exe_{}", std::process::id()));
         std::fs::write(&exe, "version 1").unwrap();
         let loc = Location::for_exe(&exe).unwrap();
         assert!(!superseded(&exe, &loc));
@@ -263,7 +294,7 @@ mod tests {
     /// what the daemon keeps per build directory doesn't grow per build.
     #[test]
     fn digests_read_once() {
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_begin_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_daemon_begin_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let digests = dir.join(".ninja_rs_digests");
@@ -276,6 +307,76 @@ mod tests {
             assert!(matches!(daemon.handle(Request::Begin(b)), Response::Begun { .. }));
         }
         assert_eq!(daemon.seeded.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A build's environment is kept while it scans, however many builds
+    /// begin meanwhile (a configure's `try_compile` builds): those used
+    /// least recently go.
+    #[test]
+    fn sessions_by_last_use() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_sessions_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon::new(Box::new(|_| {}));
+        let begin = |name: &str| match daemon.handle(Request::Begin(Begin { build_dir: dir.join(name), ..Default::default() })) {
+            Response::Begun { session } => session,
+            r => panic!("{r:?}"),
+        };
+        let scan = |session| {
+            daemon.handle(Request::Scan {
+                session,
+                argv: vec![dir.join("no-such-cc").to_string_lossy().into_owned(), "-c".into(), "x.c".into()],
+                cwd: dir.clone(),
+            })
+        };
+        let long = begin("long");
+        let first = begin("TryCompile-first");
+        for i in 0..2 * KEPT_SESSIONS {
+            begin(&format!("TryCompile-{i}"));
+            if i % 8 == 0 {
+                assert!(matches!(scan(long), Response::Scanned(_)), "{i}");
+            }
+        }
+        assert!(matches!(scan(long), Response::Scanned(_)));
+        assert!(!matches!(scan(first), Response::Scanned(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Directories a build writes to besides its build directory aren't
+    /// watched: their files are never vouched for, and their changes don't
+    /// count against others'.
+    #[test]
+    fn volatile_dirs_unwatched() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        use cpp_deps::scan::Watch;
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_volatile_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in [".git", "src", "gen", "build"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let dir = crate::watch::strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+        let a = dir.join("src/a.h");
+        std::fs::write(&a, "a").unwrap();
+        let daemon = Daemon::new(Box::new(|_| {}));
+        let begin = || daemon.handle(Request::Begin(Begin { build_dir: dir.join("build"), volatile: vec![dir.join("gen")], ..Default::default() }));
+        begin();
+        assert_eq!(daemon.watcher.token(&a), None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.watcher.roots().iter().all(|(_, s)| *s != RootState::Unsynced) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        daemon.watcher.token(&a);
+        begin();
+        let t = daemon.watcher.token(&a).expect("vouched for");
+        assert_eq!(daemon.watcher.token(&dir.join("gen/out.h")), None);
+        std::fs::write(dir.join("gen/out.h"), "generated").unwrap();
+        // Its event, if any, came before the sync's.
+        begin();
+        assert!(daemon.watcher.unchanged_since(t));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

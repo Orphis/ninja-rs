@@ -270,8 +270,8 @@ pub fn check_rc_option(group: &[String]) -> Result<(), RcOptionError> {
 /// absolute (relative ones are resolved where ninja-rs started, not -C).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TlsFlags {
-    /// `--tls_certificate`: a CA (PEM) trusted to sign server certificates,
-    /// besides the web PKI roots.
+    /// `--tls_certificate`: the CA (PEM; possibly several) trusted to sign
+    /// server certificates, instead of the web PKI roots (as Bazel's).
     pub certificate: Option<String>,
     /// `--tls_client_certificate` and `--tls_client_key`: the client's
     /// certificate and private key (PEM), for mTLS.
@@ -299,33 +299,48 @@ impl TlsFlags {
 
 /// Explains a failed connection to a `grpcs://` endpoint (or one without a
 /// scheme, which means TLS): what was sent, and what the error usually
-/// means. Empty for other errors.
-pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags) -> String {
-    if !(endpoint.starts_with("grpcs://") || endpoint.starts_with("https://") || !endpoint.contains("://")) {
+/// means. Empty for other errors. A connection closed is only explained
+/// when the server never answered anything (`first_contact`): with TLS 1.3,
+/// a server refusing the client's certificate may just close it after the
+/// handshake; later, it's a broken connection (made again already).
+pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool) -> String {
+    let Some(rest) =
+        endpoint.strip_prefix("grpcs://").or_else(|| endpoint.strip_prefix("https://")).or_else(|| (!endpoint.contains("://")).then_some(endpoint))
+    else {
         return String::new();
-    }
+    };
     let e = error.to_ascii_lowercase();
     let cert = match &tls.client_certificate {
         Some(c) => format!("the client certificate {c}"),
         None => "no client certificate (--tls_client_certificate)".to_string(),
     };
-    if e.contains("unknownissuer") || e.contains("invalid peer certificate") {
+    let hint = if e.contains("unknownissuer") || e.contains("unknown issuer") {
         let ca = match &tls.certificate {
-            Some(c) => format!("the public roots and {c}"),
-            None => "the public roots only (--tls_certificate adds a CA)".to_string(),
+            Some(c) => format!("{c} only"),
+            None => "the public roots (--tls_certificate names a CA instead)".to_string(),
         };
-        format!(
-            "
-  the server's certificate isn't trusted: checked against {ca}"
-        )
-    } else if e.contains("broken pipe") || e.contains("connection closed") || e.contains("connection reset") || e.contains("certificate") {
-        format!(
-            "
-  the server closed the connection after the TLS handshake, as when it refuses the client's certificate: sent {cert}"
-        )
+        format!("the server's certificate isn't trusted: checked against {ca}")
+    } else if e.contains("notvalidforname") || e.contains("not valid for name") {
+        let name = tls.authority_override.clone().unwrap_or_else(|| {
+            let host = rest.split('/').next().unwrap_or(rest);
+            match host.strip_prefix('[') {
+                Some(v6) => v6.split(']').next().unwrap_or(v6).to_string(),
+                None => host.split(':').next().unwrap_or(host).to_string(),
+            }
+        });
+        format!("the server's certificate isn't valid for {name} (--tls_authority_override checks it against another name)")
+    } else if e.contains("expired") || e.contains("notvalidyet") || e.contains("not valid yet") {
+        "the server's certificate has expired, or isn't valid yet (is the clock right?)".to_string()
+    } else if e.contains("invalid peer certificate") {
+        "the server's certificate was refused".to_string()
+    } else if e.contains("alert") && ["certificate", "unknownca", "accessdenied", "handshakefailure"].iter().any(|a| e.contains(a)) {
+        format!("the server refused the client's certificate: sent {cert}")
+    } else if first_contact && ["broken pipe", "connection closed", "connection reset", "unexpected eof"].iter().any(|c| e.contains(c)) {
+        format!("the server closed the connection before answering anything, as when it refuses the client's certificate: sent {cert}")
     } else {
-        String::new()
-    }
+        return String::new();
+    };
+    format!("\n  {hint}")
 }
 
 /// Build event reporting, with Bazel's flag names.
@@ -336,6 +351,9 @@ pub struct BesFlags {
     /// BES project / instance name.
     pub instance_name: String,
     pub headers: Vec<(String, String)>,
+    /// How long the service may take to answer a call, or to ack events
+    /// waiting for it (`--bes_rpc_timeout`).
+    pub rpc_timeout: std::time::Duration,
     /// Printed with the invocation id appended.
     pub results_url: Option<String>,
     /// Writes the events, length-delimited, to this file.
@@ -360,6 +378,7 @@ impl Default for BesFlags {
             backend: None,
             instance_name: String::new(),
             headers: Vec::new(),
+            rpc_timeout: std::time::Duration::from_secs(15),
             results_url: None,
             binary_file: None,
             keywords: Vec::new(),
@@ -435,6 +454,9 @@ pub struct RemoteFlags {
     /// `--remote_timeout`: how long a call may take, or a transfer go
     /// without moving (executions aren't bounded).
     pub timeout: std::time::Duration,
+    /// `--action_env=NAME=VALUE`, or `NAME` for the value ninja-rs has:
+    /// variables every remote action gets, in order (the last wins).
+    pub action_env: Vec<(String, Option<String>)>,
 }
 
 impl RemoteFlags {
@@ -446,6 +468,12 @@ impl RemoteFlags {
     /// A remote cache without remote execution.
     pub fn cache_only(&self) -> bool {
         self.executor.is_none() && self.cache.is_some()
+    }
+
+    /// `--action_env`, with the values of the variables named alone (those
+    /// unset left out).
+    pub fn action_env(&self) -> Vec<(String, String)> {
+        self.action_env.iter().filter_map(|(name, value)| Some((name.clone(), value.clone().or_else(|| std::env::var(name).ok())?))).collect()
     }
 }
 
@@ -476,7 +504,7 @@ pub const USAGE: &str = "usage: ninja-rs [options] [targets...]
 if targets are unspecified, builds the 'default' target (see manual).
 
 options:
-  --version      print ninja version (\"{version}\")
+  --version      print ninja version (\"{version}\"; with -v, ninja-rs' too)
   -v, --verbose  show all command lines while building
   --quiet        don't show progress status, just command output
   --status FMT   progress status format using Ninja-style $vars
@@ -549,6 +577,8 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
                              deliverables, named targets and local inputs (minimal,
                              and Bazel's toplevel) [default=all]
   --remote_download_minimal  same as --remote_download_outputs=minimal
+  --remote_download_toplevel  same as --remote_download_outputs=toplevel
+  --remote_download_all      same as --remote_download_outputs=all
   --execution_log_file=FILE  log every remote action (key, command, inputs) as JSON lines
   --remote_include_scanner=conservative|preprocessor|clang-scan-deps|compiler
                              how compiles' inputs are found: following every #include;
@@ -562,10 +592,12 @@ remote execution (REAPI v2; only for build.ninja files with rbe_version = 1):
   --[no]daemon               keep scanned headers, compiler profiles, digests and
                              toolchain trees between builds in a daemon watching their
                              files (-t daemon) [default=off; on with NINJA_RS_DAEMON=1]
+  --action_env=NAME[=VALUE]  set NAME in the environment of remote actions (and local
+                             runs of them): to VALUE, or to its value here (repeatable)
 
 TLS (grpcs:// endpoints: the remote service and the Build Event Service):
-  --tls_certificate=FILE     CA certificate (PEM) trusted to sign server certificates,
-                             besides the public roots
+  --tls_certificate=FILE     CA certificate (PEM; possibly several) trusted to sign
+                             server certificates, instead of the public roots
   --tls_client_certificate=FILE  client certificate (PEM), for mTLS
   --tls_client_key=FILE      the client certificate's private key (PEM)
   --tls_authority_override=NAME  check server certificates against NAME, not the host
@@ -580,6 +612,8 @@ build events (Bazel's Build Event Protocol):
   --bes_timeout=DURATION     wait at most this long for the upload at the end (60s,
                              5m; seconds without a unit; 0 waits as long as it
                              takes) [default=60s]
+  --bes_rpc_timeout=DURATION how long the service may take to answer a call, or to
+                             ack the events sent [default=15s]
   --build_event_binary_file=PATH  also write the events to PATH (length-delimited)
   --build_event_publish_all_actions  report every action, not only failed ones
   --build_metadata=K=V       extra build metadata (repeatable)
@@ -589,6 +623,14 @@ build events (Bazel's Build Event Protocol):
 
 pub fn usage() -> String {
     USAGE.replace("{version}", ninja_core::parser::NINJA_VERSION).replace("{jobs}", &guess_parallelism().to_string())
+}
+
+/// `--version`: the ninja language level alone, as ninja prints it (tools
+/// parse the whole output as a version); with `-v`, ninja-rs' own version
+/// and commit on a second line.
+fn version_text(verbose: bool) -> String {
+    let level = ninja_core::parser::NINJA_VERSION;
+    if verbose { format!("{level}\nninja-rs {}\n", crate::version()) } else { format!("{level}\n") }
 }
 
 fn parse_int(flag: &str, v: &str) -> Result<i64, String> {
@@ -668,6 +710,12 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
     let key_value = |flag: &str, v: &str| -> Result<(String, String), String> {
         v.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).ok_or_else(|| format!("--{flag} expects KEY=VALUE, got '{v}'"))
     };
+    // A gRPC header: a valid name and an ASCII value.
+    let header = |flag: &str, v: &str| -> Result<(String, String), String> {
+        let (k, val) = key_value(flag, v)?;
+        rbe_client::header(&k, &val).map_err(|e| format!("--{flag}: {e:#}"))?;
+        Ok((k, val))
+    };
     let mut i = 0;
     let mut positional = Vec::new();
     while i < args.len() {
@@ -704,7 +752,7 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                 continue;
             }
             match name {
-                "version" => return Ok(ParseOutcome::Exit(format!("{}\n", ninja_core::parser::NINJA_VERSION), 0)),
+                "version" => return Ok(ParseOutcome::Exit(version_text(args.iter().any(|a| a == "-v" || a == "--verbose")), 0)),
                 "verbose" => o.verbosity = Verbosity::Verbose,
                 "quiet" => o.verbosity = Verbosity::NoStatusUpdate,
                 "status" => o.status_format = Some(value(&mut i)?),
@@ -722,10 +770,17 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                 "remote_executor" => o.remote.executor = unless_empty(value(&mut i)?),
                 "remote_cache" => o.remote.cache = unless_empty(value(&mut i)?),
                 "remote_instance_name" => o.remote.instance_name = value(&mut i)?,
-                "remote_header" => {
+                "remote_header" => o.remote.headers.push(header(name, &value(&mut i)?)?),
+                "action_env" => {
                     let v = value(&mut i)?;
-                    let (k, val) = v.split_once('=').ok_or_else(|| format!("--remote_header expects KEY=VALUE, got '{v}'"))?;
-                    o.remote.headers.push((k.to_string(), val.to_string()));
+                    let (name, val) = match v.split_once('=') {
+                        Some((n, val)) => (n.to_string(), Some(val.to_string())),
+                        None => (v, None),
+                    };
+                    if name.is_empty() {
+                        return Err("--action_env expects NAME or NAME=VALUE".into());
+                    }
+                    o.remote.action_env.push((name, val));
                 }
                 "remote_jobs" => {
                     let v = value(&mut i)?;
@@ -735,7 +790,7 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                     }
                     o.remote.jobs = n as usize;
                 }
-                "exec_root" => o.remote.exec_root = unless_empty(value(&mut i)?),
+                "exec_root" => o.remote.exec_root = optional_path(name, &value(&mut i)?)?,
                 "remote_mnemonics" => o.remote.mnemonic_suffixes = value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
                 "remote_racing_delay" => {
                     let d = parse_duration(name, &value(&mut i)?, std::time::Duration::from_millis(1))?;
@@ -773,7 +828,8 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                         v => return Err(format!("invalid --remote_download_outputs '{v}' (all, minimal or toplevel)")),
                     }
                 }
-                "remote_download_minimal" => o.remote.download_minimal = true,
+                // Bazel's shorthands.
+                "remote_download_minimal" | "remote_download_toplevel" => o.remote.download_minimal = true,
                 "remote_download_all" => o.remote.download_minimal = false,
                 "remote_include_scanner" => o.remote.include_scanner = value(&mut i)?.parse()?,
                 "execution_log_file" => o.remote.execution_log = optional_path(name, &value(&mut i)?)?,
@@ -784,10 +840,16 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                 }
                 "bes_backend" => o.bes.backend = unless_empty(value(&mut i)?),
                 "bes_instance_name" => o.bes.instance_name = value(&mut i)?,
-                "bes_header" => o.bes.headers.push(key_value(name, &value(&mut i)?)?),
+                "bes_header" => o.bes.headers.push(header(name, &value(&mut i)?)?),
                 "bes_results_url" => o.bes.results_url = unless_empty(value(&mut i)?),
                 "bes_keywords" => o.bes.keywords.extend(value(&mut i)?.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
                 "bes_timeout" => o.bes.timeout = parse_duration(name, &value(&mut i)?, std::time::Duration::from_secs(1))?,
+                "bes_rpc_timeout" => {
+                    o.bes.rpc_timeout = parse_duration(name, &value(&mut i)?, std::time::Duration::from_secs(1))?;
+                    if o.bes.rpc_timeout.is_zero() {
+                        return Err("invalid --bes_rpc_timeout value '0'".into());
+                    }
+                }
                 "build_event_binary_file" => o.bes.binary_file = optional_path(name, &value(&mut i)?)?,
                 "build_metadata" => o.bes.build_metadata.push(key_value(name, &value(&mut i)?)?),
                 "invocation_id" => o.bes.invocation_id = unless_empty(value(&mut i)?),
@@ -988,6 +1050,19 @@ mod tests {
         assert!(parse_args(&v).is_err());
     }
 
+    /// `--action_env`: a value given, or the one ninja-rs has (none when
+    /// the variable isn't set), in order.
+    #[test]
+    fn action_env() {
+        let o = p(&["--action_env=A=x=y", "--action_env", "PATH", "--action_env=NINJA_RS_TEST_UNSET_VARIABLE", "--action_env=B="]);
+        assert_eq!(o.remote.action_env[0], ("A".into(), Some("x=y".into())));
+        let resolved = o.remote.action_env();
+        assert_eq!(resolved.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["A", "PATH", "B"]);
+        assert_eq!(resolved[1].1, std::env::var("PATH").unwrap());
+        assert_eq!(resolved[2].1, "");
+        assert!(parse_args(&["--action_env==x".to_string()]).is_err());
+    }
+
     #[test]
     fn fallback_flags() {
         let o = p(&["--remote_strict", "--remote_max_fallbacks=5", "--remote_max_fallback_ratio", "0.25"]);
@@ -1007,11 +1082,37 @@ mod tests {
         assert_eq!(p(&["--remote_racing_delay=0"]).remote.racing_delay_ms, 0);
         assert!(parse_args(&["--remote_racing".to_string(), "--remote_strict".to_string()]).is_err());
         assert!(parse_args(&["--tls_client_certificate=c.pem".to_string()]).is_err());
-        let tls = TlsFlags { client_certificate: Some("/c.pem".into()), ..Default::default() };
-        assert!(tls_hint("transport error: broken pipe", "grpcs://h:1", &tls).contains("sent the client certificate /c.pem"));
-        assert!(tls_hint("invalid peer certificate: UnknownIssuer", "h:1", &TlsFlags::default()).contains("--tls_certificate adds a CA"));
-        assert!(tls_hint("transport error: broken pipe", "grpc://h:1", &tls).is_empty());
-        assert!(tls_hint("not found", "grpcs://h:1", &tls).is_empty());
+    }
+
+    #[test]
+    fn tls_hints() {
+        let tls = TlsFlags { client_certificate: Some("/c.pem".into()), certificate: Some("/ca.pem".into()), ..Default::default() };
+        let hint = |e: &str, endpoint: &str, first_contact: bool| tls_hint(e, endpoint, &tls, first_contact);
+        // A server refusing the client's certificate.
+        let refused = hint("transport error: received fatal alert: CertificateRequired", "grpcs://h:1", false);
+        assert!(refused.contains("refused the client's certificate: sent the client certificate /c.pem"), "{refused}");
+        assert!(hint("transport error: broken pipe", "grpcs://h:1", true).contains("sent the client certificate /c.pem"));
+        // A connection that broke later isn't the certificate's fault.
+        assert_eq!(hint("transport error: connection reset", "grpcs://h:1", false), "");
+        assert!(tls_hint("invalid peer certificate: UnknownIssuer", "h:1", &TlsFlags::default(), true).contains("--tls_certificate names a CA instead"));
+        assert!(hint("invalid peer certificate: UnknownIssuer", "h:1", true).contains("checked against /ca.pem only"));
+        assert!(hint("invalid peer certificate: NotValidForName", "grpcs://[::1]:8980", true).contains("isn't valid for ::1"));
+        let expired = hint("invalid peer certificate: Expired", "grpcs://h:1", true);
+        assert!(expired.contains("has expired") && !expired.contains("trusted"), "{expired}");
+        assert_eq!(hint("transport error: broken pipe", "grpc://h:1", true), "");
+        assert_eq!(hint("not found", "grpcs://h:1", true), "");
+    }
+
+    #[test]
+    fn headers_are_checked() {
+        let o = p(&["--bes_header=x-api-key=k", "--remote_header=Authorization=Bearer t"]);
+        assert_eq!(o.bes.headers, [("x-api-key".to_string(), "k".to_string())]);
+        for bad in ["--bes_header=x key=v", "--bes_header=x-api-key=line\nbreak", "--remote_header=caf\u{e9}=v", "--bes_header=novalue"] {
+            assert!(parse_args(&[bad.to_string()]).is_err(), "{bad}");
+        }
+        assert_eq!(p(&["--bes_rpc_timeout=1m"]).bes.rpc_timeout, std::time::Duration::from_secs(60));
+        assert_eq!(BesFlags::default().rpc_timeout, std::time::Duration::from_secs(15));
+        assert!(parse_args(&["--bes_rpc_timeout=0".to_string()]).is_err());
     }
 
     /// Bazel's values: empty unsets, durations with units.
@@ -1028,6 +1129,11 @@ mod tests {
         assert_eq!(p(&["--remote_racing_delay=1s"]).remote.racing_delay_ms, 1000);
         assert_eq!(p(&["--remote_racing_delay=40"]).remote.racing_delay_ms, 40);
         assert!(p(&["--remote_download_outputs=toplevel"]).remote.download_minimal);
+        assert!(p(&["--remote_download_toplevel"]).remote.download_minimal);
+        assert!(!p(&["--remote_download_toplevel", "--remote_download_all"]).remote.download_minimal);
+        // Paths are absolute, `~` expanded.
+        let root = p(&["--exec_root=rel/root"]).remote.exec_root.unwrap();
+        assert_eq!(root, std::path::absolute("rel/root").unwrap().to_string_lossy());
         let o = p(&["--remote_retries=2", "--remote_timeout=5m"]);
         assert_eq!((o.remote.retries, o.remote.timeout), (2, Duration::from_secs(300)));
         for bad in ["--bes_timeout=60x", "--bes_timeout=s", "--bes_timeout=-1s", "--remote_download_outputs=some", "--remote_retries=-1", "--remote_timeout=0"]
@@ -1038,7 +1144,42 @@ mod tests {
 
     #[test]
     fn version() {
-        let v = vec!["--version".to_string()];
-        assert!(matches!(parse_args(&v).unwrap(), ParseOutcome::Exit(_, 0)));
+        let text = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let ParseOutcome::Exit(text, 0) = parse_args(&args).unwrap() else { panic!("--version doesn't exit") };
+            text
+        };
+        assert_eq!(text(&["--version"]), format!("{}\n", ninja_core::parser::NINJA_VERSION));
+        assert_eq!(text(&["-v", "--version"]), format!("{}\nninja-rs {}\n", ninja_core::parser::NINJA_VERSION, crate::version()));
+    }
+
+    /// One version for Cargo and Bazel builds: the workspace's (Cargo.toml)
+    /// and the module's (MODULE.bazel), which BUILD files give the crates.
+    #[test]
+    fn version_is_the_workspace_one() {
+        let path = |f: &str| match std::env::var_os("TEST_SRCDIR") {
+            // Bazel: a data file, in the runfiles tree, or (Windows) in
+            // the manifest of them.
+            Some(r) => {
+                let tree = std::path::PathBuf::from(r).join("_main").join(f);
+                let manifest = std::env::var_os("RUNFILES_MANIFEST_FILE").and_then(|m| std::fs::read_to_string(m).ok()).unwrap_or_default();
+                let key = format!("_main/{f} ");
+                manifest.lines().find_map(|l| l.strip_prefix(&key)).map_or(tree, std::path::PathBuf::from)
+            }
+            // Cargo: the package directory, set when tests run.
+            None => std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default()).join("../..").join(f),
+        };
+        let read = |f: &str| std::fs::read_to_string(path(f)).unwrap_or_else(|e| panic!("{f}: {e}"));
+        // The first `version = "..."` after `after`.
+        let version_after = |text: &str, after: &str| -> String {
+            let rest = &text[text.find(after).unwrap_or_else(|| panic!("no {after}"))..];
+            let rest = &rest[rest.find("version = \"").expect("a version") + "version = \"".len()..];
+            rest[..rest.find('"').unwrap()].to_string()
+        };
+        let cargo = version_after(&read("Cargo.toml"), "[workspace.package]");
+        let bazel = version_after(&read("MODULE.bazel"), "module(");
+        assert_eq!((cargo.as_str(), bazel.as_str()), (env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_VERSION")));
+        let commit = crate::version().strip_prefix(env!("CARGO_PKG_VERSION")).unwrap();
+        assert!(commit.is_empty() || commit.strip_prefix('+').is_some_and(|c| c.len() >= 7 && c.bytes().all(|b| b.is_ascii_hexdigit())), "{commit}");
     }
 }

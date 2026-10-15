@@ -16,9 +16,11 @@
 //!   as Bazel does), or fails with its first failed edge. Its outputs are
 //!   those of its `rbe_artifact` (or `rbe_deliverable`) edges: CAS
 //!   references (`bytestream://`) for outputs built remotely, `file://`
-//!   otherwise, hashed off the build loop (and kept in the file digest
-//!   cache, which build events persist too). Targets that never complete
-//!   (after a failure, or an interruption) are `Aborted`.
+//!   otherwise, hashed off the build loop, a few targets at once (and kept
+//!   in the file digest cache, which build events persist too); after an
+//!   interruption, targets still waiting for theirs are reported without
+//!   them. Targets that never complete (after a failure, or an
+//!   interruption) are `Aborted`.
 //! - **Actions:** failed edges are reported as `ActionExecuted` (all of them
 //!   with `--build_event_publish_all_actions`); every edge counts in
 //!   `BuildMetrics`.
@@ -202,6 +204,9 @@ struct Inner {
     targets: BTreeMap<TargetKey, TargetState>,
     /// The target of every edge the requested targets need.
     edge_targets: HashMap<EdgeId, TargetKey>,
+    /// The edges their target waits for: those it counted (see
+    /// `TargetState::remaining`). Only their end counts down.
+    counted: std::collections::HashSet<EdgeId>,
     /// The targets were planned (`plan`): edges added to or removed from
     /// the plan since change what they wait for.
     planned: bool,
@@ -219,6 +224,16 @@ struct Inner {
     early_console: String,
 }
 
+impl Inner {
+    /// One edge fewer for the target `key` to wait for: the target, when
+    /// that was its last.
+    fn count_down(&mut self, key: &TargetKey) -> Option<TargetKey> {
+        let t = self.targets.get_mut(key).filter(|t| !t.done)?;
+        t.remaining = t.remaining.saturating_sub(1);
+        (t.remaining == 0).then(|| key.clone())
+    }
+}
+
 pub struct Bes {
     flags: BesFlags,
     /// For explaining a failed connection to the backend.
@@ -231,6 +246,9 @@ pub struct Bes {
     /// Completed targets waiting for their artifacts' digests (see
     /// `report_targets`).
     hashing: tokio::sync::mpsc::UnboundedSender<Hashing>,
+    /// Set once the build was interrupted: targets are reported without
+    /// waiting for their artifacts' digests.
+    hurry: tokio::sync::watch::Sender<bool>,
     file: Mutex<Option<std::io::BufWriter<std::fs::File>>>,
     /// A nested invocation: its events go to the outermost one instead.
     relay_out: Mutex<Option<ninja_daemon::ipc::Stream>>,
@@ -282,11 +300,12 @@ impl Bes {
                     config.keywords.extend([format!("command_name={command}"), "protocol_name=BEP".to_string()]);
                     config.lifecycle_events = flags.lifecycle_events;
                     config.headers = flags.headers.clone();
+                    config.rpc_timeout = flags.rpc_timeout;
                     config.trace = std::env::var_os("NINJA_RS_BES_DEBUG").is_some_and(|v| !v.is_empty());
                     // A failed connection is reported at the end (`finish`).
                     uploader = Some(BesUploader::connecting(async move { rbe_client::connect_channel(&connect).await }, config));
                 }
-                Err(e) => eprintln!("ninja: warning: build events won't be uploaded: {e}{}", crate::options::tls_hint(&e, backend, tls)),
+                Err(e) => eprintln!("ninja: warning: build events won't be uploaded: {e}"),
             }
         }
         let file = flags.binary_file.as_ref().and_then(|p| match std::fs::File::create(p) {
@@ -301,6 +320,7 @@ impl Bes {
         }
         let relay_in = relay.as_ref().map(|r| r.address.clone());
         let (hashing, jobs) = tokio::sync::mpsc::unbounded_channel();
+        let (hurry, hurried) = tokio::sync::watch::channel(false);
         let bes = Arc::new(Bes {
             flags: flags.clone(),
             tls: tls.clone(),
@@ -309,6 +329,7 @@ impl Bes {
             store,
             uploader: Mutex::new(uploader),
             hashing,
+            hurry,
             file: Mutex::new(file),
             relay_out: Mutex::new(relay_out),
             relay_in,
@@ -322,7 +343,7 @@ impl Bes {
             typed: if exec { opts.tool_args.iter().skip_while(|a| *a == "--").cloned().collect() } else { opts.targets.clone() },
             command,
         });
-        tokio::spawn(report_targets(Arc::downgrade(&bes), jobs));
+        tokio::spawn(report_targets(Arc::downgrade(&bes), jobs, hurried));
         if let Some(r) = relay {
             bes.serve_relay(r.listener);
         }
@@ -342,6 +363,10 @@ impl Bes {
         std::thread::spawn(move || {
             let mut connections = 0;
             while let Ok(mut stream) = listener.accept() {
+                // The stream ended: later events have nowhere to go.
+                if me.upgrade().is_none_or(|b| b.inner.lock().unwrap().stream.is_finished()) {
+                    return;
+                }
                 let me = me.clone();
                 connections += 1;
                 let connection = connections;
@@ -457,7 +482,7 @@ impl Bes {
     /// (BES services show them as the invocation's title).
     pub fn announce(&self, patterns: &[String]) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.patterns.is_none() {
+        if inner.patterns.is_none() && !inner.stream.is_finished() {
             let events = self.start_events(&mut inner, patterns.to_vec());
             self.send(events);
         }
@@ -478,6 +503,11 @@ impl Bes {
     /// line, when nothing announced others before).
     fn emit(&self, f: impl FnOnce(&mut Inner) -> Vec<bep::BuildEvent>) {
         let mut inner = self.inner.lock().unwrap();
+        // After the end (a nested invocation's events relayed late, a
+        // target reported once its artifacts were hashed): nowhere to go.
+        if inner.stream.is_finished() {
+            return;
+        }
         let mut events = if inner.patterns.is_none() { self.start_events(&mut inner, self.typed.clone()) } else { Vec::new() };
         events.extend(f(&mut inner));
         self.send(events);
@@ -548,7 +578,7 @@ impl Bes {
         let started = bep::BuildStarted {
             uuid: self.ids.invocation_id.clone(),
             start_time: Some(timestamp(start)),
-            build_tool_version: format!("{TOOL_NAME} {}", env!("CARGO_PKG_VERSION")),
+            build_tool_version: format!("{TOOL_NAME} {}", crate::version()),
             options_description: argv.iter().skip(1).cloned().collect::<Vec<_>>().join(" "),
             command: self.command.into(),
             working_directory: workspace.clone(),
@@ -626,6 +656,7 @@ impl Bes {
         }
         let mut targets: BTreeMap<TargetKey, TargetState> = BTreeMap::new();
         let mut edge_targets: HashMap<EdgeId, TargetKey> = HashMap::new();
+        let mut counted = std::collections::HashSet::new();
         let mut configs: BTreeMap<Option<String>, Configuration> = BTreeMap::new();
         let mut cas: HashMap<String, (String, i64)> = HashMap::new();
         for edge in edges {
@@ -650,6 +681,7 @@ impl Bes {
             edge_targets.insert(edge, key);
             if want != Want::Nothing {
                 t.remaining += 1;
+                counted.insert(edge);
             }
             if binding("rbe_artifact").as_deref() == Some("1") || binding("rbe_deliverable").as_deref() == Some("1") {
                 for &o in &state.edge(edge).outputs {
@@ -675,6 +707,7 @@ impl Bes {
         self.emit(|i| {
             i.targets = targets;
             i.edge_targets = edge_targets;
+            i.counted = counted;
             i.planned = true;
             for (path, digest) in cas {
                 i.cas.entry(path).or_insert(digest);
@@ -730,13 +763,13 @@ impl Bes {
                 return;
             }
             let Some(key) = inner.edge_targets.get(&edge).cloned() else { return };
-            let Some(t) = inner.targets.get_mut(&key).filter(|t| !t.done) else { return };
             if added {
-                t.remaining += 1;
+                if inner.targets.get(&key).is_some_and(|t| !t.done) && inner.counted.insert(edge) {
+                    inner.targets.get_mut(&key).expect("a target").remaining += 1;
+                }
                 None
             } else {
-                t.remaining = t.remaining.saturating_sub(1);
-                (t.remaining == 0).then_some(key)
+                inner.counted.remove(&edge).then(|| inner.count_down(&key)).flatten()
             }
         };
         if let Some(key) = complete {
@@ -774,8 +807,16 @@ impl Bes {
             || self.uploader.lock().unwrap().as_ref().is_some_and(|u| !u.is_closed())
     }
 
+    /// The build was interrupted: targets waiting for their artifacts'
+    /// digests are reported without them (`settle` and `finish` don't wait
+    /// for the hashing).
+    pub fn interrupted(&self) {
+        self.hurry.send_replace(true);
+    }
+
     /// Waits until the targets completed so far are reported: their
-    /// artifacts' digests are in the store's cache then.
+    /// artifacts' digests are in the store's cache then (but after an
+    /// interruption).
     pub async fn settle(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self.hashing.send(Hashing::Settled(tx)).is_ok() {
@@ -819,14 +860,25 @@ impl Bes {
             _ => {
                 let d = rbe_client::tree::file_digest(p, Some(&self.store.digests)).ok()?;
                 let abs = std::path::absolute(p).ok()?;
-                (format!("file://{}", abs.to_string_lossy().replace('\\', "/")), d.hash, d.size_bytes)
+                (file_uri(&abs.to_string_lossy()), d.hash, d.size_bytes)
             }
         };
         Some(bep::File { path_prefix, name, file: Some(bep::file::File::Uri(uri)), digest, length })
     }
 
-    pub fn edge_started(&self, edge: EdgeId) {
-        self.inner.lock().unwrap().starts.insert(edge, SystemTime::now());
+    /// An edge started. One the targets weren't planned with (a dyndep
+    /// file brought it) counts in its target from now, unless that one
+    /// completed already.
+    pub fn edge_started(&self, info: &EdgeInfo) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.starts.insert(info.edge, SystemTime::now());
+        let Some(target) = info.binding("rbe_target") else { return };
+        let key = (target.to_string(), info.binding("rbe_config").map(str::to_string));
+        if inner.planned && !inner.counted.contains(&info.edge) && inner.targets.get(&key).is_some_and(|t| !t.done) {
+            inner.counted.insert(info.edge);
+            inner.edge_targets.insert(info.edge, key.clone());
+            inner.targets.get_mut(&key).expect("a target").remaining += 1;
+        }
     }
 
     /// Reports a finished edge: its console output, its action (if failed or
@@ -905,13 +957,10 @@ impl Bes {
         if let Some(key) = key {
             let done = {
                 let mut inner = self.inner.lock().unwrap();
-                match inner.targets.get_mut(&key) {
-                    Some(t) if !t.done => {
-                        t.remaining = t.remaining.saturating_sub(1);
-                        !success || t.remaining == 0
-                    }
-                    _ => false,
-                }
+                // A failed edge fails its target; only an edge it counted
+                // counts down.
+                let counted = inner.counted.remove(&info.edge);
+                if !success { inner.targets.get(&key).is_some_and(|t| !t.done) } else { counted && inner.count_down(&key).is_some() }
             };
             if done {
                 self.complete(&key, success);
@@ -936,8 +985,11 @@ impl Bes {
     /// build's end and metrics), and waits for the upload, up to
     /// `--bes_timeout`.
     pub async fn finish(&self, exit_code: i32) {
-        self.settle().await;
         let interrupted = exit_code == crate::EXIT_INTERRUPTED;
+        if interrupted {
+            self.interrupted();
+        }
+        self.settle().await;
         let reason = if interrupted {
             bep::aborted::AbortReason::UserInterrupted
         } else if exit_code != 0 {
@@ -1039,10 +1091,17 @@ impl Bes {
             // Zero waits as long as it takes, as Bazel's --bes_timeout=0.
             let timeout = Some(self.flags.timeout).filter(|t| !t.is_zero()).unwrap_or(Duration::MAX);
             match tokio::time::timeout(timeout, u.finish(outcome)).await {
-                Ok(Ok(_)) => {}
+                Ok(Ok(summary)) => {
+                    if let Some(e) = summary.lifecycle_error {
+                        let off =
+                            if e.contains("UNIMPLEMENTED") || e.contains("Unimplemented") { " (--nobes_lifecycle_events stops sending them)" } else { "" };
+                        eprintln!("ninja: warning: build events were uploaded, not all their lifecycle events: {e}{off}");
+                    }
+                }
                 Ok(Err(e)) => {
                     let e = format!("{e:#}");
-                    let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls)).unwrap_or_default();
+                    let first_contact = e.contains("never answered") || e.contains("connecting to");
+                    let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls, first_contact)).unwrap_or_default();
                     eprintln!("ninja: warning: build event upload failed: {e}{hint}");
                 }
                 Err(_) => eprintln!("ninja: warning: build event upload didn't finish within {timeout:?}"),
@@ -1054,19 +1113,72 @@ impl Bes {
     }
 }
 
+/// A `file://` URI for an absolute path: `file:///C:/x` on Windows.
+fn file_uri(abs: &str) -> String {
+    let path = abs.replace('\\', "/");
+    if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") }
+}
+
+/// Targets whose artifacts are hashed at once.
+const HASHERS: usize = 4;
+
 /// Reports completed targets, in order, once their artifacts are hashed:
 /// off the build loop and outside `Bes::inner` (relayed events go on), as
-/// an artifact can be gigabytes.
-async fn report_targets(bes: Weak<Bes>, mut jobs: tokio::sync::mpsc::UnboundedReceiver<Hashing>) {
-    while let Some(job) = jobs.recv().await {
-        match job {
-            Hashing::Target { key, paths, cas } => {
-                let Some(bes) = bes.upgrade() else { return };
-                let b = bes.clone();
-                let files = tokio::task::spawn_blocking(move || paths.iter().filter_map(|p| b.file_entry(p, &cas)).collect()).await;
-                bes.report_completed(&key, true, files.unwrap_or_default());
+/// an artifact can be gigabytes, `HASHERS` targets at once. Once `hurry`
+/// is set (an interruption), those still waiting are reported without
+/// their artifacts.
+async fn report_targets(bes: Weak<Bes>, mut jobs: tokio::sync::mpsc::UnboundedReceiver<Hashing>, hurry: tokio::sync::watch::Receiver<bool>) {
+    enum Started {
+        Target(TargetKey, tokio::task::JoinHandle<Vec<bep::File>>),
+        Settled(tokio::sync::oneshot::Sender<()>),
+    }
+    let (tx, mut started) = tokio::sync::mpsc::unbounded_channel();
+    // Starts hashing the targets as they come.
+    {
+        let (bes, hurry) = (bes.clone(), hurry.clone());
+        let pool = Arc::new(tokio::sync::Semaphore::new(HASHERS));
+        tokio::spawn(async move {
+            while let Some(job) = jobs.recv().await {
+                let s = match job {
+                    Hashing::Target { key, paths, cas } => {
+                        let (bes, pool, hurry) = (bes.clone(), pool.clone(), hurry.clone());
+                        Started::Target(
+                            key,
+                            tokio::spawn(async move {
+                                let Ok(_hashing) = pool.acquire_owned().await else { return Vec::new() };
+                                match bes.upgrade() {
+                                    Some(b) if !*hurry.borrow() => {
+                                        tokio::task::spawn_blocking(move || paths.iter().filter_map(|p| b.file_entry(p, &cas)).collect())
+                                            .await
+                                            .unwrap_or_default()
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            }),
+                        )
+                    }
+                    Hashing::Settled(done) => Started::Settled(done),
+                };
+                if tx.send(s).is_err() {
+                    return;
+                }
             }
-            Hashing::Settled(done) => {
+        });
+    }
+    // Reports them in order.
+    let mut hurry = hurry;
+    while let Some(s) = started.recv().await {
+        match s {
+            Started::Target(key, mut hashed) => {
+                let files = tokio::select! {
+                    biased;
+                    files = &mut hashed => files.unwrap_or_default(),
+                    _ = hurry.wait_for(|h| *h) => Vec::new(),
+                };
+                let Some(bes) = bes.upgrade() else { return };
+                bes.report_completed(&key, true, files);
+            }
+            Started::Settled(done) => {
                 let _ = done.send(());
             }
         }
@@ -1095,7 +1207,7 @@ impl Status for ReportingStatus<'_> {
     fn build_edge_started(&mut self, info: &EdgeInfo, start_ms: i64) {
         self.printer.build_edge_started(info, start_ms);
         if let Some(b) = &self.bes {
-            b.edge_started(info.edge);
+            b.edge_started(info);
         }
     }
     fn build_edge_finished(&mut self, info: &EdgeInfo, end_ms: i64, exit_code: Option<i32>, kind: &ExecKind, output: &[u8]) {
@@ -1179,7 +1291,7 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_bes_{name}_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_rs_bes_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1265,5 +1377,157 @@ mod tests {
         let start = Instant::now();
         bes.finish(0).await;
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+    }
+
+    /// A build of up-to-date targets, each with one artifact edge: the
+    /// graph and the requested nodes.
+    fn targets_graph(artifacts: &[(&str, &Path)]) -> (State, Vec<NodeId>) {
+        let mut manifest = "rule gen\n  command = gen\n".to_string();
+        for (target, artifact) in artifacts {
+            let path = artifact.to_string_lossy().replace('$', "$$").replace(':', "$:").replace(' ', "$ ");
+            manifest.push_str(&format!("build {path}: gen\n  rbe_target = {target}\n  rbe_artifact = 1\n"));
+        }
+        let mut state = State::new();
+        let files = ninja_core::parser::MemFiles::default();
+        ninja_core::parser::ManifestParser::new(&mut state, &files, Default::default()).parse_test(&manifest).unwrap();
+        let nodes = state.edges.iter().map(|e| e.outputs[0]).collect();
+        (state, nodes)
+    }
+
+    /// The labels of the targets completed, in order, and whether each had
+    /// files.
+    #[cfg(unix)]
+    fn completed(file: &Path) -> Vec<(String, bool)> {
+        read_binary_file(file)
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match (e.id.and_then(|i| i.id), e.payload) {
+                (Some(bep::build_event_id::Id::TargetCompleted(t)), Some(Payload::Completed(c))) => {
+                    Some((t.label, c.output_group.iter().any(|g| !g.file_sets.is_empty())))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A file that can't be read until the end returned writes to it and
+    /// closes it (a FIFO held open for writing: opening it to read doesn't
+    /// wait, reading does).
+    #[cfg(unix)]
+    fn fifo(path: &Path) -> std::fs::File {
+        let c_path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        std::fs::File::options().read(true).write(true).open(path).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupted_builds_dont_wait_for_hashing() {
+        let dir = test_dir("interrupted");
+        let artifact = dir.join("app.bin");
+        let mut writer = fifo(&artifact);
+        let file = dir.join("events.bep");
+        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+        let (state, nodes) = targets_graph(&[("app", &artifact)]);
+        bes.plan(&state, &Plan::default(), &nodes, Default::default(), &[], None);
+        let finished = tokio::time::timeout(Duration::from_secs(5), bes.finish(crate::EXIT_INTERRUPTED)).await;
+        // Unblocks the hashing, if it started.
+        writer.write_all(b"hello").unwrap();
+        drop(writer);
+        finished.expect("the end waited for the artifact's digest");
+        assert_eq!(completed(&file), [("//:app".to_string(), false)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn artifacts_are_hashed_several_targets_at_once() {
+        let dir = test_dir("at_once");
+        let (slow, quick) = (dir.join("slow.bin"), dir.join("quick.bin"));
+        let mut writer = fifo(&slow);
+        std::fs::write(&quick, "quick").unwrap();
+        // Old enough for its digest to be kept.
+        std::fs::File::options().write(true).open(&quick).unwrap().set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
+        let file = dir.join("events.bep");
+        let store = Store::new();
+        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, store.clone(), None).await;
+        let (state, nodes) = targets_graph(&[("a_slow", &slow), ("b_quick", &quick)]);
+        bes.plan(&state, &Plan::default(), &nodes, Default::default(), &[], None);
+        // The second target's artifact is hashed while the first waits.
+        let hashed = async {
+            while !store.digests.entries().iter().any(|(p, _, _)| p.ends_with("quick.bin")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let hashed = tokio::time::timeout(Duration::from_secs(5), hashed).await;
+        writer.write_all(b"slow").unwrap();
+        drop(writer);
+        hashed.expect("the targets were hashed one at a time");
+        bes.finish(0).await;
+        // Reported in order all the same.
+        assert_eq!(completed(&file), [("//:a_slow".to_string(), true), ("//:b_quick".to_string(), true)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn events_after_the_end_go_nowhere() {
+        let dir = test_dir("after_the_end");
+        let file = dir.join("events.bep");
+        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+        bes.announce(&[]);
+        bes.finish(0).await;
+        // A message, a nested invocation's event relayed late.
+        bes.message("ninja: late\n");
+        let source = RelaySource::new(&dir, &dir.join("nested").to_string_lossy(), 1);
+        let late = bep::BuildEvent {
+            id: Some(id::progress(0)),
+            payload: Some(Payload::Progress(bep::Progress { stdout: String::new(), stderr: "late\n".into() })),
+            ..Default::default()
+        };
+        bes.relayed(&source, late);
+        rbe_bes::events::validate(&read_binary_file(&file).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edges_the_plan_didnt_know_count_once_started() {
+        let dir = test_dir("dyndep");
+        let (a, b, d) = (dir.join("a.o"), dir.join("b.o"), dir.join("d.o"));
+        let (state, nodes) = targets_graph(&[("app", &a), ("app", &b), ("app", &d)]);
+        let bes = Bes::start(&options(&[]), &InvocationIds::default(), None, Store::new(), None).await;
+        // The plan wants a and b; a dyndep file brings d later.
+        let mut plan = Plan::default();
+        for e in [EdgeId(0), EdgeId(1)] {
+            plan.want.insert(e, Want::ToStart);
+        }
+        bes.plan(&state, &plan, &nodes[..2], Default::default(), &[], None);
+        let info = |e: u32, out: &Path| EdgeInfo {
+            edge: EdgeId(e),
+            description: String::new(),
+            command: "gen".into(),
+            outputs: vec![out.to_string_lossy().into_owned()],
+            use_console: false,
+            bindings: vec![("rbe_target".into(), "app".into())],
+            cas_outputs: Vec::new(),
+        };
+        let run = |e: u32, out: &Path| {
+            bes.edge_started(&info(e, out));
+            bes.edge_finished(&info(e, out), None, &ExecKind::Local, b"", "");
+        };
+        let done = || bes.inner.lock().unwrap().targets[&("app".to_string(), None)].done;
+        run(2, &d);
+        run(0, &a);
+        assert!(!done(), "the target completed with b still to run");
+        run(1, &b);
+        assert!(done());
+        bes.finish(0).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_uris() {
+        assert_eq!(file_uri("/home/u/out/app"), "file:///home/u/out/app");
+        assert_eq!(file_uri(r"C:\b\out\app.exe"), "file:///C:/b/out/app.exe");
     }
 }

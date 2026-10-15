@@ -11,10 +11,11 @@
 //! Results depend on the flags (`-std`, `-target`, `-O`, `-m...`, `-f...`,
 //! `/std:`, `/EH...`, `/MD`...), so callers cache them per compiler and flags.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::expr::Dialect;
 
@@ -113,6 +114,49 @@ pub struct Compiler<'a> {
     pub cwd: &'a Path,
     /// Its environment (None: this process's).
     pub env: Option<&'a [(String, String)]>,
+    /// How long a run may take (see `TIMEOUT`).
+    pub timeout: Duration,
+}
+
+/// How long a compiler may take to answer: a hung one would otherwise hold
+/// every scan of its profile (and the daemon's for good).
+pub const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs `cmd` with `input` on its standard input (when piped), and waits
+/// for it at most `timeout`: then it's killed (what it started may run on,
+/// and is left to finish).
+fn output(mut cmd: Command, input: Option<String>, timeout: Duration) -> std::io::Result<std::process::Output> {
+    let mut child = cmd.spawn()?;
+    let writer = child.stdin.take().map(|mut stdin| std::thread::spawn(move || stdin.write_all(input.unwrap_or_default().as_bytes())));
+    let read = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let start = Instant::now();
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("timed out after {}s", timeout.as_secs_f32())));
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    };
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    Ok(std::process::Output { status, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default() })
 }
 
 /// A temporary source file, deleted when dropped.
@@ -148,18 +192,18 @@ pub fn fingerprint(c: &Compiler) -> String {
     if let Some(env) = c.env {
         cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
     }
-    cmd.env("LC_ALL", "C").current_dir(c.cwd).stdin(Stdio::null());
+    cmd.env("LC_ALL", "C").current_dir(c.cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     if c.style != Style::Msvc {
         cmd.arg("--version");
     }
-    match cmd.output() {
+    match output(cmd, None, c.timeout) {
         Ok(out) => format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
         Err(_) => String::new(),
     }
 }
 
 /// Runs the compiler on `input` with its flags and the `extra` flags of the
-/// operation; Err when it fails.
+/// operation; Err when it fails or takes too long.
 pub fn run(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, String> {
     let (compiler, lang) = (c.path, c.lang);
     let mut cmd = Command::new(compiler);
@@ -180,15 +224,7 @@ pub fn run(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, String> {
             _source = src;
         }
     }
-    let mut child = cmd.spawn().map_err(|e| format!("running {}: {e}", compiler.display()))?;
-    let writer = child.stdin.take().map(|mut stdin| {
-        let input = input.to_string();
-        std::thread::spawn(move || stdin.write_all(input.as_bytes()))
-    });
-    let out = child.wait_with_output().map_err(|e| format!("running {}: {e}", compiler.display()))?;
-    if let Some(w) = writer {
-        let _ = w.join();
-    }
+    let out = output(cmd, Some(input.to_string()), c.timeout).map_err(|e| format!("running {}: {e}", compiler.display()))?;
     let ran = Ran { stdout: String::from_utf8_lossy(&out.stdout).into_owned(), stderr: String::from_utf8_lossy(&out.stderr).into_owned() };
     if !out.status.success() {
         let first = ran.stderr.lines().chain(ran.stdout.lines()).find(|l| l.contains("error")).unwrap_or("").to_string();
@@ -402,6 +438,28 @@ mod tests {
         assert_eq!(answers_of("NINJA_RS_QUERY 0 +1\nNINJA_RS_QUERY 0 +4\nNINJA_RS_QUERY 1 0\n", 2), vec![Some(5), Some(0)]);
     }
 
+    /// A compiler that never answers is given up on.
+    #[test]
+    fn hung_compiler() {
+        let dir = std::env::temp_dir().join(format!("cpp_deps_hung_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = if cfg!(windows) {
+            let s = dir.join("hung.cmd");
+            std::fs::write(&s, "@ping -n 30 127.0.0.1 >NUL\r\n@echo #define X 1\r\n").unwrap();
+            s
+        } else {
+            let s = dir.join("hung");
+            std::fs::write(&s, "#!/bin/sh\nsleep 30\necho '#define X 1'\n").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&s, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            s
+        };
+        let c = Compiler { path: &script, args: &[], style: Style::Gcc, lang: "c", cwd: &dir, env: None, timeout: Duration::from_millis(300) };
+        let e = run(&c, &["-dM", "-E"], "").err().unwrap_or_default();
+        assert!(e.contains("timed out"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Against a real compiler, when `CPP_DEPS_TEST_CXX` names one.
     #[test]
     fn real_compiler() {
@@ -409,7 +467,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let style = if crate::external::is_cl_style(&[cxx.to_string_lossy().into_owned()]) { Style::ClangCl } else { Style::Gcc };
         let std = [if style == Style::Gcc { "-std=c++17" } else { "/std:c++17" }.to_string()];
-        let c = Compiler { path: Path::new(&cxx), args: &std, style, lang: "c++", cwd: &cwd, env: None };
+        let c = Compiler { path: Path::new(&cxx), args: &std, style, lang: "c++", cwd: &cwd, env: None, timeout: TIMEOUT };
         let p = probe(&c).unwrap();
         // Clang's banner, or GCC's.
         assert!(fingerprint(&c).contains("version") || fingerprint(&c).contains("Free Software Foundation"), "{}", fingerprint(&c));
@@ -449,7 +507,7 @@ mod tests {
         let Some(cl) = std::env::var_os("CPP_DEPS_TEST_CL") else { return };
         let cwd = std::env::temp_dir();
         let args = ["/std:c++20".to_string(), "/EHsc".to_string()];
-        let c = Compiler { path: Path::new(&cl), args: &args, style: Style::Msvc, lang: "c++", cwd: &cwd, env: None };
+        let c = Compiler { path: Path::new(&cl), args: &args, style: Style::Msvc, lang: "c++", cwd: &cwd, env: None, timeout: TIMEOUT };
         let p = probe(&c).unwrap();
         assert!(fingerprint(&c).contains("Version"), "{}", fingerprint(&c));
         assert!(p.predefines.contains("#define _MSC_VER "), "{}", p.predefines);

@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Changes with the messages: a client and a daemon must agree.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// Larger frames are refused (a corrupt length).
 const MAX_FRAME: usize = 1 << 30;
@@ -38,7 +38,7 @@ pub enum Request {
     Stop,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Begin {
     /// Its files may change during the build: they are always checked.
     pub build_dir: PathBuf,
@@ -56,13 +56,22 @@ pub struct Begin {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Hello { protocol: u32, pid: u32, version: String },
-    Begun { session: u64 },
+    Hello {
+        protocol: u32,
+        pid: u32,
+        version: String,
+    },
+    Begun {
+        session: u64,
+    },
     Scanned(Result<ScanOutput, String>),
     Files(Vec<Result<FileInfo, String>>),
     Tree(Result<TreeInfo, String>),
     Status(Status),
     Stopping,
+    /// A scan named a build the daemon no longer keeps (see `Begin`): it
+    /// begins again.
+    UnknownBuild,
     Error(String),
 }
 

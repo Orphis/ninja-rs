@@ -1,0 +1,9 @@
+[package]
+name = "test-dirs"
+description = "Directories for tests, under Bazel's TEST_TMPDIR when set, removed when done"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]

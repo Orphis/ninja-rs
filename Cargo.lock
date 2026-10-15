@@ -144,6 +144,7 @@ name = "cpp-deps"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "test-dirs",
 ]
 
 [[package]]
@@ -207,6 +208,7 @@ dependencies = [
  "prost",
  "rbe-bes",
  "sha2",
+ "test-dirs",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -654,6 +656,7 @@ name = "ninja-core"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "test-dirs",
  "tokio",
 ]
 
@@ -668,6 +671,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "test-dirs",
 ]
 
 [[package]]
@@ -684,6 +688,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "test-dirs",
  "tokio",
 ]
 
@@ -702,6 +707,7 @@ dependencies = [
  "rbe-client",
  "serde",
  "serde_json",
+ "test-dirs",
  "tokio",
 ]
 
@@ -930,9 +936,9 @@ dependencies = [
  "fastcdc",
  "hex",
  "prost",
- "prost-types",
  "sha2",
  "tempfile",
+ "test-dirs",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -1183,6 +1189,10 @@ dependencies = [
  "rustix",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "test-dirs"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"

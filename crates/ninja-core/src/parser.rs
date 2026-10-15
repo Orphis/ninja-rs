@@ -31,6 +31,10 @@ pub struct ParserOptions {
 /// `ninja_required_version` checks and `--version`.
 pub const NINJA_VERSION: &str = "1.13.1";
 
+/// Starts the errors ninja reports as fatal (`ninja: fatal: ...`) rather
+/// than as errors.
+pub const FATAL: &str = "fatal: ";
+
 /// Parses "major.minor[...]" like ninja's `ParseVersion` (atoi semantics).
 pub fn parse_version(v: &str) -> (i32, i32) {
     fn atoi(s: &str) -> i32 {
@@ -355,7 +359,7 @@ fn check_ninja_version(required: &str) -> Result<(), String> {
         return Ok(());
     }
     if (bin_major == file_major && bin_minor < file_minor) || bin_major < file_major {
-        return Err(format!("ninja version ({NINJA_VERSION}) incompatible with build file ninja_required_version version ({required})."));
+        return Err(format!("{FATAL}ninja version ({NINJA_VERSION}) incompatible with build file ninja_required_version version ({required})."));
     }
     Ok(())
 }

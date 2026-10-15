@@ -5,10 +5,11 @@
 //!   directory with `.git`, `.hg`, `.jj`, `.sl` or `.svn`), and directories
 //!   the daemon was asked for whole (toolchain inputs). Files elsewhere
 //!   (system headers) aren't watched: they're checked once per build, as
-//!   without the daemon. So are build directories, whose files change
-//!   during builds (forgotten once no build named them for a while). A
-//!   root found around others (a checkout whose toolchain was listed
-//!   first) takes them over.
+//!   without the daemon. So are build directories and the others builds
+//!   write to, whose files change during builds (forgotten once no build
+//!   named them for a while): nothing in them is watched, nor is a root
+//!   made there. A root found around others (a checkout whose toolchain
+//!   was listed first) takes them over.
 //! - **Lazily** (inotify, a watch per directory): a repository's root is
 //!   watched alone at first, then the directories of the files checked in
 //!   it (and those listed), with those above them (whose renaming moves
@@ -24,24 +25,33 @@
 //!   each build, the daemon creates a file (a cookie) for every root it can
 //!   write to and waits for its event, which comes after every change made
 //!   before (Watchman's technique). Cookies go in the repository's own
-//!   directory (`.git` and the like) when there is one, out of the trees
-//!   builds list; else, with inotify, in a directory of the daemon's (one
-//!   queue carries every watch's events, in order); else at the root's top,
-//!   which tree walks skip. A root whose watcher lost events (a queue
-//!   overflow) is out of sync again, and everything under it is checked
-//!   again; with inotify, it's watched again from scratch (a directory
-//!   replaced meanwhile took its watch along unseen), vouched for after
-//!   the next sync. So is a directory whose watch went (its file system
-//!   was unmounted).
+//!   directory (`.git` and the like) when there is one; else, with inotify,
+//!   in a directory of the daemon's (one queue carries every watch's
+//!   events, in order); else at the root's top (a Windows worktree or
+//!   submodule, whose `.git` is a file, or a toolchain). Tree walks skip
+//!   both. A root that can't be written to is trusted without a cookie
+//!   (system directories change rarely); one whose cookie can't be made
+//!   otherwise, or doesn't come back, is watched again. A root whose
+//!   watcher lost events (a queue overflow) is out of sync again, and
+//!   everything under it is checked again; with inotify, it's watched
+//!   again from scratch (a directory replaced meanwhile took its watch
+//!   along unseen), vouched for after the next sync. So is a root replaced
+//!   (renamed, removed, mounted over) or one with file systems mounted or
+//!   unmounted under it (Linux), and a directory whose watch went (its
+//!   file system was unmounted).
 //! - **Events** drop the entries they concern (`Listener`): a file's, the
 //!   names of its directory when it's created, removed or renamed, and
 //!   everything under a directory that was.
 //! - **Paths.** Only paths without symbolic links are vouched for: events
-//!   come for real paths.
+//!   come for real paths. Nor are paths in a repository's own directory,
+//!   whose events are ignored (git writes there all the time), nor, on
+//!   Linux, on file systems under a root that may not report every change.
 //!
 //! Backends: inotify on Linux (the build directories aren't watched, so
 //!   that compiles writing objects don't flood the queue),
-//!   `ReadDirectoryChangesW` on Windows. Elsewhere nothing is watched.
+//!   `ReadDirectoryChangesW` on Windows (whose events in build directories
+//!   are dropped before anything else is done with them). Elsewhere
+//!   nothing is watched.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -86,15 +96,72 @@ struct Root {
     synced: u64,
     /// Failed for want of watches: not started again before then.
     retry_after: Option<Instant>,
+    /// What its directory was when its watch was set up: one replaced
+    /// since (or mounted over) isn't the one watched.
+    id: Option<DirId>,
+    /// Linux: the file systems mounted in it then (keys), and whether each
+    /// reports every change.
+    mounts: Vec<(PathBuf, bool)>,
 }
 
-/// Directories marking a repository: its root is watched; events inside
-/// them are ignored.
-const VCS_DIRS: &[&str] = &[".git", ".hg", ".jj", ".sl", ".svn"];
+/// Directories marking a repository: its root is watched; nothing inside
+/// them is vouched for, and their events are ignored.
+pub const VCS_DIRS: &[&str] = &[".git", ".hg", ".jj", ".sl", ".svn"];
 
 /// Names of the files the daemon creates for a moment to sync a root: tree
 /// walks skip them, its own and the builds' alike.
 pub const COOKIE_PREFIX: &str = ".ninja-rs-cookie-";
+
+/// Whether tree walks skip an entry named `name`, the daemon's and the
+/// builds' alike: the watcher's cookies, and repositories' own directories
+/// (or a worktree's `.git` file), whose changes it doesn't follow.
+pub fn walk_skips(name: &std::ffi::OsStr) -> bool {
+    VCS_DIRS.iter().any(|v| name == *v) || name.to_string_lossy().starts_with(COOKIE_PREFIX)
+}
+
+/// Whether `key` is in a repository's own directory, or is one.
+fn in_repository_dir(key: &Path) -> bool {
+    key.components().any(|c| matches!(c, Component::Normal(n) if VCS_DIRS.iter().any(|v| n == *v)))
+}
+
+/// A directory's identity: its device (volume) and inode (file ID).
+type DirId = (u64, u128);
+
+#[cfg(unix)]
+fn dir_id(dir: &Path) -> Option<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(dir).ok()?;
+    Some((m.dev(), m.ino() as u128))
+}
+
+#[cfg(windows)]
+fn dir_id(dir: &Path) -> Option<DirId> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ID_INFO: i32 = 0x12;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(file: *mut std::ffi::c_void, class: i32, info: *mut std::ffi::c_void, size: u32) -> i32;
+    }
+    #[repr(C)]
+    struct IdInfo {
+        volume: u64,
+        id: [u8; 16],
+    }
+    // Attributes only: no sharing conflict, even with a directory in use.
+    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(dir).ok()?;
+    let mut info = IdInfo { volume: 0, id: [0; 16] };
+    // SAFETY: an open handle, and a buffer writable for its size.
+    let ok = unsafe { GetFileInformationByHandleEx(f.as_raw_handle(), FILE_ID_INFO, (&raw mut info).cast(), size_of::<IdInfo>() as u32) };
+    (ok != 0).then(|| (info.volume, u128::from_le_bytes(info.id)))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn dir_id(_dir: &Path) -> Option<DirId> {
+    None
+}
 
 /// Directories builds named (keys, with their paths), and when one last
 /// did. A path is in one when one of its ancestors is: a lookup per
@@ -149,7 +216,7 @@ trait Backend: Send + Sync {
     /// backend and not `whole`, the root and its cookie directory alone.
     fn watch(&self, root: &Path, cookie_dir: &Path, whole: bool) -> io::Result<()>;
     /// Watches one directory more, with everything under it when `whole`
-    /// (`lazy` backends).
+    /// (`lazy` backends). Err for one in a build directory: not watched.
     fn watch_dir(&self, _dir: &Path, _whole: bool) -> io::Result<()> {
         Ok(())
     }
@@ -159,10 +226,10 @@ trait Backend: Send + Sync {
     fn lazy(&self) -> bool {
         false
     }
-    /// `dir`'s events aren't needed (a build directory).
+    /// `dir` became a build directory: its events aren't needed.
     fn ignore(&self, _dir: &Path) {}
-    /// `dir`'s events are needed again: watched if under a directory
-    /// watched whole.
+    /// `dir` no longer is: its events are needed again, and it's watched
+    /// if under a directory watched whole.
     fn unignore(&self, _dir: &Path) -> io::Result<()> {
         Ok(())
     }
@@ -176,7 +243,8 @@ pub struct Watcher {
     seq: AtomicU64,
     events: AtomicU64,
     roots: RwLock<Vec<Root>>,
-    /// Build directories.
+    /// Build directories, and the others builds write to: the one set the
+    /// daemon has (`Files` and the preprocessor's cache ask it).
     ignored: BuildDirs,
     /// Where cookies go for roots without a repository directory, with a
     /// watch per directory (`set_cookie_dir`).
@@ -188,12 +256,19 @@ pub struct Watcher {
     repos: RwLock<HashMap<PathBuf, Option<PathBuf>>>,
     /// Directories (keys) and whether their path is their real one.
     real_dirs: RwLock<HashMap<PathBuf, bool>>,
+    /// The directories (keys) `repos`, `real_dirs` and `watched` have
+    /// entries for, and those above them: an event on a path not in it
+    /// concerns none of their entries, which it then doesn't go through.
+    learned: RwLock<HashSet<PathBuf>>,
     /// Syncs started: a directory watched (lazily) during the `n`th is
     /// vouched for once a later one brought its root in sync.
     epoch: AtomicU64,
     /// Directories watched lazily (keys): the epoch they were, and whether
     /// with everything under them.
     watched: RwLock<HashMap<PathBuf, (u64, bool)>>,
+    /// Linux: the file systems mounted (keys), and whether each reports
+    /// every change.
+    mount_table: RwLock<Vec<(PathBuf, bool)>>,
     listeners: RwLock<Vec<Arc<dyn Listener>>>,
     /// Cookies waited for, and those seen.
     cookies: Mutex<HashMap<String, bool>>,
@@ -215,8 +290,10 @@ impl Watcher {
             known_dirs: RwLock::default(),
             repos: RwLock::default(),
             real_dirs: RwLock::default(),
+            learned: RwLock::default(),
             epoch: AtomicU64::new(0),
             watched: RwLock::default(),
+            mount_table: RwLock::default(),
             listeners: RwLock::default(),
             cookies: Mutex::default(),
             cookie_seen: Condvar::new(),
@@ -269,26 +346,70 @@ impl Watcher {
         self.watched.write().unwrap().retain(|k, _| !k.starts_with(key));
     }
 
-    /// A build directory: its events are ignored, and its files never
-    /// vouched for (those that were are checked again).
+    /// Notes that something was learned about the directory `key` (see
+    /// `learned`).
+    fn learn(&self, key: &Path) {
+        if self.learned.read().unwrap().contains(key) {
+            return;
+        }
+        let mut learned = self.learned.write().unwrap();
+        for a in key.ancestors() {
+            if !learned.insert(a.to_path_buf()) {
+                break;
+            }
+        }
+    }
+
+    /// Forgets what was learned about `key` and the directories under it,
+    /// and their lazy watches (a directory created there again is watched
+    /// again).
+    fn forget_learned(&self, key: &Path) {
+        if !self.learned.read().unwrap().contains(key) {
+            return;
+        }
+        self.learned.write().unwrap().retain(|k| !k.starts_with(key));
+        self.real_dirs.write().unwrap().retain(|k, _| !k.starts_with(key));
+        self.repos.write().unwrap().retain(|k, _| !k.starts_with(key));
+        self.forget_watched(key);
+    }
+
+    /// A build directory, or another one builds write to: its events are
+    /// ignored, and its files never vouched for (those that were are
+    /// checked again). Roots in it go (watched again once it expires).
     pub fn ignore(&self, dir: &Path) {
         let key = self.key(dir);
         if !self.ignored.insert(key.clone(), dir) {
             return;
         }
+        let gone: Vec<Root> = {
+            let mut roots = self.roots.write().unwrap();
+            let (gone, kept) = std::mem::take(&mut *roots).into_iter().partition(|r| r.key.starts_with(&key));
+            *roots = kept;
+            gone
+        };
         if let Some(b) = self.backend() {
             b.ignore(dir);
+            for r in &gone {
+                b.unwatch(&r.path);
+            }
         }
         self.forget_watched(&key);
         self.drop_under(dir);
     }
 
     /// Forgets the build directories no build named since `before`: watched
-    /// again with the rest (a build names its own when it begins).
+    /// again with the rest (a build names its own when it begins). Nothing
+    /// in them was watched; were a root made there meanwhile, it's watched
+    /// again from scratch.
     pub fn expire(&self, before: Instant) {
         for dir in self.ignored.expire(before) {
-            let Some(Err(e)) = self.backend().map(|b| b.unignore(&dir)) else { continue };
             let key = self.key(&dir);
+            self.forget_watched(&key);
+            let inside: Vec<PathBuf> = self.roots.read().unwrap().iter().filter(|r| r.key.starts_with(&key)).map(|r| r.key.clone()).collect();
+            for rkey in inside {
+                self.restart(&rkey, "no longer in a build directory");
+            }
+            let Some(Err(e)) = self.backend().map(|b| b.unignore(&dir)) else { continue };
             let root = self.roots.read().unwrap().iter().find(|r| key.starts_with(&r.key)).map(|r| r.key.clone());
             match root {
                 Some(rkey) if e.kind() == io::ErrorKind::StorageFull => self.release(&rkey, &e),
@@ -298,17 +419,21 @@ impl Watcher {
         }
     }
 
-    fn is_ignored(&self, key: &Path) -> bool {
+    /// Whether `key` is in a build directory (or another one builds write
+    /// to).
+    pub(crate) fn is_ignored(&self, key: &Path) -> bool {
         self.ignored.contains(key)
     }
 
     /// Watches `dir`, a repository (lazily, see the module's doc) or,
-    /// `whole`, everything under it (unless a root has it already). Roots
-    /// under it become part of it: their watches and cookies would overlap
-    /// its own.
+    /// `whole`, everything under it (unless a root has it already, or it's
+    /// in a build directory). Roots under it become part of it: their
+    /// watches and cookies would overlap its own.
     pub fn add_root(&self, dir: &Path, whole: bool) {
         let key = self.key(dir);
-        let cookie_dir = self.cookie_dir_of(dir);
+        if self.is_ignored(&key) {
+            return;
+        }
         let nested: Vec<Root> = {
             let mut roots = self.roots.write().unwrap();
             if roots.iter().any(|r| key.starts_with(&r.key)) {
@@ -320,10 +445,12 @@ impl Watcher {
                 path: dir.to_path_buf(),
                 key: key.clone(),
                 state: RootState::Starting,
-                cookie_dir: cookie_dir.clone(),
+                cookie_dir: dir.to_path_buf(),
                 whole,
                 synced: 0,
                 retry_after: None,
+                id: None,
+                mounts: Vec::new(),
             });
             nested
         };
@@ -334,7 +461,7 @@ impl Watcher {
             self.forget_watched(&r.key);
             self.drop_under(&r.path);
         }
-        self.start(dir.to_path_buf(), key, cookie_dir, whole);
+        self.start(dir.to_path_buf(), key, whole);
     }
 
     /// Where `dir`'s cookies go (see the module's doc).
@@ -349,9 +476,13 @@ impl Watcher {
     }
 
     /// Watches `dir` and everything under it (a toolchain): a root of its
-    /// own, or in a repository watched lazily, a whole directory of it.
+    /// own, or in a repository watched lazily, a whole directory of it. Not
+    /// in a build directory, whose files are checked every time.
     pub fn watch_tree(&self, dir: &Path) {
         let key = self.key(dir);
+        if self.is_ignored(&key) {
+            return;
+        }
         let root = self.roots.read().unwrap().iter().find(|r| key.starts_with(&r.key)).map(|r| (r.key.clone(), r.path.clone(), r.whole, r.synced));
         match root {
             Some((rkey, rpath, false, synced)) if self.lazy() => {
@@ -364,14 +495,22 @@ impl Watcher {
         }
     }
 
-    /// Sets up a root's watch, in the background.
-    fn start(&self, dir: PathBuf, key: PathBuf, cookie_dir: PathBuf, whole: bool) {
+    /// Sets up a root's watch, in the background: where its cookies go,
+    /// what its directory is and what's mounted in it are found again.
+    fn start(&self, dir: PathBuf, key: PathBuf, whole: bool) {
         let me = self.me.clone();
         std::thread::spawn(move || {
             let Some(w) = me.upgrade() else { return };
             let t = Instant::now();
-            // Watched from before the next sync.
+            // Watched from before the next sync, and found before it's
+            // watched: a directory there since isn't the one watched.
             let epoch = w.epoch.load(Ordering::SeqCst);
+            let (cookie_dir, id, mounts) = (w.cookie_dir_of(&dir), dir_id(&dir), w.mounts_in(&key));
+            {
+                let mut roots = w.roots.write().unwrap();
+                let Some(r) = roots.iter_mut().find(|r| r.key == key) else { return };
+                (r.cookie_dir, r.id, r.mounts) = (cookie_dir.clone(), id, mounts);
+            }
             let (state, out_of_watches) = match (w.backend(), local_file_system(&dir)) {
                 (None, _) => (RootState::Failed("file watching is not supported on this system".into()), None),
                 (_, Err(why)) => (RootState::Failed(why), None),
@@ -382,6 +521,7 @@ impl Watcher {
                 },
             };
             if state == RootState::Unsynced && w.lazy() && !whole {
+                w.learn(&key);
                 w.watched.write().unwrap().insert(key.clone(), (epoch, false));
             }
             (w.log)(&format!("watching {} ({:.0?}): {state:?}", dir.display(), t.elapsed()));
@@ -392,11 +532,52 @@ impl Watcher {
         });
     }
 
+    /// Watches a root again from scratch (its watch is broken, or of a
+    /// directory no longer at its path): what was vouched for under it is
+    /// checked again, and vouched for after the next sync.
+    fn restart(&self, key: &Path, why: &str) {
+        let (path, whole) = {
+            let mut roots = self.roots.write().unwrap();
+            let Some(r) = roots.iter_mut().find(|r| r.key == key) else { return };
+            r.state = RootState::Starting;
+            (r.path.clone(), r.whole)
+        };
+        (self.log)(&format!("{}: {why}: watching it again", path.display()));
+        if let Some(b) = self.backend() {
+            b.unwatch(&path);
+        }
+        self.forget_watched(key);
+        self.drop_under(&path);
+        self.start(path, key.to_path_buf(), whole);
+    }
+
+    /// Linux: the file systems mounted in `key` (or on it), and whether
+    /// each reports every change.
+    fn mounts_in(&self, key: &Path) -> Vec<(PathBuf, bool)> {
+        self.mount_table.read().unwrap().iter().filter(|(m, _)| m.starts_with(key)).cloned().collect()
+    }
+
+    /// Linux: the file systems mounted changed. A root with one mounted or
+    /// unmounted in it is watched again from scratch: a directory mounted
+    /// over is hidden from its watch, and so are the files under it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn mounts_changed(&self, table: Vec<(PathBuf, bool)>) {
+        *self.mount_table.write().unwrap() = table;
+        let roots: Vec<(PathBuf, Vec<(PathBuf, bool)>)> =
+            self.roots.read().unwrap().iter().filter(|r| !matches!(r.state, RootState::Failed(_))).map(|r| (r.key.clone(), r.mounts.clone())).collect();
+        for (key, mounts) in roots {
+            if self.mounts_in(&key) != mounts {
+                self.restart(&key, "file systems were mounted or unmounted there");
+            }
+        }
+    }
+
     /// Whether `chain`'s directories (from a lazily watched root down) are
     /// watched since before the root's last sync (`synced`), the last one
     /// with everything under it when `tree`. Those that aren't are watched
     /// now, vouched for after the next sync. Err: out of watches (a
-    /// directory that can't be watched otherwise, gone, is just not).
+    /// directory that can't be watched otherwise, gone or in a build
+    /// directory, is just not).
     fn lazily_watched(&self, chain: &[PathBuf], tree: bool, synced: u64) -> io::Result<bool> {
         let mut missing: Vec<(PathBuf, bool)> = Vec::new();
         let mut ok = true;
@@ -420,7 +601,9 @@ impl Watcher {
         for (d, whole) in missing {
             match b.watch_dir(&d, whole) {
                 Ok(()) => {
-                    self.watched.write().unwrap().insert(self.key(&d), (epoch, whole));
+                    let k = self.key(&d);
+                    self.learn(&k);
+                    self.watched.write().unwrap().insert(k, (epoch, whole));
                 }
                 Err(e) if e.kind() == io::ErrorKind::StorageFull => return Err(e),
                 Err(_) => return Ok(false),
@@ -461,7 +644,8 @@ impl Watcher {
         }
     }
 
-    /// The repository `dir` is in (cached for every directory on the way).
+    /// The repository `dir` is in (cached for every directory on the way;
+    /// until the next sync when there's none).
     fn repository(&self, dir: &Path) -> Option<PathBuf> {
         let mut walked = Vec::new();
         let mut found = None;
@@ -479,6 +663,9 @@ impl Watcher {
             }
             cur = d.parent();
         }
+        for k in &walked {
+            self.learn(k);
+        }
         let mut repos = self.repos.write().unwrap();
         for k in walked {
             repos.insert(k, found.clone());
@@ -493,6 +680,7 @@ impl Watcher {
         let dkey = self.key(dir);
         let cached = self.real_dirs.read().unwrap().get(&dkey).copied();
         let real_dir = cached.unwrap_or_else(|| {
+            self.learn(&dkey);
             let real = std::fs::canonicalize(dir).is_ok_and(|c| self.key(&strip_verbatim(c)) == dkey);
             self.real_dirs.write().unwrap().insert(dkey, real);
             real
@@ -521,13 +709,16 @@ impl Watcher {
         }
     }
 
-    /// Before a build: restarts the watches that failed, and brings every
-    /// root in sync (see the module's doc). Roots the daemon can't write to
-    /// are trusted without a cookie: system directories change rarely.
+    /// Before a build: restarts the watches that failed or are of a
+    /// directory no longer at their root's path, and brings every root in
+    /// sync (see the module's doc). Roots the daemon can't write to are
+    /// trusted without a cookie: system directories change rarely.
     pub fn sync(&self) {
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        // A repository made since a lookup found none is found now.
+        self.repos.write().unwrap().retain(|_, r| r.is_some());
         let now = Instant::now();
-        let failed: Vec<(PathBuf, PathBuf, PathBuf, bool)> = {
+        let failed: Vec<(PathBuf, PathBuf, bool)> = {
             let mut roots = self.roots.write().unwrap();
             roots
                 .iter_mut()
@@ -535,39 +726,58 @@ impl Watcher {
                 .map(|r| {
                     r.state = RootState::Starting;
                     r.retry_after = None;
-                    (r.path.clone(), r.key.clone(), r.cookie_dir.clone(), r.whole)
+                    (r.path.clone(), r.key.clone(), r.whole)
                 })
                 .collect()
         };
-        for (path, key, cookie_dir, whole) in failed {
-            self.start(path, key, cookie_dir, whole);
+        for (path, key, whole) in failed {
+            self.start(path, key, whole);
         }
-        static N: AtomicU64 = AtomicU64::new(0);
-        let roots: Vec<(PathBuf, PathBuf, PathBuf)> = self
+        // Replaced (a fresh clone where the old one was), or mounted over:
+        // no event says so on Windows, nor for a mount.
+        let ids: Vec<(PathBuf, PathBuf, DirId)> = self
             .roots
             .read()
             .unwrap()
             .iter()
             .filter(|r| matches!(r.state, RootState::Unsynced | RootState::Trusted))
-            .map(|r| (r.key.clone(), r.path.clone(), r.cookie_dir.clone()))
+            .filter_map(|r| Some((r.key.clone(), r.path.clone(), r.id?)))
+            .collect();
+        for (key, path, id) in ids {
+            if dir_id(&path) != Some(id) {
+                self.restart(&key, "replaced");
+            }
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        let roots: Vec<(PathBuf, PathBuf)> = self
+            .roots
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r.state, RootState::Unsynced | RootState::Trusted))
+            .map(|r| (r.key.clone(), r.cookie_dir.clone()))
             .collect();
         let mut waiting = Vec::new();
-        for (key, path, cookie_dir) in roots {
+        for (key, cookie_dir) in roots {
             let name = format!("{COOKIE_PREFIX}{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
             self.cookies.lock().unwrap().insert(name.clone(), false);
             let file = cookie_dir.join(&name);
-            // The daemon's own directory is made again if it went (watched
-            // again once the root's cookie is missed).
-            let own = self.cookie_dir.get() == Some(&cookie_dir);
-            if std::fs::File::create(&file).is_ok() || (own && std::fs::create_dir_all(&cookie_dir).and_then(|()| std::fs::File::create(&file)).is_ok()) {
-                waiting.push((key, path, name, file));
-            } else {
-                self.cookies.lock().unwrap().remove(&name);
-                self.synced(&key, epoch);
+            match std::fs::File::create(&file) {
+                Ok(_) => waiting.push((key, name, file)),
+                Err(e) => {
+                    self.cookies.lock().unwrap().remove(&name);
+                    if matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem) {
+                        self.synced(&key, epoch);
+                    } else {
+                        // Its repository's directory went, or the daemon's
+                        // own (made again): nothing tells the watch works.
+                        self.restart(&key, &format!("making its cookie: {e}"));
+                    }
+                }
             }
         }
         let deadline = Instant::now() + COOKIE_TIMEOUT;
-        for (key, path, name, file) in waiting {
+        for (key, name, file) in waiting {
             let mut cookies = self.cookies.lock().unwrap();
             while cookies.get(&name) == Some(&false) {
                 let left = deadline.saturating_duration_since(Instant::now());
@@ -583,19 +793,7 @@ impl Watcher {
                 self.synced(&key, epoch);
             } else {
                 // The watch is broken: what it vouched for is checked again.
-                (self.log)(&format!("no event from {} in {COOKIE_TIMEOUT:?}: watching it again", path.display()));
-                self.untrust(&key);
-                self.forget_watched(&key);
-                let restart = {
-                    let mut roots = self.roots.write().unwrap();
-                    roots.iter_mut().find(|r| r.key == key).map(|r| {
-                        r.state = RootState::Starting;
-                        (r.cookie_dir.clone(), r.whole)
-                    })
-                };
-                if let Some((cookie_dir, whole)) = restart {
-                    self.start(path, key, cookie_dir, whole);
-                }
+                self.restart(&key, &format!("no event in {COOKIE_TIMEOUT:?}"));
             }
         }
     }
@@ -632,7 +830,7 @@ impl Watcher {
     fn lost(&self, under: Option<&Path>) {
         let ukey = under.map(|p| self.key(p));
         let lazy = self.lazy();
-        let hit: Vec<(PathBuf, PathBuf, PathBuf, bool, bool)> = {
+        let hit: Vec<(PathBuf, PathBuf, bool, bool)> = {
             let mut roots = self.roots.write().unwrap();
             roots
                 .iter_mut()
@@ -644,18 +842,18 @@ impl Watcher {
                     } else if r.state == RootState::Trusted {
                         r.state = RootState::Unsynced;
                     }
-                    (r.key.clone(), r.path.clone(), r.cookie_dir.clone(), r.whole, restart)
+                    (r.key.clone(), r.path.clone(), r.whole, restart)
                 })
                 .collect()
         };
         (self.log)(&format!("events lost ({}): checking files again", under.map_or("every root".to_string(), |r| r.display().to_string())));
-        for (key, path, cookie_dir, whole, restart) in hit {
+        for (key, path, whole, restart) in hit {
             if restart {
                 self.forget_watched(&key);
             }
             self.untrust(&key);
             if restart {
-                self.start(path, key, cookie_dir, whole);
+                self.start(path, key, whole);
             }
         }
     }
@@ -667,8 +865,7 @@ impl Watcher {
     fn unwatched(&self, dir: &Path) {
         let key = self.key(dir);
         self.forget_watched(&key);
-        self.real_dirs.write().unwrap().retain(|k, _| !k.starts_with(&key));
-        self.repos.write().unwrap().retain(|k, _| !k.starts_with(&key));
+        self.forget_learned(&key);
         self.drop_under(dir);
     }
 
@@ -687,6 +884,31 @@ impl Watcher {
         self.forget_watched(&key);
     }
 
+    /// Whether an event on `path` may matter (`ReadDirectoryChangesW`
+    /// reports everything in a root, its build directories included): not
+    /// in a build directory, nor in a repository's own directory (but for
+    /// a cookie, or that directory itself).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn wanted(&self, path: &Path) -> bool {
+        if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with(COOKIE_PREFIX)) {
+            return true;
+        }
+        let key = self.key(path);
+        !self.is_ignored(&key) && (!in_repository_dir(&key) || key.file_name().is_some_and(|n| VCS_DIRS.iter().any(|v| n == *v)))
+    }
+
+    /// Something under `dir` changed, its name unknown (a short name for a
+    /// file gone): everything under it is checked again.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn changed_under(&self, dir: &Path) {
+        let key = self.key(dir);
+        if self.is_ignored(&key) {
+            return;
+        }
+        self.forget_learned(&key);
+        self.drop_under(dir);
+    }
+
     /// A backend saw `path` change: `structural` when it was created,
     /// removed or renamed.
     fn event(&self, path: &Path, structural: bool) {
@@ -701,7 +923,19 @@ impl Watcher {
             return;
         }
         let key = self.key(path);
-        if self.is_ignored(&key) || key.components().any(|c| matches!(c, Component::Normal(n) if VCS_DIRS.iter().any(|v| n == *v))) {
+        if self.is_ignored(&key) {
+            return;
+        }
+        if in_repository_dir(&key) {
+            // Nothing there is vouched for. A repository's directory made
+            // or removed: lookups of the repository beside it change.
+            if structural
+                && key.file_name().is_some_and(|n| VCS_DIRS.iter().any(|v| n == *v))
+                && let Some(parent) = key.parent()
+                && self.learned.read().unwrap().contains(parent)
+            {
+                self.repos.write().unwrap().retain(|k, _| !k.starts_with(parent));
+            }
             return;
         }
         self.seq.fetch_add(1, Ordering::SeqCst);
@@ -723,16 +957,9 @@ impl Watcher {
                 l.changed(path, Change::Tree);
             }
         }
-        // What was learned about directories there, and their watches
-        // (a directory created there again is watched again).
-        self.real_dirs.write().unwrap().retain(|k, _| !k.starts_with(&key));
-        self.forget_watched(&key);
-        let repos_under = match key.file_name().and_then(|n| n.to_str()) {
-            // A repository appeared or went: lookups beside it change.
-            Some(n) if VCS_DIRS.contains(&n) => key.parent().map(Path::to_path_buf).unwrap_or_else(|| key.clone()),
-            _ => key.clone(),
-        };
-        self.repos.write().unwrap().retain(|k, _| !k.starts_with(&repos_under));
+        // What was learned about directories there: a file's events (most
+        // of them) concern nothing of it.
+        self.forget_learned(&key);
     }
 }
 
@@ -743,15 +970,21 @@ impl Watcher {
     fn vouch(&self, path: &Path, tree: bool) -> Option<u64> {
         let seq = self.seq.load(Ordering::SeqCst);
         let key = self.key(path);
-        if self.is_ignored(&key) {
+        // Their events are ignored.
+        if self.is_ignored(&key) || in_repository_dir(&key) {
             return None;
         }
         let root = {
             let roots = self.roots.read().unwrap();
-            roots.iter().find(|r| key.starts_with(&r.key)).map(|r| (r.key.clone(), r.path.clone(), r.state.clone(), r.whole, r.synced))
+            roots.iter().find(|r| key.starts_with(&r.key)).map(|r| {
+                let remote = r.mounts.iter().any(|(m, local)| !local && key.starts_with(m));
+                (r.key.clone(), r.path.clone(), r.state.clone(), r.whole, r.synced, remote)
+            })
         };
         match root {
-            Some((rkey, rpath, state @ (RootState::Trusted | RootState::Unsynced), whole, synced)) => {
+            // On a file system that may not report every change.
+            Some((.., true)) => None,
+            Some((rkey, rpath, state @ (RootState::Trusted | RootState::Unsynced), whole, synced, false)) => {
                 let is_dir = self.real(path)?;
                 // Lazily watched: the directories down to the file's, or
                 // to the directory (its names come with its own events;
@@ -806,6 +1039,10 @@ impl cpp_deps::scan::Watch for Watcher {
     fn unchanged_since(&self, token: u64) -> bool {
         self.seq.load(Ordering::SeqCst) == token
     }
+
+    fn volatile(&self, path: &Path) -> bool {
+        self.is_ignored(&self.key(path))
+    }
 }
 
 /// `p` as a key: lowercase on case-insensitive file systems.
@@ -829,7 +1066,7 @@ mod platform {
 
     use super::*;
     use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     pub(super) fn backend(sink: Weak<Watcher>) -> Option<Box<dyn Backend>> {
         // SAFETY: plain syscall.
@@ -837,10 +1074,78 @@ mod platform {
         if fd < 0 {
             return None;
         }
-        let inotify = Arc::new(Inotify { fd, wds: Mutex::default(), ignored: RwLock::default(), whole: RwLock::default(), sink });
+        // Read before roots are watched; changed since it was opened, it
+        // says so (`poll`).
+        if let (Ok(mut table), Some(w)) = (std::fs::File::open("/proc/self/mountinfo"), sink.upgrade()) {
+            *w.mount_table.write().unwrap() = read_mounts(&mut table, w.case_insensitive);
+            let sink = sink.clone();
+            std::thread::spawn(move || watch_mounts(table, sink));
+        }
+        let inotify = Arc::new(Inotify { fd, wds: Mutex::default(), whole: RwLock::default(), sink });
         let reader = inotify.clone();
         std::thread::spawn(move || reader.read_loop());
         Some(Box::new(Shared(inotify)))
+    }
+
+    /// The file systems `/proc/self/mountinfo` lists (keys), and whether
+    /// each reports every change.
+    fn read_mounts(file: &mut std::fs::File, case_insensitive: bool) -> Vec<(PathBuf, bool)> {
+        use std::io::{Read, Seek};
+        let mut text = String::new();
+        if file.rewind().and_then(|()| file.read_to_string(&mut text)).is_err() {
+            return Vec::new();
+        }
+        parse_mounts(&text).into_iter().map(|(p, local)| (key(&p, case_insensitive), local)).collect()
+    }
+
+    /// The mount points of a `mountinfo` (spaces and the like escaped in
+    /// octal), and whether their file system reports every change (those
+    /// `local_file_system` accepts).
+    pub(super) fn parse_mounts(text: &str) -> Vec<(PathBuf, bool)> {
+        const LOCAL: &[&str] = &["ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "f2fs", "zfs", "bcachefs", "overlay", "reiserfs", "jfs", "nilfs2"];
+        let unescape = |s: &str| {
+            let b = s.as_bytes();
+            let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
+            while i < b.len() {
+                match (b[i], b.get(i + 1..i + 4).and_then(|o| u8::from_str_radix(std::str::from_utf8(o).ok()?, 8).ok())) {
+                    (b'\\', Some(c)) => {
+                        out.push(c);
+                        i += 4;
+                    }
+                    (c, _) => {
+                        out.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            PathBuf::from(std::ffi::OsString::from_vec(out))
+        };
+        text.lines()
+            .filter_map(|line| {
+                let (fields, rest) = line.split_once(" - ")?;
+                let point = fields.split(' ').nth(4)?;
+                let kind = rest.split(' ').next()?;
+                Some((unescape(point), LOCAL.contains(&kind)))
+            })
+            .collect()
+    }
+
+    /// Tells the watcher when file systems are mounted or unmounted.
+    fn watch_mounts(mut table: std::fs::File, sink: Weak<Watcher>) {
+        use std::os::fd::AsRawFd;
+        loop {
+            let mut pfd = libc::pollfd { fd: table.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
+            // SAFETY: one valid pollfd. Every while without a change:
+            // whether the watcher is still there.
+            let n = unsafe { libc::poll(&mut pfd, 1, 10_000) };
+            let Some(w) = sink.upgrade() else { return };
+            if n < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return;
+            }
+            if n > 0 && pfd.revents & (libc::POLLPRI | libc::POLLERR) != 0 {
+                w.mounts_changed(read_mounts(&mut table, w.case_insensitive));
+            }
+        }
     }
 
     struct Shared(Arc<Inotify>);
@@ -879,13 +1184,12 @@ mod platform {
         }
 
         fn ignore(&self, dir: &Path) {
-            self.0.ignored.write().unwrap().insert(dir.to_path_buf());
             self.unwatch(dir);
         }
 
         fn unignore(&self, dir: &Path) -> io::Result<()> {
-            self.0.ignored.write().unwrap().remove(dir);
-            if !under(&self.0.whole, dir) {
+            // Still in another one, or watched when needed.
+            if self.0.is_ignored(dir) || !under(&self.0.whole, dir) {
                 return Ok(());
             }
             match self.0.add_tree(dir) {
@@ -905,7 +1209,6 @@ mod platform {
         fd: i32,
         /// Watch descriptors and their directories.
         wds: Mutex<HashMap<i32, PathBuf>>,
-        ignored: RwLock<HashSet<PathBuf>>,
         /// Directories watched with everything under them: directories
         /// created there are watched as they appear.
         whole: RwLock<HashSet<PathBuf>>,
@@ -927,15 +1230,21 @@ mod platform {
 
     const STRUCTURAL: u32 = libc::IN_CREATE | libc::IN_DELETE | libc::IN_MOVED_FROM | libc::IN_MOVED_TO | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF;
 
+    /// Why a directory in a build directory isn't watched.
+    fn build_dir(dir: &Path) -> io::Error {
+        io::Error::other(format!("{} is in a build directory", dir.display()))
+    }
+
     impl Inotify {
+        /// Whether `dir` is in a build directory (see `Watcher::ignore`).
         fn is_ignored(&self, dir: &Path) -> bool {
-            under(&self.ignored, dir)
+            self.sink.upgrade().is_some_and(|w| w.is_ignored(&w.key(dir)))
         }
 
-        /// Watches `dir` alone.
+        /// Watches `dir` alone (not in a build directory).
         fn add_one(&self, dir: &Path) -> io::Result<()> {
             if self.is_ignored(dir) {
-                return Ok(());
+                return Err(build_dir(dir));
             }
             let c = CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
             // SAFETY: `c` is a valid C string.
@@ -949,12 +1258,16 @@ mod platform {
         }
 
         /// Watches `dir` and the directories under it (not into
-        /// repositories' own directories, nor build directories). Out of
-        /// watches, gives back those it added.
+        /// repositories' own directories, nor build directories, whose
+        /// files aren't vouched for). Out of watches, gives back those it
+        /// added; `dir` itself in a build directory isn't watched.
         fn add_tree(&self, dir: &Path) -> io::Result<()> {
+            if self.is_ignored(dir) {
+                return Err(build_dir(dir));
+            }
             let mut stack = vec![dir.to_path_buf()];
             while let Some(d) = stack.pop() {
-                if self.is_ignored(&d) {
+                if d != dir && self.is_ignored(&d) {
                     continue;
                 }
                 let c = CString::new(d.as_os_str().as_bytes()).map_err(io::Error::other)?;
@@ -1051,9 +1364,10 @@ mod platform {
                 self.remove_tree(&path);
             }
             // Under a directory watched whole, new directories are watched
-            // (elsewhere, when needed). One gone already (or a file now)
-            // has its own events; one that can't be watched is a loss.
-            if is_dir && ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 && under(&self.whole, &path) {
+            // (elsewhere, when needed; never build directories). One gone
+            // already (or a file now) has its own events; one that can't be
+            // watched is a loss.
+            if is_dir && ev.mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 && under(&self.whole, &path) && !self.is_ignored(&path) {
                 match self.add_tree(&path) {
                     Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {}
                     Err(_) => sink.lost(Some(&path)),
@@ -1091,7 +1405,7 @@ mod platform {
         /// the directory watched again when needed; a root's stops.
         #[test]
         fn watches_gone() {
-            let dir = std::env::temp_dir().join(format!("ninja_daemon_gone_{}", std::process::id()));
+            let dir = test_dirs::base().join(format!("ninja_daemon_gone_{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join(".git")).unwrap();
             std::fs::create_dir_all(dir.join("mnt/sub")).unwrap();
@@ -1114,7 +1428,6 @@ mod platform {
             let backend = Inotify {
                 fd: -1,
                 wds: Mutex::new(HashMap::from([(1, dir.join("mnt")), (2, dir.clone())])),
-                ignored: Default::default(),
                 whole: Default::default(),
                 sink: Arc::downgrade(&w),
             };
@@ -1126,6 +1439,64 @@ mod platform {
             assert!(w.token(&f).is_some());
             backend.handle(&w, &event(2, libc::IN_IGNORED), b"");
             assert!(matches!(w.roots()[0].1, RootState::Failed(_)), "{:?}", w.roots());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Mount points, unescaped, and whether their file systems report
+        /// every change.
+        #[test]
+        fn mount_tables() {
+            let text = "22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\n\
+                        40 22 0:35 / /mnt/c rw,noatime - 9p drvfs rw\n\
+                        41 22 0:36 / /home/u/my\\040repo/sub rw - tmpfs none rw\n";
+            let expected = [("/", true), ("/mnt/c", false), ("/home/u/my repo/sub", true)].map(|(p, l)| (PathBuf::from(p), l));
+            assert_eq!(parse_mounts(text), expected);
+        }
+
+        /// A file system mounted in a root (over a watched directory, which
+        /// hides it from its watch): the root is watched again from
+        /// scratch. Files on one that may not report every change aren't
+        /// vouched for.
+        #[test]
+        fn mounts_in_roots() {
+            let dir = std::env::temp_dir().join(format!("ninja_daemon_mounts_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            for d in [".git", "a", "net"] {
+                std::fs::create_dir_all(dir.join(d)).unwrap();
+            }
+            let dir = std::fs::canonicalize(&dir).unwrap();
+            let (f, g) = (dir.join("a/f.h"), dir.join("net/g.h"));
+            std::fs::write(&f, "f").unwrap();
+            std::fs::write(&g, "g").unwrap();
+            let w = Watcher::new(false, Box::new(|_| {}));
+            let in_sync = || {
+                w.token(&f);
+                w.token(&g);
+                w.sync();
+                w.token(&f).is_some()
+            };
+            assert_eq!(w.token(&f), None);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !in_sync() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(w.token(&g).is_some());
+            let mut table = w.mount_table.read().unwrap().clone();
+            table.push((dir.join("a"), true));
+            w.mounts_changed(table.clone());
+            assert_eq!(w.token(&f), None);
+            while !in_sync() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            table.push((dir.join("net"), false));
+            w.mounts_changed(table);
+            while !in_sync() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(w.token(&g), None);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -1167,6 +1538,7 @@ mod platform {
             routine: *const c_void,
         ) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn CancelIoEx(handle: Handle, overlapped: *mut c_void) -> i32;
         fn GetLongPathNameW(short: *const u16, long: *mut u16, len: u32) -> u32;
     }
 
@@ -1176,12 +1548,32 @@ mod platform {
 
     struct Directories {
         sink: Weak<Watcher>,
-        /// Roots with a running reader, and what stops it.
-        active: Arc<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>>,
+        /// Roots with a running reader.
+        active: Arc<Mutex<HashMap<PathBuf, Reader>>>,
+    }
+
+    struct Reader {
+        stop: Arc<AtomicBool>,
+        /// The directory's, shared with the reader: open while either has
+        /// it.
+        handle: Arc<Owned>,
+    }
+
+    impl Reader {
+        /// Stops the reader: its read is cancelled.
+        fn stop(&self) {
+            self.stop.store(true, Ordering::SeqCst);
+            // SAFETY: an open handle (this reference keeps it open).
+            unsafe { CancelIoEx(self.handle.0, std::ptr::null_mut()) };
+        }
     }
 
     struct Owned(Handle);
+    // SAFETY: a handle owned by one thread at a time (the reader it's
+    // moved to), closed once when dropped; Windows handles may be used from
+    // any thread.
     unsafe impl Send for Owned {}
+    unsafe impl Sync for Owned {}
     impl Drop for Owned {
         fn drop(&mut self) {
             // SAFETY: the handle is owned.
@@ -1190,9 +1582,12 @@ mod platform {
     }
 
     impl Backend for Directories {
+        /// A reader already there reads what was at `root` then (a root
+        /// replaced since by a fresh clone, say): it's stopped, and the
+        /// directory there now opened.
         fn watch(&self, root: &Path, _cookie_dir: &Path, _whole: bool) -> io::Result<()> {
-            if self.active.lock().unwrap().contains_key(root) {
-                return Ok(());
+            if let Some(old) = self.active.lock().unwrap().remove(root) {
+                old.stop();
             }
             let wide: Vec<u16> = root.as_os_str().encode_wide().chain([0]).collect();
             // SAFETY: `wide` is NUL-terminated.
@@ -1210,19 +1605,19 @@ mod platform {
             if h == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
-            let handle = Owned(h);
+            let handle = Arc::new(Owned(h));
             // The first read sets up the watch: events from then on are
             // kept between reads (in a buffer of the first read's size).
             let (tx, rx) = std::sync::mpsc::channel();
             let root = root.to_path_buf();
             let sink = self.sink.clone();
             let stop = Arc::new(AtomicBool::new(false));
-            self.active.lock().unwrap().insert(root.clone(), stop.clone());
+            self.active.lock().unwrap().insert(root.clone(), Reader { stop: stop.clone(), handle: handle.clone() });
             let active = self.active.clone();
             std::thread::spawn(move || {
-                read_loop(handle, &root, sink, tx, &stop);
+                read_loop(&handle, &root, sink, tx, &stop);
                 let mut active = active.lock().unwrap();
-                if active.get(&root).is_some_and(|s| Arc::ptr_eq(s, &stop)) {
+                if active.get(&root).is_some_and(|r| Arc::ptr_eq(&r.stop, &stop)) {
                     active.remove(&root);
                 }
             });
@@ -1233,23 +1628,22 @@ mod platform {
             Ok(())
         }
 
-        /// The readers stop at their next event (a synchronous read can't
-        /// be interrupted).
         fn unwatch(&self, dir: &Path) {
-            self.active.lock().unwrap().retain(|root, stop| {
+            self.active.lock().unwrap().retain(|root, reader| {
                 let under = root.starts_with(dir);
                 if under {
-                    stop.store(true, Ordering::SeqCst);
+                    reader.stop();
                 }
                 !under
             });
         }
     }
 
-    fn read_loop(handle: Owned, root: &Path, sink: Weak<Watcher>, started: std::sync::mpsc::Sender<()>, stop: &AtomicBool) {
+    fn read_loop(handle: &Owned, root: &Path, sink: Weak<Watcher>, started: std::sync::mpsc::Sender<()>, stop: &AtomicBool) {
         let mut buf = vec![0u32; 1 << 18];
         let _ = started.send(());
-        loop {
+        // Stopped between reads, or during one (cancelled).
+        while !stop.load(Ordering::SeqCst) {
             let mut n = 0u32;
             // SAFETY: `buf` is u32-aligned and writable for its byte length.
             let ok = unsafe {
@@ -1272,6 +1666,8 @@ mod platform {
                 w.lost(Some(root));
                 continue;
             }
+            // SAFETY: the call filled the first `n` bytes of `buf` (at most
+            // its byte length), which isn't changed while `bytes` lives.
             let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), n as usize) };
             let mut off = 0usize;
             loop {
@@ -1280,10 +1676,15 @@ mod platform {
                 let name: Vec<u16> = bytes[off + 12..off + 12 + len].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
                 let path = root.join(std::ffi::OsString::from_wide(&name));
                 match long_path(&path) {
+                    // Build directories' (most of a build's events) go
+                    // first, before any stat: a burst of them would
+                    // overflow the buffer.
+                    Some(Named::Path(p)) if !w.wanted(&p) => {}
                     // A directory's timestamps follow its files', whose
                     // own events tell what changed.
-                    Some(p) if action == FILE_ACTION_MODIFIED && p.is_dir() => {}
-                    Some(p) => w.event(&p, action != FILE_ACTION_MODIFIED),
+                    Some(Named::Path(p)) if action == FILE_ACTION_MODIFIED && p.is_dir() => {}
+                    Some(Named::Path(p)) => w.event(&p, action != FILE_ACTION_MODIFIED),
+                    Some(Named::Under(d)) => w.changed_under(&d),
                     None => w.lost(Some(root)),
                 }
                 if next == 0 {
@@ -1294,15 +1695,30 @@ mod platform {
         }
     }
 
-    /// `path` with long names: events may use a short (8.3) name. None when
-    /// it has one and can't be expanded (the file is gone).
-    fn long_path(path: &Path) -> Option<PathBuf> {
-        let short = |c: &std::ffi::OsStr| {
-            let s = c.to_string_lossy();
-            s.find('~').is_some_and(|i| s[i + 1..].starts_with(|ch: char| ch.is_ascii_digit()))
-        };
+    /// What an event's path names.
+    #[derive(Debug, PartialEq)]
+    enum Named {
+        /// That path, with long names.
+        Path(PathBuf),
+        /// Something under that directory, whose name is unknown.
+        Under(PathBuf),
+    }
+
+    /// Whether `name` has the shape of a short (8.3) name: a base of up to
+    /// 8 characters with `~` and digits in it, and an extension of up to 3
+    /// (not `x.c.~1~`, a backup file).
+    fn short(name: &std::ffi::OsStr) -> bool {
+        let s = name.to_string_lossy();
+        let (base, ext) = s.split_once('.').unwrap_or((&s, ""));
+        base.len() <= 8 && ext.len() <= 3 && !ext.contains('.') && base.find('~').is_some_and(|i| base[i + 1..].starts_with(|c: char| c.is_ascii_digit()))
+    }
+
+    /// `path` with long names: events may use a short name. One that can't
+    /// be expanded (the file is gone) names something under the deepest
+    /// directory that can; None when none can (the root went).
+    fn long_path(path: &Path) -> Option<Named> {
         if !path.components().any(|c| short(c.as_os_str())) {
-            return Some(path.to_path_buf());
+            return Some(Named::Path(path.to_path_buf()));
         }
         let expand = |p: &Path| -> Option<PathBuf> {
             let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
@@ -1311,11 +1727,38 @@ mod platform {
             let n = unsafe { GetLongPathNameW(wide.as_ptr(), out.as_mut_ptr(), out.len() as u32) } as usize;
             (n > 0 && n < out.len()).then(|| PathBuf::from(std::ffi::OsString::from_wide(&out[..n])))
         };
-        expand(path).or_else(|| {
-            // Gone: its directory, if only the directory has short names.
-            let (dir, name) = (path.parent()?, path.file_name()?);
-            if short(name) { None } else { expand(dir).map(|d| d.join(name)) }
-        })
+        if let Some(p) = expand(path) {
+            return Some(Named::Path(p));
+        }
+        // Gone: its directory, if only the directory has short names.
+        let (dir, name) = (path.parent()?, path.file_name()?);
+        if !short(name)
+            && let Some(d) = expand(dir)
+        {
+            return Some(Named::Path(d.join(name)));
+        }
+        dir.ancestors().find_map(expand).map(Named::Under)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Events' short names are expanded; a name merely like one (a
+        /// backup file's) is kept as is, though gone; a short name gone
+        /// names something under its directory.
+        #[test]
+        fn long_names() {
+            let dir = std::env::temp_dir().join(format!("ninja_daemon_short_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+            let backup = dir.join("x.c.~1~");
+            assert_eq!(long_path(&backup), Some(Named::Path(backup.clone())));
+            assert_eq!(long_path(&dir.join("ABCDEF~1.H")), Some(Named::Under(dir.clone())));
+            assert_eq!(long_path(&dir.join("GONE~1").join("x.h")), Some(Named::Under(dir.clone())));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
@@ -1414,7 +1857,7 @@ mod tests {
         if cfg!(not(any(target_os = "linux", windows))) {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_watch_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_daemon_watch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("inc/sub")).unwrap();
@@ -1464,7 +1907,7 @@ mod tests {
         std::fs::write(&moved, "zzz").unwrap();
         wait_for("the moved file", || rec.0.lock().unwrap().iter().any(|(p, _)| *p == moved));
         // Paths through symbolic links aren't vouched for.
-        let outside = std::env::temp_dir().join(format!("ninja_daemon_watch_out_{}", std::process::id()));
+        let outside = test_dirs::base().join(format!("ninja_daemon_watch_out_{}", std::process::id()));
         std::fs::create_dir_all(&outside).unwrap();
         #[cfg(unix)]
         {
@@ -1483,7 +1926,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn watches_lazily() {
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_lazy_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_daemon_lazy_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for d in [".git", "src/a", "other/deep/er", "tc/bin/sub"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
@@ -1527,7 +1970,7 @@ mod tests {
         if cfg!(not(any(target_os = "linux", windows))) {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_listed_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_daemon_listed_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for d in [".git", "inc1", "inc2"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
@@ -1574,7 +2017,7 @@ mod tests {
                 }
             }
         }
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_lost_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_daemon_lost_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("d")).unwrap();
@@ -1626,7 +2069,7 @@ mod tests {
         if cfg!(not(any(target_os = "linux", windows))) {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_cookies_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_daemon_cookies_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         for d in ["repo/.git", "repo/tc/bin", "tc2/bin"] {
             std::fs::create_dir_all(dir.join(d)).unwrap();
@@ -1660,7 +2103,7 @@ mod tests {
         if cfg!(not(any(target_os = "linux", windows))) {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_expire_{}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja_daemon_expire_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("tc/out")).unwrap();
         let dir = strip_verbatim(std::fs::canonicalize(&dir).unwrap());
@@ -1677,6 +2120,196 @@ mod tests {
         assert!(w.token(&f).is_some());
         std::fs::write(&f, "f").unwrap();
         wait_for("its change", || rec.0.lock().unwrap().iter().any(|(p, _)| *p == f));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing in a repository's own directory is vouched for (`.git/index`,
+    /// a ref a version stamp depends on): its events are ignored.
+    #[test]
+    fn repositories_own_files() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_vcs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let dir = strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+        let (a, head, index) = (dir.join("src/a.h"), dir.join(".git/refs/heads/main"), dir.join(".git/index"));
+        for f in [&a, &head, &index] {
+            std::fs::write(f, "x").unwrap();
+        }
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        assert_eq!(w.token(&a), None);
+        wait_for("the watch", || w.roots().iter().any(|(_, s)| *s == RootState::Unsynced));
+        for f in [&a, &head, &index] {
+            w.token(f);
+        }
+        w.sync();
+        assert!(w.token(&a).is_some());
+        assert_eq!((w.token(&head), w.token(&index), w.token(&dir.join(".git/refs"))), (None, None, None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository's directory created in a watched root: lookups of the
+    /// repository there see it.
+    #[test]
+    fn repositories_created() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_newrepo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("tc/sub")).unwrap();
+        let dir = strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+        let (tc, sub) = (dir.join("tc"), dir.join("tc/sub"));
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        w.watch_tree(&tc);
+        wait_for("the watch", || w.roots().iter().any(|(_, s)| *s == RootState::Unsynced));
+        assert_ne!(w.repository(&sub), Some(sub.clone()));
+        std::fs::create_dir(sub.join(".git")).unwrap();
+        wait_for("the new repository", || w.repository(&sub) == Some(sub.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root whose cookie can't be made (its repository's directory went)
+    /// isn't in sync: it's watched again, its cookies made elsewhere.
+    #[test]
+    fn cookie_errors() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_cookie_err_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("repo/src")).unwrap();
+        let dir = strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+        let a = dir.join("repo/src/a.h");
+        std::fs::write(&a, "a").unwrap();
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        w.set_cookie_dir(&dir.join("cookies"));
+        assert_eq!(w.token(&a), None);
+        wait_for("the watch", || w.roots().iter().any(|(_, s)| *s == RootState::Unsynced));
+        std::fs::remove_dir(dir.join("repo/.git")).unwrap();
+        w.sync();
+        assert_ne!(w.roots()[0].1, RootState::Trusted);
+        wait_for("in sync", || {
+            w.sync();
+            w.roots()[0].1 == RootState::Trusted
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A burst of files created costs the same however many directories the
+    /// watcher knows: only a directory's own events go through what it
+    /// learned under it.
+    #[test]
+    fn event_cost() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_cost_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let dir = strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        let sub = |i: usize| dir.join(format!("m{}", i % 50)).join(format!("d{i}"));
+        for i in 0..4000 {
+            w.real(&sub(i).join("f.h"));
+            w.repository(&sub(i));
+        }
+        let t = Instant::now();
+        for i in 0..10_000 {
+            w.event(&sub(0).join(format!("new{i}.h")), true);
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // A directory's own event still drops what was learned there.
+        let k = w.key(&sub(1));
+        assert!(w.real_dirs.read().unwrap().contains_key(&k) && w.repos.read().unwrap().contains_key(&k));
+        w.event(&dir.join("m1"), true);
+        assert!(!w.real_dirs.read().unwrap().contains_key(&k) && !w.repos.read().unwrap().contains_key(&k));
+        assert!(w.repos.read().unwrap().contains_key(&w.key(&sub(2))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// inotify: nothing in a build directory is watched or vouched for, not
+    /// even a toolchain asked for whole (it would be trusted unwatched, its
+    /// cookies waited for in vain); once it expires, it's watched again and
+    /// its changes seen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn build_dirs_unwatched() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_unwatched_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["repo/.git", "repo/src", "repo/build/_deps/tc/bin", "out/tc/.git", "out/tc/bin"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let (repo, tc1, tc2) = (dir.join("repo"), dir.join("repo/build/_deps/tc"), dir.join("out/tc"));
+        let a = repo.join("src/a.h");
+        std::fs::write(&a, "a").unwrap();
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let l2 = lines.clone();
+        let w = Watcher::new(false, Box::new(move |m| l2.lock().unwrap().push(m.to_string())));
+        w.set_cookie_dir(&dir.join("cookies"));
+        let rec = Arc::new(Recorder::default());
+        w.listen(rec.clone());
+        w.ignore(&repo.join("build"));
+        w.ignore(&dir.join("out"));
+        assert_eq!(w.token(&a), None);
+        wait_for("the watch", || w.roots().iter().any(|(_, s)| *s == RootState::Unsynced));
+        w.watch_tree(&tc1);
+        w.watch_tree(&tc2);
+        w.sync();
+        assert_eq!(w.roots(), vec![(repo.clone(), RootState::Trusted)]);
+        assert!(!w.watched.read().unwrap().keys().any(|k| k.starts_with(&tc1)), "{:?}", w.watched.read().unwrap().keys());
+        assert_eq!((w.tree_token(&tc1), w.tree_token(&tc2)), (None, None));
+        w.expire(Instant::now());
+        w.watch_tree(&tc1);
+        w.watch_tree(&tc2);
+        wait_for("the watches", || w.roots().iter().all(|(_, s)| *s == RootState::Unsynced || *s == RootState::Trusted));
+        w.sync();
+        assert!(w.tree_token(&tc1).is_some() && w.tree_token(&tc2).is_some(), "{:?}", w.roots());
+        for tc in [&tc1, &tc2] {
+            std::fs::write(tc.join("bin/cc"), "cc").unwrap();
+            wait_for("its change", || rec.0.lock().unwrap().iter().any(|(p, _)| *p == tc.join("bin/cc")));
+        }
+        // A build directory made in a tree watched whole isn't watched (nor
+        // is that a loss).
+        w.ignore(&tc2.join("out"));
+        std::fs::create_dir(tc2.join("out")).unwrap();
+        w.sync();
+        assert!(w.roots().iter().all(|(_, s)| *s == RootState::Trusted), "{:?}", lines.lock().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows: a root replaced (a fresh clone where the old one was) is
+    /// watched again, from its new directory.
+    #[cfg(windows)]
+    #[test]
+    fn replaced_roots() {
+        let dir = std::env::temp_dir().join(format!("ninja_daemon_replaced_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("repo/src")).unwrap();
+        let dir = strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+        let (repo, a) = (dir.join("repo"), dir.join("repo/src/a.h"));
+        std::fs::write(&a, "a").unwrap();
+        let w = Watcher::new(true, Box::new(|_| {}));
+        let rec = Arc::new(Recorder::default());
+        w.listen(rec.clone());
+        assert_eq!(w.token(&a), None);
+        wait_for("the watch", || w.roots().iter().any(|(_, s)| *s == RootState::Unsynced));
+        w.sync();
+        assert!(w.token(&a).is_some());
+        std::fs::rename(&repo, dir.join("repo.old")).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(&a, "the new clone's").unwrap();
+        wait_for("the new root in sync", || {
+            w.sync();
+            w.token(&a).is_some()
+        });
+        rec.0.lock().unwrap().clear();
+        std::fs::write(&a, "changed").unwrap();
+        wait_for("its change", || rec.0.lock().unwrap().iter().any(|(p, _)| w.key(p) == w.key(&a)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

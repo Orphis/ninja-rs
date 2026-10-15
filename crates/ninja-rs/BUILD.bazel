@@ -13,6 +13,7 @@ rust_library(
     ),
     crate_name = "ninja_rs",
     crate_root = "src/lib.rs",
+    version = module_version(),
     deps = [
         "//crates/ninja-core",
         "//crates/ninja-daemon",
@@ -30,7 +31,7 @@ rust_library(
     }),
 )
 
-# Embeds the Windows long path manifest (MSVC targets; see build.rs).
+# Embeds the Windows long path manifest (see build.rs).
 cargo_build_script(
     name = "build_script",
     srcs = ["build.rs"],
@@ -49,19 +50,34 @@ rust_binary(
 
 rust_test(
     name = "ninja_rs_lib_test",
+    size = "small",
     crate = ":ninja_rs_lib",
+    # The versions the crates get (options::tests).
+    data = [
+        "//:Cargo.toml",
+        "//:MODULE.bazel",
+    ],
+    version = module_version(),
+    deps = ["//crates/test-dirs"],
 )
 
 # End-to-end remote execution and build event tests against the in-process
-# fake REAPI and BES server.
+# fake REAPI and BES server: a few minutes, split in shards (the harness
+# honours TEST_SHARD_INDEX, and --test_filter).
 rust_test(
     name = "remote_e2e",
-    srcs = ["tests/remote_e2e.rs"],
+    size = "large",
+    srcs = [
+        "tests/harness/mod.rs",
+        "tests/remote_e2e.rs",
+    ],
+    crate_root = "tests/remote_e2e.rs",
     data = [
         ":ninja-rs",
         "//crates/fake-reapi:test_certs",
     ],
     rustc_env = {"CARGO_BIN_EXE_ninja-rs": "$(rootpath :ninja-rs)"},
+    shard_count = 4,
     use_libtest_harness = False,
     deps = [
         ":ninja_rs_lib",
@@ -69,21 +85,34 @@ rust_test(
         "//crates/ninja-core",
         "//crates/ninja-daemon",
         "//crates/ninja-remote",
+        "//crates/test-dirs",
         "//third_party/cargo-rbe/rbe-bes",
         "//third_party/cargo-rbe/rbe-client",
         "@crates//:prost",
+        "@crates//:serde_json",
         "@crates//:tokio",
-    ],
+    ] + select({
+        "@platforms//os:windows": [],
+        "//conditions:default": ["@crates//:libc"],
+    }),
 )
 
 # Command line tests (tools, --status, the jobserver) running the binary.
 rust_test(
     name = "cli_e2e",
-    srcs = ["tests/cli_e2e.rs"],
+    size = "medium",
+    srcs = [
+        "tests/cli_e2e.rs",
+        "tests/harness/mod.rs",
+    ],
+    crate_root = "tests/cli_e2e.rs",
     data = [":ninja-rs"],
     rustc_env = {"CARGO_BIN_EXE_ninja-rs": "$(rootpath :ninja-rs)"},
     use_libtest_harness = False,
-    deps = [":ninja_rs_lib"] + select({
+    deps = [
+        ":ninja_rs_lib",
+        "//crates/test-dirs",
+    ] + select({
         "@platforms//os:windows": [],
         "//conditions:default": ["@crates//:libc"],
     }),

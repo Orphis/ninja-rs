@@ -19,7 +19,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use ninja_core::build::{BuildConfig, Builder};
-use ninja_core::build_log::{BUILD_LOG_FILE, BuildLog};
+use ninja_core::build_log::{BUILD_LOG_FILE, BuildLog, LOCK_FILE, LogLock};
 use ninja_core::canon::canonicalize_path;
 use ninja_core::deps_log::{DEPS_LOG_FILE, DepsLog};
 use ninja_core::disk::{Disk, RealDisk, StatCounters};
@@ -42,6 +42,12 @@ pub const RBE_BINDINGS: &[&str] = &["rbe_local", "rbe_mnemonic", "rbe_target", "
 /// The version of the RBE interface this executor implements.
 pub const RBE_VERSION: &str = "1";
 
+/// This executor's version (`--version`, build events, remote requests),
+/// with its commit: the daemon's (see `ninja_daemon::server::version`).
+pub fn version() -> &'static str {
+    ninja_daemon::server::version()
+}
+
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_FAILURE: i32 = 1;
 pub const EXIT_INTERRUPTED: i32 = 130;
@@ -51,6 +57,9 @@ pub struct Service {
     interrupt: Arc<Interrupt>,
     /// Remote connection, kept across builds (keyed by endpoint/instance).
     remote_client: Option<(String, ninja_remote::Client)>,
+    /// The remote service found unreachable (keyed the same), which builds
+    /// do without (`--remote_local_fallback`) rather than wait for again.
+    remote_unreachable: Option<String>,
     /// The disk cache, kept across builds (keyed by its directory).
     disk_cache: Option<(String, Arc<ninja_remote::disk_cache::DiskCache>)>,
     digests_loaded: bool,
@@ -70,6 +79,10 @@ pub struct Service {
     /// Where nested invocations send their build events (the CLI binds it
     /// before starting threads; see `nested`).
     pub relay: Option<nested::Relay>,
+    /// The lock file of the logs the current invocation writes, and the
+    /// lock (none when an invocation it runs for holds it, or it can't be
+    /// taken).
+    logs_lock: Option<(String, Option<LogLock>)>,
 }
 
 impl Service {
@@ -78,6 +91,7 @@ impl Service {
             store: ninja_remote::Store::new(),
             interrupt,
             remote_client: None,
+            remote_unreachable: None,
             disk_cache: None,
             digests_loaded: false,
             remote_verbose: false,
@@ -88,6 +102,7 @@ impl Service {
             ids: InvocationIds::default(),
             skip_teardown: false,
             relay: None,
+            logs_lock: None,
         }
     }
 
@@ -140,6 +155,8 @@ impl Service {
 
     async fn run_invocation(&mut self, opts: &Options) -> i32 {
         self.remote_verbose = opts.remote.verbose;
+        // Tried again by each invocation (not by the manifest's rebuilds).
+        self.remote_unreachable = None;
         self.racing = opts.remote.racing.then(|| exec_runner::Racing { delay: Duration::from_millis(opts.remote.racing_delay_ms), stats: Arc::default() });
         self.ids = InvocationIds::new(&opts.bes);
         // Build events cover builds and `-t exec`, not the other tools.
@@ -158,6 +175,7 @@ impl Service {
         }
         let mut status = ReportingStatus { printer: &mut printer, bes: bes.clone() };
         let code = self.run_build_invocation(opts, &mut status).await;
+        self.logs_lock = None;
         if let Some(b) = bes {
             b.finish(code).await;
         }
@@ -176,7 +194,7 @@ impl Service {
         {
             return match t.as_str() {
                 "daemon" => daemon::tool(&opts.tool_args),
-                "exec" => exec(opts, status).await,
+                "exec" => exec(opts, status, &self.interrupt).await,
                 "wincodepage" => tools::tool_wincodepage(&opts.tool_args),
                 _ => tools::tool_restat_after_flags(&opts.tool_args),
             };
@@ -203,7 +221,15 @@ impl Service {
             let reader = RealFileReader;
             let parsed = self.timed(".ninja parse", || ManifestParser::new(&mut state, &reader, parser_opts).load(&opts.input_file));
             if let Err(e) = parsed {
-                status.error(&e);
+                match e.strip_prefix(ninja_core::parser::FATAL) {
+                    Some(fatal) => {
+                        eprintln!("ninja: fatal: {fatal}");
+                        if let Some(b) = &status.bes {
+                            b.message(&format!("ninja: fatal: {fatal}\n"));
+                        }
+                    }
+                    None => status.error(&e),
+                }
                 return EXIT_FAILURE;
             }
 
@@ -244,6 +270,10 @@ impl Service {
             if !build_dir.is_empty() && !opts.dry_run && std::fs::create_dir_all(&build_dir).is_err() {
                 status.error(&format!("creating build directory {build_dir}"));
                 return EXIT_FAILURE;
+            }
+            // Before they're read: they're this invocation's to write.
+            if (tool.is_none() && !opts.dry_run) || tool.is_some_and(|t| t.name == "recompact") {
+                self.lock_logs(&build_dir, status).await;
             }
             let build_log_loaded = self.timed(".ninja_log load", || build_log.load(&log_path));
             let deps_log_loaded = self.timed(".ninja_deps load", || deps_log.load(&deps_path));
@@ -303,11 +333,12 @@ impl Service {
                     return EXIT_FAILURE;
                 }
             };
-            // Without a backend (no remote service, or the manifest left RBE),
-            // records are moot: the outputs are built again, locally, and
-            // records kept would outlive them.
-            let remote_outputs = remote_outputs.filter(|_| backend.is_some());
-            if backend.is_none() && !opts.dry_run {
+            // Without a remote service (none, the disk cache alone, unreachable,
+            // or the manifest left RBE), records are moot: the outputs are built again,
+            // locally, and records kept would outlive them.
+            let remote = backend.as_ref().is_some_and(|b| b.transfers().is_some());
+            let remote_outputs = remote_outputs.filter(|_| remote);
+            if !remote && !opts.dry_run {
                 let _ = std::fs::remove_file(in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE));
             }
             if let (Some(b), Some(outputs)) = (&backend, &remote_outputs)
@@ -400,8 +431,11 @@ impl Service {
             }
             if keep_digests {
                 // The digests of artifacts build events are still hashing
-                // are saved too.
+                // are saved too (but after an interruption: not waited for).
                 if let Some(b) = &status.bes {
+                    if self.interrupt.is_set() {
+                        b.interrupted();
+                    }
                     b.settle().await;
                 }
                 if let Err(e) = self.store.save_digests(std::path::Path::new(&digests_file)) {
@@ -459,6 +493,44 @@ impl Service {
         EXIT_FAILURE
     }
 
+    /// Takes the lock on the logs in `build_dir` for this invocation (see
+    /// `LogLock`; ninja has none), unless it holds it already. A build
+    /// holding it is waited for: ninja users start builds in one directory
+    /// at once by mistake (an IDE's and a terminal's), and the second then
+    /// finds the work done. An invocation this one runs for (a generator
+    /// running `-t restat` while the build running it waits) lends it
+    /// instead. A lock that can't be taken (a file system without locks) is
+    /// a warning.
+    async fn lock_logs(&mut self, build_dir: &str, status: &mut dyn Status) {
+        let file = in_build_dir(build_dir, LOCK_FILE);
+        if self.logs_lock.as_ref().is_some_and(|(f, _)| *f == file) {
+            return;
+        }
+        let mut waiting = false;
+        loop {
+            let lock = match try_lock_logs(&file) {
+                Ok(LogsAccess::Locked(lock)) => Some(lock),
+                Ok(LogsAccess::Inherited) => None,
+                Ok(LogsAccess::Busy) => {
+                    if !waiting {
+                        status.info("waiting for the build running in this directory to finish...");
+                        waiting = true;
+                    }
+                    // An interrupt meanwhile ends the invocation (see
+                    // `Interrupt::unhandled`).
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(e) => {
+                    status.warning(&format!("can't lock the logs ({file}: {e}): a build running at once could undo this one's records"));
+                    None
+                }
+            };
+            self.logs_lock = Some((file, lock));
+            return;
+        }
+    }
+
     /// Ends an invocation. With `skip_teardown` the process exits next, so
     /// freeing the graph and the logs' tables is wasted work (ninja skips it
     /// too): log records are already written, and the OS closes the handles.
@@ -502,37 +574,41 @@ impl Service {
             }
         }
         let disk = self.open_disk_cache(opts, status);
+        // With --remote_local_fallback, a remote service that can't be
+        // reached is done without: the build runs locally (with the disk
+        // cache, if any), as its actions would once remote ones failed.
+        let fallback = opts.remote.local_fallback && !opts.remote.strict;
+        let key = format!("{}|{}|{:?}|{:?}", opts.remote.endpoint().cloned().unwrap_or_default(), opts.remote.instance_name, opts.remote.headers, opts.tls);
         let client = match opts.remote.endpoint() {
+            Some(_) if fallback && self.remote_unreachable.as_ref() == Some(&key) => None,
             Some(endpoint) => {
-                let key = format!("{endpoint}|{}|{:?}|{:?}", opts.remote.instance_name, opts.remote.headers, opts.tls);
                 if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
-                    let client = ninja_remote::connect(&ninja_remote::ConnectOptions {
+                    let connected = ninja_remote::connect(&ninja_remote::ConnectOptions {
                         endpoint: endpoint.clone(),
                         instance_name: opts.remote.instance_name.clone(),
                         headers: opts.remote.headers.clone(),
                         tls: opts.tls.load()?,
                     })
-                    .await
-                    .map_err(|e| format!("{e:#}{}", options::tls_hint(&format!("{e:#}"), endpoint, &opts.tls)))?;
-                    self.remote_client = Some((key, client));
+                    .await;
+                    match connected {
+                        Ok(client) => self.remote_client = Some((key.clone(), client)),
+                        Err(e) => self.unreachable(&key, endpoint, &format!("{e:#}"), opts, status)?,
+                    }
                 }
                 // Requests carry the invocation's ids, which build events
                 // report too.
-                Some(
-                    self.remote_client
-                        .as_ref()
-                        .expect("connected")
-                        .1
+                self.remote_client.as_ref().filter(|(k, _)| *k == key).map(|(_, client)| {
+                    client
                         .clone()
                         .with_request_metadata(rbe_client::proto::RequestMetadata {
-                            tool_details: Some(rbe_client::proto::ToolDetails { tool_name: "ninja-rs".into(), tool_version: env!("CARGO_PKG_VERSION").into() }),
+                            tool_details: Some(rbe_client::proto::ToolDetails { tool_name: "ninja-rs".into(), tool_version: version().into() }),
                             tool_invocation_id: self.ids.invocation_id.clone(),
                             correlated_invocations_id: self.ids.build_request_id.clone(),
                             ..Default::default()
                         })
                         .with_compression(opts.remote.cache_compression)
-                        .with_retries(opts.remote.retries, opts.remote.timeout),
-                )
+                        .with_retries(opts.remote.retries, opts.remote.timeout)
+                })
             }
             None => None,
         };
@@ -579,43 +655,68 @@ impl Service {
             }
             None => None,
         };
-        let backend = ninja_remote::Backend::new(
-            ninja_remote::BackendConfig {
-                build_dir,
-                volatile,
-                toolchains_file: file_var("rbe_toolchains"),
-                targets,
-                exec_root: opts.remote.exec_root.clone().map(Into::into),
-                jobs: opts.remote.jobs,
-                mnemonic_suffixes: opts.remote.mnemonic_suffixes.clone(),
-                local_fallback: opts.remote.local_fallback,
-                strict: opts.remote.strict,
-                max_fallbacks: opts.remote.max_fallbacks,
-                max_fallback_ratio: opts.remote.max_fallback_ratio,
-                cache_only: opts.remote.cache_only(),
-                upload_local_results: opts.remote.upload_local_results,
-                verbose: opts.remote.verbose,
-                remote_outputs,
-                download_minimal: opts.remote.download_minimal,
-                requested: Arc::new(requested.iter().map(|p| ninja_remote::remote_outputs::key(p)).collect()),
-                execution_log,
-                include_scanner: opts.remote.include_scanner,
-                daemon,
-            },
-            client,
-            disk,
-            self.store.clone(),
-        )
-        .await
-        .map_err(|e| {
-            let e = format!("{e:#}");
-            let hint = opts.remote.endpoint().map(|ep| options::tls_hint(&e, ep, &opts.tls)).unwrap_or_default();
-            format!("remote execution: {e}{hint}")
-        })?;
+        let requested: Arc<std::collections::HashSet<String>> = Arc::new(requested.iter().map(|p| ninja_remote::remote_outputs::key(p)).collect());
+        let config = |remote_outputs: Option<Arc<RemoteOutputs>>| ninja_remote::BackendConfig {
+            build_dir: build_dir.clone(),
+            volatile: volatile.clone(),
+            toolchains_file: file_var("rbe_toolchains"),
+            targets: targets.clone(),
+            exec_root: opts.remote.exec_root.clone().map(Into::into),
+            jobs: opts.remote.jobs,
+            mnemonic_suffixes: opts.remote.mnemonic_suffixes.clone(),
+            local_fallback: opts.remote.local_fallback,
+            strict: opts.remote.strict,
+            max_fallbacks: opts.remote.max_fallbacks,
+            max_fallback_ratio: opts.remote.max_fallback_ratio,
+            cache_only: opts.remote.cache_only(),
+            upload_local_results: opts.remote.upload_local_results,
+            verbose: opts.remote.verbose,
+            remote_outputs,
+            download_minimal: opts.remote.download_minimal,
+            requested: requested.clone(),
+            execution_log: execution_log.clone(),
+            include_scanner: opts.remote.include_scanner,
+            daemon: daemon.clone(),
+            action_env: opts.remote.action_env(),
+        };
+        let with_remote = client.is_some();
+        let backend = match ninja_remote::Backend::new(config(remote_outputs), client, disk.clone(), self.store.clone()).await {
+            Ok(b) => b,
+            // The service failed its first call (GetCapabilities) for a
+            // transient reason: as good as unreachable.
+            Err(e) if with_remote && rbe_client::status_of(&e).is_some_and(|s| rbe_client::transient(s.code())) => {
+                let endpoint = opts.remote.endpoint().cloned().unwrap_or_default();
+                self.unreachable(&key, &endpoint, &format!("{e:#}"), opts, status)?;
+                if disk.is_none() {
+                    return Ok(None);
+                }
+                ninja_remote::Backend::new(config(None), None, disk, self.store.clone()).await.map_err(|e| format!("remote execution: {e:#}"))?
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                let hint = opts.remote.endpoint().map(|ep| options::tls_hint(&e, ep, &opts.tls, true)).unwrap_or_default();
+                return Err(format!("remote execution: {e}{hint}"));
+            }
+        };
         if opts.remote.cache_only() && opts.remote.upload_local_results && !backend.uploads_local_results() {
             status.warning("the remote cache doesn't accept results from clients: local results aren't stored");
         }
         Ok(Some(Arc::new(backend)))
+    }
+
+    /// The remote service `key` names (at `endpoint`) couldn't be reached
+    /// (`error`): with `--remote_local_fallback` (and not
+    /// `--remote_strict`), a warning, and builds do without it; else the
+    /// build's error.
+    fn unreachable(&mut self, key: &str, endpoint: &str, error: &str, opts: &Options, status: &mut dyn Status) -> Result<(), String> {
+        let hint = options::tls_hint(error, endpoint, &opts.tls, true);
+        if !opts.remote.local_fallback || opts.remote.strict {
+            let local = if opts.remote.strict { "" } else { " (with --remote_local_fallback, the build would run locally)" };
+            return Err(format!("the remote service {endpoint} is unreachable{local}: {error}{hint}"));
+        }
+        status.warning(&format!("the remote service {endpoint} is unreachable, building locally: {error}{hint}"));
+        self.remote_unreachable = Some(key.to_string());
+        Ok(())
     }
 
     /// The `--disk_cache`, opened once per directory. A cache that can't be
@@ -696,8 +797,17 @@ impl Service {
         if let Some(c) = client {
             r.use_jobserver(c);
         }
+        let mut env = Vec::new();
         if let Some(flags) = jobserver.and_then(|j| j.makeflags.clone()) {
-            r.set_env(vec![("MAKEFLAGS".into(), flags)]);
+            env.push(("MAKEFLAGS".into(), flags));
+        }
+        // Commands writing the logs again (a generator's `-t restat`) do so
+        // for this invocation.
+        if let Some(file) = self.logs_lock.as_ref().and_then(|(f, _)| std::fs::canonicalize(f).ok()) {
+            env.push((nested::LOGS_LOCK_ENV.into(), file.to_string_lossy().into_owned()));
+        }
+        if !env.is_empty() {
+            r.set_env(env);
         }
         Box::new(r)
     }
@@ -726,6 +836,8 @@ impl Service {
             if builder.already_up_to_date() {
                 return Ok(false); // Not an error, but we didn't rebuild.
             }
+            // Its loop acts on interrupts.
+            let _handling = self.interrupt.handle();
             builder.build(runner.as_mut()).await.map_err(|e| {
                 let code = if e.interrupted { EXIT_INTERRUPTED } else { EXIT_FAILURE };
                 (e.message, code)
@@ -805,6 +917,8 @@ impl Service {
             }
             EXIT_SUCCESS
         } else {
+            // Its loop acts on interrupts.
+            let _handling = self.interrupt.handle();
             match builder.build(runner.as_mut()).await {
                 Ok(()) => EXIT_SUCCESS,
                 Err(e) => {
@@ -812,7 +926,7 @@ impl Service {
                         builder.status.failure_summary();
                     }
                     builder.status.info(&format!("build stopped: {}.", e.message));
-                    if e.interrupted { EXIT_INTERRUPTED } else { EXIT_FAILURE }
+                    if e.interrupted { EXIT_INTERRUPTED } else { failure_code(e.exit_code) }
                 }
             }
         };
@@ -834,7 +948,7 @@ impl Service {
 /// external projects, a script) whose ninja-rs invocations take this one's
 /// options and report under its invocation, as nested invocations do (see
 /// `nested`). Returns the command's exit code.
-async fn exec(opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
+async fn exec(opts: &Options, status: &mut ReportingStatus<'_>, interrupt: &Arc<Interrupt>) -> i32 {
     let args = match opts.tool_args.split_first() {
         Some((dashes, rest)) if dashes == "--" => rest,
         _ => &opts.tool_args[..],
@@ -853,7 +967,31 @@ async fn exec(opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
     {
         status.warning(&format!("can't write the execution log {log}: {e}"));
     }
-    match tokio::process::Command::new(program).args(rest).status().await {
+    let mut child = match tokio::process::Command::new(program).args(rest).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            status.error(&format!("{program}: {e}"));
+            return 127;
+        }
+    };
+    // Interrupts are the command's to act on: it gets those the terminal
+    // didn't send it too (see `forward`); another one kills it.
+    let _handling = interrupt.handle();
+    let mut seen = 0;
+    let waited = loop {
+        tokio::select! {
+            s = child.wait() => break s,
+            _ = interrupt.wait_beyond(seen) => {
+                seen = interrupt.count();
+                if seen == 1 {
+                    forward(&child, interrupt.last_signal());
+                } else {
+                    let _ = child.start_kill();
+                }
+            }
+        }
+    };
+    match waited {
         Ok(s) => match s.code() {
             Some(code) => code,
             None => {
@@ -865,10 +1003,60 @@ async fn exec(opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
             }
         },
         Err(e) => {
-            status.error(&format!("{program}: {e}"));
-            127
+            status.error(&format!("waiting for {program}: {e}"));
+            EXIT_FAILURE
         }
     }
+}
+
+/// Passes an interrupt on to `-t exec`'s command, which shares the terminal
+/// with ninja-rs: SIGTERM always (a terminal never sends it), SIGINT and
+/// SIGHUP unless the terminal sent them to its foreground process group,
+/// which holds the command too. On Windows, Ctrl-C and Ctrl-Break reach
+/// every process of the console already.
+fn forward(child: &tokio::process::Child, signal: i32) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|p| i32::try_from(p).ok())
+        && (signal == libc::SIGTERM || !in_terminal_foreground())
+    {
+        // SAFETY: plain system call; the child isn't reaped yet.
+        unsafe { libc::kill(pid, signal) };
+    }
+    #[cfg(not(unix))]
+    let _ = (child, signal);
+}
+
+/// Whether this process is in its terminal's foreground process group.
+#[cfg(unix)]
+fn in_terminal_foreground() -> bool {
+    let Ok(tty) = std::fs::File::open("/dev/tty") else { return false };
+    // SAFETY: plain system calls on an open descriptor.
+    unsafe { libc::tcgetpgrp(std::os::fd::AsRawFd::as_raw_fd(&tty)) == libc::getpgrp() }
+}
+
+/// What a build whose last failed command exited with `code` exits with:
+/// that code (as ninja 1.13 does), unless it would read as success.
+fn failure_code(code: i32) -> i32 {
+    if code == 0 || (cfg!(unix) && code & 0xff == 0) { EXIT_FAILURE } else { code }
+}
+
+/// How an invocation may write the logs whose lock file is `file`.
+pub(crate) enum LogsAccess {
+    /// This process holds the lock.
+    Locked(LogLock),
+    /// An invocation this one runs for holds it (see `nested::LOGS_LOCK_ENV`).
+    Inherited,
+    /// Another build holds it.
+    Busy,
+}
+
+/// Takes the lock file `file` of a build directory's logs, if it is free.
+pub(crate) fn try_lock_logs(file: &str) -> std::io::Result<LogsAccess> {
+    if let Some(lock) = LogLock::try_acquire(file)? {
+        return Ok(LogsAccess::Locked(lock));
+    }
+    let inherited = std::env::var_os(nested::LOGS_LOCK_ENV).is_some_and(|held| std::fs::canonicalize(file).is_ok_and(|f| f.as_os_str() == held));
+    Ok(if inherited { LogsAccess::Inherited } else { LogsAccess::Busy })
 }
 
 /// The directories a build writes to besides the build directory: its

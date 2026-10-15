@@ -20,6 +20,12 @@ use crate::options::Options;
 
 pub const ENV: &str = "NINJA_RS_PARENT";
 
+/// The lock file of the logs an invocation writes (see `LogLock`), which
+/// its commands get: one writing them again (a generator running
+/// `-t restat`, while the build waits for it) does so for the invocation,
+/// without the lock it holds.
+pub const LOGS_LOCK_ENV: &str = "NINJA_RS_LOGS_LOCK";
+
 /// What an invocation passes to the invocations its commands run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Parent {
@@ -89,13 +95,20 @@ impl Drop for SecretFlags {
 fn write_secret_flags(flags: &[String]) -> io::Result<SecretFlags> {
     let loc = Location::with_id("flags")?;
     loc.create_dir()?;
-    let path = loc.dir.join(format!("flags-{}.json", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(&path)?.write_all(serde_json::to_string(flags).map_err(io::Error::other)?.as_bytes())?;
-    Ok(SecretFlags(path))
+    write_secret_flags_in(&loc.dir, flags)
+}
+
+/// Writes `flags` to a new private file in `dir`, which is private too.
+fn write_secret_flags_in(dir: &Path, flags: &[String]) -> io::Result<SecretFlags> {
+    let path = dir.join(format!("flags-{}.json", std::process::id()));
+    // Left by a process that had the same id (the directory is this
+    // user's): a new file gets the permissions.
+    let _ = std::fs::remove_file(&path);
+    let mut file = ipc::create_private_file(&path)?;
+    // Removed if it can't be written.
+    let secret = SecretFlags(path);
+    file.write_all(serde_json::to_string(flags).map_err(io::Error::other)?.as_bytes())?;
+    Ok(secret)
 }
 
 /// Options not passed on: per invocation (ids, build events, logs written
@@ -129,6 +142,7 @@ fn exported_flags(opts: &Options) -> Vec<String> {
     let absolute = |name: &str| -> Option<String> {
         match name {
             "disk_cache" => opts.remote.disk_cache.clone(),
+            "exec_root" => opts.remote.exec_root.clone(),
             "tls_certificate" => opts.tls.certificate.clone(),
             "tls_client_certificate" => opts.tls.client_certificate.clone(),
             "tls_client_key" => opts.tls.client_key.clone(),
@@ -270,7 +284,8 @@ mod tests {
     #[test]
     fn secret_flags_stay_out_of_the_environment() {
         let flags = vec!["--remote_header=authorization=Bearer t".to_string()];
-        let secrets = write_secret_flags(&flags).unwrap();
+        let dir = test_dirs::TestDir::new("ninja-rs-secret-flags");
+        let secrets = write_secret_flags_in(&dir, &flags).unwrap();
         let path = secrets.0.clone();
         #[cfg(unix)]
         {
@@ -284,6 +299,19 @@ mod tests {
         assert_eq!(read.flags, vec!["--remote_jobs=3".to_string(), flags[0].clone()]);
         drop(secrets);
         assert!(!path.exists());
+    }
+
+    /// The file has permissions of its own, this user's and the system's,
+    /// none from its directory (which may let others read).
+    #[cfg(windows)]
+    #[test]
+    fn secret_flags_file_is_private() {
+        let dir = test_dirs::TestDir::new("ninja-rs-secret-flags");
+        let secrets = write_secret_flags_in(&dir, &["--remote_header=k=v".to_string()]).unwrap();
+        let out = std::process::Command::new("icacls").arg(&secrets.0).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(text.lines().filter(|l| l.contains(":(")).count(), 2, "{text}");
+        assert!(!text.contains("(I)"), "{text}");
     }
 
     fn parse(args: &[&str]) -> Options {

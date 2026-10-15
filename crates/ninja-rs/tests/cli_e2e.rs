@@ -5,32 +5,14 @@
 //! Commands are this test binary itself: under the name `fake-job` it
 //! records how many jobs run at once and the `MAKEFLAGS` it got.
 
+mod harness;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
 
+use harness::{ninja_exe, test_dir};
 use ninja_rs::jobserver;
-
-fn ninja_exe() -> PathBuf {
-    let path = env!("CARGO_BIN_EXE_ninja-rs");
-    if Path::new(path).exists() {
-        return std::path::absolute(path).unwrap();
-    }
-    // Bazel on Windows: no runfiles tree, a manifest of them.
-    let manifest = std::env::var("RUNFILES_MANIFEST_FILE").expect("ninja-rs binary not found");
-    let key = format!("_main/{path} ");
-    let text = std::fs::read_to_string(manifest).unwrap();
-    let line = text.lines().find(|l| l.starts_with(&key)).expect("ninja-rs binary not in the runfiles");
-    PathBuf::from(&line[key.len()..])
-}
-
-fn test_dir(name: &str) -> PathBuf {
-    let base = std::env::var_os("TEST_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("ninja-rs-cli-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 struct Run {
     code: i32,
@@ -119,9 +101,9 @@ fn test_ninjars() -> Result<(), String> {
         check(r.stderr.contains(want), &format!("--announce_rc: no '{want}' in\n{}", r.stderr))?;
     }
     let r = run(with(&["--config=bad"]));
-    check(r.code == 2 && r.stderr.contains(".ninjars:3: unrecognized option '--nope'"), &format!("an unknown option: {}", r.stderr))?;
+    check(r.code == 1 && r.stderr.contains(".ninjars:3: unrecognized option '--nope'"), &format!("an unknown option: {}", r.stderr))?;
     let r = run(with(&["--ignore_all_rc_files", "--config=other"]));
-    check(r.code == 2 && r.stderr.contains("config value 'other' is not defined"), &format!("--ignore_all_rc_files: {}", r.stderr))?;
+    check(r.code == 1 && r.stderr.contains("config value 'other' is not defined"), &format!("--ignore_all_rc_files: {}", r.stderr))?;
     // -t exec: the command's exit code.
     let exe = ninja_exe().to_string_lossy().into_owned();
     let r = run(with(&["-t", "exec", "--", &exe, "nothing"]));
@@ -158,7 +140,7 @@ fn fake_cl(args: &[String]) -> i32 {
 fn test_msvc_deps_relative() -> Result<(), String> {
     let dir = test_dir("msvcdeps");
     let cl = dir.join("fake-cl.exe");
-    std::fs::copy(std::env::current_exe().unwrap(), &cl).unwrap();
+    harness::link_self(&cl);
     let header = dir.join("gen").join("x.h");
     let m = format!(
         "rule gen\n  command = {cl} gen $out\nrule cc\n  command = {cl} cc $out {header}\n  deps = msvc\n\
@@ -171,6 +153,159 @@ fn test_msvc_deps_relative() -> Result<(), String> {
     check(r.code == 0, &format!("build failed: {}{}", r.stdout, r.stderr))?;
     let r = ninja(&dir, &["-t", "deps", "out.obj"], &[]);
     check(r.stdout.contains("    gen/x.h\n") && !r.stdout.contains(":\\") && !r.stdout.contains(":/"), &format!("deps of out.obj:\n{}", r.stdout))
+}
+
+/// `fake-cc OUT HEADER`: runs for a while, then writes how many were
+/// running halfway through (see `fake_job`) to OUT, and a depfile naming
+/// HEADER.
+fn fake_cc(args: &[String]) -> i32 {
+    let [out, header] = args else { return 2 };
+    let running = Path::new("running");
+    let _ = std::fs::create_dir_all(running);
+    let me = running.join(out);
+    std::fs::write(&me, "").unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let count = std::fs::read_dir(running).unwrap().count();
+    std::fs::remove_file(&me).unwrap();
+    std::fs::write(out, format!("{count}\n")).unwrap();
+    std::fs::write(format!("{out}.d"), format!("{out}: {header}\n")).unwrap();
+    0
+}
+
+/// Two builds at once in one build directory: one waits for the other (the
+/// logs' lock), and each output gets its own deps. Without the lock, both
+/// loaded the deps log before the other wrote, and gave their new headers
+/// the same id: `b` got `a`'s header, and changing its own rebuilt nothing.
+fn test_concurrent_builds() -> Result<(), String> {
+    let dir = test_dir("concurrent");
+    let cc = dir.join(if cfg!(windows) { "fake-cc.exe" } else { "fake-cc" });
+    std::fs::copy(std::env::current_exe().unwrap(), &cc).unwrap();
+    for h in ["old.h", "ha.h", "hb.h"] {
+        std::fs::write(dir.join(h), "").unwrap();
+    }
+    let manifest = |a: &str, b: &str| {
+        let m = format!(
+            "rule cc\n  command = {} $out $header\n  depfile = $out.d\n  deps = gcc\nbuild a: cc\n  header = {a}\nbuild b: cc\n  header = {b}\n",
+            cc.display()
+        );
+        std::fs::write(dir.join("build.ninja"), m).unwrap();
+    };
+    manifest("old.h", "old.h");
+    let r = ninja(&dir, &[], &[]);
+    check(r.code == 0, &format!("the first build failed: {}{}", r.stdout, r.stderr))?;
+    manifest("ha.h", "hb.h");
+    let start = |target: &str| {
+        let mut c = Command::new(ninja_exe());
+        c.current_dir(&dir).arg(target).env_remove("MAKEFLAGS").env_remove("NINJA_STATUS").env_remove(ninja_rs::nested::ENV);
+        c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap()
+    };
+    let (a, b) = (start("a"), start("b"));
+    let (a, b) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
+    let text = |o: &std::process::Output| format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    check(a.status.success() && b.status.success(), &format!("a build failed:\n{}\n{}", text(&a), text(&b)))?;
+    for out in ["a", "b"] {
+        let running = std::fs::read_to_string(dir.join(out)).unwrap_or_default();
+        check(running.trim() == "1", &format!("{out} ran with another command at once: {running}"))?;
+    }
+    let deps = ninja(&dir, &["-t", "deps"], &[]).stdout;
+    let of = |out: &str| deps.split("\n\n").find(|b| b.starts_with(&format!("{out}: "))).unwrap_or_default().to_string();
+    check(of("a").contains("ha.h") && !of("a").contains("hb.h"), &format!("a's deps:\n{deps}"))?;
+    check(of("b").contains("hb.h") && !of("b").contains("ha.h"), &format!("b's deps:\n{deps}"))?;
+    let r = ninja(&dir, &["-n", "-d", "explain", "b"], &[]);
+    check(r.stdout.contains("no work to do"), &format!("b isn't up to date: {}{}", r.stdout, r.stderr))
+}
+
+/// As ninja: a failed build exits with the code of the last command that
+/// failed (1.13); an unknown option prints the usage and exits with 1; a
+/// build file needing a newer ninja is fatal.
+fn test_exit_codes() -> Result<(), String> {
+    let dir = test_dir("exit_codes");
+    let fail = if cfg!(windows) { "cmd /c exit 3" } else { "exit 3" };
+    std::fs::write(dir.join("build.ninja"), format!("rule fail\n  command = {fail}\nbuild out: fail\n")).unwrap();
+    let r = ninja(&dir, &[], &[]);
+    check(r.code == 3 && r.stdout.contains("FAILED: [code=3] out"), &format!("a failed command: exit {}: {}{}", r.code, r.stdout, r.stderr))?;
+    let r = ninja(&dir, &["--bogus"], &[]);
+    check(r.code == 1 && r.stderr.starts_with("ninja: unrecognized option '--bogus'\nusage:"), &format!("--bogus: exit {}: {}", r.code, r.stderr))?;
+    let r = ninja(&dir, &["-j", "x"], &[]);
+    check(r.code == 1 && r.stderr.contains("ninja: fatal: invalid -j parameter"), &format!("-j x: exit {}: {}", r.code, r.stderr))?;
+    std::fs::write(dir.join("build.ninja"), "ninja_required_version = 99.0\n").unwrap();
+    let r = ninja(&dir, &[], &[]);
+    check(
+        r.code == 1
+            && r.stderr.contains("ninja: fatal: ninja version (")
+            && r.stderr.contains("incompatible with build file ninja_required_version version (99.0)."),
+        &format!("ninja_required_version: exit {}: {}", r.code, r.stderr),
+    )
+}
+
+/// Waits for `child` to exit, killing it after `limit`: None then.
+#[cfg(unix)]
+fn wait_at_most(child: &mut std::process::Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
+        if let Ok(Some(s)) = child.try_wait() {
+            return Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// An interrupt outside a build's loop (here while connecting to a remote
+/// executor that never answers) ends the invocation at once, as ninja dies
+/// of the signal there; it used to go on until the connection timed out.
+#[cfg(unix)]
+fn test_interrupt_outside_the_build() -> Result<(), String> {
+    let dir = test_dir("interrupt_outside");
+    std::fs::write(dir.join("build.ninja"), "rbe_version = 1\nrule r\n  command = touch $out\nbuild out: r\n").unwrap();
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let port = silent.local_addr().unwrap().port();
+    // Accepted, never answered.
+    let (connected, connecting) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in silent.incoming().flatten() {
+            held.push(s);
+            let _ = connected.send(());
+        }
+    });
+    let mut c = Command::new(ninja_exe());
+    c.current_dir(&dir).arg(format!("--remote_executor=grpc://127.0.0.1:{port}")).env_remove(ninja_rs::nested::ENV);
+    c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    if connecting.recv_timeout(Duration::from_secs(10)).is_err() {
+        let _ = child.kill();
+        return Err("ninja-rs didn't connect".into());
+    }
+    // SAFETY: plain system call.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    match wait_at_most(&mut child, Duration::from_secs(10)) {
+        Some(s) => check(s.code() == Some(128 + libc::SIGTERM), &format!("exited with {s}")),
+        None => Err("still running 10 s after SIGTERM".into()),
+    }
+}
+
+/// `-t exec` passes SIGTERM on to its command (a terminal never sends it to
+/// the command too), and exits with the command's code.
+#[cfg(unix)]
+fn test_exec_forwards_signals() -> Result<(), String> {
+    let dir = test_dir("exec_signals");
+    let script = "trap 'echo > got-term; exit 7' TERM; echo > ready; while :; do sleep 0.1; done";
+    let mut c = Command::new(ninja_exe());
+    c.current_dir(&dir).args(["-t", "exec", "sh", "-c", script]).env_remove(ninja_rs::nested::ENV);
+    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    let start = std::time::Instant::now();
+    while !dir.join("ready").exists() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // SAFETY: plain system call.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    match wait_at_most(&mut child, Duration::from_secs(10)) {
+        Some(s) => check(s.code() == Some(7) && dir.join("got-term").exists(), &format!("exited with {s}")),
+        None => Err("still running 10 s after SIGTERM".into()),
+    }
 }
 
 /// `fake-job OUT`: runs for a while, then writes how many jobs were running
@@ -193,7 +328,7 @@ fn fake_job(args: &[String]) -> i32 {
 fn jobs_fixture(name: &str, jobs: usize, header: &str) -> PathBuf {
     let dir = test_dir(name);
     let job = dir.join(if cfg!(windows) { "fake-job.exe" } else { "fake-job" });
-    std::fs::copy(std::env::current_exe().unwrap(), &job).unwrap();
+    harness::link_self(&job);
     let mut m = format!("{header}rule job\n  command = {} $out\n", job.display());
     let outs: Vec<String> = (1..=jobs).map(|i| format!("j{i}")).collect();
     for o in &outs {
@@ -452,51 +587,75 @@ fn test_jobserver_pipe() -> Result<(), String> {
     check(client.try_acquire().is_some(), "the token didn't come back")
 }
 
-/// Starts a build of two commands whose grandchildren write a marker and
-/// the output after 2 s, and interrupts it after 1 s with `interrupt`: it
-/// must stop at once like ninja, end its build events, and leave nothing
-/// behind (its secret flags file included) or written later. Skipped when
-/// `interrupt` can't interrupt.
-fn interrupted_build(name: &str, interrupt: impl FnOnce(&std::process::Child) -> Result<(), String>) -> Result<(), String> {
-    use std::process::Stdio;
+/// `fake-sleep OUT`: says it runs (`OUT.pid`), then sleeps for longer than
+/// the tests wait, then writes `OUT.marker` and `OUT`, which an interrupted
+/// build must stop it from doing.
+fn fake_sleep(args: &[String]) -> i32 {
+    let out = &args[0];
+    std::fs::write(format!("{out}.pid.tmp"), std::process::id().to_string()).unwrap();
+    std::fs::rename(format!("{out}.pid.tmp"), format!("{out}.pid")).unwrap();
+    std::thread::sleep(2 * harness::PATIENCE);
+    std::fs::write(format!("{out}.marker"), "late").unwrap();
+    std::fs::write(out, "done").unwrap();
+    0
+}
+
+/// Starts (with `launch`, given the test's directory) a build of two
+/// commands whose grandchildren sleep (`fake-sleep`), and once they run,
+/// interrupts it with `interrupt`: it must stop at once like ninja, without
+/// waiting for its commands, end its build events, stop the grandchildren,
+/// and leave nothing behind (its secret flags file included). An interrupt
+/// that can't be sent makes the test not tested.
+fn interrupted_build(
+    name: &str,
+    launch: impl FnOnce(&Path) -> Command,
+    interrupt: impl FnOnce(&mut std::process::Child) -> Result<(), String>,
+) -> Result<(), String> {
     let dir = test_dir(name);
-    let command = if cfg!(windows) {
-        "cmd /c cmd /c \"ping -n 3 127.0.0.1 >nul & echo late> $out.marker & echo done> $out\""
-    } else {
-        "sh -c 'sh -c \"sleep 2; echo late > $out.marker; echo done > $out\"; true'"
-    };
+    harness::link_self(&dir.join(if cfg!(windows) { "fake-sleep.exe" } else { "fake-sleep" }));
+    let command = if cfg!(windows) { "cmd /c cmd /c \".\\fake-sleep $out\"" } else { "sh -c 'sh -c \"./fake-sleep $out\"; true'" };
     std::fs::write(dir.join("build.ninja"), format!("rule slow\n  command = {command}\nbuild a: slow\nbuild b: slow\n")).unwrap();
     // Where the secret flags file for nested builds goes.
     let private = dir.join("private");
     std::fs::create_dir(&private).unwrap();
     #[cfg(unix)]
     std::fs::set_permissions(&private, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    let mut c = Command::new(ninja_exe());
+    let mut c = launch(&dir);
     c.current_dir(&dir).args(["-j2", "--remote_header=x=y", "--build_event_binary_file=events.bin"]);
     c.env_remove("MAKEFLAGS").env_remove("NINJA_STATUS").env_remove(ninja_rs::nested::ENV).env("NINJA_RS_DAEMON_DIR", &private);
-    c.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut c, 0x200); // CREATE_NEW_PROCESS_GROUP
-    let start = std::time::Instant::now();
+    // Files, not pipes: nothing blocks on them while the test waits.
+    c.stdout(std::fs::File::create(dir.join("stdout.txt")).unwrap()).stderr(std::fs::File::create(dir.join("stderr.txt")).unwrap());
     let mut child = c.spawn().map_err(|e| e.to_string())?;
-    std::thread::sleep(Duration::from_secs(1));
+    let started = || dir.join("a.pid").exists() && dir.join("b.pid").exists();
+    let running = harness::wait_for("the commands running", || started() || child.try_wait().is_ok_and(|s| s.is_some()))
+        .and_then(|()| if started() { Ok(()) } else { Err("ninja-rs exited before its commands ran".into()) });
     let flags_written = std::fs::read_dir(&private).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("flags-"));
-    if let Err(e) = interrupt(&child) {
+    let interrupted = running.and_then(|()| interrupt(&mut child));
+    // It exits long before its commands would end.
+    let exited = harness::wait_for("ninja-rs exiting", || child.try_wait().is_ok_and(|s| s.is_some()));
+    if exited.is_err() || interrupted.is_err() {
         let _ = child.kill();
-        let _ = child.wait();
-        println!("{name} not tested: {e}");
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+    let text = format!("{}{}", read("stdout.txt"), read("stderr.txt")).replace("\r\n", "\n");
+    interrupted.map_err(|e| format!("{name}: {e}\n{text}"))?;
+    #[cfg(windows)]
+    if status.code() == Some(NO_CTRL_BREAK) {
+        harness::not_tested(&format!("{name}: {}", text.trim()));
         return Ok(());
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let exited = start.elapsed();
-    std::thread::sleep(Duration::from_secs(4).saturating_sub(start.elapsed()));
-    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)).replace("\r\n", "\n");
-    check(out.status.code() == Some(130), &format!("{name}: {}\n{text}", out.status))?;
+    exited.map_err(|e| format!("{name}: {e}\n{text}"))?;
+    check(status.code() == Some(130), &format!("{name}: {status}\n{text}"))?;
     check(text.contains("ninja: build stopped: interrupted by user.\n"), &format!("{name}:\n{text}"))?;
-    check(exited < Duration::from_secs(2), &format!("{name}: exited after {exited:?}"))?;
     check(flags_written, &format!("{name}: no secret flags file while building"))?;
     let events = std::fs::read(dir.join("events.bin")).unwrap_or_default();
     check(events.windows(b"INTERRUPTED".len()).any(|w| w == b"INTERRUPTED"), &format!("{name}: no interrupted build in the build events"))?;
+    // The grandchildren got it too: they're gone, before they wrote.
+    for out in ["a", "b"] {
+        let pid: u32 = read(&format!("{out}.pid")).trim().parse().map_err(|e| format!("{name}: {out}.pid: {e}"))?;
+        harness::wait_for(&format!("{name}: {out}'s command stopped"), || !harness::alive(pid))?;
+    }
     let mut left: Vec<String> = ["a", "b", "a.marker", "b.marker", ".ninja_lock"].into_iter().filter(|f| dir.join(f).exists()).map(String::from).collect();
     left.extend(std::fs::read_dir(&private).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()));
     check(left.is_empty(), &format!("{name}: left behind or written after the build: {left:?}"))
@@ -508,31 +667,79 @@ fn interrupted_build(name: &str, interrupt: impl FnOnce(&std::process::Child) ->
 #[cfg(unix)]
 fn test_interrupt_signals() -> Result<(), String> {
     for (name, signal) in [("sigterm", libc::SIGTERM), ("sighup", libc::SIGHUP), ("sigint", libc::SIGINT)] {
-        interrupted_build(name, |child| {
-            // SAFETY: plain system call.
-            unsafe { libc::kill(child.id() as i32, signal) };
-            Ok(())
-        })?;
+        interrupted_build(
+            name,
+            |_| Command::new(ninja_exe()),
+            |child| {
+                // SAFETY: plain system call.
+                unsafe { libc::kill(child.id() as i32, signal) };
+                Ok(())
+            },
+        )?;
     }
     Ok(())
+}
+
+/// What `console_host` exits with when it can't send Ctrl-Break.
+#[cfg(windows)]
+const NO_CTRL_BREAK: i32 = 125;
+
+/// `console-host PROGRAM ARGS...`: runs PROGRAM in a process group of its
+/// own, on this process's console, and sends it Ctrl-Break when a line
+/// arrives on stdin; exits with its exit code. Started with
+/// CREATE_NO_WINDOW, it has a console (without a window), which the test
+/// may not have (CI, Bazel) and Ctrl-Break needs.
+#[cfg(windows)]
+fn console_host(args: &[String]) -> i32 {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+    const CTRL_BREAK_EVENT: u32 = 1;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+    let mut child = match Command::new(&args[0]).args(&args[1..]).stdin(std::process::Stdio::null()).creation_flags(CREATE_NEW_PROCESS_GROUP).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("console-host: {}: {e}", args[0]);
+            return 1;
+        }
+    };
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return 1;
+    }
+    // SAFETY: plain system call; the child leads a process group of its
+    // own, on this console.
+    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) } == 0 {
+        eprintln!("console-host: can't send Ctrl-Break: {}", std::io::Error::last_os_error());
+        let _ = child.kill();
+        let _ = child.wait();
+        return NO_CTRL_BREAK;
+    }
+    child.wait().map_or(1, |s| s.code().unwrap_or(1))
 }
 
 /// Ctrl-Break interrupts a build as Ctrl-C does, as in ninja; the commands'
 /// jobs are terminated and waited for.
 #[cfg(windows)]
 fn test_interrupt_ctrl_break() -> Result<(), String> {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
-    }
-    interrupted_build("ctrl-break", |child| {
-        // SAFETY: plain system call; ninja-rs runs in a process group of
-        // its own. It fails without a console.
-        match unsafe { GenerateConsoleCtrlEvent(1, child.id()) } {
-            0 => Err(format!("Ctrl-Break: {}", std::io::Error::last_os_error())),
-            _ => Ok(()),
-        }
-    })
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    interrupted_build(
+        "ctrl-break",
+        |dir| {
+            let host = dir.join("console-host.exe");
+            harness::link_self(&host);
+            let mut c = Command::new(host);
+            c.arg(ninja_exe()).stdin(std::process::Stdio::piped()).creation_flags(CREATE_NO_WINDOW);
+            c
+        },
+        |child| writeln!(child.stdin.take().expect("stdin"), "break").map_err(|e| format!("console-host: {e}")),
+    )
 }
 
 fn main() -> ExitCode {
@@ -546,7 +753,20 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ExitCode::from(fake_cl(&args) as u8);
     }
-    type Test = (&'static str, fn() -> Result<(), String>);
+    if stem.starts_with("fake-cc") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ExitCode::from(fake_cc(&args) as u8);
+    }
+    if stem.starts_with("fake-sleep") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ExitCode::from(fake_sleep(&args) as u8);
+    }
+    #[cfg(windows)]
+    if stem.starts_with("console-host") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ExitCode::from(console_host(&args) as u8);
+    }
+    use harness::Test;
     #[allow(unused_mut)]
     let mut tests: Vec<Test> = vec![
         ("rules", test_rules),
@@ -561,40 +781,20 @@ fn main() -> ExitCode {
         ("jobserver_client", test_jobserver_client),
         ("ninjars", test_ninjars),
         ("build_event_digests", test_build_event_digests),
+        ("concurrent_builds", test_concurrent_builds),
+        ("exit_codes", test_exit_codes),
     ];
     #[cfg(unix)]
     tests.push(("jobserver_pipe", test_jobserver_pipe));
     #[cfg(unix)]
     tests.push(("interrupt_signals", test_interrupt_signals));
+    #[cfg(unix)]
+    tests.push(("interrupt_outside_the_build", test_interrupt_outside_the_build));
+    #[cfg(unix)]
+    tests.push(("exec_forwards_signals", test_exec_forwards_signals));
     #[cfg(windows)]
     tests.push(("msvc_deps_relative", test_msvc_deps_relative));
     #[cfg(windows)]
     tests.push(("interrupt_ctrl_break", test_interrupt_ctrl_break));
-    let filter: Vec<String> = std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
-    tests.retain(|(name, _)| filter.is_empty() || filter.iter().any(|f| name.contains(f.as_str())));
-    let count = tests.len();
-    let mut failed = 0;
-    for (name, t) in tests {
-        match t() {
-            Ok(()) => println!("test {name} ... ok"),
-            Err(e) => {
-                println!("test {name} ... FAILED: {e}");
-                failed += 1;
-            }
-        }
-    }
-    println!("test result: {} passed; {failed} failed", count - failed);
-    if failed > 0 {
-        return ExitCode::FAILURE;
-    }
-    // The fixtures (copies of this binary, hundreds of MB each), kept
-    // after a failure to look into.
-    let base = std::env::var_os("TEST_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let prefix = format!("ninja-rs-cli-{}-", std::process::id());
-    for e in std::fs::read_dir(&base).into_iter().flatten().flatten() {
-        if e.file_name().to_string_lossy().starts_with(&prefix) {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
-    }
-    ExitCode::SUCCESS
+    harness::run("cli", tests)
 }

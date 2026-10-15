@@ -14,6 +14,13 @@ fn with_extension(path: &str, ext: &str) -> String {
     format!("{}.{ext}", &path[..stem_end])
 }
 
+/// Whether an argument of a cl-style compile names a source, by its
+/// extension.
+fn is_source(arg: &str) -> bool {
+    let ext = arg.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "c" | "cc" | "cpp" | "cxx" | "c++" | "ixx" | "cppm")
+}
+
 /// The files `argv`, a compile command (response files expanded), writes
 /// besides its output and depfile, as named in it (relative to its working
 /// directory, or absolute). `msvc`: a cl-style command line. An error means
@@ -34,6 +41,10 @@ pub fn side_outputs(argv: &[String], msvc: bool) -> Result<Vec<String>, String> 
     let mut make_deps = false;
     let mut make_deps_file: Option<String> = None;
     let mut pdb = false;
+    // GCC's and Clang's option renaming the files named after the output.
+    let mut renamed: Option<&str> = None;
+    // A cl-style compile's sources, which name its object with `/Fo<dir>\`.
+    let mut sources: Vec<String> = Vec::new();
     // An option's value: glued to it, or the next argument.
     let value = |glued: &str, i: &mut usize| -> Option<String> {
         if glued.is_empty() {
@@ -52,9 +63,19 @@ pub fn side_outputs(argv: &[String], msvc: bool) -> Result<Vec<String>, String> 
             Some(rest) if msvc => (rest, false),
             _ => (arg, msvc),
         };
+        // A source: not an option (a POSIX path is one too).
+        if cl && is_source(a) && (!a.starts_with(['/', '-']) || std::path::Path::new(a).is_file()) {
+            sources.push(a.to_string());
+            continue;
+        }
         if cl && let Some(o) = a.strip_prefix('/').or_else(|| a.strip_prefix('-')) {
+            // `/Fo:path` and `/Fo: path` too.
             if let Some(p) = o.strip_prefix("Fo") {
-                output = value(p, &mut i);
+                output = value(p.strip_prefix(':').unwrap_or(p), &mut i);
+                continue;
+            }
+            if let Some(p) = o.strip_prefix("Tc").or_else(|| o.strip_prefix("Tp")) {
+                sources.extend(value(p, &mut i));
                 continue;
             }
             if o == "Zi" || o == "ZI" {
@@ -65,9 +86,11 @@ pub fn side_outputs(argv: &[String], msvc: bool) -> Result<Vec<String>, String> 
                 if p.starts_with(':') {
                     continue; // `/sourceDependencies:directives`, never alone.
                 }
+                // A directory (named so, or one there is) gets a file named
+                // after the source.
                 match value(p, &mut i) {
                     Some(v) if v == "-" => {}
-                    Some(v) if !v.ends_with(['/', '\\']) => files.push(v),
+                    Some(v) if !v.ends_with(['/', '\\']) && !std::path::Path::new(&v).is_dir() => files.push(v),
                     _ => return unknown(arg),
                 }
                 continue;
@@ -126,6 +149,11 @@ pub fn side_outputs(argv: &[String], msvc: bool) -> Result<Vec<String>, String> 
         } else if a.starts_with("-save-temps") || a.starts_with("-fdump-") || a == "-fcallgraph-info" || a.starts_with("-fcallgraph-info=") || a == "-aux-info"
         {
             return unknown(arg);
+        } else if let Some(flag) = ["-dumpdir", "-dumpbase-ext", "-dumpbase"].into_iter().find(|f| a.starts_with(f)) {
+            renamed = Some(flag);
+            if a == flag {
+                i += 1;
+            }
         } else if matches!(
             a,
             "-MT" | "-MQ" | "-Xclang" | "-mllvm" | "-Xlinker" | "-Xassembler" | "-Xpreprocessor" | "-D" | "-U" | "-I" | "-include" | "-isystem"
@@ -139,7 +167,18 @@ pub fn side_outputs(argv: &[String], msvc: bool) -> Result<Vec<String>, String> 
     if pdb && !clang_cl {
         return unknown("/Zi");
     }
+    // `/Fo<dir>\`: the object is named after the source, there.
+    let output = match output {
+        Some(o) if msvc && o.ends_with(['/', '\\']) => match sources.as_slice() {
+            [s] => Some(format!("{o}{}", with_extension(&s[s.rfind(['/', '\\']).map_or(0, |i| i + 1)..], "obj"))),
+            _ => None,
+        },
+        o => o,
+    };
     let next_to_output = |ext: &str| -> Result<String, String> {
+        if let Some(flag) = renamed {
+            return Err(format!("{flag} renames the .{ext} file the action would return"));
+        }
         output.as_deref().map(|o| with_extension(o, ext)).ok_or_else(|| format!("no output to name the .{ext} file after"))
     };
     if split_dwarf {
@@ -211,6 +250,28 @@ mod tests {
         assert!(outs("clang -c a.c -gsplit-dwarf", false).is_err());
         // A macro named like an option is no option.
         assert_eq!(outs(&format!("{base} -D -ftime-trace"), false).unwrap(), Vec::<String>::new());
+        // Files named after the output another way: they can't be named.
+        assert!(outs(&format!("{base} -gsplit-dwarf -dumpdir obj/x/"), false).is_err());
+        assert!(outs(&format!("{base} --coverage -dumpbase a.c"), false).is_err());
+        assert_eq!(outs(&format!("{base} -dumpdir obj/x/"), false).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cl_output_forms() {
+        // `/Fo:` with the path glued or apart, and a directory.
+        assert_eq!(outs("clang-cl /c a.c /Fo:obj/a.obj -ftime-trace", true).unwrap(), ["obj/a.json"]);
+        assert_eq!(outs("clang-cl /c a.c /Fo: obj/a.obj -ftime-trace", true).unwrap(), ["obj/a.json"]);
+        assert_eq!(outs(r"clang-cl /c src\a.c /Foobj\ -ftime-trace", true).unwrap(), [r"obj\a.json"]);
+        assert_eq!(outs("clang-cl /c /Tpsrc/a.cxx /Foobj/ /clang:-gsplit-dwarf", true).unwrap(), ["obj/a.dwo"]);
+        // Several sources into a directory: no one object to name them after.
+        assert!(outs("clang-cl /c a.c b.c /Foobj/ -ftime-trace", true).is_err());
+        // /sourceDependencies naming a directory that is there, without a
+        // trailing separator.
+        let dir = std::env::temp_dir().join(format!("ninja-rs-srcdeps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmd = format!("cl.exe /c a.c /Foobj/a.obj /sourceDependencies {}", dir.to_string_lossy());
+        assert!(side_outputs(&cmd.split(' ').map(str::to_string).collect::<Vec<_>>(), true).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

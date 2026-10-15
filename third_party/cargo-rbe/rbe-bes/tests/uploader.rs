@@ -18,6 +18,8 @@ struct Recorded {
     lifecycle: Vec<bes::PublishLifecycleEventRequest>,
     /// Requests received, per stream (one entry per `PublishBuildToolEventStream` call).
     streams: Vec<Vec<bes::PublishBuildToolEventStreamRequest>>,
+    /// The calls answered, in order: lifecycle events, and streams opened.
+    calls: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -30,6 +32,20 @@ struct Fake {
     refuse: Option<tonic::Code>,
     /// Lifecycle events are answered once this has permits.
     lifecycle_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Lifecycle events are answered after this long.
+    lifecycle_delay: Duration,
+    /// The first lifecycle events, so many of them, fail with this code.
+    lifecycle_failures: Option<(tonic::Code, usize)>,
+}
+
+fn kind(e: &Event) -> &'static str {
+    match e {
+        Event::BuildEnqueued(_) => "enqueued",
+        Event::InvocationAttemptStarted(_) => "started",
+        Event::InvocationAttemptFinished(_) => "invocation finished",
+        Event::BuildFinished(_) => "build finished",
+        _ => "other",
+    }
 }
 
 #[tonic::async_trait]
@@ -38,7 +54,18 @@ impl PublishBuildEvent for Fake {
         if let Some(gate) = &self.lifecycle_gate {
             let _permit = gate.acquire().await.unwrap();
         }
-        self.rec.lock().unwrap().lifecycle.push(req.into_inner());
+        tokio::time::sleep(self.lifecycle_delay).await;
+        let mut rec = self.rec.lock().unwrap();
+        if let Some((code, n)) = self.lifecycle_failures
+            && rec.calls.iter().filter(|c| *c == "failed").count() < n
+        {
+            rec.calls.push("failed".into());
+            return Err(Status::new(code, "no lifecycle events here"));
+        }
+        let req = req.into_inner();
+        let what = kind(req.build_event.as_ref().unwrap().event.as_ref().unwrap().event.as_ref().unwrap());
+        rec.calls.push(what.into());
+        rec.lifecycle.push(req);
         Ok(Response::new(()))
     }
 
@@ -54,6 +81,7 @@ impl PublishBuildEvent for Fake {
         let mut incoming = req.into_inner();
         let stream_index = {
             let mut rec = self.rec.lock().unwrap();
+            rec.calls.push("stream".into());
             rec.streams.push(Vec::new());
             rec.streams.len() - 1
         };
@@ -81,6 +109,11 @@ impl PublishBuildEvent for Fake {
 }
 
 async fn serve(fake: Fake) -> tonic::transport::Channel {
+    let addr = serve_at(fake).await;
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap()
+}
+
+async fn serve_at(fake: Fake) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(
@@ -88,7 +121,7 @@ async fn serve(fake: Fake) -> tonic::transport::Channel {
             .add_service(PublishBuildEventServer::new(fake))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
-    tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap()
+    addr
 }
 
 fn config() -> BesConfig {
@@ -136,8 +169,8 @@ async fn streams_events_in_order_between_lifecycle_events() {
         let id = r.ordered_build_event.as_ref().unwrap().stream_id.as_ref().unwrap();
         assert_eq!((id.build_id.as_str(), id.invocation_id.as_str()), ("build-1", "inv-1"));
         assert_eq!(id.component, bes::stream_id::BuildComponent::Tool as i32);
-        // Keywords only on the first event. The stream doesn't wait for
-        // the lifecycle events: the server mustn't check for them.
+        // Keywords only on the first event. The lifecycle events before the
+        // stream may have failed: the server mustn't check for them.
         assert_eq!(r.notification_keywords.is_empty(), i > 0);
         assert!(!r.check_preceding_lifecycle_events_present);
     }
@@ -153,14 +186,7 @@ async fn streams_events_in_order_between_lifecycle_events() {
         .iter()
         .map(|r| {
             let e = r.build_event.as_ref().unwrap();
-            let kind = match e.event.as_ref().unwrap().event.as_ref().unwrap() {
-                Event::BuildEnqueued(_) => "enqueued",
-                Event::InvocationAttemptStarted(_) => "started",
-                Event::InvocationAttemptFinished(_) => "invocation finished",
-                Event::BuildFinished(_) => "build finished",
-                _ => "other",
-            };
-            (kind, e.sequence_number)
+            (kind(e.event.as_ref().unwrap().event.as_ref().unwrap()), e.sequence_number)
         })
         .collect();
     assert_eq!(kinds, vec![("enqueued", 1), ("started", 1), ("invocation finished", 2), ("build finished", 2)]);
@@ -230,25 +256,121 @@ async fn without_lifecycle_events_only_the_stream_is_sent() {
 }
 
 #[tokio::test]
-async fn lifecycle_events_dont_hold_the_stream_back() {
+async fn lifecycle_start_events_go_before_the_stream() {
+    // Slow, but within the deadline: the stream waits for them.
+    let fake = Fake { lifecycle_delay: Duration::from_millis(200), ..Default::default() };
+    let up = BesUploader::start(serve(fake.clone()).await, config());
+    up.send(progress(0, "x"));
+    up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+    assert_eq!(fake.rec.lock().unwrap().calls, ["enqueued", "started", "stream", "invocation finished", "build finished"]);
+}
+
+#[tokio::test]
+async fn lifecycle_events_hold_the_stream_back_briefly() {
+    // A lifecycle service that never answers: the stream goes on after a
+    // deadline; the upload went through, without them.
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let fake = Fake { lifecycle_gate: Some(gate.clone()), ..Default::default() };
-    let up = BesUploader::start(serve(fake.clone()).await, config());
+    let mut c = config();
+    c.rpc_timeout = Duration::from_millis(300);
+    c.max_retries = 1;
+    let up = BesUploader::start(serve(fake.clone()).await, c);
     for i in 0..3 {
         up.send(progress(i, "x"));
     }
-    // The events go out while the lifecycle service hasn't answered.
-    let streamed = async {
-        while fake.rec.lock().unwrap().streams.first().is_none_or(|s| s.len() < 3) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), streamed).await.expect("the stream waited for the lifecycle events");
-    assert!(fake.rec.lock().unwrap().lifecycle.is_empty());
-    gate.add_permits(100);
+    let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+    assert!(summary.lifecycle_error.is_some_and(|e| e.contains("BuildEnqueued") && e.contains("no answer")));
+    let rec = fake.rec.lock().unwrap();
+    assert_eq!(seqs(&rec.streams[0]), [1, 2, 3, 4]);
+    assert!(rec.lifecycle.is_empty());
+}
+
+#[tokio::test]
+async fn failing_lifecycle_events_dont_fail_the_upload() {
+    // A BES without lifecycle events: every event is acked all the same.
+    let fake = Fake { lifecycle_failures: Some((tonic::Code::Unimplemented, usize::MAX)), ..Default::default() };
+    let up = BesUploader::start(serve(fake.clone()).await, config());
+    up.send(progress(0, "x"));
+    let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+    assert!(summary.lifecycle_error.is_some_and(|e| e.contains("no lifecycle events here")));
+    assert_eq!(seqs(&fake.rec.lock().unwrap().streams[0]), [1, 2]);
+}
+
+#[tokio::test]
+async fn the_build_ends_in_lifecycle_events_whenever_the_stream_went_through() {
+    // The events before the stream failed: those after it are sent, so that
+    // a lifecycle UI doesn't keep the invocation open.
+    let fake = Fake { lifecycle_failures: Some((tonic::Code::FailedPrecondition, 1)), ..Default::default() };
+    let up = BesUploader::start(serve(fake.clone()).await, config());
+    up.send(progress(0, "x"));
     up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
-    // The build's end comes after the stream's.
-    assert_eq!(fake.rec.lock().unwrap().lifecycle.len(), 4);
+    assert_eq!(fake.rec.lock().unwrap().calls, ["failed", "stream", "invocation finished", "build finished"]);
+}
+
+/// A TCP proxy in front of `upstream` dropping its first connection at
+/// the first request (once the HTTP/2 handshake went through): a reset,
+/// as a server restarting or a load balancer gives.
+async fn resetting_proxy(upstream: std::net::SocketAddr) -> tonic::transport::Channel {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut first = true;
+        while let Ok((mut client, _)) = listener.accept().await {
+            let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+            if !std::mem::take(&mut first) {
+                tokio::spawn(async move { tokio::io::copy_bidirectional(&mut client, &mut server).await });
+                continue;
+            }
+            tokio::spawn(async move {
+                let (mut cr, mut cw) = client.into_split();
+                let (mut sr, mut sw) = server.into_split();
+                let down = tokio::spawn(async move { tokio::io::copy(&mut sr, &mut cw).await });
+                let mut preface = [0u8; 24];
+                if cr.read_exact(&mut preface).await.is_err() || sw.write_all(&preface).await.is_err() {
+                    return;
+                }
+                // HTTP/2 frames up to the first HEADERS one (a request).
+                loop {
+                    let mut h = [0u8; 9];
+                    if cr.read_exact(&mut h).await.is_err() || h[3] == 1 {
+                        break;
+                    }
+                    let mut payload = vec![0u8; ((h[0] as usize) << 16) | ((h[1] as usize) << 8) | h[2] as usize];
+                    if cr.read_exact(&mut payload).await.is_err() || sw.write_all(&h).await.is_err() || sw.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                }
+                down.abort();
+            });
+        }
+    });
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap()
+}
+
+#[tokio::test]
+async fn connections_broken_before_any_answer_are_made_again() {
+    for lifecycle_events in [true, false] {
+        let fake = Fake::default();
+        let mut c = config();
+        c.lifecycle_events = lifecycle_events;
+        let up = BesUploader::start(resetting_proxy(serve_at(fake.clone()).await).await, c);
+        up.send(progress(0, "x"));
+        let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+        assert_eq!(summary.lifecycle_error, None);
+        let rec = fake.rec.lock().unwrap();
+        assert_eq!(seqs(rec.streams.last().unwrap()), [1, 2]);
+        assert_eq!(rec.lifecycle.len(), if lifecycle_events { 4 } else { 0 });
+    }
+}
+
+#[tokio::test]
+async fn invalid_headers_fail_the_upload() {
+    let mut c = config();
+    c.headers = vec![("x-api-key".into(), "line\nbreak".into())];
+    let up = BesUploader::start(serve(Fake::default()).await, c);
+    let err = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap_err();
+    assert!(err.to_string().contains("invalid value for header `x-api-key`"), "{err}");
 }
 
 /// A backend that accepts connections and never says anything (as a hung

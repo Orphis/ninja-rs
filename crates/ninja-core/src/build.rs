@@ -674,11 +674,14 @@ impl Default for BuildConfig {
 pub struct BuildError {
     pub message: String,
     pub interrupted: bool,
+    /// What ninja (1.13) exits with: the code of the last command that
+    /// failed, else 1.
+    pub exit_code: i32,
 }
 
 impl BuildError {
     fn new(m: impl Into<String>) -> Self {
-        Self { message: m.into(), interrupted: false }
+        Self { message: m.into(), interrupted: false, exit_code: 1 }
     }
 }
 
@@ -698,6 +701,8 @@ pub struct Builder<'a> {
     rewinds: HashMap<EdgeId, u32>,
     /// Targets and validation nodes given to the dirty scan so far.
     scanned: Vec<NodeId>,
+    /// The exit code of the last command that failed, 0 before any.
+    failure_code: i32,
 }
 
 /// How many times an edge may wait again for lost inputs before it fails.
@@ -728,6 +733,7 @@ impl<'a> Builder<'a> {
             deps_node_cache: Vec::new(),
             rewinds: HashMap::default(),
             scanned: Vec::new(),
+            failure_code: 0,
         }
     }
 
@@ -1359,6 +1365,14 @@ impl<'a> Builder<'a> {
                 let mut capacity = runner.can_run_more();
                 while capacity > 0 {
                     let Some(edge) = self.find_work() else { break };
+                    // As in ninja: a generator (CMake) may run `-t restat`,
+                    // which replaces the build log; records go to the new
+                    // one, reopened when the next is written.
+                    if self.state.edge_binding_bool(edge, "generator")
+                        && let Some(log) = self.build_log.as_deref_mut()
+                    {
+                        log.close();
+                    }
                     if let Err(e) = self.start_edge(edge, runner) {
                         self.cleanup(runner).await;
                         self.status.build_finished();
@@ -1394,7 +1408,7 @@ impl<'a> Builder<'a> {
                 if result.status == ExitStatus::Interrupted {
                     self.cleanup(runner).await;
                     self.status.build_finished();
-                    return Err(BuildError { message: "interrupted by user".into(), interrupted: true });
+                    return Err(BuildError { message: "interrupted by user".into(), interrupted: true, exit_code: 130 });
                 }
                 let success = match self.finish_command(result) {
                     Ok(success) => success,
@@ -1420,7 +1434,7 @@ impl<'a> Builder<'a> {
             } else {
                 "stuck [this is a bug]"
             };
-            return Err(BuildError::new(msg));
+            return Err(BuildError { exit_code: if self.failure_code != 0 { self.failure_code } else { 1 }, ..BuildError::new(msg) });
         }
         self.status.build_finished();
         let _ = self.disk.remove_file(&self.lock_file_path);
@@ -1603,6 +1617,9 @@ impl<'a> Builder<'a> {
             ExitStatus::Failure(c) => Some(c),
             ExitStatus::Interrupted => Some(130),
         };
+        if let Some(c) = code {
+            self.failure_code = c;
+        }
         self.status.build_edge_finished(&info, end_ms, code, &result.kind, &result.output);
 
         // The rest of this function only applies to successful commands.

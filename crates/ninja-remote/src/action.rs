@@ -10,6 +10,7 @@ use rbe_client::proto as re;
 use rbe_client::{BlobSet, BlobSource, DigestCache, InputTree};
 
 use crate::cmdline::{join_posix_chain, join_rsp, split_rsp, unwrap_command};
+use crate::env::Tool;
 use crate::paths::{ExecRoot, PathMapper, TreeIndex, normalize_abs};
 use crate::scanner::{self, Scanner, Style, decode_rsp, expand_response_files, parse_compile, search_path};
 use crate::store::Store;
@@ -66,6 +67,8 @@ pub struct Shared {
     /// contents may change during the build, so the scanners check them
     /// every time.
     pub volatile: Vec<PathBuf>,
+    /// `--action_env`: variables every action gets, as given.
+    pub action_env: Vec<(String, String)>,
 }
 
 impl Shared {
@@ -119,10 +122,28 @@ pub struct Prepared {
     /// declares: one the generator vouches the action describes, with the
     /// files it sends.
     pub toolchain_declared: bool,
+    /// The inputs read from the host's files, with the digests the key
+    /// has (not those of toolchain directories, sent whole): a local run
+    /// checks them afterwards.
+    pub local_inputs: Vec<(PathBuf, re::Digest)>,
+    /// A variable set here that a tool of the action reads, which the
+    /// action can't carry (see `env`): a local run's result isn't the
+    /// action's.
+    pub env_refused: Option<String>,
 }
 
 fn to_s(p: &Path) -> String {
     p.to_string_lossy().into_owned()
+}
+
+/// Whether a step's command line is cl-style (cl.exe, clang-cl, MSVC's
+/// linkers and librarian): `/D` defines a macro there.
+fn cl_style(exe: &Path, argv: &[String]) -> bool {
+    let name = exe.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    scanner::compiler_style(&to_s(exe), argv) == Some(Style::Msvc)
+        || crate::link::linker_flavor(&to_s(exe)) == Some(crate::link::Flavor::Msvc)
+        || name == "lib"
+        || name == "llvm-lib"
 }
 
 /// Prepares the REAPI action for `task`. Errors mean "run it locally".
@@ -170,9 +191,16 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     let mut whole_dirs: Vec<PathBuf> = Vec::new();
     let mut rsp_files: Vec<PathBuf> = Vec::new();
     let (expanded, rsps) = expand_response_files(argv, build_dir, windows);
+    // Steps with cl-style command lines, and their response files.
+    let cl_steps: Vec<bool> = steps.iter().zip(&exes).map(|(s, e)| cl_style(e, s)).collect();
+    let mut cl_rsp_files: Vec<PathBuf> = if cl_steps[0] { rsps.clone() } else { Vec::new() };
     rsp_files.extend(rsps);
-    for later in &steps[1..] {
-        rsp_files.extend(expand_response_files(later, build_dir, windows).1);
+    for (later, cl) in steps[1..].iter().zip(&cl_steps[1..]) {
+        let rsps = expand_response_files(later, build_dir, windows).1;
+        if *cl {
+            cl_rsp_files.extend(rsps.iter().cloned());
+        }
+        rsp_files.extend(rsps);
     }
     // A driver that compiles nothing links: its linker's inputs are found
     // from its dry run, like a linker's from its arguments.
@@ -236,12 +264,19 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         match found {
             Ok(found) => {
                 files.extend(found);
-                files.extend(parse_compile(&expanded, build_dir).extra_files);
+                let info = parse_compile(&expanded, build_dir);
+                files.extend(info.extra_files);
+                whole_dirs.extend(info.extra_dirs);
                 scanned = true;
             }
             Err(e) => {
+                // Every time with --remote_verbose, else once per reason.
+                let why = format!("{:?} include scanner: {e}; scanning conservatively", shared.include_scanner);
+                if shared.store.scan.fell_back(&e) && !shared.verbose {
+                    eprintln!("ninja-rs: warning: {why} (said once per reason)");
+                }
                 if shared.verbose {
-                    warnings.push(format!("{:?} include scanner: {e}; scanning conservatively", shared.include_scanner));
+                    warnings.push(why);
                 }
             }
         }
@@ -275,6 +310,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         whole_dirs.extend(r.dirs);
         warnings.extend(r.warnings);
         files.extend(info.extra_files);
+        whole_dirs.extend(info.extra_dirs);
     }
     // Declared inputs (explicit, implicit, and deps found by earlier builds).
     // Outputs of remote actions that weren't downloaded go in by digest.
@@ -311,7 +347,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     // Thin archives bring their members, which aren't declared inputs (a
     // compile reads none).
     if style.is_none() || driver_link {
-        let members = crate::archive::expand(&task.inputs, build_dir, shared.remote_outputs.as_deref(), &shared.store)?;
+        let members = crate::archive::expand(&task.inputs, build_dir, shared.remote_outputs.as_deref(), &shared.store, crate::archive::Outside::Refuse)?;
         for m in members {
             let p = scanner::normalize(&build_dir.join(&m));
             if p.is_file() {
@@ -455,23 +491,41 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         let rel = mapper.tree_path(&to_s(f)).ok_or_else(|| format!("{} is outside the exec root", f.display()))?;
         inputs.push((rel, f.clone()));
     }
+    // A definition keeps its absolute path (see `PathMapper::rewrite_args`):
+    // one naming an input (a header included through the macro) names it
+    // where a remote worker doesn't have it.
+    {
+        let programs: std::collections::HashSet<String> = exes.iter().map(|e| path_key(&scanner::normalize(e))).collect();
+        let read: std::collections::HashSet<String> = inputs.iter().map(|(_, f)| path_key(f)).filter(|k| !programs.contains(k)).collect();
+        let rsp_args: Vec<(Vec<String>, bool)> = rsp_rewritten.iter().map(|(p, c)| (split_rsp(c, windows), cl_rsp_files.contains(p))).collect();
+        let args = steps.iter().zip(cl_steps.iter().copied()).chain(rsp_args.iter().map(|(a, cl)| (a, *cl)));
+        for (argv, cl) in args {
+            if let Some(p) =
+                crate::paths::defined_paths(argv, cl, windows).into_iter().find(|p| read.contains(&path_key(Path::new(&normalize_abs(p, windows)))))
+            {
+                return Err(format!("a definition names the input {p} by its absolute path, which a remote worker doesn't have"));
+            }
+        }
+    }
     // Digests: the daemon's, which knows what didn't change, or hashed here
     // (through the digest cache).
     let known = shared.daemon().and_then(|d| {
         let paths: Vec<PathBuf> = inputs.iter().map(|(_, f)| f.clone()).collect();
         d.files(&paths).map_err(|e| shared.daemon_failed(&e)).ok()
     });
+    let mut local_inputs = Vec::with_capacity(inputs.len());
     for (i, (rel, f)) in inputs.into_iter().enumerate() {
-        match known.as_ref().map(|k| &k[i]) {
+        let (digest, executable) = match known.as_ref().map(|k| &k[i]) {
             Some(Ok(info)) => {
                 let digest = re::Digest { hash: info.hash.clone(), size_bytes: info.size as i64 };
                 // Saved with the build's digests, for a daemon that restarts.
                 store.digests.put(&f, info.stamp(), digest.clone());
-                tree.add_file_with_digest(&rel, &f, digest, info.executable)
+                (digest, info.executable)
             }
-            _ => tree.add_file_cached(&rel, &f, Some(&store.digests)),
-        }
-        .map_err(|e| format!("{e:#}"))?;
+            _ => (rbe_client::tree::file_digest(&f, Some(&store.digests)).map_err(|e| format!("{e:#}"))?, crate::backend::is_executable(&f)),
+        };
+        tree.add_file_with_digest(&rel, &f, digest.clone(), executable).map_err(|e| format!("{e:#}"))?;
+        local_inputs.push((f, digest));
         tree_files.push(rel);
         input_files += 1;
     }
@@ -493,7 +547,8 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     let mut rsp_files = Vec::new();
     for (path, content) in rsp_rewritten {
         let rel = mapper.tree_path(&to_s(&path)).ok_or_else(|| format!("{} is outside the exec root", path.display()))?;
-        let args: Vec<String> = mapper.rewrite_args(&split_rsp(&content, windows)).into_iter().map(slashed).collect();
+        let cl = cl_rsp_files.contains(&path);
+        let args: Vec<String> = mapper.rewrite_args(&split_rsp(&content, windows), cl).into_iter().map(slashed).collect();
         let bytes = join_rsp(&args, windows).into_bytes();
         tree.add_bytes(&rel, bytes.clone(), false).map_err(|e| format!("{e:#}"))?;
         rsp_files.push((path, bytes));
@@ -504,8 +559,8 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
 
     // Command line: one command, or a chain run by the shell.
     let mut remote_steps: Vec<Vec<String>> = Vec::new();
-    for (argv, exe) in steps.iter().zip(&exes) {
-        let mut arguments: Vec<String> = mapper.rewrite_args(argv).into_iter().map(slashed).collect();
+    for ((argv, exe), cl) in steps.iter().zip(&exes).zip(&cl_steps) {
+        let mut arguments: Vec<String> = mapper.rewrite_args(argv, *cl).into_iter().map(slashed).collect();
         if let Some(rel) = mapper.tree_path(&to_s(exe)) {
             let mut p = mapper.rel_from_work_dir(&rel);
             if !p.contains('/') {
@@ -520,13 +575,18 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     }
     let arguments =
         if remote_steps.len() == 1 { remote_steps.pop().unwrap() } else { vec!["/bin/sh".to_string(), "-c".to_string(), join_posix_chain(&remote_steps)] };
-    let mut env: BTreeMap<String, String> = BTreeMap::new();
-    if style == Some(Style::Msvc)
-        && let Ok(inc) = std::env::var("INCLUDE")
-    {
-        let mapped: Vec<String> = inc.split(';').filter(|s| !s.is_empty()).map(|p| mapper.rewrite_arg(p)).collect();
-        env.insert("INCLUDE".into(), mapped.join(";"));
-    }
+    // The variables its tools read (see `env`).
+    let tools: Vec<Tool> = steps
+        .iter()
+        .zip(&exes)
+        .enumerate()
+        .map(|(i, (argv, exe))| {
+            let style = scanner::compiler_style(&to_s(exe), argv);
+            if i == 0 { Tool::of(exe, &expanded, style) } else { Tool::of(exe, argv, style) }
+        })
+        .collect();
+    let (env, env_refused): (BTreeMap<String, String>, Option<String>) =
+        crate::env::action_env(&tools, &mut mapper, &|name| std::env::var(name).ok(), &shared.action_env);
 
     // Outputs.
     let mut outputs = Vec::new();
@@ -607,6 +667,8 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         input_root_digest,
         input_digests,
         toolchain_declared,
+        local_inputs,
+        env_refused,
     })
 }
 

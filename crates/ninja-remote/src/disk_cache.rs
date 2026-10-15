@@ -24,7 +24,7 @@
 //! digests, in `chunked/`. Blobs that differ by a few edits, such as two
 //! builds of an executable, then share most of their chunks, and the cache
 //! stores those once. A blob downloaded from a remote cache that splits
-//! blobs keeps the remote's chunks ([`DiskCache::put_chunked`]). Every blob goes through [`DiskCache::read_blob`] and
+//! blobs keeps the remote's chunks ([`DiskCache::put_chunked_into`]). Every blob goes through [`DiskCache::read_blob`] and
 //! the `put_*` methods, which split and reassemble them: callers don't see
 //! chunks. A blob is present when it is stored whole or when its layout and
 //! all its chunks are, so a layout may outlive some of its chunks.
@@ -216,7 +216,10 @@ impl DiskCache {
             data.extend_from_slice(&self.read_whole(c)?);
         }
         // The layout names the chunks; the whole must still be the blob.
-        rbe_client::verify(d, &data).ok()?;
+        if rbe_client::verify(d, &data).is_err() {
+            self.drop_layout(d);
+            return None;
+        }
         Some(data)
     }
 
@@ -231,16 +234,42 @@ impl DiskCache {
             return out.write_all(&data).is_ok();
         }
         let Some(chunks) = self.layout(d) else { return false };
-        let mut hasher = Sha256::new();
-        for c in &chunks {
-            let Some(data) = self.read_whole(c) else { return false };
-            hasher.update(&data);
-            if out.write_all(&data).is_err() {
-                return false;
+        match self.assemble(&chunks, d, out) {
+            Some(true) => true,
+            Some(false) => {
+                self.drop_layout(d);
+                false
             }
+            None => false,
         }
-        // The layout names the chunks; the whole must still be the blob.
-        hex::encode(hasher.finalize()) == d.hash
+    }
+
+    /// Writes chunks to `out`: whether they make up the blob `d`, or None
+    /// when one is missing or `out` fails.
+    fn assemble(&self, chunks: &[re::Digest], d: &re::Digest, out: &mut dyn Write) -> Option<bool> {
+        let mut hasher = Sha256::new();
+        for c in chunks {
+            let data = self.read_whole(c)?;
+            hasher.update(&data);
+            out.write_all(&data).ok()?;
+        }
+        Some(hex::encode(hasher.finalize()) == d.hash)
+    }
+
+    /// Removes a layout whose chunks don't make up its blob (a server's
+    /// wrong answer, a writer's bug): a miss, which storing the blob again
+    /// replaces. Kept, the blob would look present and never be readable.
+    fn drop_layout(&self, d: &re::Digest) {
+        if let Some(p) = self.layout_path(&d.hash) {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// The file of a blob stored whole, unread: for a part of it (a thin
+    /// archive's member list), which can't be checked against the digest.
+    pub fn blob_file(&self, d: &re::Digest) -> Option<PathBuf> {
+        let p = self.blob_path(&d.hash)?;
+        std::fs::metadata(&p).is_ok_and(|m| m.len() as i64 == d.size_bytes).then_some(p)
     }
 
     /// A blob stored whole. One whose contents aren't its digest (a torn
@@ -280,28 +309,45 @@ impl DiskCache {
     /// split as it's read, without loading it whole.
     pub fn put_file(&self, path: &Path, digests: Option<&dyn DigestCache>) -> anyhow::Result<re::Digest> {
         let d = rbe_client::tree::file_digest(path, digests)?;
-        if self.contains_blob(&d) {
-            return Ok(d);
+        self.put_file_as(path, &d, true)?;
+        Ok(d)
+    }
+
+    /// Stores a file known to hold the blob `d` (a download, checked as it
+    /// was written, into a file only this process writes): read once, and
+    /// hashed only to name its chunks. Should the file not be the blob
+    /// after all, its layout is dropped when read (see `read_blob`).
+    pub fn put_file_with_digest(&self, path: &Path, d: &re::Digest) -> anyhow::Result<()> {
+        self.put_file_as(path, d, false)
+    }
+
+    /// Stores `path` as the blob `d`; `check`: that its contents are still
+    /// `d`'s, when it was hashed earlier and could have changed since.
+    fn put_file_as(&self, path: &Path, d: &re::Digest, check: bool) -> anyhow::Result<()> {
+        if self.contains_blob(d) {
+            return Ok(());
         }
-        if !is_chunked(&d) {
+        if !is_chunked(d) {
             let data = std::fs::read(path)?;
             anyhow::ensure!(data.len() as i64 == d.size_bytes, "{} changed while being stored", path.display());
             self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, &data)?;
-            return Ok(d);
+            return Ok(());
         }
         let file = std::fs::File::open(path)?;
         let mut whole = Sha256::new();
-        let mut chunks = Vec::new();
+        let (mut chunks, mut size) = (Vec::new(), 0);
         for c in CHUNKER.stream(file) {
             let c = c.map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-            whole.update(&c.data);
+            if check {
+                whole.update(&c.data);
+            }
+            size += c.data.len() as i64;
             chunks.push(self.put_chunk(&c.data)?);
         }
-        // The layout must describe the blob `d` names: check the file
-        // didn't change since it was hashed.
-        anyhow::ensure!(hex::encode(whole.finalize()) == d.hash, "{} changed while being stored", path.display());
-        self.put_layout(&d, re::SplitBlobResponse { chunk_digests: chunks, chunking_function: FAST_CDC })?;
-        Ok(d)
+        // The layout must describe the blob `d` names.
+        anyhow::ensure!(size == d.size_bytes && (!check || hex::encode(whole.finalize()) == d.hash), "{} changed while being stored", path.display());
+        self.put_layout(d, re::SplitBlobResponse { chunk_digests: chunks, chunking_function: FAST_CDC })?;
+        Ok(())
     }
 
     fn put_chunk(&self, chunk: &[u8]) -> std::io::Result<re::Digest> {
@@ -336,11 +382,19 @@ impl DiskCache {
         self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, data)
     }
 
-    /// Records how a large blob (see [`is_chunked`]) was split. Its chunks
-    /// must be stored first, and have been checked to make it up.
-    pub fn put_chunked(&self, d: &re::Digest, split: re::SplitBlobResponse) -> std::io::Result<()> {
-        debug_assert!(is_chunked(d));
-        self.put_layout(d, split)
+    /// Writes the blob the chunks a remote split `d` into make up to `out`,
+    /// and records that layout when they make up `d`: a server's wrong
+    /// answer is never stored. Its chunks must be stored first. Whether
+    /// they did; what was written is to be discarded when they didn't.
+    pub fn put_chunked_into(&self, d: &re::Digest, split: re::SplitBlobResponse, out: &mut dyn Write) -> std::io::Result<bool> {
+        if !is_chunked(d) || split.chunk_digests.iter().map(|c| c.size_bytes).sum::<i64>() != d.size_bytes {
+            return Ok(false);
+        }
+        if self.assemble(&split.chunk_digests, d, out) != Some(true) {
+            return Ok(false);
+        }
+        self.put_layout(d, split)?;
+        Ok(true)
     }
 
     /// The action's result, if cached and if the CAS still holds all its
@@ -487,7 +541,7 @@ mod tests {
     use super::*;
 
     fn cache(name: &str) -> (DiskCache, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-disk-cache-{}-{name}", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-disk-cache-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (DiskCache::open(&dir).unwrap(), dir)
     }
@@ -603,6 +657,8 @@ mod tests {
         assert_eq!(c.bytes_written(), 10);
         other.unlock().unwrap();
         assert!(c.collect_garbage(1000, 900).unwrap().is_some());
+        // Closed first: Windows doesn't remove open files.
+        drop((c, other));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -685,6 +741,66 @@ mod tests {
         std::fs::write(&f, &small).unwrap();
         let d = c.put_file(&f, None).unwrap();
         assert!(c.blob_path(&d.hash).unwrap().exists() && !c.layout_path(&d.hash).unwrap().exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A layout whose chunks are each right and add up to the size, but
+    /// don't make up the blob (a server's wrong split): never stored from a
+    /// download, and one stored anyway (by another writer) is dropped when
+    /// read, so that storing the blob replaces it.
+    #[test]
+    fn wrong_layouts() {
+        let (c, dir) = cache("wrong-layout");
+        let real = noise(5 << 20, 7);
+        let d = rbe_client::digest_of(&real);
+        let other = noise(5 << 20, 8);
+        let (a, b) = other.split_at(3 << 20);
+        let (da, db) = (rbe_client::digest_of(a), rbe_client::digest_of(b));
+        c.put_chunk_bytes(&da, a).unwrap();
+        c.put_chunk_bytes(&db, b).unwrap();
+        let split = re::SplitBlobResponse { chunk_digests: vec![da, db], chunking_function: FAST_CDC };
+        let mut sink = Vec::new();
+        assert!(!c.put_chunked_into(&d, split.clone(), &mut sink).unwrap());
+        assert!(!c.contains_blob(&d));
+        // Stored anyway: it looks present until read.
+        c.put_layout(&d, split.clone()).unwrap();
+        assert!(c.contains_blob(&d));
+        assert!(c.read_blob(&d).is_none());
+        assert!(!c.contains_blob(&d));
+        c.put_bytes(&d, &real).unwrap();
+        assert_eq!(c.read_blob(&d).unwrap(), real);
+        // The same through `read_blob_into`, then storing a file.
+        let f = dir.join("other.bin");
+        std::fs::write(&f, &other).unwrap();
+        let d2 = rbe_client::digest_of(&other);
+        let (x, y) = real.split_at(3 << 20);
+        let (dx, dy) = (rbe_client::digest_of(x), rbe_client::digest_of(y));
+        c.put_chunk_bytes(&dx, x).unwrap();
+        c.put_chunk_bytes(&dy, y).unwrap();
+        c.put_layout(&d2, re::SplitBlobResponse { chunk_digests: vec![dx, dy], chunking_function: FAST_CDC }).unwrap();
+        assert!(!c.read_blob_into(&d2, &mut Vec::new()));
+        assert_eq!(c.put_file(&f, None).unwrap(), d2);
+        assert_eq!(c.read_blob(&d2).unwrap(), other);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A download stored with its known digest: the same layout as hashing
+    /// it gives.
+    #[test]
+    fn files_with_known_digests() {
+        let (c, dir) = cache("known-digest");
+        let data = noise(5 << 20, 9);
+        let f = dir.join("big.bin");
+        std::fs::write(&f, &data).unwrap();
+        let d = rbe_client::digest_of(&data);
+        c.put_file_with_digest(&f, &d).unwrap();
+        let expected: Vec<_> = CHUNKER.chunks(&data).map(rbe_client::digest_of).collect();
+        assert_eq!(stored_layout(&c, &d), expected);
+        assert_eq!(c.read_blob(&d).unwrap(), data);
+        // A file that isn't the blob's size isn't stored as it.
+        let short = re::Digest { hash: "ab".repeat(32), size_bytes: d.size_bytes + 1 };
+        assert!(c.put_file_with_digest(&f, &short).is_err());
+        assert!(!c.contains_blob(&short));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

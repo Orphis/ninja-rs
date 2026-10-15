@@ -142,6 +142,11 @@ impl EventStream {
         self.posted.contains(&key(id))
     }
 
+    /// Whether the stream ended (`finish`): nothing can be posted after.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
     /// Posts an event, announcing it through a progress event first if no
     /// earlier event did. Posting an id again is a no-op.
     pub fn post(&mut self, id: bep::BuildEventId, children: Vec<bep::BuildEventId>, payload: Payload) -> Vec<bep::BuildEvent> {

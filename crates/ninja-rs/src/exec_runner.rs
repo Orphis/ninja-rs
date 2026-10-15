@@ -18,6 +18,7 @@ use std::time::Duration;
 use ninja_core::graph::EdgeId;
 use ninja_core::runner::{
     AbortFuture, CommandRunner, ExecKind, ExitStatus, LocalCapture, LocalCommand, Race, RemoteBackend, RemoteOutcome, Side, Task, TaskResult, WaitFuture,
+    with_host_stop,
 };
 use ninja_core::subprocess::{Interrupt, Stop, run_argv, run_argv_cancellable, run_local_command_cancellable, run_local_command_env};
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
@@ -313,7 +314,7 @@ async fn run_raced(
     let race = Race::new();
     let remote = async {
         let _permit = remote_slots.acquire().await;
-        backend.execute_raced(task.clone(), race.clone()).await
+        with_host_stop(stop.clone(), backend.execute_raced(task.clone(), race.clone())).await
     };
     let local = race_local(&task, &local_slots, &env, &backend, &race, racing.delay, &stop);
     tokio::pin!(remote, local);
@@ -424,7 +425,7 @@ impl CommandRunner for ExecRunner {
                 let h = self.tasks.spawn(async move {
                     let outcome = {
                         let _permit = remote_slots.acquire().await;
-                        backend.execute(task.clone()).await
+                        with_host_stop(stop.clone(), backend.execute(task.clone())).await
                     };
                     match outcome {
                         RemoteOutcome::Done(r) => r,
@@ -499,9 +500,10 @@ impl CommandRunner for ExecRunner {
 
     fn abort(&mut self) -> AbortFuture<'_> {
         Box::pin(async move {
-            // Local commands first, waited for, so that none writes outputs
-            // after the build deletes them; then the rest (remote
-            // executions, tasks waiting for a slot) is dropped.
+            // Local commands first (steps backends run on the host too),
+            // waited for, so that none writes outputs after the build
+            // deletes them; then the rest (remote executions, tasks waiting
+            // for a slot) is dropped.
             self.stop.stop(Some(&self.interrupt)).await;
             self.tasks.abort_all();
             while self.tasks.join_next().await.is_some() {}
@@ -538,13 +540,15 @@ mod tests {
 
     #[tokio::test]
     async fn abort_waits_for_every_local_process() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-abort", std::process::id()));
+        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-abort", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // The command's grandchild writes the marker after about 2 s.
         let marker = dir.join("late.txt");
         let command = if cfg!(windows) {
-            format!("cmd /c cmd /c \"ping -n 3 127.0.0.1 >nul & echo late> {}\"", marker.display())
+            // `waitfor` stops on Ctrl-Break; the marker is written only if it
+            // timed out.
+            format!("cmd /c cmd /v:on /c \"waitfor /t 2 ninjarsabort{} >nul 2>&1 & if !errorlevel! == 1 echo late> {}\"", std::process::id(), marker.display())
         } else {
             format!("sh -c 'sh -c \"sleep 2; echo late > {}\"; true'", marker.display())
         };
@@ -559,6 +563,51 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!marker.exists(), "a process of the command kept running");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A backend whose action is a step on the host.
+    #[cfg(unix)]
+    struct HostStep(String);
+
+    #[cfg(unix)]
+    impl RemoteBackend for HostStep {
+        fn wants(&self, _: &Task) -> bool {
+            true
+        }
+        fn execute(&self, task: Task) -> ninja_core::runner::RemoteFuture {
+            let argv = vec!["sh".to_string(), "-c".to_string(), self.0.clone()];
+            Box::pin(async move {
+                let stop = ninja_core::runner::host_stop();
+                let (status, output) = run_argv(&argv, &std::env::temp_dir(), &[], &stop).await;
+                RemoteOutcome::Done(TaskResult { edge: task.edge, status, output, kind: ExecKind::Remote, cas_outputs: Vec::new(), lost_inputs: Vec::new() })
+            })
+        }
+        fn max_jobs(&self) -> usize {
+            1
+        }
+    }
+
+    /// Steps a backend runs on the host are stopped as local commands are:
+    /// with the interrupt's signal, and waited for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_stops_host_steps() {
+        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-abort-host", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ready, stopped) = (dir.join("ready"), dir.join("stopped"));
+        let step = format!("trap 'echo > {}; exit 1' INT; echo > {}; while :; do sleep 0.1; done", stopped.display(), ready.display());
+        let interrupt = Interrupt::new();
+        let mut runner = ExecRunner::new(2, Some(Arc::new(HostStep(step))), interrupt.clone());
+        runner.start_command(Task::default()).unwrap();
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        interrupt.trigger();
+        assert_eq!(runner.wait_for_command().await.map(|r| r.status), Some(ExitStatus::Interrupted));
+        runner.abort().await;
+        assert!(stopped.exists(), "the step didn't get the interrupt's signal before the build went on");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

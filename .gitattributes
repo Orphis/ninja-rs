@@ -3,3 +3,6 @@
 crates/ninja-remote/testdata/** binary
 # Hooks run with sh on every platform: no carriage returns.
 .githooks/* text eol=lf
+# Read by sh and by rustc_env_files on every platform: no carriage returns.
+*.sh text eol=lf
+crates/ninja-daemon/commit.env text eol=lf

@@ -9,6 +9,10 @@ bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
 bazel_dep(name = "rules_cc", version = "0.2.26")
 
+# libzstd for zstd-sys, built with the C/C++ toolchain rather than by the
+# crate's build script (see the annotation below).
+bazel_dep(name = "zstd", version = "1.5.7.bcr.1")
+
 # Hermetic LLVM C/C++ toolchain (clang, clang-cl, lld, lld-link) and sysroots.
 # https://github.com/hermeticbuild/hermetic-llvm
 bazel_dep(name = "llvm", version = "0.8.24")
@@ -75,5 +79,20 @@ crate.from_cargo(
         "x86_64-pc-windows-gnullvm",
         "x86_64-unknown-linux-gnu",
     ],
+)
+
+# The C library from its module (rules_rs' well-known annotation): the
+# crate's build script would compile it outside Bazel's toolchain.
+crate.annotation(
+    crate = "zstd-sys",
+    gen_build_script = "off",
+    deps = ["@zstd"],
+)
+
+# Optimized in every build, as Cargo's profile has it: debug builds hash
+# toolchains (hundreds of MB, the tests' too) in seconds rather than minutes.
+crate.annotation(
+    crate = "sha2",
+    rustc_flags = ["-Copt-level=3"],
 )
 use_repo(crate, "crates")

@@ -2,9 +2,12 @@
 //! `--bes_backend`.
 //!
 //! - **Lifecycle events** (optional, like `--bes_lifecycle_events`):
-//!   `BuildEnqueued` and `InvocationAttemptStarted` alongside the stream
-//!   (which doesn't wait for them), `InvocationAttemptFinished` and
-//!   `BuildFinished` after it, through `PublishLifecycleEvent`.
+//!   `BuildEnqueued` and `InvocationAttemptStarted` before the stream, as
+//!   Bazel sends them (within `START_TIMEOUT`: a slow lifecycle service
+//!   doesn't hold the events back long), `InvocationAttemptFinished` and
+//!   `BuildFinished` once it went through, through `PublishLifecycleEvent`.
+//!   They don't fail the upload: what failed is in
+//!   `UploadSummary::lifecycle_error`.
 //! - **Build tool stream:** one `PublishBuildToolEventStream` call carrying
 //!   each event as an `OrderedBuildEvent` with consecutive sequence numbers,
 //!   ending with `ComponentStreamFinished`. The server acks sequence numbers;
@@ -14,8 +17,9 @@
 //! Events are queued without blocking and sent by a background task, which
 //! connects first, so a slow or unavailable backend never slows the build
 //! down. Every call has a deadline (`BesConfig::rpc_timeout`), and a
-//! backend that never answered anything isn't called again: the upload
-//! fails instead of waiting for it.
+//! backend that never answered anything isn't called again (but for a
+//! connection that broke, twice): the upload fails instead of waiting for
+//! it.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,7 +93,18 @@ pub struct UploadSummary {
     /// Build tool events sent, including the final `ComponentStreamFinished`.
     pub events: u64,
     pub reconnects: u32,
+    /// Why lifecycle events didn't all go through (the first failure).
+    pub lifecycle_error: Option<String>,
 }
+
+/// How long the lifecycle events before the stream may take: the stream
+/// waits for them.
+const START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Calls a backend that never answered anything gets again when the
+/// connection broke (reset, refused): one restarting, or a load balancer's
+/// hiccup.
+const FIRST_CONTACT_RETRIES: u32 = 2;
 
 enum Cmd {
     Event(Box<bep::BuildEvent>, SystemTime),
@@ -117,9 +132,11 @@ impl BesUploader {
         TRACE.store(config.trace, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
+            let mut rx = rx;
+            let headers = metadata(&config.headers)?;
             let channel = connect.await?;
             trace(format_args!("connected"));
-            run(PublishBuildEventClient::new(channel), config, rx).await
+            Upload { client: PublishBuildEventClient::new(channel), config, headers, answered: AtomicBool::new(false) }.run(&mut rx).await
         });
         Self { tx, task }
     }
@@ -203,8 +220,8 @@ pub fn lifecycle_requests(
 }
 
 /// One build tool stream request. Keywords go with the first event only,
-/// as Bazel does. The stream doesn't wait for the lifecycle events (see
-/// `run`): the server mustn't require them first.
+/// as Bazel does. The lifecycle events before the stream may have failed
+/// (see `Upload::run`): the server mustn't require them first.
 pub fn tool_request(config: &BesConfig, seq: i64, event: Event, at: SystemTime) -> bes::PublishBuildToolEventStreamRequest {
     bes::PublishBuildToolEventStreamRequest {
         ordered_build_event: Some(bes::OrderedBuildEvent {
@@ -222,45 +239,58 @@ pub fn pack(event: &bep::BuildEvent) -> Event {
     Event::BazelEvent(prost_types::Any { type_url: BAZEL_EVENT_TYPE_URL.into(), value: event.encode_to_vec() })
 }
 
-/// Makes a call until it succeeds, fails for good, or failed
-/// `max_retries` times. Each call may take `rpc_timeout`.
-async fn with_retries<T, F, Fut>(config: &BesConfig, what: &str, answered: &AtomicBool, mut f: F) -> Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, tonic::Status>>,
-{
-    let mut backoff = config.initial_backoff;
-    let mut attempt = 0;
-    loop {
-        let e = match tokio::time::timeout(config.rpc_timeout, f()).await {
-            Ok(Ok(v)) => {
-                answered.store(true, Ordering::Relaxed);
-                return Ok(v);
-            }
-            Ok(Err(e)) => {
-                note_answer(answered, &e);
-                e
-            }
-            Err(_) => no_answer(config),
-        };
-        if attempt >= config.max_retries || !retryable(&e) || !answered.load(Ordering::Relaxed) {
-            bail!("{what}: {e}");
-        }
-        attempt += 1;
-        tokio::time::sleep(backoff).await;
-        backoff *= 2;
+/// Extra gRPC headers as metadata.
+type Headers = Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>;
+
+/// `BesConfig::headers` as metadata: a name or value that isn't valid
+/// fails the upload, as an invalid `--remote_header` fails remote calls.
+fn metadata(headers: &[(String, String)]) -> Result<Headers> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let key = tonic::metadata::AsciiMetadataKey::from_bytes(k.to_ascii_lowercase().as_bytes()).with_context(|| format!("invalid header name `{k}`"))?;
+            let value = v.parse().with_context(|| format!("invalid value for header `{k}`"))?;
+            Ok((key, value))
+        })
+        .collect()
+}
+
+/// What a call left unanswered fails with (see `no_answer`): its status's
+/// source, which tells it apart from a broken connection's.
+#[derive(Debug)]
+struct NoAnswer;
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no answer")
     }
 }
 
-/// A call the backend didn't answer within `rpc_timeout`.
-fn no_answer(config: &BesConfig) -> tonic::Status {
-    tonic::Status::deadline_exceeded(format!("no answer within {:?}", config.rpc_timeout))
+impl std::error::Error for NoAnswer {}
+
+/// Whether `s` stands for a connection that broke (reset, refused, closed:
+/// it carries the transport's error), not for an answer, a call left
+/// unanswered or a connection attempt that timed out.
+fn broken_connection(s: &tonic::Status) -> bool {
+    let mut cause = std::error::Error::source(s);
+    if cause.is_none() {
+        return false;
+    }
+    while let Some(e) = cause {
+        let text = e.to_string().to_ascii_lowercase();
+        if e.is::<NoAnswer>() || text.contains("timed out") || text.contains("timeout") || text.contains("certificate") {
+            return false;
+        }
+        cause = e.source();
+    }
+    true
 }
 
 /// Notes that the backend answered, when `status` is its own: one standing
-/// for a broken connection has the transport's error as its source.
-/// Until the backend answered something, failures aren't retried: it is
-/// gone, or isn't a BES.
+/// for a broken connection has the transport's error as its source, one
+/// for a call left unanswered `NoAnswer`. Until the backend answered
+/// something, failures aren't retried (but for a connection that broke): it
+/// is gone, or isn't a BES.
 fn note_answer(answered: &AtomicBool, status: &tonic::Status) {
     if std::error::Error::source(status).is_none() {
         answered.store(true, Ordering::Relaxed);
@@ -280,46 +310,228 @@ fn retryable(s: &tonic::Status) -> bool {
     )
 }
 
-async fn run(client: PublishBuildEventClient<Channel>, config: BesConfig, mut rx: mpsc::UnboundedReceiver<Cmd>) -> Result<UploadSummary> {
-    let answered = AtomicBool::new(false);
-    let mut stream_client = client.clone();
-    if !config.lifecycle_events {
-        return Ok(stream_events(&mut stream_client, &config, &mut rx, &answered).await?.0);
-    }
-    // The stream doesn't wait for the lifecycle events: a slow or failing
-    // lifecycle service doesn't hold the build's events back.
-    let (started, streamed) = tokio::join!(
-        publish_lifecycle(&client, &config, lifecycle_requests(&config, None, SystemTime::now()), &answered),
-        stream_events(&mut stream_client, &config, &mut rx, &answered),
-    );
-    let (summary, outcome) = streamed?;
-    started?;
-    publish_lifecycle(&client, &config, lifecycle_requests(&config, Some(outcome), SystemTime::now()), &answered).await?;
-    Ok(summary)
+/// The background task: the backend's client, and what its calls share.
+struct Upload {
+    client: PublishBuildEventClient<Channel>,
+    config: BesConfig,
+    headers: Headers,
+    /// Whether the backend answered anything yet (see `note_answer`).
+    answered: AtomicBool,
 }
 
-async fn publish_lifecycle(
-    client: &PublishBuildEventClient<Channel>,
-    config: &BesConfig,
-    requests: Vec<bes::PublishLifecycleEventRequest>,
-    answered: &AtomicBool,
-) -> Result<()> {
-    for r in requests {
-        let what = r.build_event.as_ref().and_then(|e| e.event.as_ref()).and_then(|e| e.event.as_ref()).map(|e| match e {
-            Event::BuildEnqueued(_) => "BuildEnqueued",
-            Event::InvocationAttemptStarted(_) => "InvocationAttemptStarted",
-            Event::InvocationAttemptFinished(_) => "InvocationAttemptFinished",
-            Event::BuildFinished(_) => "BuildFinished",
-            _ => "other",
-        });
-        with_retries(config, "BES lifecycle event", answered, || {
-            let (r, mut c) = (r.clone(), client.clone());
-            async move { c.publish_lifecycle_event(request(config, r)).await }
-        })
-        .await?;
-        trace(format_args!("lifecycle {} sent", what.unwrap_or_default()));
+impl Upload {
+    async fn run(&self, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<UploadSummary> {
+        let config = &self.config;
+        let mut lifecycle_error = None;
+        if config.lifecycle_events {
+            // Before the stream, as Bazel sends them, but within
+            // START_TIMEOUT and without retries: the build's events don't
+            // wait long for a slow or failing lifecycle service.
+            let requests = lifecycle_requests(config, None, SystemTime::now());
+            if let Err(e) = self.publish_lifecycle(requests, 0, config.rpc_timeout.min(START_TIMEOUT)).await {
+                trace(format_args!("{e:#}"));
+                lifecycle_error = Some(format!("{e:#}"));
+            }
+        }
+        let (mut summary, outcome) = self.stream_events(rx).await?;
+        if config.lifecycle_events {
+            // Whenever the stream went through: a lifecycle UI closes the
+            // invocation, whatever became of the events before it.
+            let requests = lifecycle_requests(config, Some(outcome), SystemTime::now());
+            if let Err(e) = self.publish_lifecycle(requests, config.max_retries, config.rpc_timeout).await {
+                trace(format_args!("{e:#}"));
+                lifecycle_error.get_or_insert(format!("{e:#}"));
+            }
+        }
+        summary.lifecycle_error = lifecycle_error;
+        Ok(summary)
     }
-    Ok(())
+
+    /// Makes a call until it succeeds, fails for good, or failed `retries`
+    /// times. Each call may take `deadline`.
+    async fn with_retries<T, F, Fut>(&self, what: &str, retries: u32, deadline: Duration, mut f: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, tonic::Status>>,
+    {
+        let mut backoff = self.config.initial_backoff;
+        let mut attempt = 0;
+        loop {
+            let e = match tokio::time::timeout(deadline, f()).await {
+                Ok(Ok(v)) => {
+                    self.answered.store(true, Ordering::Relaxed);
+                    return Ok(v);
+                }
+                Ok(Err(e)) => {
+                    note_answer(&self.answered, &e);
+                    e
+                }
+                Err(_) => no_answer(deadline),
+            };
+            if attempt >= self.budget(&e, retries) || !retryable(&e) {
+                bail!("{what}: {e}");
+            }
+            attempt += 1;
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
+        }
+    }
+
+    /// How many times a call failing with `e` is made again, of `retries`:
+    /// none until the backend answered something, but twice for a
+    /// connection that broke (a call left unanswered would cost a deadline
+    /// each time).
+    fn budget(&self, e: &tonic::Status, retries: u32) -> u32 {
+        if self.answered.load(Ordering::Relaxed) {
+            retries
+        } else if broken_connection(e) {
+            FIRST_CONTACT_RETRIES.min(self.config.max_retries)
+        } else {
+            0
+        }
+    }
+
+    /// Sends lifecycle events, in order, until one fails.
+    async fn publish_lifecycle(&self, requests: Vec<bes::PublishLifecycleEventRequest>, retries: u32, deadline: Duration) -> Result<()> {
+        for r in requests {
+            let what = r.build_event.as_ref().and_then(|e| e.event.as_ref()).and_then(|e| e.event.as_ref()).map(|e| match e {
+                Event::BuildEnqueued(_) => "BuildEnqueued",
+                Event::InvocationAttemptStarted(_) => "InvocationAttemptStarted",
+                Event::InvocationAttemptFinished(_) => "InvocationAttemptFinished",
+                Event::BuildFinished(_) => "BuildFinished",
+                _ => "other",
+            });
+            self.with_retries(&format!("BES lifecycle event {}", what.unwrap_or_default()), retries, deadline, || {
+                let (r, mut c) = (r.clone(), self.client.clone());
+                async move { c.publish_lifecycle_event(self.request(r)).await }
+            })
+            .await?;
+            trace(format_args!("lifecycle {} sent", what.unwrap_or_default()));
+        }
+        Ok(())
+    }
+
+    /// Wraps a message (or a request stream) with the configured headers.
+    fn request<T>(&self, message: T) -> tonic::Request<T> {
+        let mut r = tonic::Request::new(message);
+        for (k, v) in &self.headers {
+            r.metadata_mut().insert(k.clone(), v.clone());
+        }
+        r
+    }
+
+    /// Sends every queued event through `PublishBuildToolEventStream` until
+    /// the producer finishes and everything is acked, reconnecting as
+    /// needed (also when events wait for an ack longer than `rpc_timeout`).
+    async fn stream_events(&self, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<(UploadSummary, BuildOutcome)> {
+        let config = &self.config;
+        let answered = &self.answered;
+        let mut client = self.client.clone();
+        let mut pending: VecDeque<bes::PublishBuildToolEventStreamRequest> = VecDeque::new();
+        let mut next_seq = 1i64;
+        let mut outcome: Option<BuildOutcome> = None;
+        let mut summary = UploadSummary::default();
+        let mut failures = 0u32;
+        let mut backoff = config.initial_backoff;
+        // The producer went away without `finish`: end the stream as failed.
+        let abandoned = || Cmd::Finish(BuildOutcome { success: false, exit_code: 1 });
+
+        // Open the stream once there's an event: some servers only answer then.
+        let first = rx.recv().await.unwrap_or_else(abandoned);
+        accept(first, config, &mut pending, &mut next_seq, &mut outcome, &mut summary);
+        loop {
+            // Everything not yet acked is resent, in order, on a new stream.
+            let (tx, req_rx) = mpsc::unbounded_channel();
+            let mut tx = Some(tx);
+            let mut sent_upto = 0i64;
+            trace(format_args!("opening the stream ({} events pending)", pending.len()));
+            let call = client.publish_build_tool_event_stream(self.request(UnboundedReceiverStream::new(req_rx)));
+            tokio::pin!(call);
+            let mut responses: Option<tonic::Streaming<bes::PublishBuildToolEventStreamResponse>> = None;
+            // Since when events have waited for the backend's next answer.
+            let mut waiting = tokio::time::Instant::now();
+            let err = loop {
+                if let Some(t) = &tx {
+                    let start = sent_upto;
+                    for r in pending.iter().filter(|r| seq_of(r) > start) {
+                        let _ = t.send(r.clone());
+                        sent_upto = seq_of(r);
+                    }
+                    // The final event is queued once there's an outcome: half-close.
+                    if outcome.is_some() {
+                        trace(format_args!("half-closing after event {sent_upto}"));
+                        tx = None;
+                    }
+                }
+                tokio::select! {
+                    r = &mut call, if responses.is_none() => match r {
+                        Ok(resp) => {
+                            trace(format_args!("stream open"));
+                            answered.store(true, Ordering::Relaxed);
+                            waiting = tokio::time::Instant::now();
+                            responses = Some(resp.into_inner());
+                        }
+                        Err(e) => {
+                            note_answer(answered, &e);
+                            break e;
+                        }
+                    },
+                    cmd = rx.recv(), if outcome.is_none() => {
+                        if pending.is_empty() {
+                            waiting = tokio::time::Instant::now();
+                        }
+                        accept(cmd.unwrap_or_else(abandoned), config, &mut pending, &mut next_seq, &mut outcome, &mut summary);
+                    }
+                    ack = next_ack(&mut responses), if responses.is_some() => match ack {
+                        Some(Ok(ack)) => {
+                            answered.store(true, Ordering::Relaxed);
+                            waiting = tokio::time::Instant::now();
+                            let before = pending.len();
+                            while pending.front().is_some_and(|r| seq_of(r) <= ack.sequence_number) {
+                                pending.pop_front();
+                            }
+                            if pending.len() < before {
+                                failures = 0;
+                                backoff = config.initial_backoff;
+                            }
+                            if let (Some(o), true) = (outcome, pending.is_empty()) {
+                                trace(format_args!("all {} events acked", ack.sequence_number));
+                                return Ok((summary, o));
+                            }
+                        }
+                        Some(Err(e)) => {
+                            note_answer(answered, &e);
+                            break e;
+                        }
+                        None => match (outcome, pending.is_empty()) {
+                            (Some(o), true) => {
+                                trace(format_args!("stream closed by the server, all acked"));
+                                return Ok((summary, o));
+                            }
+                            _ => break tonic::Status::unavailable("stream closed before every event was acked"),
+                        },
+                    },
+                    () = tokio::time::sleep_until(waiting + config.rpc_timeout), if !pending.is_empty() => break no_answer(config.rpc_timeout),
+                }
+            };
+            failures += 1;
+            trace(format_args!("stream failed ({} pending): {err}", pending.len()));
+            if failures > self.budget(&err, config.max_retries) || !retryable(&err) {
+                let never = if answered.load(Ordering::Relaxed) { "" } else { " (the backend never answered)" };
+                bail!("BES upload failed after {failures} attempts{never}: {err}");
+            }
+            summary.reconnects += 1;
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
+        }
+    }
+}
+
+/// A call the backend didn't answer within `deadline`.
+fn no_answer(deadline: Duration) -> tonic::Status {
+    let mut s = tonic::Status::deadline_exceeded(format!("no answer within {deadline:?}"));
+    s.set_source(std::sync::Arc::new(NoAnswer));
+    s
 }
 
 /// Whether `trace` prints: `BesConfig::trace` of the last uploader started.
@@ -334,130 +546,8 @@ fn trace(what: std::fmt::Arguments<'_>) {
     }
 }
 
-/// Wraps a message (or a request stream) with the configured headers.
-/// Headers that aren't valid gRPC metadata are left out.
-fn request<T>(config: &BesConfig, message: T) -> tonic::Request<T> {
-    let mut r = tonic::Request::new(message);
-    for (k, v) in &config.headers {
-        if let (Ok(k), Ok(v)) = (
-            tonic::metadata::AsciiMetadataKey::from_bytes(k.to_ascii_lowercase().as_bytes()),
-            tonic::metadata::AsciiMetadataValue::try_from(v.as_str()),
-        ) {
-            r.metadata_mut().insert(k, v);
-        }
-    }
-    r
-}
-
 fn seq_of(r: &bes::PublishBuildToolEventStreamRequest) -> i64 {
     r.ordered_build_event.as_ref().map_or(0, |e| e.sequence_number)
-}
-
-/// Sends every queued event through `PublishBuildToolEventStream` until the
-/// producer finishes and everything is acked, reconnecting as needed (also
-/// when events wait for an ack longer than `rpc_timeout`).
-async fn stream_events(
-    client: &mut PublishBuildEventClient<Channel>,
-    config: &BesConfig,
-    rx: &mut mpsc::UnboundedReceiver<Cmd>,
-    answered: &AtomicBool,
-) -> Result<(UploadSummary, BuildOutcome)> {
-    let mut pending: VecDeque<bes::PublishBuildToolEventStreamRequest> = VecDeque::new();
-    let mut next_seq = 1i64;
-    let mut outcome: Option<BuildOutcome> = None;
-    let mut summary = UploadSummary::default();
-    let mut failures = 0u32;
-    let mut backoff = config.initial_backoff;
-    // The producer went away without `finish`: end the stream as failed.
-    let abandoned = || Cmd::Finish(BuildOutcome { success: false, exit_code: 1 });
-
-    // Open the stream once there's an event: some servers only answer then.
-    let first = rx.recv().await.unwrap_or_else(abandoned);
-    accept(first, config, &mut pending, &mut next_seq, &mut outcome, &mut summary);
-    loop {
-        // Everything not yet acked is resent, in order, on a new stream.
-        let (tx, req_rx) = mpsc::unbounded_channel();
-        let mut tx = Some(tx);
-        let mut sent_upto = 0i64;
-        trace(format_args!("opening the stream ({} events pending)", pending.len()));
-        let call = client.publish_build_tool_event_stream(request(config, UnboundedReceiverStream::new(req_rx)));
-        tokio::pin!(call);
-        let mut responses: Option<tonic::Streaming<bes::PublishBuildToolEventStreamResponse>> = None;
-        // Since when events have waited for the backend's next answer.
-        let mut waiting = tokio::time::Instant::now();
-        let err = loop {
-            if let Some(t) = &tx {
-                let start = sent_upto;
-                for r in pending.iter().filter(|r| seq_of(r) > start) {
-                    let _ = t.send(r.clone());
-                    sent_upto = seq_of(r);
-                }
-                // The final event is queued once there's an outcome: half-close.
-                if outcome.is_some() {
-                    trace(format_args!("half-closing after event {sent_upto}"));
-                    tx = None;
-                }
-            }
-            tokio::select! {
-                r = &mut call, if responses.is_none() => match r {
-                    Ok(resp) => {
-                        trace(format_args!("stream open"));
-                        answered.store(true, Ordering::Relaxed);
-                        waiting = tokio::time::Instant::now();
-                        responses = Some(resp.into_inner());
-                    }
-                    Err(e) => {
-                        note_answer(answered, &e);
-                        break e;
-                    }
-                },
-                cmd = rx.recv(), if outcome.is_none() => {
-                    if pending.is_empty() {
-                        waiting = tokio::time::Instant::now();
-                    }
-                    accept(cmd.unwrap_or_else(abandoned), config, &mut pending, &mut next_seq, &mut outcome, &mut summary);
-                }
-                ack = next_ack(&mut responses), if responses.is_some() => match ack {
-                    Some(Ok(ack)) => {
-                        answered.store(true, Ordering::Relaxed);
-                        waiting = tokio::time::Instant::now();
-                        let before = pending.len();
-                        while pending.front().is_some_and(|r| seq_of(r) <= ack.sequence_number) {
-                            pending.pop_front();
-                        }
-                        if pending.len() < before {
-                            failures = 0;
-                            backoff = config.initial_backoff;
-                        }
-                        if let (Some(o), true) = (outcome, pending.is_empty()) {
-                            trace(format_args!("all {} events acked", ack.sequence_number));
-                            return Ok((summary, o));
-                        }
-                    }
-                    Some(Err(e)) => {
-                        note_answer(answered, &e);
-                        break e;
-                    }
-                    None => match (outcome, pending.is_empty()) {
-                        (Some(o), true) => {
-                            trace(format_args!("stream closed by the server, all acked"));
-                            return Ok((summary, o));
-                        }
-                        _ => break tonic::Status::unavailable("stream closed before every event was acked"),
-                    },
-                },
-                () = tokio::time::sleep_until(waiting + config.rpc_timeout), if !pending.is_empty() => break no_answer(config),
-            }
-        };
-        failures += 1;
-        trace(format_args!("stream failed ({} pending): {err}", pending.len()));
-        if failures > config.max_retries || !retryable(&err) || !answered.load(Ordering::Relaxed) {
-            bail!("BES upload failed after {failures} attempts: {err}");
-        }
-        summary.reconnects += 1;
-        tokio::time::sleep(backoff).await;
-        backoff *= 2;
-    }
 }
 
 async fn next_ack(
