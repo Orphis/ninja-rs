@@ -136,26 +136,7 @@ fn dir_id(dir: &Path) -> Option<DirId> {
 
 #[cfg(windows)]
 fn dir_id(dir: &Path) -> Option<DirId> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    const FILE_READ_ATTRIBUTES: u32 = 0x80;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_ID_INFO: i32 = 0x12;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(file: *mut std::ffi::c_void, class: i32, info: *mut std::ffi::c_void, size: u32) -> i32;
-    }
-    #[repr(C)]
-    struct IdInfo {
-        volume: u64,
-        id: [u8; 16],
-    }
-    // Attributes only: no sharing conflict, even with a directory in use.
-    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(dir).ok()?;
-    let mut info = IdInfo { volume: 0, id: [0; 16] };
-    // SAFETY: an open handle, and a buffer writable for its size.
-    let ok = unsafe { GetFileInformationByHandleEx(f.as_raw_handle(), FILE_ID_INFO, (&raw mut info).cast(), size_of::<IdInfo>() as u32) };
-    (ok != 0).then(|| (info.volume, u128::from_le_bytes(info.id)))
+    ninja_os::windows::file_id(&ninja_os::windows::open_attributes(dir).ok()?)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1509,38 +1490,26 @@ mod platform {
     //! the buffer overflowed: events were lost.
 
     use super::*;
-    use std::ffi::c_void;
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::atomic::AtomicBool;
 
-    type Handle = *mut c_void;
-    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
-    const FILE_LIST_DIRECTORY: u32 = 0x1;
-    const FILE_SHARE_ALL: u32 = 0x7;
-    const OPEN_EXISTING: u32 = 3;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    // File and directory names, attributes, size, last write, creation, security.
-    const FILTER: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x40 | 0x100;
-    const ERROR_NOTIFY_ENUM_DIR: i32 = 1022;
-    const FILE_ACTION_MODIFIED: u32 = 3;
+    use ninja_os::windows::wide;
+    use windows_sys::Win32::Foundation::{ERROR_NOTIFY_ENUM_DIR, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ACTION_MODIFIED, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetLongPathNameW, OPEN_EXISTING, ReadDirectoryChangesW,
+    };
+    use windows_sys::Win32::System::IO::CancelIoEx;
 
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateFileW(name: *const u16, access: u32, share: u32, security: *const c_void, disposition: u32, flags: u32, template: Handle) -> Handle;
-        fn ReadDirectoryChangesW(
-            dir: Handle,
-            buffer: *mut c_void,
-            len: u32,
-            subtree: i32,
-            filter: u32,
-            returned: *mut u32,
-            overlapped: *mut c_void,
-            routine: *const c_void,
-        ) -> i32;
-        fn CloseHandle(handle: Handle) -> i32;
-        fn CancelIoEx(handle: Handle, overlapped: *mut c_void) -> i32;
-        fn GetLongPathNameW(short: *const u16, long: *mut u16, len: u32) -> u32;
-    }
+    const FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_DIR_NAME
+        | FILE_NOTIFY_CHANGE_ATTRIBUTES
+        | FILE_NOTIFY_CHANGE_SIZE
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_CREATION
+        | FILE_NOTIFY_CHANGE_SECURITY;
 
     pub(super) fn backend(sink: Weak<Watcher>) -> Option<Box<dyn Backend>> {
         Some(Box::new(Directories { sink, active: Arc::default() }))
@@ -1556,7 +1525,7 @@ mod platform {
         stop: Arc<AtomicBool>,
         /// The directory's, shared with the reader: open while either has
         /// it.
-        handle: Arc<Owned>,
+        handle: Arc<OwnedHandle>,
     }
 
     impl Reader {
@@ -1564,20 +1533,7 @@ mod platform {
         fn stop(&self) {
             self.stop.store(true, Ordering::SeqCst);
             // SAFETY: an open handle (this reference keeps it open).
-            unsafe { CancelIoEx(self.handle.0, std::ptr::null_mut()) };
-        }
-    }
-
-    struct Owned(Handle);
-    // SAFETY: a handle owned by one thread at a time (the reader it's
-    // moved to), closed once when dropped; Windows handles may be used from
-    // any thread.
-    unsafe impl Send for Owned {}
-    unsafe impl Sync for Owned {}
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            // SAFETY: the handle is owned.
-            unsafe { CloseHandle(self.0) };
+            unsafe { CancelIoEx(self.handle.as_raw_handle(), std::ptr::null()) };
         }
     }
 
@@ -1589,13 +1545,13 @@ mod platform {
             if let Some(old) = self.active.lock().unwrap().remove(root) {
                 old.stop();
             }
-            let wide: Vec<u16> = root.as_os_str().encode_wide().chain([0]).collect();
+            let wide = wide(root);
             // SAFETY: `wide` is NUL-terminated.
             let h = unsafe {
                 CreateFileW(
                     wide.as_ptr(),
                     FILE_LIST_DIRECTORY,
-                    FILE_SHARE_ALL,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     std::ptr::null(),
                     OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS,
@@ -1605,7 +1561,8 @@ mod platform {
             if h == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
-            let handle = Arc::new(Owned(h));
+            // SAFETY: a new handle, owned from now on.
+            let handle = Arc::new(unsafe { OwnedHandle::from_raw_handle(h) });
             // The first read sets up the watch: events from then on are
             // kept between reads (in a buffer of the first read's size).
             let (tx, rx) = std::sync::mpsc::channel();
@@ -1639,7 +1596,7 @@ mod platform {
         }
     }
 
-    fn read_loop(handle: &Owned, root: &Path, sink: Weak<Watcher>, started: std::sync::mpsc::Sender<()>, stop: &AtomicBool) {
+    fn read_loop(handle: &OwnedHandle, root: &Path, sink: Weak<Watcher>, started: std::sync::mpsc::Sender<()>, stop: &AtomicBool) {
         let mut buf = vec![0u32; 1 << 18];
         let _ = started.send(());
         // Stopped between reads, or during one (cancelled).
@@ -1647,7 +1604,7 @@ mod platform {
             let mut n = 0u32;
             // SAFETY: `buf` is u32-aligned and writable for its byte length.
             let ok = unsafe {
-                ReadDirectoryChangesW(handle.0, buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 1, FILTER, &mut n, std::ptr::null_mut(), std::ptr::null())
+                ReadDirectoryChangesW(handle.as_raw_handle(), buf.as_mut_ptr().cast(), (buf.len() * 4) as u32, 1, FILTER, &mut n, std::ptr::null_mut(), None)
             };
             if stop.load(Ordering::SeqCst) {
                 return;
@@ -1655,7 +1612,7 @@ mod platform {
             let Some(w) = sink.upgrade() else { return };
             if ok == 0 {
                 let e = io::Error::last_os_error();
-                if e.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR) {
+                if e.raw_os_error() == Some(ERROR_NOTIFY_ENUM_DIR as i32) {
                     w.lost(Some(root));
                     continue;
                 }
@@ -1721,7 +1678,7 @@ mod platform {
             return Some(Named::Path(path.to_path_buf()));
         }
         let expand = |p: &Path| -> Option<PathBuf> {
-            let wide: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+            let wide = wide(p);
             let mut out = vec![0u16; 32768];
             // SAFETY: both buffers are valid; `out` is writable for its length.
             let n = unsafe { GetLongPathNameW(wide.as_ptr(), out.as_mut_ptr(), out.len() as u32) } as usize;
@@ -1795,14 +1752,9 @@ fn local_file_system(dir: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn local_file_system(dir: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    const DRIVE_REMOTE: u32 = 4;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetVolumePathNameW(path: *const u16, volume: *mut u16, len: u32) -> i32;
-        fn GetDriveTypeW(root: *const u16) -> u32;
-    }
-    let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumePathNameW};
+    use windows_sys::Win32::System::WindowsProgramming::DRIVE_REMOTE;
+    let path = ninja_os::windows::wide(dir);
     let mut volume = vec![0u16; 1024];
     // SAFETY: a NUL-terminated path and a buffer of the given length.
     if unsafe { GetVolumePathNameW(path.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) } == 0 {

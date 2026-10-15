@@ -658,6 +658,7 @@ dependencies = [
  "libc",
  "test-dirs",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -667,11 +668,22 @@ dependencies = [
  "cpp-deps",
  "hex",
  "libc",
- "rbe-client",
+ "ninja-os",
  "serde",
  "serde_json",
  "sha2",
  "test-dirs",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ninja-os"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "test-dirs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -683,6 +695,7 @@ dependencies = [
  "hex",
  "ninja-core",
  "ninja-daemon",
+ "ninja-os",
  "prost",
  "rbe-client",
  "serde",
@@ -700,6 +713,7 @@ dependencies = [
  "libc",
  "ninja-core",
  "ninja-daemon",
+ "ninja-os",
  "ninja-remote",
  "prost",
  "prost-types",
@@ -709,6 +723,7 @@ dependencies = [
  "serde_json",
  "test-dirs",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -935,6 +950,7 @@ dependencies = [
  "bazel-remote-apis",
  "fastcdc",
  "hex",
+ "ninja-os",
  "prost",
  "sha2",
  "tempfile",

@@ -178,15 +178,9 @@ pub fn wait_for(what: &str, mut done: impl FnMut() -> bool) -> Result<(), String
 pub fn alive(pid: u32) -> bool {
     #[cfg(windows)]
     {
-        use std::ffi::c_void;
-        const SYNCHRONIZE: u32 = 0x0010_0000;
-        const WAIT_TIMEOUT: u32 = 0x102;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
-            fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
-            fn CloseHandle(handle: *mut c_void) -> i32;
-        }
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+        use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
         // SAFETY: plain system calls; the handle is closed below.
         unsafe {
             let h = OpenProcess(SYNCHRONIZE, 0, pid);

@@ -451,8 +451,9 @@ fn test_status_format() -> Result<(), String> {
     check(r.code == 1 && r.stderr.contains("unknown variable 'nope' in --status format"), &format!("an unknown --status variable must fail:\n{}", r.stderr))
 }
 
-/// Failed commands are shown again before "build stopped" when other output
+/// Failed commands are named again before "build stopped" when other output
 /// followed them (ninja issue 2378), not when the only one is still last.
+/// Their `FAILED:` blocks aren't repeated: IDEs would count the errors twice.
 fn test_failure_summary() -> Result<(), String> {
     let dir = test_dir("summary");
     let (fail, noisy) =
@@ -472,16 +473,12 @@ default all
     );
     std::fs::write(dir.join("build.ninja"), manifest).unwrap();
     let r = ninja(&dir, &["-k", "0", "-j1"], &[]);
-    let summary = format!(
-        "ninja: 2 commands failed:
-FAILED: a.o
-{}
-a.o: error
-FAILED: c.o
-",
-        fail.replace("$out", "a.o")
-    );
-    let at = r.stdout.find(&summary).ok_or_else(|| {
+    let summary = "ninja: 2 commands failed:\n  a.o\n  c.o\n";
+    check(
+        r.stdout.matches("FAILED: ").count() == 2 && r.stdout.lines().filter(|l| *l == "a.o: error").count() == 1,
+        &format!("errors repeated:\n{}", r.stdout),
+    )?;
+    let at = r.stdout.find(summary).ok_or_else(|| {
         format!(
             "no summary:
 {}",
@@ -505,6 +502,165 @@ FAILED: c.o
             r.stdout
         ),
     )
+}
+
+/// `NINJA_STATUS` as in ninja 1.13: `%P` predicts from the time the finished
+/// commands took and the build log's times of the others, and an unknown
+/// placeholder is fatal.
+fn test_ninja_status() -> Result<(), String> {
+    let dir = jobs_fixture("ninja_status", 2, "");
+    let env = [("NINJA_STATUS", "[%P] ")];
+    let predicted = |out: &str| -> Vec<String> { out.lines().filter_map(|l| Some(l.strip_prefix('[')?.split_once(']')?.0.to_string())).collect() };
+    // Without a build log, the second command takes as long as the first.
+    let r = ninja(&dir, &["-j1"], &env);
+    check(r.code == 0 && predicted(&r.stdout) == [" 50%", "100%"], &format!("without a build log:\n{}", r.stdout))?;
+    // The build log says they take 1000 s.
+    let log = std::fs::read_to_string(dir.join(".ninja_rs_log")).unwrap();
+    let log: String = log
+        .lines()
+        .map(|line| match line.split('\t').collect::<Vec<_>>().as_slice() {
+            [start, _, rest @ ..] if rest.len() == 3 => format!("{start}\t{}\t{}\n", start.parse::<i64>().unwrap() + 1_000_000, rest.join("\t")),
+            _ => format!("{line}\n"),
+        })
+        .collect();
+    std::fs::write(dir.join(".ninja_rs_log"), log).unwrap();
+    for out in ["j1", "j2"] {
+        std::fs::remove_file(dir.join(out)).unwrap();
+    }
+    let r = ninja(&dir, &["-j1"], &env);
+    check(r.code == 0 && predicted(&r.stdout) == ["  0%", "100%"], &format!("with a build log:\n{}", r.stdout))?;
+    let r = ninja(&dir, &["-n"], &[("NINJA_STATUS", "[%f/%x] ")]);
+    check(r.code == 1 && r.stderr.contains("ninja: fatal: unknown placeholder '%x' in $NINJA_STATUS"), &format!("an unknown placeholder: {}", r.stderr))
+}
+
+/// On a terminal, as ninja: the status line as wide as the terminal says
+/// (not `COLUMNS`), the rest of the line erased; without `TERM`, plain lines.
+#[cfg(unix)]
+fn test_terminal_status() -> Result<(), String> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = test_dir("terminal_status");
+    std::fs::write(dir.join("build.ninja"), format!("rule r\n  command = true\n  description = {}\nbuild a: r\n", "x".repeat(100))).unwrap();
+    // What ninja-rs writes to a terminal 40 columns wide.
+    let run = |term: Option<&str>| -> Result<String, String> {
+        // SAFETY: a new pseudo-terminal, its name copied at once.
+        let (mut master, name) = unsafe {
+            let fd = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+            if fd < 0 || libc::grantpt(fd) != 0 || libc::unlockpt(fd) != 0 {
+                return Err(format!("no pseudo-terminal: {}", std::io::Error::last_os_error()));
+            }
+            let size = libc::winsize { ws_row: 24, ws_col: 40, ws_xpixel: 0, ws_ypixel: 0 };
+            libc::ioctl(fd, libc::TIOCSWINSZ, &size);
+            (std::fs::File::from_raw_fd(fd), std::ffi::CStr::from_ptr(libc::ptsname(fd)).to_string_lossy().into_owned())
+        };
+        let terminal = std::fs::File::options().read(true).write(true).custom_flags(libc::O_NOCTTY).open(name).map_err(|e| e.to_string())?;
+        let mut c = Command::new(ninja_exe());
+        c.current_dir(&dir).stdout(terminal).env("COLUMNS", "100").env_remove("NINJA_STATUS").env_remove("NO_COLOR").env_remove(ninja_rs::nested::ENV);
+        match term {
+            Some(t) => c.env("TERM", t),
+            None => c.env_remove("TERM"),
+        };
+        let status = c.status().map_err(|e| e.to_string())?;
+        // The terminal closed (the end of the output, then EIO).
+        drop(c);
+        let mut out = Vec::new();
+        let _ = master.read_to_end(&mut out);
+        check(status.success(), &format!("the build failed: {}", String::from_utf8_lossy(&out)))?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    };
+    let line = |finished: usize| format!("\r[{finished}/1] {}...{}\x1b[K", "x".repeat(12), "x".repeat(19));
+    check_eq(&run(Some("xterm"))?, &format!("{}{}\r\n", line(0), line(1)), "TERM=xterm")?;
+    check_eq(&run(None)?, &format!("[1/1] {}\r\n", "x".repeat(100)), "without TERM")
+}
+
+/// `console-screen NINJA...` runs ninja-rs on its console, escape sequences
+/// off as a new console starts, then prints whether they are on, the
+/// console's width, and what its screen shows.
+#[cfg(windows)]
+fn console_screen(args: &[String]) -> i32 {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[derive(Default)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Info {
+        size: Coord,
+        cursor: Coord,
+        attributes: u16,
+        window: [i16; 4],
+        maximum_window_size: Coord,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetConsoleMode(console: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(console: *mut c_void, mode: u32) -> i32;
+        fn GetConsoleScreenBufferInfo(console: *mut c_void, info: *mut Info) -> i32;
+        fn ReadConsoleOutputCharacterW(console: *mut c_void, chars: *mut u16, len: u32, at: Coord, read: *mut u32) -> i32;
+    }
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
+    let console = match std::fs::File::options().read(true).write(true).open("CONOUT$") {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("console-screen: {e}");
+            return 1;
+        }
+    };
+    let handle = console.as_raw_handle();
+    let mut mode = 0;
+    // SAFETY: plain system calls on the console.
+    unsafe {
+        GetConsoleMode(handle, &mut mode);
+        SetConsoleMode(handle, mode & !ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+    let (Ok(stdout), Ok(stderr)) = (console.try_clone(), console.try_clone()) else { return 1 };
+    let code = Command::new(&args[0]).args(&args[1..]).stdout(stdout).stderr(stderr).status().map_or(1, |s| s.code().unwrap_or(1));
+    let mut info = Info::default();
+    // SAFETY: as above.
+    unsafe {
+        GetConsoleMode(handle, &mut mode);
+        GetConsoleScreenBufferInfo(handle, &mut info);
+    }
+    println!("escapes {} width {}", mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0, info.size.x);
+    for y in 0..=info.cursor.y {
+        let mut row = vec![0u16; info.size.x.max(0) as usize];
+        let mut read = 0;
+        // SAFETY: reads a row at most, into `row`.
+        unsafe { ReadConsoleOutputCharacterW(handle, row.as_mut_ptr(), row.len() as u32, Coord { x: 0, y }, &mut read) };
+        println!("{}", String::from_utf16_lossy(&row[..read as usize]).trim_end());
+    }
+    code
+}
+
+/// On a Windows console, as ninja: escape sequences turned on, so colors
+/// show as such, and the status line as wide as the console.
+#[cfg(windows)]
+fn test_console_status() -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let dir = test_dir("console_status");
+    let host = dir.join("console-screen.exe");
+    harness::link_self(&host);
+    std::fs::write(dir.join("build.ninja"), format!("rule fail\n  command = cmd /c exit 1\n  description = {}\nbuild a: fail\n", "x".repeat(300))).unwrap();
+    let mut c = Command::new(host);
+    c.arg(ninja_exe()).current_dir(&dir).creation_flags(CREATE_NO_WINDOW);
+    for var in ["TERM", "NO_COLOR", "CLICOLOR_FORCE", "FORCE_COLOR", "NINJA_STATUS", "MAKEFLAGS", ninja_rs::nested::ENV] {
+        c.env_remove(var);
+    }
+    let out = c.output().map_err(|e| e.to_string())?;
+    let screen = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+    let width = screen.lines().next().and_then(|l| l.strip_prefix("escapes true width ")?.parse::<usize>().ok());
+    let width = width.ok_or_else(|| format!("escape sequences not turned on:\n{screen}"))?;
+    check(!screen.contains('\x1b') && screen.contains("\nFAILED: a\ncmd /c exit 1\n"), &format!("escape sequences shown:\n{screen}"))?;
+    // Filling the last column leaves the cursor there, and erasing the rest
+    // of the line erases it (with ninja too).
+    let status = screen.lines().find(|l| l.starts_with("[1/1] x")).unwrap_or_default();
+    check(status.contains("...") && (width - 1..=width).contains(&status.chars().count()), &format!("the status line isn't {width} wide:\n{screen}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -692,12 +848,8 @@ const NO_CTRL_BREAK: i32 = 125;
 #[cfg(windows)]
 fn console_host(args: &[String]) -> i32 {
     use std::os::windows::process::CommandExt;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-    const CTRL_BREAK_EVENT: u32 = 1;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
-    }
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
     let mut child = match Command::new(&args[0]).args(&args[1..]).stdin(std::process::Stdio::null()).creation_flags(CREATE_NEW_PROCESS_GROUP).spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -766,6 +918,11 @@ fn main() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         return ExitCode::from(console_host(&args) as u8);
     }
+    #[cfg(windows)]
+    if stem.starts_with("console-screen") {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return ExitCode::from(console_screen(&args) as u8);
+    }
     use harness::Test;
     #[allow(unused_mut)]
     let mut tests: Vec<Test> = vec![
@@ -776,6 +933,7 @@ fn main() -> ExitCode {
         ("missingdeps", test_missingdeps),
         ("status_format", test_status_format),
         ("failure_summary", test_failure_summary),
+        ("ninja_status", test_ninja_status),
         ("jobserver_pool", test_jobserver_pool),
         ("jobserver_pool_from_manifest", test_jobserver_pool_from_manifest),
         ("jobserver_client", test_jobserver_client),
@@ -787,6 +945,8 @@ fn main() -> ExitCode {
     #[cfg(unix)]
     tests.push(("jobserver_pipe", test_jobserver_pipe));
     #[cfg(unix)]
+    tests.push(("terminal_status", test_terminal_status));
+    #[cfg(unix)]
     tests.push(("interrupt_signals", test_interrupt_signals));
     #[cfg(unix)]
     tests.push(("interrupt_outside_the_build", test_interrupt_outside_the_build));
@@ -796,5 +956,7 @@ fn main() -> ExitCode {
     tests.push(("msvc_deps_relative", test_msvc_deps_relative));
     #[cfg(windows)]
     tests.push(("interrupt_ctrl_break", test_interrupt_ctrl_break));
+    #[cfg(windows)]
+    tests.push(("console_status", test_console_status));
     harness::run("cli", tests)
 }

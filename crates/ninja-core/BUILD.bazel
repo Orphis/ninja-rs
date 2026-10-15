@@ -8,7 +8,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     crate_name = "ninja_core",
     deps = ["@crates//:tokio"] + select({
-        "@platforms//os:windows": [],
+        "@platforms//os:windows": ["@crates//:windows-sys"],
         "//conditions:default": ["@crates//:libc"],
     }),
 )

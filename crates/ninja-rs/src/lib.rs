@@ -166,10 +166,15 @@ impl Service {
         } else {
             None
         };
-        let mut printer = StatusPrinter::new(opts.verbosity);
-        if let Some(fmt) = &opts.status_format
-            && let Err(e) = printer.set_status_format(fmt)
-        {
+        let mut printer = StatusPrinter::new(opts.verbosity, opts.parallelism);
+        let format = match &opts.status_format {
+            Some(fmt) => printer.set_status_format(fmt),
+            // An unknown `NINJA_STATUS` placeholder is fatal, as in ninja,
+            // but before the build rather than at its first status line.
+            None if opts.tool.is_none() => printer.check_progress_status_format(),
+            None => Ok(()),
+        };
+        if let Err(e) = format {
             eprintln!("ninja: fatal: {e}");
             return EXIT_FAILURE;
         }

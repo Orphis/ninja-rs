@@ -522,7 +522,10 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
                 store.digests.put(&f, info.stamp(), digest.clone());
                 (digest, info.executable)
             }
-            _ => (rbe_client::tree::file_digest(&f, Some(&store.digests)).map_err(|e| format!("{e:#}"))?, crate::backend::is_executable(&f)),
+            _ => (
+                rbe_client::tree::file_digest(&f, Some(&store.digests)).map_err(|e| format!("{e:#}"))?,
+                std::fs::metadata(&f).is_ok_and(|m| ninja_os::is_executable(&m)),
+            ),
         };
         tree.add_file_with_digest(&rel, &f, digest.clone(), executable).map_err(|e| format!("{e:#}"))?;
         local_inputs.push((f, digest));

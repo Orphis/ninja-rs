@@ -11,6 +11,7 @@ rust_library(
         "//crates/cpp-deps",
         "//crates/ninja-core",
         "//crates/ninja-daemon",
+        "//crates/ninja-os",
         "//third_party/cargo-rbe/rbe-client",
         "@crates//:anyhow",
         "@crates//:hex",

@@ -770,115 +770,75 @@ fn reaps_orphans() -> bool {
 
 #[cfg(windows)]
 mod job {
-    use std::ffi::c_void;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
-    type Handle = *mut c_void;
-    /// `JobObjectBasicAccountingInformation`.
-    const BASIC_ACCOUNTING: i32 = 1;
-    /// `JobObjectExtendedLimitInformation`.
-    const EXTENDED_LIMITS: i32 = 9;
-    /// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`.
-    const BREAKAWAY_OK: u32 = 0x800;
-    /// `CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP`: a command joins its
-    /// job before it runs, and Ctrl-C reaches ninja-rs only, as in ninja.
-    pub const CREATION_FLAGS: u32 = 0x4 | 0x200;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        SetInformationJobObject, TerminateJobObject,
+    };
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED};
 
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicAccounting {
-        total_user_time: i64,
-        total_kernel_time: i64,
-        this_period_total_user_time: i64,
-        this_period_total_kernel_time: i64,
-        total_page_fault_count: u32,
-        total_processes: u32,
-        active_processes: u32,
-        total_terminated_processes: u32,
-    }
-
-    /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`.
-    #[repr(C)]
-    #[derive(Default)]
-    struct ExtendedLimits {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-        io_counters: [u64; 6],
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
-        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
-        fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, length: u32) -> i32;
-        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
-        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
-        fn QueryInformationJobObject(job: Handle, class: i32, info: *mut c_void, length: u32, returned: *mut u32) -> i32;
-        fn CloseHandle(handle: Handle) -> i32;
-    }
+    /// A command joins its job before it runs, and Ctrl-C reaches ninja-rs
+    /// only, as in ninja.
+    pub const CREATION_FLAGS: u32 = CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP;
 
     // std keeps the handle of a new process's thread to itself: a process
     // spawned suspended is resumed whole, with this ntdll export (long
     // stable, if undocumented; PsSuspend and debuggers use it).
     #[link(name = "ntdll")]
     unsafe extern "system" {
-        fn NtResumeProcess(process: Handle) -> i32;
+        fn NtResumeProcess(process: HANDLE) -> i32;
     }
-
-    /// `CTRL_BREAK_EVENT`.
-    const CTRL_BREAK: u32 = 1;
 
     /// Sends Ctrl-Break to the process group `group`, as ninja does to stop
     /// a command. False without a console to send it through.
     pub fn ctrl_break(group: u32) -> bool {
         // SAFETY: plain system call.
-        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK, group) != 0 }
+        unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, group) != 0 }
     }
 
     /// A job object holding a command's processes.
-    pub struct Job(Handle);
-
-    // SAFETY: job handles may be used from any thread.
-    unsafe impl Send for Job {}
-    unsafe impl Sync for Job {}
+    pub struct Job(OwnedHandle);
 
     impl Job {
         /// Puts `process`, created suspended, in a new job (when it can),
         /// then resumes it.
-        pub fn start(process: std::os::windows::io::RawHandle) -> std::io::Result<Option<Job>> {
+        pub fn start(process: RawHandle) -> std::io::Result<Option<Job>> {
             let job = Self::with_process(process);
             // SAFETY: a valid process handle, with all access rights.
-            let status = unsafe { NtResumeProcess(process as Handle) };
+            let status = unsafe { NtResumeProcess(process) };
             if status < 0 {
                 return Err(std::io::Error::other(format!("resuming the process: NTSTATUS {status:#x}")));
             }
             Ok(job)
         }
 
-        fn with_process(process: std::os::windows::io::RawHandle) -> Option<Job> {
-            // SAFETY: a new anonymous job, and a valid process handle.
+        fn with_process(process: RawHandle) -> Option<Job> {
+            // SAFETY: a new anonymous job, owned from then on, and a valid
+            // process handle.
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if job.is_null() {
                     return None;
                 }
+                let job = OwnedHandle::from_raw_handle(job);
                 // A process asking to leave the job (a server, as with
                 // setsid on POSIX) may: its creation would fail otherwise,
                 // where it works under ninja, which has no jobs.
-                let limits = ExtendedLimits { limit_flags: BREAKAWAY_OK, ..Default::default() };
-                SetInformationJobObject(job, EXTENDED_LIMITS, (&limits as *const ExtendedLimits).cast(), std::mem::size_of::<ExtendedLimits>() as u32);
-                if AssignProcessToJobObject(job, process as Handle) == 0 {
-                    CloseHandle(job);
+                let limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+                    BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION { LimitFlags: JOB_OBJECT_LIMIT_BREAKAWAY_OK, ..Default::default() },
+                    ..Default::default()
+                };
+                SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                if AssignProcessToJobObject(job.as_raw_handle(), process) == 0 {
                     return None;
                 }
                 Some(Job(job))
@@ -887,29 +847,22 @@ mod job {
 
         pub fn terminate(&self) {
             // SAFETY: the handle is open.
-            unsafe { TerminateJobObject(self.0, 1) };
+            unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) };
         }
 
         pub fn active_processes(&self) -> u32 {
-            let mut info = BasicAccounting::default();
+            let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
             // SAFETY: the handle is open; the buffer has the class's size.
             let ok = unsafe {
                 QueryInformationJobObject(
-                    self.0,
-                    BASIC_ACCOUNTING,
-                    (&mut info as *mut BasicAccounting).cast(),
-                    std::mem::size_of::<BasicAccounting>() as u32,
+                    self.0.as_raw_handle(),
+                    JobObjectBasicAccountingInformation,
+                    (&raw mut info).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
                     std::ptr::null_mut(),
                 )
             };
-            if ok == 0 { 0 } else { info.active_processes }
-        }
-    }
-
-    impl Drop for Job {
-        fn drop(&mut self) {
-            // SAFETY: the handle is open and owned.
-            unsafe { CloseHandle(self.0) };
+            if ok == 0 { 0 } else { info.ActiveProcesses }
         }
     }
 
@@ -924,19 +877,19 @@ mod job {
             let mut child = std::process::Command::new("cmd").args(["/c", "exit 3"]).creation_flags(CREATION_FLAGS).spawn().unwrap();
             let job = Job::start(child.as_raw_handle()).unwrap().expect("a job");
             assert_eq!(child.wait().unwrap().code(), Some(3));
-            let mut limits = ExtendedLimits::default();
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             // SAFETY: the handle is open; the buffer has the class's size.
             let ok = unsafe {
                 QueryInformationJobObject(
-                    job.0,
-                    EXTENDED_LIMITS,
-                    (&mut limits as *mut ExtendedLimits).cast(),
-                    std::mem::size_of::<ExtendedLimits>() as u32,
+                    job.0.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&raw mut limits).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
                     std::ptr::null_mut(),
                 )
             };
             assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
-            assert_eq!(limits.limit_flags, BREAKAWAY_OK);
+            assert_eq!(limits.BasicLimitInformation.LimitFlags, JOB_OBJECT_LIMIT_BREAKAWAY_OK);
         }
     }
 }
@@ -1175,10 +1128,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn stopping_sends_ctrl_break_first() {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32;
-        }
+        use windows_sys::Win32::System::Console::GetConsoleProcessList;
         let mut list = [0u32; 4];
         // SAFETY: a buffer of the size given.
         if unsafe { GetConsoleProcessList(list.as_mut_ptr(), 4) } == 0 {

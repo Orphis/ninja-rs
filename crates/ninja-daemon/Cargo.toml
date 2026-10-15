@@ -9,13 +9,25 @@ publish = false
 [dependencies]
 cpp-deps = { path = "../cpp-deps" }
 hex = { workspace = true }
-rbe-client = { path = "../../third_party/cargo-rbe/rbe-client" }
+ninja-os = { path = "../ninja-os" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
 
 [dev-dependencies]
 test-dirs = { path = "../test-dirs" }

@@ -1,0 +1,24 @@
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+rust_library(
+    name = "ninja-os",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "ninja_os",
+    deps = [
+        "@crates//:hex",
+        "@crates//:sha2",
+    ] + select({
+        "@platforms//os:windows": ["@crates//:windows-sys"],
+        "//conditions:default": [],
+    }),
+)
+
+rust_test(
+    name = "ninja-os_test",
+    size = "small",
+    crate = ":ninja-os",
+    deps = ["//crates/test-dirs"],
+)

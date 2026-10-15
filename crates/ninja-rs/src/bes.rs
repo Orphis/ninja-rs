@@ -66,17 +66,11 @@ impl InvocationIds {
     }
 }
 
-/// A random (version 4) UUID, from the OS-seeded hasher keys std uses.
+/// A random (version 4) UUID.
 pub fn new_uuid() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
     let mut bytes = [0u8; 16];
-    for (i, half) in bytes.chunks_mut(8).enumerate() {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(now);
-        h.write_u32(std::process::id());
-        h.write_usize(i);
-        half.copy_from_slice(&h.finish().to_be_bytes());
+    for half in bytes.chunks_mut(8) {
+        half.copy_from_slice(&ninja_os::random_u64().to_be_bytes());
     }
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -1192,8 +1186,8 @@ pub struct ReportingStatus<'a> {
 }
 
 impl Status for ReportingStatus<'_> {
-    fn edge_added_to_plan(&mut self, edge: EdgeId) {
-        self.printer.edge_added_to_plan(edge);
+    fn edge_added_to_plan(&mut self, edge: EdgeId, prev_elapsed_ms: Option<i64>) {
+        self.printer.edge_added_to_plan(edge, prev_elapsed_ms);
         if let Some(b) = &self.bes {
             b.plan_changed(edge, true);
         }

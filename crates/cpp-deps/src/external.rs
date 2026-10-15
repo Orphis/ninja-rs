@@ -145,105 +145,171 @@ pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> 
     Ok(absolute(make_deps(&String::from_utf8_lossy(&out.stdout)), cwd))
 }
 
-/// A command line as Windows programs split it (CommandLineToArgvW).
-pub fn split_windows(cmd: &str) -> Vec<String> {
+/// Splits a Windows command line into arguments following the
+/// `CommandLineToArgvW` / MSVC CRT rules. `first_is_program` applies the
+/// special rule for argv[0] (no backslash escapes, quotes just toggle).
+pub fn split_windows(cmd: &str, first_is_program: bool) -> Vec<String> {
+    let chars: Vec<char> = cmd.chars().collect();
     let mut args = Vec::new();
-    let mut cur = String::new();
-    let mut in_arg = false;
-    let mut quoted = false;
-    let mut backslashes = 0;
-    for c in cmd.chars() {
-        match c {
-            '\\' => {
-                backslashes += 1;
-                in_arg = true;
-            }
-            '"' => {
-                cur.extend(std::iter::repeat_n('\\', backslashes / 2));
-                if backslashes % 2 == 1 {
-                    cur.push('"');
-                } else {
-                    quoted = !quoted;
-                }
-                backslashes = 0;
-                in_arg = true;
-            }
-            ' ' | '\t' if !quoted => {
-                cur.extend(std::iter::repeat_n('\\', backslashes));
-                backslashes = 0;
-                if in_arg {
-                    args.push(std::mem::take(&mut cur));
-                    in_arg = false;
-                }
-            }
-            c => {
-                cur.extend(std::iter::repeat_n('\\', backslashes));
-                backslashes = 0;
-                cur.push(c);
-                in_arg = true;
-            }
+    let mut i = 0;
+    let n = chars.len();
+    let skip_ws = |i: &mut usize| {
+        while *i < n && (chars[*i] == ' ' || chars[*i] == '\t' || chars[*i] == '\n' || chars[*i] == '\r') {
+            *i += 1;
         }
+    };
+    skip_ws(&mut i);
+    if first_is_program && i < n {
+        let mut arg = String::new();
+        let mut in_quotes = false;
+        while i < n {
+            let c = chars[i];
+            if c == '"' {
+                in_quotes = !in_quotes;
+            } else if !in_quotes && (c == ' ' || c == '\t') {
+                break;
+            } else {
+                arg.push(c);
+            }
+            i += 1;
+        }
+        args.push(arg);
+        skip_ws(&mut i);
     }
-    cur.extend(std::iter::repeat_n('\\', backslashes));
-    if in_arg {
-        args.push(cur);
+    while i < n {
+        let mut arg = String::new();
+        let mut in_quotes = false;
+        while i < n {
+            let c = chars[i];
+            if c == '\\' {
+                let mut backslashes = 0;
+                while i < n && chars[i] == '\\' {
+                    backslashes += 1;
+                    i += 1;
+                }
+                if i < n && chars[i] == '"' {
+                    for _ in 0..backslashes / 2 {
+                        arg.push('\\');
+                    }
+                    if backslashes % 2 == 1 {
+                        arg.push('"');
+                        i += 1;
+                    }
+                } else {
+                    for _ in 0..backslashes {
+                        arg.push('\\');
+                    }
+                }
+                continue;
+            }
+            if c == '"' {
+                if in_quotes && i + 1 < n && chars[i + 1] == '"' {
+                    // "" inside quotes is a literal quote (post-2008 CRT rule).
+                    arg.push('"');
+                    i += 2;
+                    continue;
+                }
+                in_quotes = !in_quotes;
+                i += 1;
+                continue;
+            }
+            if !in_quotes && (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                break;
+            }
+            arg.push(c);
+            i += 1;
+        }
+        args.push(arg);
+        skip_ws(&mut i);
     }
     args
 }
 
-/// A command line as a POSIX shell splits it (quotes and backslashes).
-pub fn split_posix(cmd: &str) -> Vec<String> {
+/// Characters that make a POSIX command need a real shell.
+fn is_shell_meta(c: char) -> bool {
+    matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '#' | '!' | '\n')
+}
+
+/// Splits a POSIX shell command into words. Returns `None` if the command
+/// uses shell features (pipes, redirections, expansions, globs, ...) that
+/// would need a real shell.
+pub fn split_posix(cmd: &str) -> Option<Vec<String>> {
     let mut args = Vec::new();
     let mut cur = String::new();
-    let mut in_arg = false;
-    let mut chars = cmd.chars();
+    let mut have = false;
+    let mut chars = cmd.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            ' ' | '\t' => {
+                if have {
+                    args.push(std::mem::take(&mut cur));
+                    have = false;
+                }
+            }
             '\'' => {
-                in_arg = true;
-                for c in chars.by_ref() {
-                    if c == '\'' {
-                        break;
+                have = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => cur.push(c),
+                        None => return None,
                     }
-                    cur.push(c);
                 }
             }
             '"' => {
-                in_arg = true;
-                while let Some(c) = chars.next() {
-                    match c {
-                        '"' => break,
-                        '\\' => cur.extend(chars.next()),
-                        c => cur.push(c),
+                have = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(c @ ('"' | '\\' | '$' | '`')) => cur.push(c),
+                            Some('\n') => {}
+                            Some(c) => {
+                                cur.push('\\');
+                                cur.push(c);
+                            }
+                            None => return None,
+                        },
+                        Some('$') | Some('`') => return None,
+                        Some(c) => cur.push(c),
+                        None => return None,
                     }
                 }
             }
             '\\' => {
-                in_arg = true;
-                cur.extend(chars.next());
+                have = true;
+                match chars.next() {
+                    Some('\n') => {}
+                    Some(c) => cur.push(c),
+                    None => return None,
+                }
             }
-            ' ' | '\t' | '\n' => {
-                if in_arg {
-                    args.push(std::mem::take(&mut cur));
-                    in_arg = false;
+            c if is_shell_meta(c) => {
+                // '#' only starts a comment at the beginning of a word; '~'
+                // only expands at the beginning; '=' etc. are fine.
+                if (c == '#' || c == '~') && have {
+                    cur.push(c);
+                } else {
+                    return None;
                 }
             }
             c => {
+                have = true;
                 cur.push(c);
-                in_arg = true;
             }
         }
     }
-    if in_arg {
+    if have {
         args.push(cur);
     }
-    args
+    Some(args)
 }
 
-/// A command line (a compilation database's `command`) split as the host's
-/// programs do.
+/// A command line (a compilation database's `command`) split as builds
+/// split a command's (ninja-remote's `cmdline`): empty when it needs a
+/// shell.
 pub fn split_command(cmd: &str) -> Vec<String> {
-    if cfg!(windows) { split_windows(cmd) } else { split_posix(cmd) }
+    if cfg!(windows) { split_windows(cmd, true) } else { split_posix(cmd).unwrap_or_default() }
 }
 
 #[cfg(test)]
@@ -258,8 +324,24 @@ mod tests {
     fn splitting() {
         // Escaped quotes don't quote; backslashes are literal unless before
         // a quote.
-        assert_eq!(split_windows(r#"cl /DA=\"x y\" "C:\dir b\c.cpp" -Dz\\"#), s(&["cl", r#"/DA="x"#, r#"y""#, r"C:\dir b\c.cpp", r"-Dz\\"]));
-        assert_eq!(split_posix(r#"cc -DA=\"x\" 'a b.c' "c d" e\ f"#), s(&["cc", r#"-DA="x""#, "a b.c", "c d", "e f"]));
+        assert_eq!(split_windows(r#"cl /DA=\"x y\" "C:\dir b\c.cpp" -Dz\\"#, false), s(&["cl", r#"/DA="x"#, r#"y""#, r"C:\dir b\c.cpp", r"-Dz\\"]));
+        assert_eq!(split_posix(r#"cc -DA=\"x\" 'a b.c' "c d" e\ f"#), Some(s(&["cc", r#"-DA="x""#, "a b.c", "c d", "e f"])));
+    }
+
+    #[test]
+    fn windows_split() {
+        assert_eq!(split_windows(r#""C:\Program Files\x.exe" -a "b c" d\"e"#, true), s(&[r"C:\Program Files\x.exe", "-a", "b c", "d\"e"]));
+        assert_eq!(split_windows(r#"a\\\"b "c\\" d"#, false), s(&[r#"a\"b"#, r"c\", "d"]));
+        assert_eq!(split_windows(r"C:\a\b.exe /FoC:\x\y.obj", true), s(&[r"C:\a\b.exe", r"/FoC:\x\y.obj"]));
+        assert_eq!(split_windows(r#"x "a""b""#, true), s(&["x", "a\"b"]));
+    }
+
+    #[test]
+    fn posix_split() {
+        assert_eq!(split_posix("cc -c 'a b.c' -o \"x y.o\" -DX=\\\"1\\\""), Some(s(&["cc", "-c", "a b.c", "-o", "x y.o", "-DX=\"1\""])));
+        assert_eq!(split_posix("cc a.c > out"), None);
+        assert_eq!(split_posix("cc $FLAGS"), None);
+        assert_eq!(split_posix("cc -o a#b x~y"), Some(s(&["cc", "-o", "a#b", "x~y"])));
     }
 
     #[test]

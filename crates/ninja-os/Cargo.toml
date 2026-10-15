@@ -1,0 +1,24 @@
+[package]
+name = "ninja-os"
+description = "What ninja-rs' crates share from the operating system: file stamps and digests, random numbers, Windows security"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+hex = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+test-dirs = { path = "../test-dirs" }

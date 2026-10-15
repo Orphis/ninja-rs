@@ -9,8 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use cpp_deps::scan::Watch;
-use rbe_client::proto as re;
-use rbe_client::tree::FileStamp;
+use ninja_os::{Digest, FileStamp};
 
 use crate::proto::{FileInfo, TreeInfo};
 use crate::watch::{Change, Listener, Watcher, key, strip_verbatim, walk_skips};
@@ -18,21 +17,9 @@ use crate::watch::{Change, Listener, Watcher, key, strip_verbatim, walk_skips};
 /// The session of entries the watcher vouches for.
 const WATCHED: u64 = u64::MAX;
 
-/// What a digest is valid for: the file's `FileStamp` and, on Windows, its
-/// change time and file ID. (There the stamp has the creation time, which
-/// NTFS gives back to a file created again under its name within 15 s, and
-/// nothing a rewrite in place with the modification time restored
-/// changes.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stamp {
-    file: FileStamp,
-    /// Windows: change time, volume serial number and file ID.
-    id: (u64, u64, u128),
-}
-
 struct FileEntry {
     info: FileInfo,
-    stamp: Stamp,
+    stamp: FileStamp,
     /// Checked within its file system's time granularity of its last
     /// change: changed again since, it could have kept its stamp.
     racy: bool,
@@ -48,9 +35,9 @@ struct TreeEntry {
 /// A digest kept for a file.
 enum Kept {
     /// Hashed here, for that version of the file.
-    Hashed(Stamp, re::Digest),
-    /// Saved by a build (`seed`): for its `FileStamp`.
-    Saved(FileStamp, re::Digest),
+    Hashed(FileStamp, Digest),
+    /// Saved by a build (`seed`), for that version of the file.
+    Saved(FileStamp, Digest),
     /// The watcher saw the file change since (the `n`th change it
     /// reported; 0: none yet, the file being hashed for the first time):
     /// hashed again, whatever its stamp.
@@ -68,68 +55,6 @@ pub struct Files {
     hashes: Mutex<HashMap<PathBuf, Kept>>,
     /// Changes the watcher reported (see `Kept::Changed`).
     changes: AtomicU64,
-}
-
-#[cfg(unix)]
-fn is_executable(meta: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_meta: &std::fs::Metadata) -> bool {
-    false
-}
-
-/// A file's metadata (symlinks followed) and stamp.
-#[cfg(not(windows))]
-fn stat(p: &Path) -> std::io::Result<(std::fs::Metadata, Stamp)> {
-    let meta = std::fs::metadata(p)?;
-    let file = FileStamp::of(&meta);
-    Ok((meta, Stamp { file, id: (0, 0, 0) }))
-}
-
-/// A file's metadata (symlinks followed) and stamp.
-#[cfg(windows)]
-fn stat(p: &Path) -> std::io::Result<(std::fs::Metadata, Stamp)> {
-    use std::ffi::c_void;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    const FILE_READ_ATTRIBUTES: u32 = 0x80;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_BASIC_INFO: i32 = 0;
-    const FILE_ID_INFO: i32 = 0x12;
-    #[repr(C)]
-    #[derive(Default)]
-    struct BasicInfo {
-        creation: i64,
-        access: i64,
-        write: i64,
-        change: i64,
-        attributes: u32,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct IdInfo {
-        volume: u64,
-        id: [u8; 16],
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(file: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
-    }
-    // Attributes only: no sharing conflict with writers.
-    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(p)?;
-    let meta = f.metadata()?;
-    let (mut basic, mut id) = (BasicInfo::default(), IdInfo::default());
-    // SAFETY: an open handle, and buffers writable for their sizes. A file
-    // system without them (FAT has no change time) leaves zeros.
-    unsafe {
-        GetFileInformationByHandleEx(f.as_raw_handle(), FILE_BASIC_INFO, (&raw mut basic).cast(), size_of::<BasicInfo>() as u32);
-        GetFileInformationByHandleEx(f.as_raw_handle(), FILE_ID_INFO, (&raw mut id).cast(), size_of::<IdInfo>() as u32);
-    }
-    let file = FileStamp::of(&meta);
-    Ok((meta, Stamp { file, id: (basic.change as u64, id.volume, u128::from_le_bytes(id.id)) }))
 }
 
 impl Files {
@@ -158,13 +83,13 @@ impl Files {
         self.len() == (0, 0)
     }
 
-    /// Digests a build saved: used for files whose `FileStamp` still
-    /// matches, unless the daemon knows better (it hashed the file, or saw
-    /// it change).
+    /// Digests a build saved: used for files whose stamp still matches,
+    /// unless the daemon knows better (it hashed the file, or saw it
+    /// change).
     pub fn seed(&self, entries: impl IntoIterator<Item = (PathBuf, FileStamp, String)>) {
         let mut hashes = self.hashes.lock().unwrap();
         for (p, stamp, hash) in entries {
-            hashes.entry(key(&p, self.case_insensitive)).or_insert(Kept::Saved(stamp, re::Digest { hash, size_bytes: stamp.len as i64 }));
+            hashes.entry(key(&p, self.case_insensitive)).or_insert(Kept::Saved(stamp, Digest { hash, size: stamp.len }));
         }
     }
 
@@ -203,7 +128,7 @@ impl Files {
             return Ok(e.info.clone());
         }
         let token = self.token(&k, p);
-        let (meta, stamp) = stat(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
+        let (meta, stamp) = ninja_os::stat(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
         if !meta.is_file() {
             return Err(format!("{} is not a file", p.display()));
         }
@@ -214,15 +139,17 @@ impl Files {
             e.session.store(self.checked(token), Ordering::Relaxed);
             return Ok(e.info.clone());
         }
-        let d = self.digest(p, stamp, || rbe_client::tree::hash_file(p).map_err(|e| format!("{e:#}")))?;
-        let racy = stamp.file.is_racy(SystemTime::now());
+        let d = self.digest(p, stamp, || ninja_os::hash_file(p).map_err(|e| e.to_string()))?;
+        let racy = stamp.is_racy(SystemTime::now());
         let info = FileInfo {
             hash: d.hash,
-            size: d.size_bytes as u64,
-            executable: is_executable(&meta),
-            mtime_ns: stamp.file.mtime_ns,
-            change: stamp.file.change,
-            inode: stamp.file.inode,
+            size: d.size,
+            executable: ninja_os::is_executable(&meta),
+            mtime_ns: stamp.mtime_ns,
+            change: stamp.change,
+            created: stamp.created,
+            volume: stamp.volume,
+            id: stamp.id,
         };
         // The token compared under the lock: an event counted after it
         // drops the entry after it's in.
@@ -232,15 +159,14 @@ impl Files {
     }
 
     /// `p`'s digest: the one kept for its version, or `hash`ed.
-    fn digest(&self, p: &Path, stamp: Stamp, hash: impl FnOnce() -> Result<re::Digest, String>) -> Result<re::Digest, String> {
+    fn digest(&self, p: &Path, stamp: FileStamp, hash: impl FnOnce() -> Result<Digest, String>) -> Result<Digest, String> {
         // Links to a file share its entry.
         let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
         let real = if is_link { std::fs::canonicalize(p).map(strip_verbatim).unwrap_or_else(|_| p.to_path_buf()) } else { p.to_path_buf() };
         let k = key(&real, self.case_insensitive);
         let seen = match self.hashes.lock().unwrap().entry(k.clone()) {
             Entry::Occupied(e) => match e.get() {
-                Kept::Hashed(s, d) if *s == stamp => return Ok(d.clone()),
-                Kept::Saved(s, d) if *s == stamp.file => return Ok(d.clone()),
+                Kept::Hashed(s, d) | Kept::Saved(s, d) if *s == stamp => return Ok(d.clone()),
                 Kept::Changed(n) => Some(*n),
                 _ => None,
             },
@@ -257,7 +183,7 @@ impl Files {
             // or of a mix.
             Some(Kept::Changed(n)) if Some(*n) != seen => {}
             // It may change again within the same tick, keeping its stamp.
-            _ if stamp.file.is_racy(SystemTime::now()) => {}
+            _ if stamp.is_racy(SystemTime::now()) => {}
             _ => {
                 hashes.insert(k, Kept::Hashed(stamp, d.clone()));
             }
@@ -329,9 +255,8 @@ impl Listener for Files {
         match change {
             Change::Content => {
                 self.files.write().unwrap().remove(&k);
-                // Its stamp may not tell: a build saved only a `FileStamp`
-                // (on Windows, the same after a rewrite in place with the
-                // modification time restored).
+                // Its stamp may not tell: a change within a tick of the
+                // file system's clock keeps the change time.
                 if let Some(kept) = self.hashes.lock().unwrap().get_mut(&k) {
                     *kept = Kept::Changed(self.changes.fetch_add(1, Ordering::Relaxed) + 1);
                 }
@@ -347,10 +272,11 @@ impl Listener for Files {
 }
 
 /// The first line of `.ninja_rs_digests` files.
-pub const DIGESTS_SIGNATURE: &str = "# ninja-rs digests v2";
+pub const DIGESTS_SIGNATURE: &str = "# ninja-rs digests v3";
 
 /// The entries of a `.ninja_rs_digests` file
-/// (`path\tsize\tmtime_ns\tchange\tinode\thash` lines): (path, stamp, hash).
+/// (`path\tsize\tmtime_ns\tchange\tcreated\tvolume\tid\thash` lines, see
+/// `FileStamp`): (path, stamp, hash).
 pub fn read_digests(file: &Path) -> Vec<(PathBuf, FileStamp, String)> {
     let Ok(text) = std::fs::read_to_string(file) else { return Vec::new() };
     let mut lines = text.lines();
@@ -360,11 +286,15 @@ pub fn read_digests(file: &Path) -> Vec<(PathBuf, FileStamp, String)> {
     lines
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 6 {
+            if f.len() != 8 {
                 return None;
             }
-            let (Ok(len), Ok(mtime_ns), Ok(change), Ok(inode)) = (f[1].parse(), f[2].parse(), f[3].parse(), f[4].parse()) else { return None };
-            Some((PathBuf::from(f[0]), FileStamp { len, mtime_ns, change, inode }, f[5].to_string()))
+            let (Ok(len), Ok(mtime_ns), Ok(change), Ok(created), Ok(volume), Ok(id)) =
+                (f[1].parse(), f[2].parse(), f[3].parse(), f[4].parse(), f[5].parse(), f[6].parse())
+            else {
+                return None;
+            };
+            Some((PathBuf::from(f[0]), FileStamp { len, mtime_ns, change, created, volume, id }, f[7].to_string()))
         })
         .collect()
 }
@@ -398,8 +328,7 @@ mod tests {
         // Saved digests are reused for the same version of a file.
         let b = dir.join("b.txt");
         std::fs::write(&b, "bbb").unwrap();
-        let m = std::fs::metadata(&b).unwrap();
-        files.seed([(b.clone(), FileStamp::of(&m), "made-up".to_string())]);
+        files.seed([(b.clone(), ninja_os::stat(&b).unwrap().1, "made-up".to_string())]);
         assert_eq!(files.get(&b).unwrap().hash, "made-up");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -413,7 +342,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let b = dir.join("b.txt");
         std::fs::write(&b, "bbb").unwrap();
-        let stamp = FileStamp::of(&std::fs::metadata(&b).unwrap());
+        let stamp = ninja_os::stat(&b).unwrap().1;
         let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
         let files = Files::new(w.clone(), cfg!(windows));
         files.seed([(b.clone(), stamp, "made-up".to_string())]);
@@ -441,13 +370,13 @@ mod tests {
         std::fs::File::options().write(true).open(&b).unwrap().set_modified(old).unwrap();
         let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
         let files = Files::new(w.clone(), cfg!(windows));
-        let digest = |h: &str| re::Digest { hash: h.into(), size_bytes: 3 };
+        let digest = |h: &str| Digest { hash: h.into(), size: 3 };
         let kept = |p: &Path| match files.hashes.lock().unwrap().get(&key(p, cfg!(windows))) {
             Some(Kept::Hashed(_, d)) => Some(d.hash.clone()),
             Some(Kept::Changed(_)) => Some("changed".into()),
             _ => None,
         };
-        let stamp = stat(&b).unwrap().1;
+        let stamp = ninja_os::stat(&b).unwrap().1;
         files.digest(&b, stamp, || Ok(digest("first"))).unwrap();
         assert_eq!(kept(&b).as_deref(), Some("first"));
         files.changed(&b, Change::Content);
@@ -465,7 +394,7 @@ mod tests {
         std::fs::write(&d, "ddd").unwrap();
         std::fs::File::options().write(true).open(&d).unwrap().set_modified(old).unwrap();
         files
-            .digest(&d, stat(&d).unwrap().1, || {
+            .digest(&d, ninja_os::stat(&d).unwrap().1, || {
                 files.changed(&d, Change::Content);
                 Ok(digest("mixed"))
             })
@@ -499,8 +428,8 @@ mod tests {
             }
             std::fs::write(&f, format!("version {}", i + 2)).unwrap();
             std::fs::File::options().write(true).open(&f).unwrap().set_modified(mtime).unwrap();
-            let after = FileStamp::of(&std::fs::metadata(&f).unwrap());
-            assert_eq!(after, before.stamp(), "the same `FileStamp`");
+            let (after, was) = (ninja_os::stat(&f).unwrap().1, before.stamp());
+            assert_eq!((after.len, after.mtime_ns, after.created), (was.len, was.mtime_ns, was.created), "the same size and times");
             files.new_session();
             assert_ne!(files.get(&f).unwrap().hash, before.hash, "recreated: {recreate}");
         }
@@ -600,9 +529,10 @@ mod tests {
     #[test]
     fn digest_files() {
         let f = test_dirs::base().join(format!("ninja_daemon_digests_{}", std::process::id()));
-        std::fs::write(&f, format!("{DIGESTS_SIGNATURE}\n/a/b\t3\t1000\t7\t9\tabc\nbad line\n")).unwrap();
+        std::fs::write(&f, format!("{DIGESTS_SIGNATURE}\n/a/b\t3\t1000\t7\t8\t5\t{}\tabc\nbad line\n", u128::MAX)).unwrap();
         let d = read_digests(&f);
-        assert_eq!(d, vec![(PathBuf::from("/a/b"), FileStamp { len: 3, mtime_ns: 1000, change: 7, inode: 9 }, "abc".to_string())]);
+        let stamp = FileStamp { len: 3, mtime_ns: 1000, change: 7, created: 8, volume: 5, id: u128::MAX };
+        assert_eq!(d, vec![(PathBuf::from("/a/b"), stamp, "abc".to_string())]);
         let _ = std::fs::remove_file(&f);
     }
 }

@@ -12,6 +12,7 @@ cpp-deps = { path = "../cpp-deps" }
 hex = { workspace = true }
 ninja-core = { path = "../ninja-core" }
 ninja-daemon = { path = "../ninja-daemon" }
+ninja-os = { path = "../ninja-os" }
 prost = { workspace = true }
 rbe-client = { path = "../../third_party/cargo-rbe/rbe-client" }
 serde = { workspace = true }

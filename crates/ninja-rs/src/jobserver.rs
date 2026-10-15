@@ -432,36 +432,25 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    use std::ffi::{CString, c_void};
+    use std::ffi::CString;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{CreateSemaphoreA, ReleaseSemaphore, SEMAPHORE_MODIFY_STATE, WaitForSingleObject};
+    use windows_sys::Win32::System::WindowsProgramming::OpenSemaphoreA;
 
     use super::Mode;
 
-    type Handle = *mut c_void;
-    const SYNCHRONIZE: u32 = 0x0010_0000;
-    const SEMAPHORE_MODIFY_STATE: u32 = 0x0002;
-    const WAIT_OBJECT_0: u32 = 0;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateSemaphoreA(attributes: *const c_void, initial: i32, maximum: i32, name: *const u8) -> Handle;
-        fn OpenSemaphoreA(access: u32, inherit: i32, name: *const u8) -> Handle;
-        fn ReleaseSemaphore(semaphore: Handle, count: i32, previous: *mut i32) -> i32;
-        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
-        fn CloseHandle(handle: Handle) -> i32;
-    }
-
     /// An owned semaphore handle.
-    struct Semaphore(Handle);
+    struct Semaphore(OwnedHandle);
 
-    // SAFETY: semaphore handles may be used from any thread.
-    unsafe impl Send for Semaphore {}
-    unsafe impl Sync for Semaphore {}
-
-    impl Drop for Semaphore {
-        fn drop(&mut self) {
-            // SAFETY: the handle is open and owned.
-            unsafe { CloseHandle(self.0) };
+    impl Semaphore {
+        /// Owns `h`, a new handle (None: the call that made it failed).
+        fn new(h: HANDLE) -> Option<Semaphore> {
+            // SAFETY: a new handle, owned from now on.
+            (!h.is_null()).then(|| Semaphore(unsafe { OwnedHandle::from_raw_handle(h) }))
         }
     }
 
@@ -479,21 +468,19 @@ mod sys {
             let c = c_name(name)?;
             // SAFETY: a valid NUL-terminated name.
             let h = unsafe { OpenSemaphoreA(SYNCHRONIZE | SEMAPHORE_MODIFY_STATE, 0, c.as_ptr().cast()) };
-            if h.is_null() {
-                return Err(format!("Error opening semaphore: {}", std::io::Error::last_os_error()));
-            }
-            Ok(Self { semaphore: Semaphore(h) })
+            let semaphore = Semaphore::new(h).ok_or_else(|| format!("Error opening semaphore: {}", std::io::Error::last_os_error()))?;
+            Ok(Self { semaphore })
         }
 
         pub fn try_acquire(&self) -> Option<u8> {
             // SAFETY: the handle is open. A zero timeout doesn't block.
             // Semaphore tokens have no value: always 1, like ninja.
-            (unsafe { WaitForSingleObject(self.semaphore.0, 0) } == WAIT_OBJECT_0).then_some(1)
+            (unsafe { WaitForSingleObject(self.semaphore.0.as_raw_handle(), 0) } == WAIT_OBJECT_0).then_some(1)
         }
 
         pub fn release(&self, _token: u8) {
             // SAFETY: the handle is open. Nothing can be done when this fails.
-            unsafe { ReleaseSemaphore(self.semaphore.0, 1, std::ptr::null_mut()) };
+            unsafe { ReleaseSemaphore(self.semaphore.0.as_raw_handle(), 1, std::ptr::null_mut()) };
         }
     }
 
@@ -512,10 +499,8 @@ mod sys {
             let count = i32::try_from(jobs - 1).unwrap_or(i32::MAX);
             // SAFETY: a valid NUL-terminated name, default security.
             let h = unsafe { CreateSemaphoreA(std::ptr::null(), count, count, c.as_ptr().cast()) };
-            if h.is_null() {
-                return Err(format!("Could not create semaphore: {}", std::io::Error::last_os_error()));
-            }
-            Ok(Self { name, _semaphore: Semaphore(h) })
+            let semaphore = Semaphore::new(h).ok_or_else(|| format!("Could not create semaphore: {}", std::io::Error::last_os_error()))?;
+            Ok(Self { name, _semaphore: semaphore })
         }
 
         pub fn auth(&self) -> String {

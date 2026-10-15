@@ -17,11 +17,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use cpp_deps::lex::{DirKind, Kind, P, Token};
+/// Lexical normalization (removes `.` and `..` components).
+pub use cpp_deps::scan::normalize;
 
 use crate::cmdline::split_rsp;
 
@@ -116,23 +118,6 @@ fn abs(p: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(p);
     let joined = if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) };
     normalize(&joined)
-}
-
-/// Lexical normalization (removes `.` and `..` components).
-pub fn normalize(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Expands `@file` arguments (recursively). Returns the expanded argv and

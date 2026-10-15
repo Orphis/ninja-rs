@@ -168,11 +168,8 @@ fn broke(mut cause: Option<&(dyn std::error::Error + 'static)>) -> bool {
 /// How long to wait before attempt `attempt + 1`: 100 ms doubling up to
 /// 5 s (Bazel's), give or take 10%.
 fn backoff(attempt: u32) -> Duration {
-    use std::hash::{BuildHasher, Hasher};
     let base = Duration::from_millis(100).saturating_mul(1 << attempt.min(16)).min(Duration::from_secs(5));
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u32(attempt);
-    base.mul_f64(0.9 + 0.2 * (h.finish() % 1000) as f64 / 1000.0)
+    base.mul_f64(0.9 + 0.2 * (ninja_os::random_u64() % 1000) as f64 / 1000.0)
 }
 
 /// Reads until `buf` is full or the end: fewer bytes only at the end.

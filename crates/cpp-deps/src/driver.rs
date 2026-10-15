@@ -1045,7 +1045,7 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
     // cl and clang-cl take flags from `CL` before the command's, and from
     // `_CL_` after: the probe sees them, the scan doesn't.
     for var in ["CL", "_CL_"] {
-        for a in env.var(var).map(|v| split_windows(&v)).unwrap_or_default() {
+        for a in env.var(var).map(|v| split_windows(&v, false)).unwrap_or_default() {
             if a.strip_prefix('/').or_else(|| a.strip_prefix('-')).is_none_or(|f| cl_parsed(f) || cl_unsupported(f)) {
                 return Err(format!("{var} has {a}"));
             }

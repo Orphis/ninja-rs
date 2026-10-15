@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Changes with the messages: a client and a daemon must agree.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// Larger frames are refused (a corrupt length).
 const MAX_FRAME: usize = 1 << 30;
@@ -106,17 +106,21 @@ pub struct FileInfo {
     pub executable: bool,
     /// Nanoseconds since the Unix epoch.
     pub mtime_ns: u64,
-    /// The rest of its `FileStamp`: change (or creation) time and inode.
+    /// The rest of its `FileStamp`.
     #[serde(default)]
     pub change: u64,
     #[serde(default)]
-    pub inode: u64,
+    pub created: u64,
+    #[serde(default)]
+    pub volume: u64,
+    #[serde(default)]
+    pub id: u128,
 }
 
 impl FileInfo {
     /// What the digest is valid for.
-    pub fn stamp(&self) -> rbe_client::tree::FileStamp {
-        rbe_client::tree::FileStamp { len: self.size, mtime_ns: self.mtime_ns, change: self.change, inode: self.inode }
+    pub fn stamp(&self) -> ninja_os::FileStamp {
+        ninja_os::FileStamp { len: self.size, mtime_ns: self.mtime_ns, change: self.change, created: self.created, volume: self.volume, id: self.id }
     }
 }
 
@@ -193,5 +197,10 @@ mod tests {
         assert!(read::<Request>(&mut r).unwrap().is_none());
         let mut bad = &[0xff, 0xff, 0xff, 0xff][..];
         assert!(read::<Request>(&mut bad).is_err());
+        // File IDs take 128 bits (ReFS).
+        let info = FileInfo { hash: "h".into(), size: 1, executable: false, mtime_ns: 2, change: 3, created: 4, volume: 5, id: u128::MAX };
+        let mut buf = Vec::new();
+        write(&mut buf, &Response::Files(vec![Ok(info.clone())])).unwrap();
+        assert!(matches!(read::<Response>(&mut buf.as_slice()).unwrap(), Some(Response::Files(f)) if f == vec![Ok(info)]));
     }
 }

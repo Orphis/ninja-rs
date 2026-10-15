@@ -17,6 +17,7 @@ rust_library(
     deps = [
         "//crates/ninja-core",
         "//crates/ninja-daemon",
+        "//crates/ninja-os",
         "//crates/ninja-remote",
         "//third_party/cargo-rbe/rbe-bes",
         "//third_party/cargo-rbe/rbe-client",
@@ -26,7 +27,7 @@ rust_library(
         "@crates//:serde_json",
         "@crates//:tokio",
     ] + select({
-        "@platforms//os:windows": [],
+        "@platforms//os:windows": ["@crates//:windows-sys"],
         "//conditions:default": ["@crates//:libc"],
     }),
 )
@@ -92,7 +93,7 @@ rust_test(
         "@crates//:serde_json",
         "@crates//:tokio",
     ] + select({
-        "@platforms//os:windows": [],
+        "@platforms//os:windows": ["@crates//:windows-sys"],
         "//conditions:default": ["@crates//:libc"],
     }),
 )
@@ -113,7 +114,7 @@ rust_test(
         ":ninja_rs_lib",
         "//crates/test-dirs",
     ] + select({
-        "@platforms//os:windows": [],
+        "@platforms//os:windows": ["@crates//:windows-sys"],
         "//conditions:default": ["@crates//:libc"],
     }),
 )

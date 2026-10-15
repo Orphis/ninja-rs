@@ -74,11 +74,8 @@ pub struct DiskCache {
 /// The PID alone isn't enough: containers sharing a cache volume have the
 /// same ones.
 pub(crate) fn unique_name() -> String {
-    use std::hash::{BuildHasher, Hasher};
     static N: AtomicU64 = AtomicU64::new(0);
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u128(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
-    format!("{}-{}-{:016x}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), h.finish())
+    format!("{}-{}-{:016x}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), ninja_os::random_u64())
 }
 
 /// How old a file in `tmp/` must be for garbage collection to remove it:

@@ -5,7 +5,7 @@
 //!
 //! Everything lives behind this one `Store`, owned by the service; nothing
 //! is global. The file digest cache can be saved to and loaded from disk
-//! (keyed by path, size and mtime); the other caches are in memory for now
+//! (keyed by path and `FileStamp`); the other caches are in memory for now
 //! but keyed so that they could be persisted the same way.
 
 use std::collections::{HashMap, HashSet};
@@ -200,7 +200,7 @@ impl Store {
             if ps.contains(['\t', '\n']) || s.is_racy(now) {
                 continue;
             }
-            out.push_str(&format!("{ps}\t{}\t{}\t{}\t{}\t{}\n", s.len, s.mtime_ns, s.change, s.inode, d.hash));
+            out.push_str(&format!("{ps}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", s.len, s.mtime_ns, s.change, s.created, s.volume, s.id, d.hash));
         }
         let tmp = file.with_extension("tmp");
         std::fs::File::create(&tmp)?.write_all(out.as_bytes())?;
@@ -229,18 +229,33 @@ mod tests {
         s.save_digests(&dir.join("digests")).unwrap();
         let s2 = Store::default();
         s2.load_digests(&dir.join("digests"));
-        let stamp = |f: &Path| rbe_client::tree::FileStamp::of(&std::fs::metadata(f).unwrap());
+        let stamp = |f: &Path| ninja_os::stat(f).unwrap().1;
         assert_eq!(s2.digests.get(&f, &stamp(&f)), Some(d.clone()));
+        // Changes within a tick of the file system's clock get the same
+        // change time: one goes by.
+        let tick = || {
+            let (probe, last) = (dir.join("tick"), stamp(&f).change);
+            loop {
+                std::fs::write(&probe, "").unwrap();
+                if stamp(&probe).change > last {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
         // New contents with the same size and modification time (as an
-        // archive extracted in place gives): not the cached digest. (On
-        // Windows the creation time stands in, which NTFS gives back to a
-        // file created again under the same name within 15 s.)
-        #[cfg(unix)]
-        {
-            std::fs::write(&f, "jello").unwrap();
-            std::fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
-            assert_ne!(rbe_client::tree::file_digest(&f, Some(&s2.digests)).unwrap(), d);
-        }
+        // archive extracted in place gives): not the cached digest. Nor for
+        // a file created again under its name, which NTFS gives its old
+        // creation time back.
+        tick();
+        std::fs::write(&f, "jello").unwrap();
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
+        assert_ne!(rbe_client::tree::file_digest(&f, Some(&s2.digests)).unwrap(), d);
+        tick();
+        std::fs::remove_file(&f).unwrap();
+        std::fs::write(&f, "hello").unwrap();
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
+        assert_eq!(rbe_client::tree::file_digest(&f, Some(&s2.digests)).unwrap(), d);
         // Modified within the time granularity: not saved. A second ago is
         // only too recent for a file system counting in seconds.
         let now = std::time::SystemTime::now();
@@ -282,7 +297,16 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(*a.files, vec!["bin/cc".to_string()]);
         // The same tree from a listing.
-        let info = ninja_daemon::proto::FileInfo { hash: rbe_client::digest_of(b"x").hash, size: 1, executable: false, mtime_ns: 0, change: 0, inode: 0 };
+        let info = ninja_daemon::proto::FileInfo {
+            hash: rbe_client::digest_of(b"x").hash,
+            size: 1,
+            executable: false,
+            mtime_ns: 0,
+            change: 0,
+            created: 0,
+            volume: 0,
+            id: 0,
+        };
         let listed = TreeInfo { dirs: vec!["bin".into()], files: vec![("bin/cc".into(), info)] };
         let c = Store::default().toolchain_tree(&dir, &|_| Some(Ok(listed.clone()))).unwrap();
         assert_eq!(c.digest, a.digest);
@@ -326,7 +350,16 @@ mod tests {
         std::fs::write(dir.join("bin/.svn/entries"), "e").unwrap();
         let a = Store::default().toolchain_tree(&dir, &|_| None).unwrap();
         assert_eq!(*a.files, vec!["bin/cc".to_string()]);
-        let info = ninja_daemon::proto::FileInfo { hash: rbe_client::digest_of(b"x").hash, size: 1, executable: false, mtime_ns: 0, change: 0, inode: 0 };
+        let info = ninja_daemon::proto::FileInfo {
+            hash: rbe_client::digest_of(b"x").hash,
+            size: 1,
+            executable: false,
+            mtime_ns: 0,
+            change: 0,
+            created: 0,
+            volume: 0,
+            id: 0,
+        };
         let listed = TreeInfo { dirs: vec!["bin".into()], files: vec![("bin/cc".into(), info)] };
         assert_eq!(Store::default().toolchain_tree(&dir, &|_| Some(Ok(listed.clone()))).unwrap().digest, a.digest);
         let mut files = Vec::new();

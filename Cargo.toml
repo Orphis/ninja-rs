@@ -25,6 +25,8 @@ tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+# Already in the graph through tokio: only the features each crate names.
+windows-sys = "0.61"
 zstd = "0.13"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "sync", "signal", "time", "fs", "io-util"] }
 

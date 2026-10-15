@@ -15,13 +15,13 @@ rust_library(
     version = module_version(),
     deps = [
         "//crates/cpp-deps",
-        "//third_party/cargo-rbe/rbe-client",
+        "//crates/ninja-os",
         "@crates//:hex",
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:sha2",
     ] + select({
-        "@platforms//os:windows": [],
+        "@platforms//os:windows": ["@crates//:windows-sys"],
         "//conditions:default": ["@crates//:libc"],
     }),
 )

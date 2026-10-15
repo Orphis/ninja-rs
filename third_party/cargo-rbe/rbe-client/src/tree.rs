@@ -4,14 +4,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
-use sha2::{Digest as _, Sha256};
 
 use crate::proto as re;
 
@@ -80,54 +77,8 @@ impl BlobSet {
     }
 }
 
-/// What a file's cached digest is valid for, besides its path: its size,
-/// modification time, and on Unix its change time and inode, which no tool
-/// sets (files extracted in place from an archive with normalized times
-/// can have new contents, the same size and an old modification time; not
-/// an old change time). Windows has its creation time instead, new for a
-/// file extracted into a new directory, but not for one written in place,
-/// or created again under its name within 15 s (NTFS gives it back): its
-/// change time needs a handle per file, too costly here.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct FileStamp {
-    pub len: u64,
-    /// Nanoseconds since the Unix epoch.
-    pub mtime_ns: u64,
-    /// Unix: change time, in nanoseconds; Windows: creation time, in 100 ns.
-    pub change: u64,
-    pub inode: u64,
-}
-
-impl FileStamp {
-    pub fn of(meta: &fs::Metadata) -> FileStamp {
-        let mtime_ns = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
-        #[cfg(unix)]
-        let (change, inode) = {
-            use std::os::unix::fs::MetadataExt;
-            ((meta.ctime() as u64).wrapping_mul(1_000_000_000).wrapping_add(meta.ctime_nsec() as u64), meta.ino())
-        };
-        #[cfg(windows)]
-        let (change, inode) = {
-            use std::os::windows::fs::MetadataExt;
-            (meta.creation_time(), 0)
-        };
-        #[cfg(not(any(unix, windows)))]
-        let (change, inode) = (0, 0);
-        FileStamp { len: meta.len(), mtime_ns, change, inode }
-    }
-
-    /// Whether the file was modified within its file system's time
-    /// granularity of `now`: changed again since, it could have kept this
-    /// stamp, so its digest isn't kept across builds (git's "racy"
-    /// entries). Whole seconds are 2 s (FAT counts in 2 s, ext3 and HFS+ in
-    /// seconds), finer times 100 ms (kernels stamp files with a clock that
-    /// ticks every few milliseconds).
-    pub fn is_racy(&self, now: SystemTime) -> bool {
-        let now_ns = now.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-        let granularity = if self.mtime_ns.is_multiple_of(1_000_000_000) { 2_000_000_000 } else { 100_000_000 };
-        self.mtime_ns.saturating_add(granularity) > now_ns
-    }
-}
+/// What a cached digest is valid for (see `ninja_os::FileStamp`).
+pub use ninja_os::FileStamp;
 
 /// A cache of file digests keyed by path and `FileStamp`, owned by the
 /// caller (no process-wide state).
@@ -160,27 +111,15 @@ impl DigestCache for MemDigestCache {
 
 /// SHA-256 of a file's contents.
 pub fn hash_file(path: &Path) -> Result<re::Digest> {
-    let mut f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut h = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut n_total = 0u64;
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        n_total += n as u64;
-        h.update(&buf[..n]);
-    }
-    Ok(re::Digest { hash: hex::encode(h.finalize()), size_bytes: n_total as i64 })
+    let d = ninja_os::hash_file(path)?;
+    Ok(re::Digest { hash: d.hash, size_bytes: d.size as i64 })
 }
 
 /// The digest of a file, through `cache` when given.
 /// The cache is keyed by the symlink-resolved path, so that many links to
 /// one file (e.g. LLVM's multi-call binary) are hashed once.
 pub fn file_digest(path: &Path, cache: Option<&dyn DigestCache>) -> Result<re::Digest> {
-    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let stamp = FileStamp::of(&meta);
+    let (_, stamp) = ninja_os::stat(path).with_context(|| format!("stat {}", path.display()))?;
     let Some(c) = cache else { return hash_file(path) };
     let is_link = fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false);
     let key = if is_link { fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()) } else { path.to_path_buf() };
@@ -190,17 +129,6 @@ pub fn file_digest(path: &Path, cache: Option<&dyn DigestCache>) -> Result<re::D
     let d = hash_file(path)?;
     c.put(&key, stamp, d.clone());
     Ok(d)
-}
-
-#[cfg(unix)]
-fn is_executable(meta: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    meta.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_meta: &fs::Metadata) -> bool {
-    false
 }
 
 #[derive(Debug)]
@@ -272,7 +200,7 @@ impl InputTree {
     pub fn add_file_cached(&mut self, rel: &str, local: &Path, cache: Option<&dyn DigestCache>) -> Result<()> {
         let meta = fs::metadata(local).with_context(|| format!("stat {}", local.display()))?;
         let digest = file_digest(local, cache)?;
-        self.insert(rel, Node::File { digest, executable: is_executable(&meta), src: BlobSource::File(local.to_path_buf()) })
+        self.insert(rel, Node::File { digest, executable: ninja_os::is_executable(&meta), src: BlobSource::File(local.to_path_buf()) })
     }
 
     /// A local file whose digest the caller already knows.

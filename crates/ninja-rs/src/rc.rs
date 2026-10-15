@@ -214,10 +214,6 @@ fn system_file(warnings: &mut Vec<String>) -> Option<PathBuf> {
     Some(f)
 }
 
-/// Version control directories: a repository's root ends the search for
-/// its `.ninjars`.
-const REPOSITORY_MARKERS: &[&str] = &[".git", ".hg", ".jj", ".sl", ".svn"];
-
 /// The workspace's file: the first `.ninjars` from `dir` up to the
 /// repository's root, short of the home directory (whose file is the
 /// user's) and of a file system's root (`/`, `D:\`). A file someone else
@@ -251,7 +247,8 @@ fn workspace_file_below(dir: &Path, home: Option<&Path>, warnings: &mut Vec<Stri
                 None => warnings.push(format!("{} skipped: other users can change it{}", f.display(), CHANGE_HINT)),
             }
         }
-        if REPOSITORY_MARKERS.iter().any(|m| d.join(m).exists()) {
+        // A repository's root ends the search.
+        if ninja_daemon::watch::VCS_DIRS.iter().any(|m| d.join(m).exists()) {
             break;
         }
     }
@@ -318,83 +315,21 @@ fn trusted_file(file: &Path) -> bool {
 /// security descriptor.
 #[cfg(windows)]
 mod sys {
-    use std::ffi::c_void;
     use std::io;
-    use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::sync::OnceLock;
 
-    type Handle = *mut c_void;
-    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
-    const READ_CONTROL: u32 = 0x0002_0000;
-    const FILE_SHARE_ALL: u32 = 0x7;
-    const OPEN_EXISTING: u32 = 3;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const SE_FILE_OBJECT: i32 = 1;
-    const OWNER_SECURITY_INFORMATION: u32 = 0x1;
-    const DACL_SECURITY_INFORMATION: u32 = 0x4;
-    const TOKEN_QUERY: u32 = 0x8;
-    const TOKEN_USER: i32 = 1;
-    const INHERIT_ONLY_ACE: u8 = 0x8;
-    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x0;
-    const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x5;
-    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 0x9;
-    const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 0xb;
     /// Rights that change a file, or what a directory holds: write data
     /// (add a file), append data (add a subdirectory), delete a child,
     /// delete, change the permissions or the owner, and the generic rights
     /// that include them.
     const WRITE: u32 = 0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000;
 
-    const EVERYONE: &str = "S-1-1-0";
     /// SYSTEM, Administrators and TrustedInstaller, who can change any
     /// file anyway.
     const ADMINISTRATORS: &[&str] = &["S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"];
     /// CREATOR OWNER and OWNER RIGHTS: the owner.
     const OWNER: &[&str] = &["S-1-3-0", "S-1-3-4"];
-
-    #[repr(C)]
-    struct Acl {
-        _revision: u8,
-        _sbz1: u8,
-        _size: u16,
-        count: u16,
-        _sbz2: u16,
-    }
-
-    #[repr(C)]
-    struct AceHeader {
-        kind: u8,
-        flags: u8,
-        _size: u16,
-    }
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateFileW(name: *const u16, access: u32, share: u32, security: *const c_void, disposition: u32, flags: u32, template: Handle) -> Handle;
-        fn CloseHandle(handle: Handle) -> i32;
-        fn GetCurrentProcess() -> Handle;
-        fn LocalFree(mem: *mut c_void) -> *mut c_void;
-    }
-
-    #[link(name = "advapi32")]
-    unsafe extern "system" {
-        fn GetSecurityInfo(
-            handle: Handle,
-            kind: i32,
-            info: u32,
-            owner: *mut *mut c_void,
-            group: *mut *mut c_void,
-            dacl: *mut *mut Acl,
-            sacl: *mut *mut Acl,
-            descriptor: *mut *mut c_void,
-        ) -> u32;
-        fn GetAce(acl: *const Acl, index: u32, ace: *mut *mut c_void) -> i32;
-        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
-        fn GetTokenInformation(token: Handle, class: i32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
-        fn ConvertSidToStringSidW(sid: *mut c_void, out: *mut *mut u16) -> i32;
-    }
 
     /// Who owns a file and who may change it.
     #[derive(Debug)]
@@ -422,130 +357,14 @@ mod sys {
 
     /// The security of `path`, or of what it links to (`follow`).
     fn security(path: &Path, follow: bool) -> io::Result<Security> {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-        let flags = FILE_FLAG_BACKUP_SEMANTICS | if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
-        // SAFETY: `wide` is NUL-terminated; the handle is closed below.
-        let h = unsafe { CreateFileW(wide.as_ptr(), READ_CONTROL, FILE_SHARE_ALL, std::ptr::null(), OPEN_EXISTING, flags, std::ptr::null_mut()) };
-        if h == INVALID_HANDLE_VALUE {
-            return Err(io::Error::last_os_error());
-        }
-        let (mut owner, mut dacl, mut descriptor) = (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
-        // SAFETY: an open handle and valid out-parameters; the descriptor,
-        // which `owner` and `dacl` point into, is freed below.
-        let status = unsafe {
-            GetSecurityInfo(
-                h,
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
-                std::ptr::null_mut(),
-                &mut dacl,
-                std::ptr::null_mut(),
-                &mut descriptor,
-            )
-        };
-        // SAFETY: opened above.
-        unsafe { CloseHandle(h) };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status as i32));
-        }
-        // SAFETY: from the descriptor, alive until freed below.
-        let result = unsafe { parse(owner, dacl) };
-        // SAFETY: allocated by GetSecurityInfo.
-        unsafe { LocalFree(descriptor) };
-        result
-    }
-
-    /// # Safety
-    /// `owner` is a SID or null, `dacl` an ACL or null, alive during the
-    /// call.
-    unsafe fn parse(owner: *mut c_void, dacl: *mut Acl) -> io::Result<Security> {
-        // No owner: nobody vouches for it.
-        // SAFETY: as the caller promises.
-        let owner = if owner.is_null() { EVERYONE.into() } else { unsafe { sid_string(owner)? } };
-        if dacl.is_null() {
-            // No DACL: everyone has every right.
-            return Ok(Security { owner, writers: vec![EVERYONE.into()] });
-        }
-        let mut writers = Vec::new();
-        // SAFETY: a valid ACL.
-        let count = unsafe { (*dacl).count };
-        for i in 0..count {
-            let mut ace = std::ptr::null_mut();
-            // SAFETY: `i` is below the ACL's count.
-            if unsafe { GetAce(dacl, u32::from(i), &mut ace) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: an ACE starts with its header.
-            let header = unsafe { ace.cast::<AceHeader>().read_unaligned() };
-            // Denied entries only take rights away; inherit-only ones are
-            // for what the directory will hold.
-            let allowed = matches!(
-                header.kind,
-                ACCESS_ALLOWED_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_ACE_TYPE | ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
-            );
-            if !allowed || header.flags & INHERIT_ONLY_ACE != 0 {
-                continue;
-            }
-            // SAFETY: the allowed kinds go on with the access mask, then
-            // (but object ACEs) the SID.
-            let mask = unsafe { ace.cast::<u8>().add(4).cast::<u32>().read_unaligned() };
-            if mask & WRITE != 0 {
-                writers.push(match header.kind {
-                    // Not on files: their SID isn't read, whoever it is.
-                    ACCESS_ALLOWED_OBJECT_ACE_TYPE | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE => EVERYONE.into(),
-                    // SAFETY: as above.
-                    _ => unsafe { sid_string(ace.cast::<u8>().add(8).cast())? },
-                });
-            }
-        }
+        let (owner, writers) = ninja_os::windows::file_security(path, follow, |rights| rights & WRITE != 0)?;
         Ok(Security { owner, writers })
-    }
-
-    /// `S-1-5-...`.
-    ///
-    /// # Safety
-    /// `sid` is a valid SID.
-    unsafe fn sid_string(sid: *mut c_void) -> io::Result<String> {
-        let mut text: *mut u16 = std::ptr::null_mut();
-        // SAFETY: a valid SID; the string is freed below.
-        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a NUL-terminated string from ConvertSidToStringSidW.
-        let s = unsafe {
-            let n = (0..).take_while(|&i| *text.add(i) != 0).count();
-            String::from_utf16_lossy(std::slice::from_raw_parts(text, n))
-        };
-        // SAFETY: allocated by ConvertSidToStringSidW.
-        unsafe { LocalFree(text.cast()) };
-        Ok(s)
     }
 
     /// The SID of the user this process runs as.
     fn current_user() -> Option<&'static str> {
         static USER: OnceLock<Option<String>> = OnceLock::new();
-        USER.get_or_init(|| {
-            let mut token: Handle = std::ptr::null_mut();
-            // SAFETY: the pseudo-handle of this process, a valid
-            // out-parameter; the token is closed below.
-            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-                return None;
-            }
-            // TOKEN_USER: a pointer to the SID (in the buffer), then attributes.
-            let mut buf = vec![0u64; 64];
-            let mut len = 0;
-            // SAFETY: the buffer is large enough for a TOKEN_USER and its SID.
-            let ok = unsafe { GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut len) };
-            // SAFETY: opened above.
-            unsafe { CloseHandle(token) };
-            if ok == 0 {
-                return None;
-            }
-            // SAFETY: the SID points into `buf`, alive here.
-            unsafe { sid_string(buf[0] as usize as *mut c_void) }.ok()
-        })
-        .as_deref()
+        USER.get_or_init(|| ninja_os::windows::current_user().ok()).as_deref()
     }
 }
 

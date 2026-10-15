@@ -895,7 +895,12 @@ impl<'a> Builder<'a> {
         self.plan.wanted_edges += 1;
         if !self.state.is_phony(edge) {
             self.plan.command_edges += 1;
-            self.status.edge_added_to_plan(edge);
+            // How long the command took last time, for the ETA: as ninja,
+            // the build log's time of the first output it has.
+            let log = self.build_log.as_deref();
+            let outputs = &self.state.edge(edge).outputs;
+            let prev = log.and_then(|log| outputs.iter().find_map(|&o| log.lookup_by_output(self.state.path(o)))).map(|l| l.end_time - l.start_time);
+            self.status.edge_added_to_plan(edge, prev);
         }
     }
 

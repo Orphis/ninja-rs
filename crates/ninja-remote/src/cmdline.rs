@@ -2,85 +2,8 @@
 //! `&&` chains and the shell no-ops generators put around commands (`:`,
 //! `true`, `cd .`), see docs/rbe-interface.md.
 
-/// Splits a Windows command line into arguments following the
-/// `CommandLineToArgvW` / MSVC CRT rules. `first_is_program` applies the
-/// special rule for argv[0] (no backslash escapes, quotes just toggle).
-pub fn split_windows(cmd: &str, first_is_program: bool) -> Vec<String> {
-    let chars: Vec<char> = cmd.chars().collect();
-    let mut args = Vec::new();
-    let mut i = 0;
-    let n = chars.len();
-    let skip_ws = |i: &mut usize| {
-        while *i < n && (chars[*i] == ' ' || chars[*i] == '\t' || chars[*i] == '\n' || chars[*i] == '\r') {
-            *i += 1;
-        }
-    };
-    skip_ws(&mut i);
-    if first_is_program && i < n {
-        let mut arg = String::new();
-        let mut in_quotes = false;
-        while i < n {
-            let c = chars[i];
-            if c == '"' {
-                in_quotes = !in_quotes;
-            } else if !in_quotes && (c == ' ' || c == '\t') {
-                break;
-            } else {
-                arg.push(c);
-            }
-            i += 1;
-        }
-        args.push(arg);
-        skip_ws(&mut i);
-    }
-    while i < n {
-        let mut arg = String::new();
-        let mut in_quotes = false;
-        while i < n {
-            let c = chars[i];
-            if c == '\\' {
-                let mut backslashes = 0;
-                while i < n && chars[i] == '\\' {
-                    backslashes += 1;
-                    i += 1;
-                }
-                if i < n && chars[i] == '"' {
-                    for _ in 0..backslashes / 2 {
-                        arg.push('\\');
-                    }
-                    if backslashes % 2 == 1 {
-                        arg.push('"');
-                        i += 1;
-                    }
-                } else {
-                    for _ in 0..backslashes {
-                        arg.push('\\');
-                    }
-                }
-                continue;
-            }
-            if c == '"' {
-                if in_quotes && i + 1 < n && chars[i + 1] == '"' {
-                    // "" inside quotes is a literal quote (post-2008 CRT rule).
-                    arg.push('"');
-                    i += 2;
-                    continue;
-                }
-                in_quotes = !in_quotes;
-                i += 1;
-                continue;
-            }
-            if !in_quotes && (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
-                break;
-            }
-            arg.push(c);
-            i += 1;
-        }
-        args.push(arg);
-        skip_ws(&mut i);
-    }
-    args
-}
+/// The scanner's tokenizers: its tools split command lines as builds do.
+pub use cpp_deps::external::{split_posix, split_windows};
 
 /// Quotes an argument for a Windows command line.
 pub fn quote_windows(arg: &str) -> String {
@@ -90,86 +13,6 @@ pub fn quote_windows(arg: &str) -> String {
         out = "\"\"".into();
     }
     out
-}
-
-/// Characters that make a POSIX command need a real shell.
-fn is_shell_meta(c: char) -> bool {
-    matches!(c, '|' | '&' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '~' | '#' | '!' | '\n')
-}
-
-/// Splits a POSIX shell command into words. Returns `None` if the command
-/// uses shell features (pipes, redirections, expansions, globs, ...) that
-/// would need a real shell.
-pub fn split_posix(cmd: &str) -> Option<Vec<String>> {
-    let mut args = Vec::new();
-    let mut cur = String::new();
-    let mut have = false;
-    let mut chars = cmd.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            ' ' | '\t' => {
-                if have {
-                    args.push(std::mem::take(&mut cur));
-                    have = false;
-                }
-            }
-            '\'' => {
-                have = true;
-                loop {
-                    match chars.next() {
-                        Some('\'') => break,
-                        Some(c) => cur.push(c),
-                        None => return None,
-                    }
-                }
-            }
-            '"' => {
-                have = true;
-                loop {
-                    match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(c @ ('"' | '\\' | '$' | '`')) => cur.push(c),
-                            Some('\n') => {}
-                            Some(c) => {
-                                cur.push('\\');
-                                cur.push(c);
-                            }
-                            None => return None,
-                        },
-                        Some('$') | Some('`') => return None,
-                        Some(c) => cur.push(c),
-                        None => return None,
-                    }
-                }
-            }
-            '\\' => {
-                have = true;
-                match chars.next() {
-                    Some('\n') => {}
-                    Some(c) => cur.push(c),
-                    None => return None,
-                }
-            }
-            c if is_shell_meta(c) => {
-                // '#' only starts a comment at the beginning of a word; '~'
-                // only expands at the beginning; '=' etc. are fine.
-                if (c == '#' || c == '~') && have {
-                    cur.push(c);
-                } else {
-                    return None;
-                }
-            }
-            c => {
-                have = true;
-                cur.push(c);
-            }
-        }
-    }
-    if have {
-        args.push(cur);
-    }
-    Some(args)
 }
 
 /// Quotes a word for a POSIX shell.
@@ -379,22 +222,6 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
-    }
-
-    #[test]
-    fn windows_split() {
-        assert_eq!(split_windows(r#""C:\Program Files\x.exe" -a "b c" d\"e"#, true), s(&[r"C:\Program Files\x.exe", "-a", "b c", "d\"e"]));
-        assert_eq!(split_windows(r#"a\\\"b "c\\" d"#, false), s(&[r#"a\"b"#, r"c\", "d"]));
-        assert_eq!(split_windows(r"C:\a\b.exe /FoC:\x\y.obj", true), s(&[r"C:\a\b.exe", r"/FoC:\x\y.obj"]));
-        assert_eq!(split_windows(r#"x "a""b""#, true), s(&["x", "a\"b"]));
-    }
-
-    #[test]
-    fn posix_split() {
-        assert_eq!(split_posix("cc -c 'a b.c' -o \"x y.o\" -DX=\\\"1\\\""), Some(s(&["cc", "-c", "a b.c", "-o", "x y.o", "-DX=\"1\""])));
-        assert_eq!(split_posix("cc a.c > out"), None);
-        assert_eq!(split_posix("cc $FLAGS"), None);
-        assert_eq!(split_posix("cc -o a#b x~y"), Some(s(&["cc", "-o", "a#b", "x~y"])));
     }
 
     fn steps(cmd: &str, windows: bool) -> Vec<Vec<String>> {
