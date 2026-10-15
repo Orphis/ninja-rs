@@ -87,25 +87,29 @@ pub trait DigestCache: Send + Sync {
     fn put(&self, path: &Path, stamp: FileStamp, digest: re::Digest);
 }
 
-/// A simple in-memory [`DigestCache`].
+/// A simple in-memory [`DigestCache`]. Each entry says whether its file
+/// could still change unseen when it was put (see `FileStamp::is_racy`).
 #[derive(Default)]
-pub struct MemDigestCache(Mutex<HashMap<PathBuf, (FileStamp, re::Digest)>>);
+pub struct MemDigestCache(Mutex<HashMap<PathBuf, (FileStamp, re::Digest, bool)>>);
 
 impl MemDigestCache {
-    /// All entries, for persisting the cache.
+    /// The entries to persist the cache with: not those put while their
+    /// file could still change unseen, however long ago that was (a file
+    /// changed again within its time granularity would keep its stamp).
     pub fn entries(&self) -> Vec<(PathBuf, FileStamp, re::Digest)> {
-        self.0.lock().unwrap().iter().map(|(p, (s, d))| (p.clone(), *s, d.clone())).collect()
+        self.0.lock().unwrap().iter().filter(|(_, (_, _, racy))| !racy).map(|(p, (s, d, _))| (p.clone(), *s, d.clone())).collect()
     }
 }
 
 impl DigestCache for MemDigestCache {
     fn get(&self, path: &Path, stamp: &FileStamp) -> Option<re::Digest> {
         let map = self.0.lock().unwrap();
-        let (s, d) = map.get(path)?;
+        let (s, d, _) = map.get(path)?;
         if s == stamp { Some(d.clone()) } else { None }
     }
     fn put(&self, path: &Path, stamp: FileStamp, digest: re::Digest) {
-        self.0.lock().unwrap().insert(path.to_path_buf(), (stamp, digest));
+        let racy = stamp.is_racy(std::time::SystemTime::now());
+        self.0.lock().unwrap().insert(path.to_path_buf(), (stamp, digest, racy));
     }
 }
 
@@ -448,6 +452,20 @@ pub fn valid_name(name: &str) -> bool {
         && !(cfg!(windows) && name.contains(':'))
 }
 
+/// The most files and directories an output `Tree` may expand to: its
+/// directories may share children, each listed once, so that a small tree
+/// can stand for a huge one (2^40 paths).
+const MAX_TREE_ENTRIES: usize = 1 << 20;
+
+/// Counts `n` more entries of an output tree being expanded.
+fn expanding(entries: &mut usize, n: usize) -> Result<()> {
+    *entries += n;
+    if *entries > MAX_TREE_ENTRIES {
+        bail!("output tree expands to more than {MAX_TREE_ENTRIES} files and directories");
+    }
+    Ok(())
+}
+
 /// Lists every file of an output `Tree` with its path relative to the root.
 pub fn tree_files(tree: &re::Tree) -> Result<Vec<(PathBuf, re::FileNode)>> {
     let by_digest: HashMap<String, &re::Directory> = tree
@@ -458,7 +476,9 @@ pub fn tree_files(tree: &re::Tree) -> Result<Vec<(PathBuf, re::FileNode)>> {
     let root = tree.root.as_ref().context("output tree without root")?;
     let mut files = Vec::new();
     let mut stack = vec![(PathBuf::new(), root)];
+    let mut entries = 0;
     while let Some((rel, dir)) = stack.pop() {
+        expanding(&mut entries, 1 + dir.files.len())?;
         for f in &dir.files {
             if !valid_name(&f.name) {
                 bail!("output tree names a file {:?}", f.name);
@@ -491,7 +511,9 @@ pub fn tree_dirs(tree: &re::Tree) -> Result<Vec<PathBuf>> {
     let root = tree.root.as_ref().context("output tree without root")?;
     let mut dirs = Vec::new();
     let mut stack = vec![(PathBuf::new(), root)];
+    let mut entries = 0;
     while let Some((rel, dir)) = stack.pop() {
+        expanding(&mut entries, 1)?;
         for sub in &dir.directories {
             let h = sub.digest.as_ref().map(|d| d.hash.clone()).unwrap_or_default();
             let child = by_digest.get(&h).with_context(|| format!("tree is missing directory {h}"))?;
@@ -589,15 +611,51 @@ mod tests {
         assert_eq!(dirs, vec![PathBuf::from("a"), PathBuf::from("a/b"), PathBuf::from("a/empty")]);
     }
 
+    #[test]
+    fn trees_sharing_children_are_bounded() {
+        // 40 levels of directories naming the one below twice: 2^40 paths.
+        let mut dir = re::Directory { files: vec![re::FileNode { name: "f".into(), digest: Some(crate::digest_of(b"x")), ..Default::default() }], ..Default::default() };
+        let mut children = Vec::new();
+        for _ in 0..40 {
+            let d = crate::digest_of_message(&dir).0;
+            children.push(dir);
+            let sub = |name: &str| re::DirectoryNode { name: name.into(), digest: Some(d.clone()) };
+            dir = re::Directory { directories: vec![sub("a"), sub("b")], ..Default::default() };
+        }
+        let tree = re::Tree { root: Some(dir), children };
+        assert!(format!("{:#}", tree_files(&tree).unwrap_err()).contains("expands to more than"));
+        assert!(tree_dirs(&tree).is_err());
+    }
+
+    #[test]
+    fn digests_put_while_racy_arent_persisted() {
+        let dir = test_dirs::TestDir::new("rbe-racy-digests");
+        let (fresh, old) = (dir.join("fresh"), dir.join("old"));
+        std::fs::write(&fresh, "fresh").unwrap();
+        std::fs::write(&old, "old").unwrap();
+        let set = |p: &Path, t| std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+        let now = std::time::SystemTime::now();
+        // Modified within the time granularity of when it's hashed (here, a
+        // clock ahead): used, but not persisted, even once that's long past.
+        set(&fresh, now + std::time::Duration::from_secs(3600));
+        set(&old, now - std::time::Duration::from_secs(3600));
+        let cache = MemDigestCache::default();
+        let d = file_digest(&fresh, Some(&cache)).unwrap();
+        file_digest(&old, Some(&cache)).unwrap();
+        assert_eq!(cache.get(&fresh, &ninja_os::stat(&fresh).unwrap().1), Some(d));
+        let kept: Vec<PathBuf> = cache.entries().into_iter().map(|(p, _, _)| p).collect();
+        assert_eq!(kept, [old]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn materialize_local_links_real_files_and_resolves_subtrees() {
-        let src = tempfile::tempdir().unwrap();
-        let real = src.path().join("real");
+        let src = test_dirs::TestDir::new("rbe-materialize-src");
+        let real = src.join("real");
         std::fs::write(&real, b"payload").unwrap();
-        let link = src.path().join("alias");
+        let link = src.join("alias");
         std::os::unix::fs::symlink("real", &link).unwrap();
-        let sub = tempfile::tempdir().unwrap();
+        let sub = test_dirs::TestDir::new("rbe-materialize-sub");
 
         let mut t = InputTree::new();
         t.add_file("bin/tool", &link).unwrap();
@@ -605,16 +663,16 @@ mod tests {
         let sub_digest = crate::digest_of(b"subtree");
         t.add_subtree("toolchain", sub_digest.clone()).unwrap();
 
-        let root = tempfile::tempdir().unwrap();
-        t.materialize_local(root.path(), &|rel, d| (rel == "toolchain" && *d == sub_digest).then(|| sub.path().to_path_buf()))
+        let root = test_dirs::TestDir::new("rbe-materialize-root");
+        t.materialize_local(&root, &|rel, d| (rel == "toolchain" && *d == sub_digest).then(|| sub.to_path_buf()))
             .unwrap();
         // A symlinked input is materialized as the file it points to.
-        assert_eq!(std::fs::read(root.path().join("bin/tool")).unwrap(), b"payload");
-        assert!(!std::fs::symlink_metadata(root.path().join("bin/tool")).unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read(root.path().join("gen/data")).unwrap(), b"inline");
-        assert_eq!(std::fs::read_link(root.path().join("toolchain")).unwrap(), sub.path());
+        assert_eq!(std::fs::read(root.join("bin/tool")).unwrap(), b"payload");
+        assert!(!std::fs::symlink_metadata(root.join("bin/tool")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(root.join("gen/data")).unwrap(), b"inline");
+        assert_eq!(std::fs::read_link(root.join("toolchain")).unwrap(), sub.path());
         // An unknown subtree is an error.
-        let other = tempfile::tempdir().unwrap();
-        assert!(t.materialize_local(other.path(), &|_, _| None).is_err());
+        let other = test_dirs::TestDir::new("rbe-materialize-other");
+        assert!(t.materialize_local(&other, &|_, _| None).is_err());
     }
 }

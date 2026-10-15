@@ -15,11 +15,14 @@ pub struct Dialect {
     /// are operators (C++; MSVC only in conforming mode, `/permissive-`).
     /// In C they're `<iso646.h>` macros, expanded before evaluation.
     pub alt_operators: bool,
+    /// MSVC's integer suffixes (`i64`, `ui64`...): cl's, and Clang's with
+    /// Microsoft extensions.
+    pub ms_suffixes: bool,
 }
 
 impl Dialect {
-    pub const C: Dialect = Dialect { true_false: false, alt_operators: false };
-    pub const CXX: Dialect = Dialect { true_false: true, alt_operators: true };
+    pub const C: Dialect = Dialect { true_false: false, alt_operators: false, ms_suffixes: false };
+    pub const CXX: Dialect = Dialect { true_false: true, alt_operators: true, ms_suffixes: false };
 }
 
 /// The operator an alternative token spells.
@@ -70,8 +73,8 @@ struct Parser<'a> {
 
 type R = Result<Val, String>;
 
-/// An integer literal's value and signedness.
-fn integer(s: &str) -> Result<Val, String> {
+/// An integer literal's value and signedness (`ms`: with MSVC's suffixes).
+fn integer(s: &str, ms: bool) -> Result<Val, String> {
     let s = s.replace('\'', "");
     let lower = s.to_ascii_lowercase();
     let (digits, radix) = if let Some(h) = lower.strip_prefix("0x") {
@@ -85,7 +88,8 @@ fn integer(s: &str) -> Result<Val, String> {
     };
     let end = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
     let (num, suffix) = digits.split_at(end);
-    if !suffix.chars().all(|c| matches!(c, 'u' | 'l' | 'z' | 'w' | 'b')) || (num.is_empty() && radix != 8) {
+    let ms_suffix = ms && matches!(suffix.strip_prefix('u').unwrap_or(suffix), "i8" | "i16" | "i32" | "i64" | "i128");
+    if !(ms_suffix || suffix.chars().all(|c| matches!(c, 'u' | 'l' | 'z' | 'w' | 'b'))) || (num.is_empty() && radix != 8) {
         return Err(format!("invalid integer literal {s}"));
     }
     let v = if num.is_empty() { 0 } else { u64::from_str_radix(num, radix).map_err(|_| format!("integer literal too large: {s}"))? };
@@ -169,7 +173,7 @@ impl Parser<'_> {
         let t = *self.peek().ok_or("missing expression")?;
         self.pos += 1;
         match t.kind {
-            Kind::Number => integer(t.sym.as_str()),
+            Kind::Number => integer(t.sym.as_str(), self.dialect.ms_suffixes),
             Kind::Char => character(t.sym.as_str()),
             Kind::Unknown => Ok(Val::Unknown),
             Kind::Ident => {
@@ -388,7 +392,12 @@ mod tests {
         assert!(c("1 and 1").is_err());
         assert_eq!(c("true"), Ok(Val::int(0)));
         assert_eq!(c("not"), Ok(Val::int(0)));
-        assert_eq!(eval(&tokens(b"true"), Dialect { true_false: true, alt_operators: false }), Ok(Val::int(1)));
+        assert_eq!(eval(&tokens(b"true"), Dialect { true_false: true, ..Dialect::C }), Ok(Val::int(1)));
+        // MSVC's suffixes, for cl and Clang with Microsoft extensions.
+        let ms = Dialect { ms_suffixes: true, ..Dialect::CXX };
+        assert_eq!(eval(&tokens(b"0xffui64 == 255 && 1i64 && 2I32 == 2 && -1i8 < 0 && -1ui64 > 0"), ms), Ok(Val::int(1)));
+        assert!(ev("1i64").is_err());
+        assert!(eval(&tokens(b"1i63"), ms).is_err());
     }
 
     #[test]

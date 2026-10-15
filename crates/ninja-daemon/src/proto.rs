@@ -151,6 +151,11 @@ pub struct Status {
     /// Directories watched one by one (inotify).
     #[serde(default)]
     pub watched_dirs: usize,
+    /// Directories builds write to, never vouched for, and whether all
+    /// that's under each is theirs (else only its own files: it holds
+    /// roots), those named last first.
+    #[serde(default)]
+    pub ignored: Vec<(PathBuf, bool)>,
     /// Files the preprocessor lexed, and found lexed already.
     pub files_lexed: u64,
     pub files_reused: u64,

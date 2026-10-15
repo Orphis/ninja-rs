@@ -1,0 +1,5 @@
+# Tests make their directories with the test-dirs crate: under Bazel's
+# TEST_TMPDIR, removed when the test is done, kept when it fails.
+disallowed-methods = [
+    { path = "std::env::temp_dir", reason = "tests use test_dirs::TestDir (Bazel's TEST_TMPDIR, removed when done); allow it where a build's own temporary files are meant" },
+]

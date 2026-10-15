@@ -544,6 +544,22 @@ fn fail() {
     assert_eq!(t.commands().len(), 1);
 }
 
+/// The lock file outputs are time-stamped with goes, however the build
+/// ends, as ninja's `Cleanup` has it.
+#[test]
+fn lock_file_removed_whatever_the_outcome() {
+    for (manifest, result) in [
+        ("rule fail\n  command = fail\nbuild out1: fail\n", Err("subcommand failed".to_string())),
+        ("rule interrupt\n  command = interrupt\nbuild out1: interrupt\n", Err("interrupted by user".to_string())),
+        ("build out1: cat in1\n", Ok(())),
+    ] {
+        let mut t = BuildTest::new();
+        t.parse(manifest);
+        assert_eq!(t.build(&["out1"]), result);
+        assert_eq!(t.fs.stat(".ninja_lock").unwrap(), 0, "{manifest}");
+    }
+}
+
 /// As in ninja 1.13, a failed build exits with the code of the last command
 /// that failed.
 #[test]
@@ -1245,18 +1261,15 @@ fn generator_command_change_does_not_rebuild() {
     assert!(t.add(&["out"]).unwrap());
 }
 
-/// The build log is closed before a generator edge, as in ninja: CMake runs
-/// `-t restat` then, which replaces the log, and later records must go to
-/// the new one.
+/// A generator replacing the build log (an older ninja-rs's `-t restat`, a
+/// recompaction outside the lock): later records go to the new one.
 #[test]
 fn records_follow_a_build_log_replaced_by_a_generator() {
-    let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-regen-log", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = test_dirs::TestDir::new("ninja_core_regen_log");
     let path = dir.join("log").to_string_lossy().into_owned();
     let mut t = BuildTest::new();
     let mut log = BuildLog::new();
-    log.open_for_write(&path, &|_| true).unwrap();
+    log.open_for_write(&path, &|_| true, crate::build_log::Access::Exclusive).unwrap();
     t.build_log = Some(log);
     t.parse(&format!(
         "rule regen\n  command = regen\n  generator = 1\nbuild first: cat in1\nbuild out: regen first\n  test_dependency = {}\nbuild after: cat out\n",
@@ -1269,7 +1282,6 @@ fn records_follow_a_build_log_replaced_by_a_generator() {
     for o in ["first", "out", "after"] {
         assert!(log.lookup_by_output(o).is_some(), "{o} isn't in the log");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1459,6 +1471,54 @@ build out: list-inputs in
     t.fs.create("in", "");
     t.build(&["out"]).unwrap();
     assert_eq!(t.fs.read_file("out").unwrap().unwrap(), b"in h1.h h2.h");
+}
+
+/// A runner that doesn't read tasks' inputs (no remote backend) isn't
+/// given any; one that does gets each once, the hints included.
+#[test]
+fn inputs_for_runners_reading_them() {
+    struct NoInputs<'a>(FakeRunner<'a>);
+    impl CommandRunner for NoInputs<'_> {
+        fn can_run_more(&self) -> usize {
+            self.0.can_run_more()
+        }
+        fn start_command(&mut self, task: Task) -> Result<(), String> {
+            self.0.start_command(task)
+        }
+        fn wait_for_command(&mut self) -> WaitFuture<'_> {
+            self.0.wait_for_command()
+        }
+        fn active_edges(&self) -> Vec<EdgeId> {
+            self.0.active_edges()
+        }
+        fn abort(&mut self) -> AbortFuture<'_> {
+            self.0.abort()
+        }
+        fn wants_inputs(&self) -> bool {
+            false
+        }
+    }
+    let fixture = || {
+        let mut t = BuildTest::empty();
+        t.parse("rule list-inputs\n  command = list $in\n  depfile = $out.d\nbuild out: list-inputs in h1.h\n");
+        t.fs.create("out", "");
+        t.fs.create("out.d", "out: h1.h h2.h sub/../h2.h\n");
+        t.fs.tick();
+        t.fs.create("in", "");
+        t.fs.create("h1.h", "");
+        t
+    };
+    let mut t = fixture();
+    t.build(&["out"]).unwrap();
+    assert_eq!(t.fs.read_file("out").unwrap().unwrap(), b"in h1.h h2.h");
+    let mut t = fixture();
+    let mut status = NullStatus::default();
+    let mut b = Builder::new(&mut t.state, &t.fs, None, None, &t.config, &mut status);
+    b.add_target_by_name("out").unwrap();
+    let mut runner = NoInputs(FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 1, lost: Vec::new() });
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(b.build(&mut runner)).unwrap();
+    assert_eq!(t.fs.read_file("out").unwrap().unwrap(), b"");
 }
 
 const RESTAT_STALE_DEPFILE: &str = "rule true

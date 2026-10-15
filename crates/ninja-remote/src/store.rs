@@ -51,6 +51,37 @@ pub fn walk_files(dir: &Path, rel: &str, out: &mut Vec<String>) {
     }
 }
 
+/// The most files, and bytes, the directories of computed includes send
+/// (see `dir_files`): above, the compile runs locally.
+pub const DIR_FILES_MAX: usize = 1000;
+pub const DIR_BYTES_MAX: u64 = 64 << 20;
+
+/// The files directly in `dirs` (not their subdirectories': a source root
+/// may hold the build directory), for computed includes the scanner can't
+/// name. Err (the compile runs locally, with the reason) above
+/// `DIR_FILES_MAX` files or `DIR_BYTES_MAX` bytes.
+pub fn dir_files<'a>(dirs: impl IntoIterator<Item = &'a PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let (mut files, mut bytes) = (Vec::new(), 0u64);
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten().filter(|e| !ninja_daemon::watch::walk_skips(&e.file_name())) {
+            // (Links followed.)
+            let Ok(meta) = std::fs::metadata(e.path()) else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            bytes += meta.len();
+            files.push(e.path());
+            if files.len() > DIR_FILES_MAX || bytes > DIR_BYTES_MAX {
+                let mb = DIR_BYTES_MAX >> 20;
+                return Err(format!("computed #include: the directories to send ({}...) have over {DIR_FILES_MAX} files or {mb} MB", dir.display()));
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 impl ToolchainTree {
     /// The tree of `dir` from its listing, as `InputTree::add_dir` builds
     /// it.
@@ -188,11 +219,15 @@ impl Store {
 
     /// Saves the file digest cache.
     pub fn save_digests(&self, file: &Path) -> std::io::Result<()> {
+        self.save_digests_at(file, std::time::SystemTime::now())
+    }
+
+    /// `save_digests`, `now` being the time.
+    fn save_digests_at(&self, file: &Path, now: SystemTime) -> std::io::Result<()> {
         let mut out = String::from(DIGESTS_SIGNATURE);
         out.push('\n');
         let mut entries = self.digests.entries();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        let now = std::time::SystemTime::now();
         for (p, s, d) in entries {
             let ps = p.to_string_lossy();
             // A file modified within the time granularity of now could
@@ -217,8 +252,7 @@ mod tests {
 
     #[test]
     fn digests_round_trip() {
-        let dir = test_dirs::base().join(format!("ninja_rs_store_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("ninja_rs_store");
         let f = dir.join("a.txt");
         std::fs::write(&f, "hello").unwrap();
         // Modified a while ago: a recent file's digest isn't saved.
@@ -257,7 +291,8 @@ mod tests {
         std::fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
         assert_eq!(rbe_client::tree::file_digest(&f, Some(&s2.digests)).unwrap(), d);
         // Modified within the time granularity: not saved. A second ago is
-        // only too recent for a file system counting in seconds.
+        // only too recent for a file system counting in seconds. (Saved at
+        // that time: however long the test takes.)
         let now = std::time::SystemTime::now();
         let whole = |t: std::time::SystemTime| {
             let s = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -273,7 +308,7 @@ mod tests {
         let fresh = set("fresh.txt", now);
         let second = set("second.txt", whole(now));
         let fine = set("fine.txt", whole(now) - std::time::Duration::from_secs(1) + std::time::Duration::from_millis(1));
-        s2.save_digests(&dir.join("digests")).unwrap();
+        s2.save_digests_at(&dir.join("digests"), now).unwrap();
         let s3 = Store::default();
         s3.load_digests(&dir.join("digests"));
         assert!(s3.digests.get(&fresh, &stamp(&fresh)).is_none());
@@ -283,12 +318,11 @@ mod tests {
         if !stamp(&fine).mtime_ns.is_multiple_of(1_000_000_000) {
             assert!(s3.digests.get(&fine, &stamp(&fine)).is_some());
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn toolchain_tree_is_built_once() {
-        let dir = test_dirs::base().join(format!("ninja_rs_tc_{}", std::process::id()));
+        let dir = test_dirs::TestDir::new("ninja_rs_tc");
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::write(dir.join("bin/cc"), "x").unwrap();
         let s = Store::default();
@@ -311,15 +345,14 @@ mod tests {
         let c = Store::default().toolchain_tree(&dir, &|_| Some(Ok(listed.clone()))).unwrap();
         assert_eq!(c.digest, a.digest);
         assert_eq!(c.files, a.files);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A tree that couldn't be built is kept for the invocation: actions
     /// don't each walk it again. One the daemon couldn't list is read here.
     #[test]
     fn toolchain_tree_errors() {
-        let dir = test_dirs::base().join(format!("ninja_rs_tc_err_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = test_dirs::TestDir::new("ninja_rs_tc_err");
+        let dir = base.join("tc");
         let s = Store::default();
         assert!(s.toolchain_tree(&dir, &|_| None).is_err());
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -333,7 +366,6 @@ mod tests {
         std::fs::write(dir.join(format!("{}1-2", ninja_daemon::watch::COOKIE_PREFIX)), "").unwrap();
         let c = Store::default().toolchain_tree(&dir, &|_| None).unwrap();
         assert_eq!((c.digest.clone(), c.files.clone()), (a.digest.clone(), a.files.clone()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Repositories' own directories aren't part of toolchain trees (a
@@ -341,8 +373,7 @@ mod tests {
     /// with and without it.
     #[test]
     fn toolchain_trees_skip_repositories() {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_tc_vcs_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("ninja_rs_tc_vcs");
         std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
         std::fs::create_dir_all(dir.join("bin/.svn")).unwrap();
         std::fs::write(dir.join("bin/cc"), "x").unwrap();
@@ -365,6 +396,5 @@ mod tests {
         let mut files = Vec::new();
         walk_files(&dir, "", &mut files);
         assert_eq!(files, vec!["bin/cc".to_string()]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

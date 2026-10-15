@@ -1,5 +1,6 @@
 //! The uploader against an in-process fake BES backend.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +21,8 @@ struct Recorded {
     streams: Vec<Vec<bes::PublishBuildToolEventStreamRequest>>,
     /// The calls answered, in order: lifecycle events, and streams opened.
     calls: Vec<String>,
+    /// Streams closed for being idle (see `Fake::idle_close`).
+    idle_closed: usize,
 }
 
 #[derive(Clone, Default)]
@@ -36,6 +39,16 @@ struct Fake {
     lifecycle_delay: Duration,
     /// The first lifecycle events, so many of them, fail with this code.
     lifecycle_failures: Option<(tonic::Code, usize)>,
+    /// The lifecycle events from the `n`th call on (from 0) are never
+    /// answered (`None`), or fail with this code.
+    lifecycle_from: Option<(usize, Option<tonic::Code>)>,
+    /// Lifecycle calls received, answered or not.
+    lifecycle_received: Arc<AtomicUsize>,
+    /// Streams are never answered.
+    stream_hang: bool,
+    /// A stream is closed once it went this long without an event after
+    /// its last ack (a proxy closing idle streams).
+    idle_close: Option<Duration>,
 }
 
 fn kind(e: &Event) -> &'static str {
@@ -51,6 +64,12 @@ fn kind(e: &Event) -> &'static str {
 #[tonic::async_trait]
 impl PublishBuildEvent for Fake {
     async fn publish_lifecycle_event(&self, req: Request<bes::PublishLifecycleEventRequest>) -> Result<Response<()>, Status> {
+        let n = self.lifecycle_received.fetch_add(1, Ordering::SeqCst);
+        match self.lifecycle_from {
+            Some((from, None)) if n >= from => std::future::pending().await,
+            Some((from, Some(code))) if n >= from => return Err(Status::new(code, "lifecycle events failing")),
+            _ => {}
+        }
         if let Some(gate) = &self.lifecycle_gate {
             let _permit = gate.acquire().await.unwrap();
         }
@@ -85,12 +104,28 @@ impl PublishBuildEvent for Fake {
             rec.streams.push(Vec::new());
             rec.streams.len() - 1
         };
+        if self.stream_hang {
+            std::future::pending::<()>().await;
+        }
         let break_after = if stream_index == 0 { self.break_first_after } else { None };
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let rec = self.rec.clone();
+        let idle_close = self.idle_close;
         tokio::spawn(async move {
             let mut n = 0;
-            while let Some(Ok(r)) = incoming.next().await {
+            loop {
+                let next = match (idle_close, n) {
+                    (Some(idle), 1..) => match tokio::time::timeout(idle, incoming.next()).await {
+                        Ok(next) => next,
+                        Err(_) => {
+                            rec.lock().unwrap().idle_closed += 1;
+                            let _ = tx.send(Err(Status::unavailable("idle stream closed"))).await;
+                            return;
+                        }
+                    },
+                    _ => incoming.next().await,
+                };
+                let Some(Ok(r)) = next else { return };
                 n += 1;
                 rec.lock().unwrap().streams[stream_index].push(r.clone());
                 if break_after == Some(n) {
@@ -266,23 +301,58 @@ async fn lifecycle_start_events_go_before_the_stream() {
 }
 
 #[tokio::test]
-async fn lifecycle_events_hold_the_stream_back_briefly() {
-    // A lifecycle service that never answers: the stream goes on after a
-    // deadline; the upload went through, without them.
-    let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let fake = Fake { lifecycle_gate: Some(gate.clone()), ..Default::default() };
+async fn unanswered_lifecycle_events_hold_the_stream_back_once() {
+    // A lifecycle service that never answers: the stream goes on after one
+    // deadline (for both events before it), the upload goes through, and
+    // the events after it aren't sent (the service doesn't know of the
+    // build), with the retries the stream gets or not.
+    let fake = Fake { lifecycle_from: Some((0, None)), ..Default::default() };
     let mut c = config();
-    c.rpc_timeout = Duration::from_millis(300);
-    c.max_retries = 1;
+    c.rpc_timeout = Duration::from_secs(1);
     let up = BesUploader::start(serve(fake.clone()).await, c);
     for i in 0..3 {
         up.send(progress(i, "x"));
     }
     let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
     assert!(summary.lifecycle_error.is_some_and(|e| e.contains("BuildEnqueued") && e.contains("no answer")));
-    let rec = fake.rec.lock().unwrap();
-    assert_eq!(seqs(&rec.streams[0]), [1, 2, 3, 4]);
-    assert!(rec.lifecycle.is_empty());
+    assert_eq!(seqs(&fake.rec.lock().unwrap().streams[0]), [1, 2, 3, 4]);
+    assert_eq!(fake.lifecycle_received.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn lifecycle_events_after_the_stream_arent_retried() {
+    // Never answered (within one deadline for both), or failing: once.
+    for failing in [None, Some(tonic::Code::Unavailable)] {
+        let fake = Fake { lifecycle_from: Some((2, failing)), ..Default::default() };
+        let mut c = config();
+        c.rpc_timeout = Duration::from_secs(2);
+        let up = BesUploader::start(serve(fake.clone()).await, c);
+        up.send(progress(0, "x"));
+        let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+        assert!(summary.lifecycle_error.is_some_and(|e| e.contains("InvocationAttemptFinished")), "{failing:?}");
+        assert_eq!(fake.lifecycle_received.load(Ordering::SeqCst), 3, "{failing:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_end_of_an_upload_says_what_it_waits_for() {
+    // The lifecycle events after the stream are still going: every build
+    // event was acked.
+    let fake = Fake { lifecycle_from: Some((2, None)), ..Default::default() };
+    let up = BesUploader::start(serve(fake.clone()).await, config());
+    let acked = up.acked();
+    up.send(progress(0, "x"));
+    assert!(!acked.get());
+    let closing = async {
+        while fake.lifecycle_received.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        r = up.finish(BuildOutcome { success: true, exit_code: 0 }) => panic!("finished while a lifecycle event hung: {r:?}"),
+        () = closing => {}
+    }
+    assert!(acked.get());
 }
 
 #[tokio::test]
@@ -297,14 +367,41 @@ async fn failing_lifecycle_events_dont_fail_the_upload() {
 }
 
 #[tokio::test]
-async fn the_build_ends_in_lifecycle_events_whenever_the_stream_went_through() {
-    // The events before the stream failed: those after it are sent, so that
-    // a lifecycle UI doesn't keep the invocation open.
+async fn lifecycle_events_after_the_stream_need_those_before_it() {
+    // The events before the stream failed: the service doesn't know of the
+    // build, and isn't told it ended.
     let fake = Fake { lifecycle_failures: Some((tonic::Code::FailedPrecondition, 1)), ..Default::default() };
     let up = BesUploader::start(serve(fake.clone()).await, config());
     up.send(progress(0, "x"));
-    up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
-    assert_eq!(fake.rec.lock().unwrap().calls, ["failed", "stream", "invocation finished", "build finished"]);
+    let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+    assert!(summary.lifecycle_error.is_some_and(|e| e.contains("BuildEnqueued")));
+    assert_eq!(fake.rec.lock().unwrap().calls, ["failed", "stream"]);
+}
+
+#[tokio::test]
+async fn streams_closed_while_idle_are_opened_again_with_the_next_event() {
+    // A proxy closing idle streams, through a build step saying nothing:
+    // no stream is opened until there's an event, and closing is no
+    // failure.
+    let fake = Fake { idle_close: Some(Duration::from_millis(50)), ..Default::default() };
+    let up = BesUploader::start(serve(fake.clone()).await, config());
+    for i in 0..6 {
+        up.send(progress(i, "x"));
+        let closed = async {
+            while fake.rec.lock().unwrap().idle_closed <= i as usize {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), closed).await.expect("the stream wasn't closed");
+        // Silence: a stream opened now would be closed too, and count.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fake.rec.lock().unwrap().streams.len(), i as usize + 1, "a stream opened without events");
+    }
+    let summary = up.finish(BuildOutcome { success: true, exit_code: 0 }).await.unwrap();
+    assert_eq!(summary.reconnects, 0);
+    let rec = fake.rec.lock().unwrap();
+    let sent: Vec<i64> = rec.streams.iter().flat_map(|s| seqs(s)).collect();
+    assert_eq!(sent, (1..=7).collect::<Vec<i64>>());
 }
 
 /// A TCP proxy in front of `upstream` dropping its first connection at
@@ -373,33 +470,23 @@ async fn invalid_headers_fail_the_upload() {
     assert!(err.to_string().contains("invalid value for header `x-api-key`"), "{err}");
 }
 
-/// A backend that accepts connections and never says anything (as a hung
-/// one does: the kernel still accepts them).
-async fn silent_backend() -> tonic::transport::Channel {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || {
-        let held: Vec<_> = listener.incoming().collect();
-        drop(held);
-    });
-    tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap().connect().await.unwrap()
-}
-
 #[tokio::test]
 async fn a_silent_backend_costs_one_deadline() {
     for lifecycle_events in [true, false] {
+        // A backend taking calls and never answering (as a hung one does).
+        let fake = Fake { lifecycle_from: Some((0, None)), stream_hang: true, ..Default::default() };
         let mut c = config();
         c.lifecycle_events = lifecycle_events;
         c.rpc_timeout = Duration::from_millis(300);
-        let up = BesUploader::start(silent_backend().await, c);
+        let up = BesUploader::start(serve(fake.clone()).await, c);
         up.send(progress(0, "x"));
-        let start = std::time::Instant::now();
         // However long the build waits for the upload (--bes_timeout=0).
-        let finished = tokio::time::timeout(Duration::from_secs(10), up.finish(BuildOutcome { success: true, exit_code: 0 })).await;
+        let finished = tokio::time::timeout(Duration::from_secs(60), up.finish(BuildOutcome { success: true, exit_code: 0 })).await;
         let err = finished.expect("the upload waited for the backend forever").unwrap_err();
         assert!(err.to_string().contains("no answer"), "{err}");
-        // Not retried: it never answered anything.
-        assert!(start.elapsed() < Duration::from_secs(3), "{:?}", start.elapsed());
+        // Not called again: it never answered anything.
+        assert_eq!(fake.lifecycle_received.load(Ordering::SeqCst), usize::from(lifecycle_events));
+        assert_eq!(fake.rec.lock().unwrap().streams.len(), 1);
     }
 }
 

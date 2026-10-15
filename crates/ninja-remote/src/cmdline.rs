@@ -73,11 +73,14 @@ pub struct Unwrapped {
 /// Turns a command line into the argv of each command it runs: a
 /// `cmd.exe /C` wrapper is removed (`windows`, the host's syntax), `&&`
 /// chains are split and shell no-ops dropped. Commands that need a shell
-/// otherwise (pipes, redirections, variables) are an error.
+/// otherwise (pipes, redirections, variables, a `cd` step) are an error.
 pub fn unwrap_command(command: &str, windows: bool) -> Result<Unwrapped, String> {
     let mut cmd = command.trim().to_string();
+    // What cmd.exe runs: its other syntax (`&`, `^`, `%VAR%`, groups) too.
+    let mut by_cmd = false;
     if windows && let Some(rest) = strip_cmd_exe(&cmd) {
         cmd = rest;
+        by_cmd = true;
     }
     let mut steps: Vec<Vec<String>> = Vec::new();
     for seg in split_and_chain(&cmd) {
@@ -88,10 +91,17 @@ pub fn unwrap_command(command: &str, windows: bool) -> Result<Unwrapped, String>
             if seg.contains(['|', '<', '>']) && !quoted_only_meta(&seg) {
                 return Err(format!("command uses shell redirection: {seg}"));
             }
+            if by_cmd && let Some(what) = cmd_syntax(&seg) {
+                return Err(format!("command uses cmd.exe's {what}: {seg}"));
+            }
             split_windows(&seg, true)
         } else {
             split_posix(&seg).ok_or_else(|| format!("command needs a shell: {seg}"))?
         };
+        // The steps after it would run elsewhere.
+        if argv.first().is_some_and(|p| p == "cd" || (windows && (p.eq_ignore_ascii_case("cd") || p.eq_ignore_ascii_case("chdir")))) {
+            return Err(format!("command changes directory: {seg}"));
+        }
         if !argv.is_empty() {
             steps.push(argv);
         }
@@ -141,6 +151,32 @@ fn strip_cmd_exe(cmd: &str) -> Option<String> {
         out = out[1..out.len() - 1].to_string();
     }
     Some(out)
+}
+
+/// What of cmd.exe's syntax a segment it runs uses besides `&&`, which
+/// splitting it into arguments would pass on literally: `&`, `^` and
+/// parentheses outside quotes, variables (`%VAR%`, expanded in quotes
+/// too).
+fn cmd_syntax(seg: &str) -> Option<&'static str> {
+    let mut in_q = false;
+    for c in seg.chars() {
+        if c == '"' {
+            in_q = !in_q;
+        } else if !in_q {
+            match c {
+                '&' => return Some("&"),
+                '^' => return Some("escapes"),
+                '(' | ')' => return Some("groups"),
+                _ => {}
+            }
+        }
+    }
+    let mut parts = seg.split('%');
+    parts.next();
+    let mut parts = parts.collect::<Vec<_>>();
+    // `%NAME%`: a name between two signs (the last part has no closing one).
+    parts.pop();
+    parts.iter().any(|name| !name.is_empty() && !name.contains([' ', '\t', '"'])).then_some("variables")
 }
 
 /// Whether every `|`, `<`, `>` in a Windows segment is inside quotes.
@@ -266,6 +302,22 @@ mod tests {
         assert!(unwrap_command(": && :", false).is_err());
         // Quoted metacharacters are fine.
         assert!(unwrap_command(r#"cl.exe "-DX=a>b" a.c"#, true).is_ok());
+        // What else cmd.exe reads in what it runs.
+        for cmd in [
+            r#"cmd.exe /C "a.exe & b.exe""#,
+            r#"cmd.exe /C "a.exe ^"x^"""#,
+            r#"cmd.exe /C "a.exe %OUT%\x.obj""#,
+            r#"cmd.exe /C "(a.exe)""#,
+            r#"cmd.exe /C "a.exe "-D%X%"""#,
+            r#"cmd.exe /C "cd sub && cl.exe a.c""#,
+        ] {
+            assert!(unwrap_command(cmd, true).is_err(), "{cmd}");
+        }
+        // Not when it doesn't run the command; a lone % isn't a variable.
+        assert!(unwrap_command(r#"cl.exe -DX=a&b -DFMT="%d" a.c"#, true).is_ok());
+        assert!(unwrap_command(r#"cmd.exe /C "cl.exe -DFMT=\"%d\" a.c""#, true).is_ok());
+        // The steps after a `cd` would run elsewhere.
+        assert!(unwrap_command("cd sub && cc -c a.c", false).is_err());
     }
 
     #[test]

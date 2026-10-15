@@ -3,11 +3,35 @@
 use std::collections::BTreeSet;
 use std::io::Write;
 
-use ninja_core::build_log::{BuildLog, LOCK_FILE, LogLock};
+use ninja_core::build_log::{Access, BuildLog, LOCK_FILE, LogLock};
 use ninja_core::canon::canonicalize_path;
 use ninja_core::deps_log::DepsLog;
 use ninja_core::disk::{Disk, RealDisk};
 use ninja_core::graph::{EdgeId, NodeId, ROOT_SCOPE, State};
+use ninja_remote::remote_outputs::{RemoteDisk, RemoteOutputs};
+
+// `print!`, `println!` and `eprintln!` as ninja's `printf`: output to a pipe
+// its reader closed (`-t targets all | head`) or to a terminal gone is lost,
+// where std's would panic. (On Unix, tools die of SIGPIPE first, as ninja's:
+// see `die_on_broken_pipe`.)
+macro_rules! print {
+    ($($arg:tt)*) => {
+        ninja_core::status::print_out(&format!($($arg)*))
+    };
+}
+macro_rules! println {
+    () => {
+        ninja_core::status::print_out("\n")
+    };
+    ($($arg:tt)*) => {
+        ninja_core::status::print_out(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        ninja_core::status::print_err(&format!("{}\n", format_args!($($arg)*)))
+    };
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum When {
@@ -61,6 +85,12 @@ pub fn find_tool(name: &str) -> Option<&'static ToolInfo> {
     TOOLS.iter().find(|t| t.name == name)
 }
 
+/// ninja's message for a tool it doesn't have, with the closest one.
+pub fn unknown_tool(name: &str) -> String {
+    let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
+    crate::options::did_you_mean("unknown tool", name, &names)
+}
+
 pub fn list_tools() -> String {
     let mut s = String::from("ninja-rs subtools:\n");
     for t in TOOLS {
@@ -74,6 +104,11 @@ pub struct ToolCtx<'a> {
     pub build_log: &'a mut BuildLog,
     pub deps_log: &'a mut DepsLog,
     pub build_log_path: String,
+    /// How the tool may write the logs (see `Service::lock_logs`).
+    pub access: Access,
+    /// The records of outputs of remote actions, for the tools removing
+    /// outputs: those of the outputs removed go.
+    pub remote_outputs: Option<&'a RemoteOutputs>,
     pub dry_run: bool,
     pub verbose: bool,
     pub quiet: bool,
@@ -181,13 +216,24 @@ fn targets_list(state: &State, nodes: &[NodeId], depth: i32, indent: usize, out:
     }
 }
 
+/// C's `atoi`: blanks, a sign and the digits that follow; 0 without any.
+fn atoi(s: &str) -> i32 {
+    let s = s.trim_start();
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let n = digits.bytes().take_while(u8::is_ascii_digit).fold(0i64, |n, d| (n * 10 + i64::from(d - b'0')).min(1 << 32));
+    (if negative { -n } else { n }).clamp(i32::MIN.into(), i32::MAX.into()) as i32
+}
+
 fn tool_targets(state: &State, args: &[String]) -> i32 {
     let mut depth = 1;
     let mut out = String::new();
     if let Some(mode) = args.first() {
         match mode.as_str() {
             "rule" => {
-                match args.get(1) {
+                match args.get(1).filter(|r| !r.is_empty()) {
                     None => {
                         for e in &state.edges {
                             for &i in &e.inputs {
@@ -214,7 +260,9 @@ fn tool_targets(state: &State, args: &[String]) -> i32 {
                 print!("{out}");
                 return 0;
             }
-            "depth" => depth = args.get(1).and_then(|d| d.parse().ok()).unwrap_or(0),
+            // As ninja's `atoi`: no number keeps the default, one that
+            // doesn't parse is 0 (the whole tree).
+            "depth" => depth = args.get(1).map_or(1, |d| atoi(d)),
             "all" => {
                 for e in &state.edges {
                     for &o in &e.outputs {
@@ -225,7 +273,7 @@ fn tool_targets(state: &State, args: &[String]) -> i32 {
                 return 0;
             }
             other => {
-                error(&format!("unknown target tool mode '{other}'"));
+                error(&crate::options::did_you_mean("unknown target tool mode", other, &["rule", "depth", "all"]));
                 return 1;
             }
         }
@@ -725,14 +773,13 @@ impl<'a> MissingDeps<'a> {
 }
 
 struct Cleaner<'a> {
-    disk: RealDisk,
+    disk: &'a dyn Disk,
     removed: BTreeSet<String>,
     count: usize,
     status: i32,
     dry_run: bool,
     verbose: bool,
     quiet: bool,
-    _p: std::marker::PhantomData<&'a ()>,
 }
 
 impl Cleaner<'_> {
@@ -856,15 +903,16 @@ fn tool_clean(ctx: &mut ToolCtx, args: &[String]) -> i32 {
         error("expected a rule to clean");
         return 1;
     }
+    let real = RealDisk::default();
+    let remote = ctx.remote_outputs.map(|outputs| RemoteDisk { inner: &real, outputs, fetch: None });
     let mut c = Cleaner {
-        disk: RealDisk::default(),
+        disk: remote.as_ref().map_or(&real as &dyn Disk, |d| d),
         removed: BTreeSet::new(),
         count: 0,
         status: 0,
         dry_run: ctx.dry_run,
         verbose: ctx.verbose || ctx.dry_run,
         quiet: ctx.quiet,
-        _p: Default::default(),
     };
     c.header();
     load_all_dyndeps(ctx.state);
@@ -932,15 +980,16 @@ fn tool_clean(ctx: &mut ToolCtx, args: &[String]) -> i32 {
 }
 
 fn tool_cleandead(ctx: &mut ToolCtx) -> i32 {
+    let real = RealDisk::default();
+    let remote = ctx.remote_outputs.map(|outputs| RemoteDisk { inner: &real, outputs, fetch: None });
     let mut c = Cleaner {
-        disk: RealDisk::default(),
+        disk: remote.as_ref().map_or(&real as &dyn Disk, |d| d),
         removed: BTreeSet::new(),
         count: 0,
         status: 0,
         dry_run: ctx.dry_run,
         verbose: ctx.verbose || ctx.dry_run,
         quiet: ctx.quiet,
-        _p: Default::default(),
     };
     c.header();
     load_all_dyndeps(ctx.state);
@@ -1064,8 +1113,13 @@ fn tool_query(ctx: &mut ToolCtx, args: &[String]) -> i32 {
 }
 
 fn tool_recompact(ctx: &mut ToolCtx) -> i32 {
+    // Run by a build holding the lock (a generator: CMake runs it at each
+    // configure), which appends to the logs meanwhile: left as they are.
+    if ctx.access == Access::Shared {
+        return 0;
+    }
     let state = &*ctx.state;
-    let live = |p: &str| state.lookup_node(p).is_some();
+    let live = |p: &str| crate::is_live(state, p);
     let path = ctx.build_log_path.clone();
     if let Err(e) = ctx.build_log.recompact(&path, &live) {
         error(&e);
@@ -1073,7 +1127,7 @@ fn tool_recompact(ctx: &mut ToolCtx) -> i32 {
     }
     let deps_path = path.replace(ninja_core::build_log::BUILD_LOG_FILE, ninja_core::deps_log::DEPS_LOG_FILE);
     if std::path::Path::new(&deps_path).exists()
-        && let Err(e) = ctx.deps_log.recompact(&deps_path, &|p: &str| state.lookup_node(p).is_some_and(|n| state.node(n).in_edge.is_some()))
+        && let Err(e) = ctx.deps_log.recompact(&deps_path, &live)
     {
         error(&e);
         return 1;
@@ -1109,15 +1163,17 @@ pub fn tool_restat_after_flags(args: &[String]) -> i32 {
         return 0;
     }
     // A build writing the log is waited for, unless it runs this (a
-    // generator): see `Service::lock_logs`.
+    // generator, which appends then): see `Service::lock_logs`.
     let lock_file = if build_dir.is_empty() { LOCK_FILE.to_string() } else { format!("{build_dir}/{LOCK_FILE}") };
-    let _lock = match crate::try_lock_logs(&lock_file) {
-        Ok(crate::LogsAccess::Locked(lock)) => Some(lock),
-        Ok(crate::LogsAccess::Busy) => {
-            println!("ninja: waiting for the build running in this directory to finish...");
-            LogLock::acquire(&lock_file).ok()
+    let (_lock, access) = match crate::try_lock_logs(&lock_file) {
+        Ok(crate::LogsAccess::Locked(lock)) => (Some(lock), Access::Exclusive),
+        Ok(crate::LogsAccess::Busy(holder)) => {
+            println!("ninja: {}", crate::waiting_message(holder.as_ref()));
+            let lock = LogLock::open(&lock_file).and_then(|mut lock| lock.lock(true).map(|_| lock));
+            (lock.ok(), Access::Exclusive)
         }
-        Ok(crate::LogsAccess::Inherited) | Err(_) => None,
+        Ok(crate::LogsAccess::Inherited) => (None, Access::Shared),
+        Err(_) => (None, Access::Exclusive),
     };
     let mut log = BuildLog::new();
     match log.load(&path) {
@@ -1128,7 +1184,7 @@ pub fn tool_restat_after_flags(args: &[String]) -> i32 {
             return 1;
         }
     }
-    if let Err(e) = log.restat(&path, &RealDisk::default(), &outputs) {
+    if let Err(e) = log.restat(&path, &RealDisk::default(), &outputs, access) {
         error(&format!("failed recompaction: {e}"));
         return 1;
     }

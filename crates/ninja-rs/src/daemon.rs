@@ -19,9 +19,12 @@ pub fn connect() -> io::Result<Client> {
     let loc = location()?;
     Client::connect_or_start(&loc, || {
         loc.create_dir()?;
-        // It exits once this binary is rebuilt (see `server::serve`).
+        // It exits once this binary is rebuilt (see `server::serve`). It
+        // serves every build: nothing of this one's (its secret flags, its
+        // logs' lock) goes to it.
         let exe = std::env::current_exe()?;
-        ipc::spawn_detached(&program(&loc)?, &["-t", "daemon", "run", "--id", &loc.id, "--exe", &exe.to_string_lossy()], &loc.dir)
+        let args = ["-t", "daemon", "run", "--id", &loc.id, "--exe", &exe.to_string_lossy()];
+        ipc::spawn_detached(&program(&loc)?, &args, &loc.dir, &[crate::nested::ENV, crate::nested::LOGS_LOCK_ENV])
     })
 }
 
@@ -38,11 +41,7 @@ fn program(loc: &Location) -> io::Result<std::path::PathBuf> {
         return Ok(copy);
     }
     // The files of other versions, unless running.
-    for e in std::fs::read_dir(&loc.dir)?.flatten() {
-        if e.path().extension().is_some_and(|x| x == "exe" || x == "lock" || x == "log") {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
+    loc.remove_others()?;
     let tmp = loc.dir.join(format!("{}.{}.tmp", loc.id, std::process::id()));
     std::fs::copy(&exe, &tmp)?;
     if std::fs::rename(&tmp, &copy).is_err() {
@@ -64,6 +63,9 @@ exits after NINJA_RS_DAEMON_IDLE seconds without builds [default=10800].
   stop    stop it
   run     run it in the foreground
 ";
+
+/// The directories builds write to `status` lists (those named last).
+const IGNORED_SHOWN: usize = 20;
 
 fn duration(secs: u64) -> String {
     match secs {
@@ -142,6 +144,15 @@ pub fn tool(args: &[String]) -> i32 {
                     println!("  roots:");
                     for (p, state) in &s.roots {
                         println!("    {}: {state}", p.display());
+                    }
+                }
+                if !s.ignored.is_empty() {
+                    println!("  directories builds write to, checked every time ({}):", s.ignored.len());
+                    for (p, whole) in s.ignored.iter().take(IGNORED_SHOWN) {
+                        println!("    {}{}", p.display(), if *whole { "" } else { " (its own files only)" });
+                    }
+                    if s.ignored.len() > IGNORED_SHOWN {
+                        println!("    and {} more", s.ignored.len() - IGNORED_SHOWN);
                     }
                 }
                 println!("  log: {}", loc.log_file().display());

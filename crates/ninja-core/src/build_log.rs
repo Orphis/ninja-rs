@@ -14,11 +14,16 @@
 //!
 //! A build writes the logs holding the build directory's lock
 //! ([`LogLock`]), which ninja doesn't have: two builds appending to the deps
-//! log at once would give their new paths the same ids.
+//! log at once would give their new paths the same ids. A build the lock
+//! holder runs (a generator's `-t restat`, a build of another
+//! configuration in the same directory) writes them too, appending only
+//! (see [`Access`]).
 
 use crate::hash::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::graph::TimeStamp;
 
@@ -26,29 +31,109 @@ pub const BUILD_LOG_FILE: &str = ".ninja_rs_log";
 /// The lock file of a build directory's logs (see [`LogLock`]).
 pub const LOCK_FILE: &str = ".ninja_rs_lock";
 
+/// How a process may write a build directory's logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Access {
+    /// It holds the build directory's lock (or none can be taken): it may
+    /// rewrite them (recompact them, cut off what it doesn't read).
+    #[default]
+    Exclusive,
+    /// A build it runs for holds the lock and appends to them meanwhile:
+    /// it appends only. A rewrite would undo what the holder appends after
+    /// it (to the file it has open), and a cut could take off a record the
+    /// holder is writing.
+    Shared,
+}
+
 /// An exclusive OS lock on a build directory's logs, held by the process
 /// writing them, and released when dropped or when the process ends,
-/// however it ends.
+/// however it ends. The lock file says who holds it (see [`Holder`]).
 pub struct LogLock {
-    _file: File,
+    file: File,
+    path: String,
+    locked: bool,
+}
+
+/// Who holds a build directory's lock, as its lock file says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Holder {
+    pub pid: u32,
+    /// When it took the lock, in ms since the Unix epoch.
+    pub since_ms: u64,
+}
+
+impl Holder {
+    /// `pid 123, started 5 s ago`.
+    pub fn describe(&self) -> String {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let secs = now.saturating_sub(self.since_ms) / 1000;
+        let ago = if secs < 120 {
+            format!("{secs} s")
+        } else if secs < 7200 {
+            format!("{} min", secs / 60)
+        } else {
+            format!("{} h", secs / 3600)
+        };
+        format!("pid {}, started {ago} ago", self.pid)
+    }
 }
 
 impl LogLock {
-    /// Takes the lock file `path`, unless another process holds it (`None`).
-    pub fn try_acquire(path: &str) -> std::io::Result<Option<LogLock>> {
-        let file = OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(LogLock { _file: file })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
-        }
+    /// Opens the lock file `path`, created if needed, without locking it
+    /// yet. On Unix read-only when this user can't write it (another
+    /// user's, in a build directory a group shares): a lock needs no more,
+    /// but on NFS, whose locks need a file open for writing.
+    pub fn open(path: &str) -> std::io::Result<LogLock> {
+        let file = match OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path) {
+            #[cfg(unix)]
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) => File::open(path)?,
+            opened => opened?,
+        };
+        Ok(LogLock { file, path: path.to_string(), locked: false })
     }
 
-    /// Takes the lock file `path`, waiting for the process holding it.
-    pub fn acquire(path: &str) -> std::io::Result<LogLock> {
-        let file = OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
-        file.lock()?;
-        Ok(LogLock { _file: file })
+    /// Takes the lock, waiting for the process holding it (`wait`), or
+    /// not: false while another holds it.
+    pub fn lock(&mut self, wait: bool) -> std::io::Result<bool> {
+        if !ninja_os::lock(&self.file, wait)? {
+            return Ok(false);
+        }
+        self.locked = true;
+        let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_millis();
+        self.say(format!("{} {since}\n", std::process::id()).as_bytes());
+        Ok(true)
+    }
+
+    /// The lock file's identity (see `ninja_os::identity`): what builds
+    /// this one runs recognize it by.
+    pub fn identity(&self) -> std::io::Result<(u64, u128)> {
+        ninja_os::identity(&self.file)
+    }
+
+    /// Who holds the lock, as the lock file says (unless its holder
+    /// couldn't write it: an older ninja-rs, another user's file).
+    pub fn holder(&self) -> Option<Holder> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        let (pid, since) = text.lines().next()?.split_once(' ')?;
+        Some(Holder { pid: pid.parse().ok()?, since_ms: since.parse().ok()? })
+    }
+
+    /// Writes `text` into the lock file, if this process may (through a
+    /// handle of its own: the lock's may be read-only). Its lock is on no
+    /// data (see `ninja_os::lock`): others read it.
+    fn say(&self, text: &[u8]) {
+        if let Ok(mut f) = OpenOptions::new().write(true).open(&self.path) {
+            let _ = f.write_all(text).and_then(|()| f.set_len(text.len() as u64));
+        }
+    }
+}
+
+impl Drop for LogLock {
+    /// The holder it named is gone.
+    fn drop(&mut self) {
+        if self.locked {
+            self.say(b"");
+        }
     }
 }
 
@@ -58,20 +143,51 @@ pub(crate) fn file_len(path: &str) -> Option<u64> {
 }
 
 /// Replaces the file `path` with `data`, through a temporary file renamed
-/// into place, named for this process and moment: another one recompacting
-/// at once, or one that died doing it, has its own.
+/// into place. Its name is fixed (as ninja's): the lock holder alone
+/// recompacts, and one killed while writing leaves a file the next one
+/// replaces.
 pub(crate) fn replace_file(path: &str, data: &[u8]) -> Result<(), String> {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-    let tmp = format!("{path}.{}-{nanos}-{n}.tmp", std::process::id());
-    let written = OpenOptions::new().write(true).create_new(true).open(&tmp).and_then(|mut f| f.write_all(data));
+    let tmp = format!("{path}.recompact");
+    let written = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp).and_then(|mut f| f.write_all(data));
     if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("writing {path}: {e}"));
     }
     Ok(())
 }
+
+/// Opens a log for appending (and reading, which locking it on Windows
+/// needs), creating it and its directory if needed.
+pub(crate) fn open_for_append(path: &str) -> std::io::Result<File> {
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    OpenOptions::new().read(true).append(true).create(true).open(path)
+}
+
+/// Opens the build log `path` for appending, with its signature if it is
+/// new or empty. A torn last line another process left (which an
+/// exclusive writer cuts off first) is ended, so that appends start on a
+/// line of their own; the line is then malformed, or a record whose hash
+/// is cut short, as good as none.
+fn open_log(path: &str) -> std::io::Result<File> {
+    let mut f = open_for_append(path)?;
+    let len = f.metadata()?.len();
+    if len == 0 {
+        f.write_all(SIGNATURE.as_bytes())?;
+    } else {
+        let mut last = [0u8];
+        f.seek(SeekFrom::Start(len - 1))?;
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            f.write_all(b"\n")?;
+        }
+    }
+    Ok(f)
+}
+
 // v2: command hashes are ninja's rapidhash (v1 used FNV-1a).
 const SIGNATURE: &str = "# ninja-rs log v2\n";
 
@@ -219,10 +335,16 @@ impl BuildLog {
         Ok(None)
     }
 
-    /// Prepares for appending; recompacts first if needed. `is_live` tells
-    /// whether an output still exists in the manifest.
-    pub fn open_for_write(&mut self, path: &str, is_live: &dyn Fn(&str) -> bool) -> Result<(), String> {
+    /// Prepares for appending, as `access` allows: an exclusive writer
+    /// recompacts first if needed (`is_live` tells whose records stay) and
+    /// cuts off a torn last line; a shared one does neither.
+    pub fn open_for_write(&mut self, path: &str, is_live: &dyn Fn(&str) -> bool, access: Access) -> Result<(), String> {
         self.path = path.to_string();
+        if access == Access::Shared {
+            // A torn line is ended instead (see `open_log`).
+            self.truncate_to = None;
+            return Ok(());
+        }
         // Written to since it was loaded (by a process that doesn't take the
         // build directory's lock): its end may not be the torn line read.
         // It is rewritten from what was read.
@@ -248,32 +370,30 @@ impl BuildLog {
         Ok(())
     }
 
+    /// The file to append to: the one at the log's path, opened again once
+    /// another process replaced it (recompacted it without the lock).
     fn ensure_open(&mut self) -> Result<&mut File, String> {
+        if self.file.as_ref().is_some_and(|f| ninja_os::replaced(f, Path::new(&self.path))) {
+            self.file = None;
+        }
         if self.file.is_none() {
             self.cut_torn_line()?;
-            let path = self.path.clone();
-            if let Some(parent) = std::path::Path::new(&path).parent()
-                && !parent.as_os_str().is_empty()
-            {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let mut f = OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("opening build log: {e}"))?;
-            if f.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-                f.write_all(SIGNATURE.as_bytes()).map_err(|e| e.to_string())?;
-            }
-            self.file = Some(f);
+            self.file = Some(open_log(&self.path).map_err(|e| format!("opening build log: {e}"))?);
         }
         Ok(self.file.as_mut().expect("opened"))
     }
 
     pub fn record(&mut self, entry: LogEntry) -> Result<(), String> {
         if !self.path.is_empty() {
-            let line = format_entry(&entry);
-            let f = self.ensure_open()?;
-            f.write_all(line.as_bytes()).map_err(|e| format!("Error writing to build log: {e}"))?;
+            self.append(&format_entry(&entry))?;
         }
         self.entries.insert(entry.output.clone(), entry);
         Ok(())
+    }
+
+    fn append(&mut self, lines: &str) -> Result<(), String> {
+        let f = self.ensure_open()?;
+        f.write_all(lines.as_bytes()).map_err(|e| format!("Error writing to build log: {e}"))
     }
 
     pub fn close(&mut self) {
@@ -298,15 +418,33 @@ impl BuildLog {
     }
 
     /// Updates recorded mtimes to the current mtimes of the outputs
-    /// (`-t restat`). With `outputs` empty, all entries are restat'ed.
-    pub fn restat(&mut self, path: &str, disk: &dyn crate::disk::Disk, outputs: &[String]) -> Result<(), String> {
+    /// (`-t restat`). With `outputs` empty, all entries are restat'ed. An
+    /// exclusive writer rewrites the log; a shared one appends the records
+    /// that changed, which win over the earlier ones.
+    pub fn restat(&mut self, path: &str, disk: &dyn crate::disk::Disk, outputs: &[String], access: Access) -> Result<(), String> {
         self.close();
+        let wanted: std::collections::HashSet<&str> = outputs.iter().map(String::as_str).collect();
+        let mut changed = Vec::new();
         for (k, e) in self.entries.iter_mut() {
-            if outputs.is_empty() || outputs.iter().any(|o| o == k) {
-                e.mtime = disk.stat(k)?;
+            if wanted.is_empty() || wanted.contains(k.as_str()) {
+                let mtime = disk.stat(k)?;
+                if mtime != e.mtime {
+                    e.mtime = mtime;
+                    changed.push(k.clone());
+                }
             }
         }
-        self.recompact(path, &|_| true)
+        if access == Access::Exclusive {
+            return self.recompact(path, &|_| true);
+        }
+        self.open_for_write(path, &|_| true, access)?;
+        changed.sort();
+        let lines: String = changed.iter().map(|k| format_entry(&self.entries[k])).collect();
+        if !lines.is_empty() {
+            self.append(&lines)?;
+        }
+        self.close();
+        Ok(())
     }
 }
 
@@ -325,18 +463,19 @@ mod tests {
         assert_eq!(hash_command("cmd.exe /c type nul > bin/t0.exe"), 0x68c9_7677_6b0c_9780);
     }
 
-    fn tmp(name: &str) -> String {
-        let d = test_dirs::base().join(format!("ninja-rs-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_file(&d);
-        d.to_string_lossy().into_owned()
+    /// A log's path, in a directory of its own (removed when dropped).
+    fn tmp(name: &str) -> (test_dirs::TestDir, String) {
+        let dir = test_dirs::TestDir::new(&format!("ninja_core_{name}"));
+        let p = dir.join("log").to_string_lossy().into_owned();
+        (dir, p)
     }
 
     #[test]
     fn write_read() {
-        let p = tmp("buildlog1");
+        let (_dir, p) = tmp("buildlog1");
         let mut log = BuildLog::new();
         log.load(&p).unwrap();
-        log.open_for_write(&p, &|_| true).unwrap();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
         log.record(LogEntry { output: "out".into(), command_hash: hash_command("cat in"), start_time: 15, end_time: 18, mtime: 0 }).unwrap();
         log.record(LogEntry { output: "mid".into(), command_hash: hash_command("cat mid"), start_time: 20, end_time: 21, mtime: 5 }).unwrap();
         log.close();
@@ -345,14 +484,13 @@ mod tests {
         assert_eq!(log2.entries().len(), 2);
         assert_eq!(log2.lookup_by_output("out"), log.lookup_by_output("out"));
         assert_eq!(log2.lookup_by_output("mid").unwrap().mtime, 5);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn last_entry_wins_and_recompact() {
-        let p = tmp("buildlog2");
+        let (_dir, p) = tmp("buildlog2");
         let mut log = BuildLog::new();
-        log.open_for_write(&p, &|_| true).unwrap();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
         for i in 0..200 {
             log.record(LogEntry { output: "out".into(), command_hash: i, start_time: i as i64, end_time: 0, mtime: 0 }).unwrap();
         }
@@ -362,29 +500,27 @@ mod tests {
         log2.load(&p).unwrap();
         assert_eq!(log2.lookup_by_output("out").unwrap().command_hash, 199);
         assert!(log2.needs_recompaction);
-        log2.open_for_write(&p, &|o| o != "dead").unwrap();
+        log2.open_for_write(&p, &|o| o != "dead", Access::Exclusive).unwrap();
         assert!(log2.lookup_by_output("dead").is_none());
         let text = std::fs::read_to_string(&p).unwrap();
         assert_eq!(text.lines().count(), 2);
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn invalid_header_ignored() {
-        let p = tmp("buildlog3");
+        let (_dir, p) = tmp("buildlog3");
         std::fs::write(&p, "# ninja log v5\n1\t2\t3\tout\tdeadbeef\n").unwrap();
         let mut log = BuildLog::new();
         assert!(log.load(&p).unwrap().is_some());
         assert!(log.entries().is_empty());
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn torn_entry_is_ignored_and_cut() {
-        let p = tmp("buildlog4");
+        let (_dir, p) = tmp("buildlog4");
         let entry = |output: &str| LogEntry { output: output.into(), command_hash: hash_command(output), start_time: 1, end_time: 2, mtime: 3 };
         let mut log = BuildLog::new();
-        log.open_for_write(&p, &|_| true).unwrap();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
         log.record(entry("a")).unwrap();
         log.record(entry("b")).unwrap();
         log.close();
@@ -396,7 +532,7 @@ mod tests {
         let mut log = BuildLog::new();
         log.load(&p).unwrap();
         assert!(log.lookup_by_output("b").is_none());
-        log.open_for_write(&p, &|_| true).unwrap();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
         log.record(entry("c")).unwrap();
         log.close();
         let mut log = BuildLog::new();
@@ -404,6 +540,136 @@ mod tests {
         assert_eq!(log.lookup_by_output("a"), Some(&entry("a")));
         assert!(log.lookup_by_output("b").is_none());
         assert_eq!(log.lookup_by_output("c"), Some(&entry("c")));
-        let _ = std::fs::remove_file(&p);
+    }
+
+    fn entry(output: &str, mtime: TimeStamp) -> LogEntry {
+        LogEntry { output: output.into(), command_hash: hash_command(output), start_time: 1, end_time: 2, mtime }
+    }
+
+    /// A shared writer (a build the lock's holder runs, which appends
+    /// meanwhile) neither recompacts the log nor cuts a torn line: it ends
+    /// the line, and appends.
+    #[test]
+    fn a_shared_writer_neither_recompacts_nor_cuts() {
+        let (_dir, p) = tmp("buildlog-shared");
+        let mut log = BuildLog::new();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        for i in 0..400 {
+            log.record(entry("dead", i)).unwrap();
+        }
+        log.record(entry("a", 1)).unwrap();
+        log.close();
+        let mut data = std::fs::read(&p).unwrap();
+        data.truncate(data.len() - 4);
+        std::fs::write(&p, &data).unwrap();
+        let mut shared = BuildLog::new();
+        shared.load(&p).unwrap();
+        assert!(shared.needs_recompaction && shared.truncate_to.is_some());
+        shared.open_for_write(&p, &|o| o != "dead", Access::Shared).unwrap();
+        shared.record(entry("b", 2)).unwrap();
+        shared.close();
+        let after = std::fs::read(&p).unwrap();
+        assert!(after.starts_with(&data), "rewritten or cut");
+        let mut log = BuildLog::new();
+        log.load(&p).unwrap();
+        assert_eq!(log.lookup_by_output("dead"), Some(&entry("dead", 399)));
+        assert_eq!(log.lookup_by_output("b"), Some(&entry("b", 2)));
+    }
+
+    /// A log another process replaced while a build appends to it: the
+    /// build's records go to the new one.
+    #[test]
+    fn a_replaced_log_is_opened_again() {
+        let (dir, p) = tmp("buildlog-replaced");
+        let mut log = BuildLog::new();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        log.record(entry("a", 1)).unwrap();
+        let other = dir.join("other");
+        std::fs::write(&other, format!("{SIGNATURE}{}", format_entry(&entry("x", 5)))).unwrap();
+        std::fs::rename(&other, &p).unwrap();
+        log.record(entry("b", 2)).unwrap();
+        log.close();
+        let mut log = BuildLog::new();
+        log.load(&p).unwrap();
+        assert_eq!(log.lookup_by_output("x"), Some(&entry("x", 5)));
+        assert_eq!(log.lookup_by_output("b"), Some(&entry("b", 2)));
+        assert!(log.lookup_by_output("a").is_none());
+    }
+
+    /// `-t restat`: an exclusive writer rewrites the log, a shared one
+    /// appends the records that changed.
+    #[test]
+    fn restat_appends_when_shared() {
+        use crate::disk::Disk;
+        let (dir, p) = tmp("buildlog-restat");
+        let disk = crate::disk::RealDisk::default();
+        let out = dir.join("out").to_string_lossy().into_owned();
+        std::fs::write(&out, "").unwrap();
+        let mtime = disk.stat(&out).unwrap();
+        let mut log = BuildLog::new();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        log.record(entry(&out, 1)).unwrap();
+        log.record(entry("other", 1)).unwrap();
+        log.close();
+        let before = std::fs::read(&p).unwrap();
+        let mut shared = BuildLog::new();
+        shared.load(&p).unwrap();
+        shared.restat(&p, &disk, std::slice::from_ref(&out), Access::Shared).unwrap();
+        let after = std::fs::read(&p).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(String::from_utf8_lossy(&after[before.len()..]), format_entry(&entry(&out, mtime)));
+        let mut exclusive = BuildLog::new();
+        exclusive.load(&p).unwrap();
+        exclusive.restat(&p, &disk, &[], Access::Exclusive).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap().lines().count(), 3);
+        let mut log = BuildLog::new();
+        log.load(&p).unwrap();
+        assert_eq!(log.lookup_by_output(&out).unwrap().mtime, mtime);
+    }
+
+    /// A recompaction killed while writing leaves its temporary file, which
+    /// the next one replaces: none stays.
+    #[test]
+    fn recompaction_reuses_its_temporary_file() {
+        let (dir, p) = tmp("buildlog-tmp");
+        std::fs::write(format!("{p}.recompact"), "left by a recompaction killed while writing").unwrap();
+        let mut log = BuildLog::new();
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        log.record(entry("a", 1)).unwrap();
+        log.recompact(&p, &|_| true).unwrap();
+        let files: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(files, ["log"]);
+    }
+
+    /// One process at a time holds the lock; the lock file says which, and
+    /// stops saying it when it lets go.
+    #[test]
+    fn the_lock_names_its_holder() {
+        let (_dir, p) = tmp("lock");
+        let mut held = LogLock::open(&p).unwrap();
+        assert!(held.lock(false).unwrap());
+        let mut other = LogLock::open(&p).unwrap();
+        assert!(!other.lock(false).unwrap());
+        let holder = other.holder().unwrap();
+        assert_eq!(holder.pid, std::process::id());
+        assert!(holder.describe().starts_with(&format!("pid {}, started ", std::process::id())), "{}", holder.describe());
+        assert_eq!(held.identity().unwrap(), other.identity().unwrap());
+        drop(held);
+        assert_eq!(other.holder(), None);
+        assert!(other.lock(false).unwrap());
+    }
+
+    /// A lock file this user can't write (another user's, in a build
+    /// directory a group shares) locks all the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_lock_file_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, p) = tmp("lock-read-only");
+        std::fs::write(&p, "").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut lock = LogLock::open(&p).unwrap();
+        assert!(lock.lock(false).unwrap());
+        assert!(!LogLock::open(&p).unwrap().lock(false).unwrap());
     }
 }

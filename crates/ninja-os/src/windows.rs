@@ -10,15 +10,17 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::path::Path;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_LOCK_VIOLATION, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
     ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION, PSID, TOKEN_QUERY, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo, FileIdInfo, GetFileInformationByHandleEx, OPEN_EXISTING, READ_CONTROL,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileBasicInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_EXISTING, READ_CONTROL, UnlockFile,
 };
+use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::SystemServices::{
     ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_OBJECT_ACE_TYPE,
 };
@@ -52,6 +54,53 @@ pub fn file_id(f: &File) -> Option<(u64, u128)> {
     // SAFETY: an open handle, and a buffer writable for its size.
     let ok = unsafe { GetFileInformationByHandleEx(f.as_raw_handle(), FileIdInfo, (&raw mut info).cast(), size_of::<FILE_ID_INFO>() as u32) };
     (ok != 0).then(|| (info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)))
+}
+
+/// A file's identity from its 64-bit file index, which every file system
+/// has.
+pub(crate) fn file_index(f: &File) -> io::Result<(u64, u128)> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: an open handle, and a buffer writable for its size.
+    if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((u64::from(info.dwVolumeSerialNumber), (u128::from(info.nFileIndexHigh) << 32) | u128::from(info.nFileIndexLow)))
+}
+
+/// Whether the file a handle is open on is deleted (or no name links to
+/// it any more), as the file another one was renamed over is.
+pub(crate) fn deleted(f: &File) -> bool {
+    let mut info = FILE_STANDARD_INFO::default();
+    // SAFETY: an open handle, and a buffer writable for its size.
+    let ok = unsafe { GetFileInformationByHandleEx(f.as_raw_handle(), FileStandardInfo, (&raw mut info).cast(), size_of::<FILE_STANDARD_INFO>() as u32) };
+    ok != 0 && (info.DeletePending || info.NumberOfLinks == 0)
+}
+
+/// The byte [`lock`] locks: past any data a locked file will hold.
+const LOCKED_BYTE: u64 = 1 << 62;
+
+/// See `crate::lock`.
+pub(crate) fn lock(f: &File, wait: bool) -> io::Result<bool> {
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous.Offset = LOCKED_BYTE as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (LOCKED_BYTE >> 32) as u32;
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | if wait { 0 } else { LOCKFILE_FAIL_IMMEDIATELY };
+    // SAFETY: an open handle, for synchronous I/O (std's): the call
+    // completes before `overlapped` goes away.
+    if unsafe { LockFileEx(f.as_raw_handle(), flags, 0, 1, 0, &mut overlapped) } != 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    if !wait && e.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) { Ok(false) } else { Err(e) }
+}
+
+/// See `crate::unlock`.
+pub(crate) fn unlock(f: &File) -> io::Result<()> {
+    // SAFETY: an open handle.
+    if unsafe { UnlockFile(f.as_raw_handle(), LOCKED_BYTE as u32, (LOCKED_BYTE >> 32) as u32, 1, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// The SID of the user `process` runs as, as a string (`S-1-5-21-...`).

@@ -309,13 +309,11 @@ mod tests {
 
     #[test]
     fn reads_from_disk() {
-        let dir = test_dirs::base().join(format!("ninja_rs_thin_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("ninja_rs_thin");
         std::fs::write(dir.join("t.a"), LLVM_GNU).unwrap();
         std::fs::write(dir.join("f.a"), FAT).unwrap();
         assert_eq!(read_members(&dir.join("t.a")).unwrap(), members(LLVM_GNU).unwrap());
         assert_eq!(read_members(&dir.join("f.a")).unwrap(), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -348,7 +346,7 @@ mod tests {
 
     #[test]
     fn expands_nested_archives() {
-        let dir = test_dirs::base().join(format!("ninja_rs_thin_expand_{}", std::process::id()));
+        let dir = test_dirs::TestDir::new("ninja_rs_thin_expand");
         std::fs::create_dir_all(dir.join("lib")).unwrap();
         std::fs::create_dir_all(dir.join("obj")).unwrap();
         std::fs::write(dir.join("lib/llvm-gnu.a"), LLVM_GNU).unwrap();
@@ -360,7 +358,6 @@ mod tests {
         let mut got = expand(&v(&["lib/outer.a", "obj/a.o"]), &dir, None, &store, Outside::Refuse).unwrap();
         got.sort();
         assert_eq!(got, v(&["lib/llvm-gnu.a", "obj/a_member_with_a_long_name.o"]));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A thin archive naming `names` (short names: 15 bytes at most).
@@ -379,8 +376,7 @@ mod tests {
     /// directory (a symlink, or a junction on Windows).
     #[test]
     fn members_outside() {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_thin_outside_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("ninja_rs_thin_outside");
         let build = dir.join("build");
         std::fs::create_dir_all(build.join("lib")).unwrap();
         std::fs::create_dir_all(dir.join("out")).unwrap();
@@ -408,6 +404,5 @@ mod tests {
         std::fs::write(build.join("lib/in.a"), thin(&["a.o", "gone.o"])).unwrap();
         std::fs::write(build.join("lib/a.o"), "a").unwrap();
         assert_eq!(expand(&v(&["lib/in.a"]), &build, None, &store, Outside::Refuse).unwrap().len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

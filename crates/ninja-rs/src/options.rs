@@ -41,6 +41,8 @@ pub struct Options {
     /// The options given, in order (for build events): from `.ninjars`
     /// files and the command line.
     pub given: Vec<GivenOption>,
+    /// About the options, printed before the invocation runs.
+    pub warnings: Vec<String>,
 }
 
 /// An option as given on the command line.
@@ -283,18 +285,33 @@ pub struct TlsFlags {
 }
 
 impl TlsFlags {
-    /// Reads the certificate files.
+    /// Reads the certificate files, which must hold PEM: certificates, and
+    /// a private key for `--tls_client_key`. Anything else (a DER file)
+    /// would leave the CAs trusted none, or the client without a key.
     pub fn load(&self) -> Result<ninja_remote::Tls, String> {
-        let read = |flag: &str, p: &Option<String>| -> Result<Option<Vec<u8>>, String> {
-            p.as_ref().map(|p| std::fs::read(p).map_err(|e| format!("--{flag}={p}: {e}"))).transpose()
+        let read = |flag: &str, p: &Option<String>, key: bool| -> Result<Option<Vec<u8>>, String> {
+            let Some(p) = p else { return Ok(None) };
+            let data = std::fs::read(p).map_err(|e| format!("--{flag}={p}: {e}"))?;
+            // The sections rustls reads: PKCS#8, PKCS#1 and SEC1 keys.
+            let found = pem_labels(&data).any(|l| if key { ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"].contains(&l) } else { l == "CERTIFICATE" });
+            if !found {
+                let (what, convert) = if key { ("private key", "openssl pkey") } else { ("certificate", "openssl x509") };
+                return Err(format!("--{flag}={p}: no PEM {what} in it (`{convert} -inform der` converts a DER one)"));
+            }
+            Ok(Some(data))
         };
         Ok(ninja_remote::Tls {
-            ca: read("tls_certificate", &self.certificate)?,
-            client_cert: read("tls_client_certificate", &self.client_certificate)?,
-            client_key: read("tls_client_key", &self.client_key)?,
+            ca: read("tls_certificate", &self.certificate, false)?,
+            client_cert: read("tls_client_certificate", &self.client_certificate, false)?,
+            client_key: read("tls_client_key", &self.client_key, true)?,
             authority_override: self.authority_override.clone(),
         })
     }
+}
+
+/// The labels of the PEM sections in `data` (`CERTIFICATE`, `PRIVATE KEY`).
+fn pem_labels(data: &[u8]) -> impl Iterator<Item = &str> {
+    data.split(|&b| b == b'\n').filter_map(|line| std::str::from_utf8(line).ok()?.trim().strip_prefix("-----BEGIN ")?.strip_suffix("-----"))
 }
 
 /// Explains a failed connection to a `grpcs://` endpoint (or one without a
@@ -302,7 +319,9 @@ impl TlsFlags {
 /// means. Empty for other errors. A connection closed is only explained
 /// when the server never answered anything (`first_contact`): with TLS 1.3,
 /// a server refusing the client's certificate may just close it after the
-/// handshake; later, it's a broken connection (made again already).
+/// handshake; later, it's a broken connection (made again already). An
+/// alert comes first: one saying the client's certificate expired isn't
+/// about the server's.
 pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool) -> String {
     let Some(rest) =
         endpoint.strip_prefix("grpcs://").or_else(|| endpoint.strip_prefix("https://")).or_else(|| (!endpoint.contains("://")).then_some(endpoint))
@@ -314,7 +333,9 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
         Some(c) => format!("the client certificate {c}"),
         None => "no client certificate (--tls_client_certificate)".to_string(),
     };
-    let hint = if e.contains("unknownissuer") || e.contains("unknown issuer") {
+    let hint = if e.contains("alert") && ["certificate", "unknownca", "accessdenied", "handshakefailure"].iter().any(|a| e.contains(a)) {
+        format!("the server refused the client's certificate: sent {cert}")
+    } else if e.contains("unknownissuer") || e.contains("unknown issuer") {
         let ca = match &tls.certificate {
             Some(c) => format!("{c} only"),
             None => "the public roots (--tls_certificate names a CA instead)".to_string(),
@@ -333,10 +354,12 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
         "the server's certificate has expired, or isn't valid yet (is the clock right?)".to_string()
     } else if e.contains("invalid peer certificate") {
         "the server's certificate was refused".to_string()
-    } else if e.contains("alert") && ["certificate", "unknownca", "accessdenied", "handshakefailure"].iter().any(|a| e.contains(a)) {
-        format!("the server refused the client's certificate: sent {cert}")
-    } else if first_contact && ["broken pipe", "connection closed", "connection reset", "unexpected eof"].iter().any(|c| e.contains(c)) {
-        format!("the server closed the connection before answering anything, as when it refuses the client's certificate: sent {cert}")
+    } else if first_contact
+        && ["broken pipe", "connection closed", "connection reset", "unexpected eof", "forcibly closed", "connection was aborted"].iter().any(|c| e.contains(c))
+    {
+        format!(
+            "the server closed the connection before answering anything, as when it refuses the client's certificate (sent {cert}), or doesn't speak TLS (grpc:// connects without)"
+        )
     } else {
         return String::new();
     };
@@ -486,8 +509,59 @@ pub const DEFAULT_DISK_CACHE_MAX_SIZE: u64 = 10 << 30;
 
 pub enum ParseOutcome {
     Run(Box<Options>),
-    /// Print this and exit with the code (e.g. --version, -h).
-    Exit(String, i32),
+    /// Print this where it says and exit with the code (`--version`, `-h`,
+    /// `-d list`).
+    Exit(String, i32, Out),
+}
+
+/// Where an answer of the command line goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Out {
+    Stdout,
+    Stderr,
+}
+
+/// What the command line alone answers, before any settings file is read,
+/// as ninja does before anything else: `--version` (CMake runs it to find
+/// the generator: a settings file mustn't change it or make it fail),
+/// `--help`, the listings (`-d list`, `-w list`, `-t list`) and an unknown
+/// tool. None for an invocation to run, or an error the whole parse reports.
+pub fn answer(args: &[String]) -> Option<(String, i32, Out)> {
+    match parse_unchecked(args) {
+        Ok(ParseOutcome::Exit(text, code, out)) => Some((text, code, out)),
+        Ok(ParseOutcome::Run(o)) => match o.tool.as_deref() {
+            Some("list") => Some((crate::tools::list_tools(), 0, Out::Stdout)),
+            Some(t) if crate::tools::find_tool(t).is_none() => Some((format!("ninja: fatal: {}\n", crate::tools::unknown_tool(t)), 1, Out::Stderr)),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+/// What ninja prints for an error of the command line: getopt's (with the
+/// usage), `Error`'s (an unknown debug or warning mode) or `Fatal`'s.
+pub fn error_text(e: &str) -> String {
+    if e.starts_with("unrecognized option") || e.contains("requires an argument") {
+        format!("ninja: {e}\n{}", usage())
+    } else if e.starts_with("invalid option") {
+        format!("ninja: {e}")
+    } else if e.starts_with("unknown debug setting") || e.starts_with("unknown warning flag") {
+        format!("ninja: error: {e}\n")
+    } else {
+        format!("ninja: fatal: {e}\n")
+    }
+}
+
+/// `what 'word'`, with the closest of `words` suggested, as ninja's
+/// `SpellcheckString` finds it.
+pub fn did_you_mean(what: &str, word: &str, words: &[&str]) -> String {
+    const MAX_DISTANCE: usize = 3;
+    let closest =
+        words.iter().map(|w| (ninja_core::graph::edit_distance(w, word, MAX_DISTANCE), w)).filter(|(d, _)| *d <= MAX_DISTANCE).min_by_key(|(d, _)| *d);
+    match closest {
+        Some((_, w)) => format!("{what} '{word}', did you mean '{w}'?"),
+        None => format!("{what} '{word}'"),
+    }
 }
 
 pub fn guess_parallelism() -> usize {
@@ -676,29 +750,53 @@ fn blank() -> Options {
         rc: RcOptions::default(),
         argv: Vec::new(),
         given: Vec::new(),
+        warnings: Vec::new(),
     }
 }
 
+/// Parses arguments all typed on the command line.
 pub fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
-    let outcome = parse_unchecked(args)?;
-    if let ParseOutcome::Run(o) = &outcome {
+    parse_invocation(args, &[])
+}
+
+/// Parses an invocation's arguments: `explicit[i]` tells whether `args[i]`
+/// was typed on the command line, not given by a settings file or the
+/// invocation running this one (true past its end).
+pub fn parse_invocation(args: &[String], explicit: &[bool]) -> Result<ParseOutcome, String> {
+    let mut outcome = parse_unchecked(args)?;
+    if let ParseOutcome::Run(o) = &mut outcome {
+        for g in &mut o.given {
+            g.explicit = explicit.get(g.index).copied().unwrap_or(true);
+        }
         validate(o)?;
     }
     Ok(outcome)
 }
 
-/// Options that must agree with each other.
-fn validate(o: &Options) -> Result<(), String> {
+/// Options that must agree with each other. One typed on the command line
+/// wins over one it conflicts with from a settings file or the invocation
+/// running this one, with a warning (Bazel takes either); two typed ones
+/// are an error.
+fn validate(o: &mut Options) -> Result<(), String> {
     if o.tls.client_certificate.is_some() != o.tls.client_key.is_some() {
         return Err("--tls_client_certificate and --tls_client_key go together".into());
     }
     if o.remote.racing && o.remote.strict {
-        return Err("--remote_racing runs actions locally, which --remote_strict forbids".into());
+        // Whether the option's last occurrence was typed.
+        let typed = |name: &str| o.given.iter().rev().find(|g| g.name == name).is_some_and(|g| g.explicit);
+        let (dropped, kept, why) = match (typed("remote_racing"), typed("remote_strict")) {
+            (true, false) => ("remote_strict", "remote_racing", "runs actions locally"),
+            (false, true) => ("remote_racing", "remote_strict", "forbids local runs"),
+            _ => return Err("--remote_racing runs actions locally, which --remote_strict forbids".into()),
+        };
+        *bool_option(o, dropped).expect("a boolean option") = false;
+        o.warnings.push(format!("--{dropped}, from a settings file or the invocation running this one, is left out: --{kept}, given here, {why}"));
     }
     if let (Some(e), Some(c)) = (&o.remote.executor, &o.remote.cache)
         && e != c
     {
-        return Err("--remote_cache and --remote_executor name different services: the executor's cache is used".into());
+        let warning = format!("--remote_cache={c} is left out: the cache of the executor (--remote_executor={e}) is used");
+        o.warnings.push(warning);
     }
     Ok(())
 }
@@ -752,12 +850,12 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                 continue;
             }
             match name {
-                "version" => return Ok(ParseOutcome::Exit(version_text(args.iter().any(|a| a == "-v" || a == "--verbose")), 0)),
+                "version" => return Ok(ParseOutcome::Exit(version_text(args.iter().any(|a| a == "-v" || a == "--verbose")), 0, Out::Stdout)),
                 "verbose" => o.verbosity = Verbosity::Verbose,
                 "quiet" => o.verbosity = Verbosity::NoStatusUpdate,
                 "status" => o.status_format = Some(value(&mut i)?),
                 "jobserver-pool" => o.jobserver_pool = true,
-                "help" => return Ok(ParseOutcome::Exit(usage(), 1)),
+                "help" => return Ok(ParseOutcome::Exit(usage(), 1, Out::Stderr)),
                 "tls_certificate" | "tls_client_certificate" | "tls_client_key" => {
                     let abs = optional_path(name, &value(&mut i)?)?;
                     match name {
@@ -906,13 +1004,15 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                         "keeprsp" => o.keep_rsp = true,
                         "stats" => o.stats = true,
                         "nostatcache" => o.no_stat_cache = true,
+                        // On stdout, exiting with 1, as ninja does.
                         "list" => {
                             return Ok(ParseOutcome::Exit(
                                 "debugging modes:\n  stats        print operation counts/timing info\n  explain      explain what caused a command to execute\n  keepdepfile  don't delete depfiles after they're read by ninja\n  keeprsp      don't delete @response files on success\n  nostatcache  don't batch stat() calls per directory and cache them\nmultiple modes can be enabled via -d FOO -d BAR\n".into(),
                                 1,
+                                Out::Stdout,
                             ));
                         }
-                        other => return Err(format!("unknown debug setting '{other}'")),
+                        other => return Err(did_you_mean("unknown debug setting", other, &["stats", "explain", "keepdepfile", "keeprsp", "nostatcache"])),
                     },
                     'f' => o.input_file = arg.unwrap(),
                     'j' => {
@@ -926,7 +1026,7 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                         o.explicit_parallelism = true;
                     }
                     'k' => {
-                        let n = parse_int("-k", arg.as_deref().unwrap())?;
+                        let n: i64 = arg.as_deref().unwrap().parse().map_err(|_| "-k parameter not numeric; did you mean -k 0?".to_string())?;
                         // We want to go until N jobs fail, which means we should
                         // allow N failures and then stop. For N <= 0, INT_MAX is
                         // close enough to infinite for most sane builds.
@@ -947,14 +1047,16 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                     'w' => match arg.as_deref().unwrap() {
                         "phonycycle=err" => o.phonycycle_err = true,
                         "phonycycle=warn" => o.phonycycle_err = false,
-                        "dupbuild=err" | "dupbuild=warn" => {}
+                        "dupbuild=err" | "dupbuild=warn" => o.warnings.push("deprecated warning 'dupbuild'".into()),
+                        "depfilemulti=err" | "depfilemulti=warn" => o.warnings.push("deprecated warning 'depfilemulti'".into()),
                         "list" => {
-                            return Ok(ParseOutcome::Exit("warning flags:\n  phonycycle={err,warn}  phony build statement references itself\n".into(), 1));
+                            let flags = "warning flags:\n  phonycycle={err,warn}  phony build statement references itself\n";
+                            return Ok(ParseOutcome::Exit(flags.into(), 1, Out::Stdout));
                         }
-                        other => return Err(format!("unknown warning flag '{other}'")),
+                        other => return Err(did_you_mean("unknown warning flag", other, &["phonycycle=err", "phonycycle=warn"])),
                     },
                     'C' => o.working_dir = arg,
-                    'h' => return Ok(ParseOutcome::Exit(usage(), 1)),
+                    'h' => return Ok(ParseOutcome::Exit(usage(), 1, Out::Stderr)),
                     other => return Err(format!("invalid option -- '{other}'\n{}", usage())),
                 }
                 if o.tool.is_some() && i == args.len() && c == 't' {
@@ -992,7 +1094,7 @@ mod tests {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         match parse_args(&v).unwrap() {
             ParseOutcome::Run(o) => *o,
-            ParseOutcome::Exit(m, _) => panic!("exit: {m}"),
+            ParseOutcome::Exit(m, ..) => panic!("exit: {m}"),
         }
     }
 
@@ -1045,9 +1147,72 @@ mod tests {
         assert!(!o.remote.upload_local_results);
         // The executor's own cache.
         let o = p(&["--remote_executor=grpc://e:1", "--remote_cache=grpc://e:1"]);
-        assert!(!o.remote.cache_only());
-        let v: Vec<String> = ["--remote_executor=grpc://e:1", "--remote_cache=grpc://c:1"].iter().map(|s| s.to_string()).collect();
-        assert!(parse_args(&v).is_err());
+        assert!(!o.remote.cache_only() && o.warnings.is_empty());
+        // Another one, which Bazel takes: the executor's is used.
+        let o = p(&["--remote_executor=grpc://e:1", "--remote_cache=grpc://c:1"]);
+        assert_eq!(o.remote.endpoint().map(String::as_str), Some("grpc://e:1"));
+        assert!(o.warnings[0].contains("--remote_cache=grpc://c:1 is left out"), "{:?}", o.warnings);
+    }
+
+    /// Options typed on the command line win over those they conflict with
+    /// from settings files and the invocation running this one (a nested
+    /// build's own options), with a warning; two typed ones don't go.
+    #[test]
+    fn typed_options_win_conflicts() {
+        let parse = |args: &[&str], explicit: &[bool]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            match parse_invocation(&args, explicit) {
+                Ok(ParseOutcome::Run(o)) => Ok(*o),
+                Ok(ParseOutcome::Exit(..)) => panic!("exit"),
+                Err(e) => Err(e),
+            }
+        };
+        let o = parse(&["--remote_racing", "--remote_strict"], &[false, true]).unwrap();
+        assert!(o.remote.strict && !o.remote.racing);
+        assert!(o.warnings[0].starts_with("--remote_racing, from a settings file or the invocation running this one, is left out"), "{:?}", o.warnings);
+        let o = parse(&["--remote_strict", "--remote_racing"], &[false, true]).unwrap();
+        assert!(o.remote.racing && !o.remote.strict);
+        assert!(parse(&["--remote_racing", "--remote_strict"], &[true, true]).is_err());
+        assert!(parse(&["--remote_racing", "--remote_strict"], &[false, false]).is_err());
+        assert!(o.given.iter().all(|g| g.explicit == (g.name == "remote_racing")));
+    }
+
+    /// As ninja: errors of the command line, the listings (on stdout,
+    /// exiting with 1), the deprecated warning flags.
+    #[test]
+    fn ninja_messages() {
+        let outcome = |args: &[&str]| parse_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let error = |args: &[&str]| error_text(&outcome(args).err().expect("an error"));
+        assert!(error(&["-j"]).starts_with("ninja: option requires an argument -- 'j'\nusage: ninja-rs"));
+        assert!(error(&["--status"]).starts_with("ninja: option '--status' requires an argument\nusage: ninja-rs"));
+        assert_eq!(error(&["-k", "x"]), "ninja: fatal: -k parameter not numeric; did you mean -k 0?\n");
+        assert_eq!(error(&["-j", "x"]), "ninja: fatal: invalid -j parameter\n");
+        assert_eq!(error(&["-d", "explian"]), "ninja: error: unknown debug setting 'explian', did you mean 'explain'?\n");
+        assert_eq!(error(&["-d", "nothing-like-it"]), "ninja: error: unknown debug setting 'nothing-like-it'\n");
+        assert_eq!(error(&["-w", "phonycycle=er"]), "ninja: error: unknown warning flag 'phonycycle=er', did you mean 'phonycycle=err'?\n");
+        for listing in ["-d", "-w"] {
+            let Ok(ParseOutcome::Exit(text, 1, Out::Stdout)) = outcome(&[listing, "list"]) else { panic!("{listing} list") };
+            assert!(text.ends_with('\n'));
+        }
+        assert!(matches!(outcome(&["-h"]), Ok(ParseOutcome::Exit(_, 1, Out::Stderr))));
+        assert_eq!(p(&["-w", "dupbuild=err"]).warnings, ["deprecated warning 'dupbuild'"]);
+    }
+
+    /// The command line alone answers `--version`, `--help`, the listings
+    /// and unknown tools, before any settings file is read.
+    #[test]
+    fn command_line_answers() {
+        let answer = |args: &[&str]| answer(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let version = format!("{}\n", ninja_core::parser::NINJA_VERSION);
+        assert_eq!(answer(&["--version"]), Some((version, 0, Out::Stdout)));
+        assert_eq!(answer(&["-t", "list"]).map(|(t, c, o)| (t.starts_with("ninja-rs subtools:\n"), c, o)), Some((true, 0, Out::Stdout)));
+        assert_eq!(answer(&["-t", "cleen"]), Some(("ninja: fatal: unknown tool 'cleen', did you mean 'clean'?\n".to_string(), 1, Out::Stderr)));
+        assert_eq!(answer(&["-t", "nothing-like-it"]).map(|a| a.0), Some("ninja: fatal: unknown tool 'nothing-like-it'\n".to_string()));
+        assert!(matches!(answer(&["--help"]), Some((_, 1, Out::Stderr))));
+        // To run, or the whole parse's error.
+        assert_eq!(answer(&["-t", "targets", "all"]), None);
+        assert_eq!(answer(&["all"]), None);
+        assert_eq!(answer(&["--bogus", "--version"]), None);
     }
 
     /// `--action_env`: a value given, or the one ninja-rs has (none when
@@ -1099,8 +1264,43 @@ mod tests {
         assert!(hint("invalid peer certificate: NotValidForName", "grpcs://[::1]:8980", true).contains("isn't valid for ::1"));
         let expired = hint("invalid peer certificate: Expired", "grpcs://h:1", true);
         assert!(expired.contains("has expired") && !expired.contains("trusted"), "{expired}");
+        // The client's certificate expired, as the server says it.
+        let expired = hint("transport error: connection error: received fatal alert: CertificateExpired", "grpcs://h:1", true);
+        assert!(expired.contains("refused the client's certificate"), "{expired}");
+        // Windows' words for a connection reset, or aborted.
+        for e in [
+            "An existing connection was forcibly closed by the remote host. (os error 10054)",
+            "An established connection was aborted by the software in your host machine. (os error 10053)",
+        ] {
+            assert!(hint(&format!("transport error: {e}"), "grpcs://h:1", true).contains("closed the connection before answering"), "{e}");
+        }
         assert_eq!(hint("transport error: broken pipe", "grpc://h:1", true), "");
         assert_eq!(hint("not found", "grpcs://h:1", true), "");
+    }
+
+    #[test]
+    fn tls_files_hold_pem() {
+        let dir = test_dirs::TestDir::new("ninja-rs-tls-files");
+        let file = |name: &str, data: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, data).unwrap();
+            Some(p.to_string_lossy().into_owned())
+        };
+        let cert = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let key = b"-----BEGIN EC PRIVATE KEY-----\r\nMHcC\r\n-----END EC PRIVATE KEY-----\r\n";
+        let tls = TlsFlags { certificate: file("ca.pem", cert), client_certificate: file("c.pem", cert), client_key: file("k.pem", key), ..Default::default() };
+        let loaded = tls.load().unwrap();
+        assert_eq!(loaded.ca.as_deref(), Some(&cert[..]));
+        assert_eq!(loaded.client_key.as_deref(), Some(&key[..]));
+        // DER, or a key where a certificate goes: said so, not an empty
+        // trust store.
+        let der = file("ca.der", &[0x30, 0x82, 0x01, 0x0a, 0x02, 0x82]);
+        let err = TlsFlags { certificate: der.clone(), ..Default::default() }.load().unwrap_err();
+        assert!(err.contains("--tls_certificate=") && err.contains("no PEM certificate"), "{err}");
+        let err = TlsFlags { client_certificate: file("key-as-cert.pem", key), client_key: tls.client_key.clone(), ..Default::default() }.load().unwrap_err();
+        assert!(err.contains("--tls_client_certificate=") && err.contains("no PEM certificate"), "{err}");
+        let err = TlsFlags { client_certificate: tls.client_certificate.clone(), client_key: der, ..Default::default() }.load().unwrap_err();
+        assert!(err.contains("--tls_client_key=") && err.contains("no PEM private key"), "{err}");
     }
 
     #[test]
@@ -1146,7 +1346,7 @@ mod tests {
     fn version() {
         let text = |args: &[&str]| {
             let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            let ParseOutcome::Exit(text, 0) = parse_args(&args).unwrap() else { panic!("--version doesn't exit") };
+            let ParseOutcome::Exit(text, 0, Out::Stdout) = parse_args(&args).unwrap() else { panic!("--version doesn't exit") };
             text
         };
         assert_eq!(text(&["--version"]), format!("{}\n", ninja_core::parser::NINJA_VERSION));
@@ -1180,6 +1380,8 @@ mod tests {
         let bazel = version_after(&read("MODULE.bazel"), "module(");
         assert_eq!((cargo.as_str(), bazel.as_str()), (env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_VERSION")));
         let commit = crate::version().strip_prefix(env!("CARGO_PKG_VERSION")).unwrap();
-        assert!(commit.is_empty() || commit.strip_prefix('+').is_some_and(|c| c.len() >= 7 && c.bytes().all(|b| b.is_ascii_hexdigit())), "{commit}");
+        // `+1a2b3c4d5e6f`, `.dirty` after it when the tree was.
+        let hex = commit.strip_prefix('+').map(|c| c.strip_suffix(".dirty").unwrap_or(c));
+        assert!(commit.is_empty() || hex.is_some_and(|c| c.len() >= 7 && c.bytes().all(|b| b.is_ascii_hexdigit())), "{commit}");
     }
 }

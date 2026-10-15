@@ -137,6 +137,13 @@ impl Client {
         let token = if self.implicit_free.swap(false, Ordering::AcqRel) { None } else { Some(self.sys.try_acquire()?) };
         Some(Slot { client: self.clone(), token })
     }
+
+    /// A slot if one is free now and nobody waits for one: those waiting
+    /// (`acquire`) take theirs first.
+    pub fn try_acquire_in_turn(self: &Arc<Self>) -> Option<Slot> {
+        let _turn = self.turn.try_lock().ok()?;
+        self.try_acquire()
+    }
 }
 
 impl Slot {
@@ -305,6 +312,9 @@ mod sys {
     pub struct Client {
         read: File,
         write: File,
+        /// The read end is a description of its own, non-blocking (see
+        /// `pipe`); else it is the pool's, read only when ready.
+        own: bool,
     }
 
     impl Client {
@@ -327,7 +337,7 @@ mod sys {
                 return Err(format!("Not a fifo path: {path}"));
             }
             let write = open(true).map_err(|e| format!("Error opening fifo for writing: {e}"))?;
-            Ok(Self { read, write })
+            Ok(Self { read, write, own: true })
         }
 
         fn pipe(read: i32, write: i32) -> Result<Self, String> {
@@ -337,17 +347,24 @@ mod sys {
             if !is_pool_descriptor(read) || !is_pool_descriptor(write) {
                 return Err("Invalid file descriptors".into());
             }
-            // Duplicates, non-blocking and closed on exec: commands inherit
-            // the originals.
-            let read = duplicate(read).ok_or("Could not duplicate read descriptor")?;
+            // Closed on exec: commands inherit the originals. Their open
+            // file descriptions are make's and its other clients': made
+            // non-blocking, they would be for them too (make 3.81 fails
+            // reading a non-blocking pipe). Where Linux gives the pipe a
+            // description of its own (`/proc/self/fd`), that one is.
             let write = duplicate(write).ok_or("Could not duplicate write descriptor")?;
-            Ok(Self { read, write })
+            if let Some(read) = reopen(read) {
+                return Ok(Self { read, write, own: true });
+            }
+            let read = duplicate(read).ok_or("Could not duplicate read descriptor")?;
+            Ok(Self { read, write, own: false })
         }
 
         pub fn try_acquire(&self) -> Option<u8> {
             let mut b = [0u8];
             loop {
-                match (&self.read).read(&mut b) {
+                let read = if self.own { (&self.read).read(&mut b) } else { read_now(&self.read, &mut b) };
+                match read {
                     Ok(1) => return Some(b[0]),
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     _ => return None,
@@ -372,18 +389,43 @@ mod sys {
         fd.try_clone_to_owned().map(File::from).and_then(|f| f.metadata()).is_ok_and(|m| m.file_type().is_fifo() || m.file_type().is_socket())
     }
 
+    /// A duplicate, closed on exec, sharing the original's description.
     fn duplicate(fd: i32) -> Option<File> {
         // SAFETY: `is_pool_descriptor` checked that the descriptor is open.
-        let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().ok()?);
-        let raw = file.as_raw_fd();
-        // SAFETY: plain fcntl calls on a descriptor we own.
-        unsafe {
-            let flags = libc::fcntl(raw, libc::F_GETFL);
-            if flags < 0 || libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return None;
-            }
+        Some(File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().ok()?))
+    }
+
+    /// The pipe `fd` reads from, opened again for reading: a description of
+    /// its own, non-blocking (Linux; not for sockets).
+    fn reopen(fd: i32) -> Option<File> {
+        if !cfg!(target_os = "linux") {
+            return None;
         }
-        Some(file)
+        let file = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(format!("/proc/self/fd/{fd}")).ok()?;
+        file.metadata().is_ok_and(|m| m.file_type().is_fifo()).then_some(file)
+    }
+
+    /// Reads from the pool's description without waiting: from a socket,
+    /// with `MSG_DONTWAIT`; from a pipe, once it is readable (a token
+    /// another process takes meanwhile makes it wait for the next one).
+    fn read_now(file: &File, buf: &mut [u8]) -> std::io::Result<usize> {
+        let fd = file.as_raw_fd();
+        // SAFETY: a buffer of the length given.
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ENOTSOCK) {
+            return Err(e);
+        }
+        let mut ready = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one pollfd, not waiting.
+        if unsafe { libc::poll(&mut ready, 1, 0) } != 1 {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        let mut file = file;
+        file.read(buf)
     }
 
     pub struct Pool {
@@ -603,8 +645,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(!waiter.is_finished());
             drop(b);
+            // The token is the waiter's, not one asking without waiting.
+            assert!(client.try_acquire_in_turn().is_none(), "a slot taken out of turn");
             assert!(!waiter.await.unwrap());
             drop(a);
+            assert!(client.try_acquire_in_turn().is_some());
         });
     }
 
@@ -656,5 +701,26 @@ mod tests {
         let f = std::fs::File::open("/dev/null").unwrap();
         assert!(Client::new(&Mode::Pipe { read: f.as_raw_fd(), write: f.as_raw_fd() }).is_err());
         assert!(Client::new(&Mode::Pipe { read: 1000, write: 1001 }).is_err());
+    }
+
+    /// The pool's descriptions stay as make has them, blocking: it shares
+    /// them with its other clients, and make 3.81 fails reading a
+    /// non-blocking pipe.
+    #[cfg(unix)]
+    #[test]
+    fn pipe_pool_stays_blocking() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let (r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"+").unwrap();
+        let client = Client::new(&Mode::Pipe { read: r.as_raw_fd(), write: w.as_raw_fd() }).unwrap();
+        let _implicit = client.try_acquire().unwrap();
+        let token = client.try_acquire();
+        assert!(token.is_some());
+        assert!(client.try_acquire().is_none(), "waited for a token");
+        for fd in [r.as_raw_fd(), w.as_raw_fd()] {
+            // SAFETY: plain fcntl call on an open descriptor.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, 0, "{fd}");
+        }
     }
 }

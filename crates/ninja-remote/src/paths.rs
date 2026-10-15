@@ -13,9 +13,13 @@ use std::path::{Path, PathBuf};
 use ninja_core::canon::canonicalize_path_with;
 
 /// Normalizes an absolute local path: `/` separators, lexically canonical,
-/// upper-case drive letter on Windows.
+/// upper-case drive letter on Windows, where a UNC path keeps its leading
+/// `//` (`//server/share/dir`).
 pub fn normalize_abs(p: &str, windows: bool) -> String {
     let s = if windows { p.replace('\\', "/") } else { p.to_string() };
+    if windows && is_unc(&s) {
+        return format!("/{}", canonicalize_path_with(&s[1..], false).0);
+    }
     let (mut c, _) = canonicalize_path_with(&s, false);
     if windows && c.len() >= 2 && c.as_bytes()[1] == b':' {
         c = format!("{}{}", c[..1].to_ascii_uppercase(), &c[1..]);
@@ -35,6 +39,20 @@ pub fn is_abs(p: &str, windows: bool) -> bool {
     }
 }
 
+/// Whether a Windows path (`/` separators) is a UNC path: `//server/...`.
+fn is_unc(p: &str) -> bool {
+    p.strip_prefix("//").is_some_and(|rest| rest.bytes().next().is_some_and(|c| c != b'/' && c != b'?' && c != b'.'))
+}
+
+/// The volume of a normalized absolute Windows path, case-folded: its
+/// drive (`C`), or a UNC path's server and share (`//server/share`).
+fn volume(p: &str) -> String {
+    if is_unc(p) {
+        return format!("//{}", components(p).iter().take(2).copied().collect::<Vec<_>>().join("/")).to_ascii_lowercase();
+    }
+    if p.len() >= 2 && p.as_bytes()[1] == b':' { p[..1].to_ascii_uppercase() } else { String::new() }
+}
+
 fn components(p: &str) -> Vec<&str> {
     p.split('/').filter(|c| !c.is_empty()).collect()
 }
@@ -49,7 +67,8 @@ fn eq_comp(a: &str, b: &str, windows: bool) -> bool {
 pub struct ExecRoot {
     windows: bool,
     /// Normalized absolute local path. `None` on Windows when paths span
-    /// several drives: the tree then has one top-level directory per drive.
+    /// several volumes: the tree then has one top-level directory per drive
+    /// (`C`), and one for UNC paths (`UNC/server/share`).
     root: Option<String>,
 }
 
@@ -62,11 +81,10 @@ impl ExecRoot {
     pub fn common(paths: &[String], windows: bool) -> Self {
         let mut it = paths.iter();
         let Some(first) = it.next() else { return Self { windows, root: Some("/".into()) } };
-        let drive = |p: &str| if windows && p.len() >= 2 && p.as_bytes()[1] == b':' { p[..1].to_ascii_uppercase() } else { String::new() };
-        let first_drive = drive(first);
+        let first_volume = if windows { volume(first) } else { String::new() };
         let mut common: Vec<String> = components(first).iter().map(|s| s.to_string()).collect();
         for p in it {
-            if windows && drive(p) != first_drive {
+            if windows && volume(p) != first_volume {
                 return Self { windows, root: None };
             }
             let comps = components(p);
@@ -76,9 +94,12 @@ impl ExecRoot {
             }
             common.truncate(n);
         }
-        let root = if windows {
+        let root = if windows && first_volume.starts_with("//") {
+            // common[..2] are the server and the share.
+            format!("//{}", common.join("/"))
+        } else if windows {
             // common[0] is the drive ("C:").
-            if common.len() <= 1 { format!("{first_drive}:/") } else { common.join("/") }
+            if common.len() <= 1 { format!("{first_volume}:/") } else { common.join("/") }
         } else {
             format!("/{}", common.join("/"))
         };
@@ -92,7 +113,16 @@ impl ExecRoot {
     /// Whether it's a file system's root (`/`, `C:/`) or spans drives:
     /// paths under it may then name the host's own files (`/dev/null`).
     pub fn is_fs_root(&self) -> bool {
-        self.root.as_deref().is_none_or(|r| components(r).len() <= usize::from(self.windows))
+        let volume = |r: &str| {
+            if !self.windows {
+                0
+            } else if is_unc(r) {
+                2
+            } else {
+                1
+            }
+        };
+        self.root.as_deref().is_none_or(|r| components(r).len() <= volume(r))
     }
 
     /// Tree path ('/'-separated, relative) of a normalized absolute local
@@ -100,7 +130,11 @@ impl ExecRoot {
     pub fn to_tree(&self, abs: &str) -> Option<String> {
         match &self.root {
             None => {
-                // Multi-drive layout: "C:/x/y" -> "C/x/y".
+                // Multi-volume layout: "C:/x/y" -> "C/x/y", "//s/h/x" ->
+                // "UNC/s/h/x".
+                if is_unc(abs) {
+                    return Some(format!("UNC/{}", components(abs).join("/")));
+                }
                 let b = abs.as_bytes();
                 if b.len() >= 2 && b[1] == b':' {
                     let rest = abs[2..].trim_start_matches('/');
@@ -130,7 +164,7 @@ impl ExecRoot {
         match &self.root {
             None => {
                 let (d, rest) = tree.split_once('/').unwrap_or((tree, ""));
-                format!("{}:/{rest}", d.to_ascii_uppercase())
+                if d == "UNC" { format!("//{rest}") } else { format!("{}:/{rest}", d.to_ascii_uppercase()) }
             }
             Some(root) => {
                 if tree.is_empty() {
@@ -270,9 +304,11 @@ impl PathMapper {
 
     /// Rewrites a command's arguments (see `rewrite_arg`), except values
     /// the program built keeps rather than opens: macro definitions (`-D`,
-    /// and `/D` on a cl-style command line, `cl`) and run-time library
-    /// paths (`-rpath`, `-R`, `-install_name`, also through `-Wl,` and
-    /// `-Xlinker`). Their absolute paths name this machine's files on
+    /// and `/D` on a cl-style command line, `cl`), run-time library paths
+    /// and the dynamic linker (`-rpath`, `-R`, `-install_name`,
+    /// `--dynamic-linker`, also through `-Wl,` and `-Xlinker`), and where it
+    /// writes profiles or the directory its debug information names (see
+    /// `RUN_TIME_PATHS`). Their absolute paths name this machine's files on
     /// purpose (a data directory, where the program finds its libraries);
     /// made relative, the program would differ from the one ninja builds,
     /// and break when run from elsewhere. A prefix map
@@ -372,7 +408,21 @@ impl PathMapper {
     /// matched against the input tree by suffix. Paths inside the build
     /// directory become relative to it, others absolute.
     pub fn map_back(&self, remote: &str, tree_files: &TreeIndex) -> String {
+        self.map_back_from(remote, tree_files, false)
+    }
+
+    /// Maps a path reported by a local run of the action's command back:
+    /// as `map_back`, but an absolute path is already the host's (a system
+    /// header), never another file of the tree with the same suffix.
+    pub fn map_back_local(&self, path: &str, tree_files: &TreeIndex) -> String {
+        self.map_back_from(path, tree_files, true)
+    }
+
+    fn map_back_from(&self, remote: &str, tree_files: &TreeIndex, local_run: bool) -> String {
         let norm = if self.windows { remote.replace('\\', "/") } else { remote.to_string() };
+        if local_run && (is_abs(&norm, self.windows) || norm.starts_with('/')) {
+            return remote.to_string();
+        }
         let tree = if is_abs(&norm, self.windows) || norm.starts_with('/') {
             match tree_files.match_suffix(&norm, self.windows) {
                 Some(t) => t,
@@ -424,14 +474,44 @@ const CL_JOINED_OPTIONS: &[&str] = &[
     "I",
 ];
 
+/// Options whose value is a path the program built uses when it runs, or
+/// records: where it writes profiles, the compilation directory its debug
+/// information names (clang-cl's through `/clang:`).
+const RUN_TIME_PATHS: &[&str] = &[
+    "-fprofile-instr-generate=",
+    "-fprofile-generate=",
+    "-fcs-profile-generate=",
+    "-fprofile-dir=",
+    "-fdebug-compilation-dir=",
+    "-fcoverage-compilation-dir=",
+    "-ffile-compilation-dir=",
+];
+
 /// Whether `arg`, after `prev` (itself after `prev2`), is a value the
 /// program built keeps (see `PathMapper::rewrite_args`).
 fn kept_value(arg: &str, prev: Option<&str>, prev2: Option<&str>, cl: bool) -> bool {
-    let runtime_path_flag = |a: &str| matches!(a, "-rpath" | "--rpath" | "-R" | "-install_name");
+    let runtime_path_flag =
+        |a: &str| matches!(a, "-rpath" | "--rpath" | "-R" | "-install_name" | "-dynamic-linker" | "--dynamic-linker" | "-fdebug-compilation-dir");
+    let inner = arg.strip_prefix("/clang:").or_else(|| arg.strip_prefix("-clang:")).unwrap_or(arg);
     defines(arg, prev, cl)
         || prev.is_some_and(runtime_path_flag)
         || (prev == Some("-Xlinker") && prev2.is_some_and(runtime_path_flag))
-        || ["-Wl,-rpath,", "-Wl,-rpath=", "-Wl,--rpath,", "-Wl,--rpath=", "-Wl,-R", "-Wl,-install_name,"].iter().any(|p| arg.starts_with(p))
+        || RUN_TIME_PATHS.iter().any(|p| inner.starts_with(p))
+        || [
+            "-Wl,-rpath,",
+            "-Wl,-rpath=",
+            "-Wl,--rpath,",
+            "-Wl,--rpath=",
+            "-Wl,-R",
+            "-Wl,-install_name,",
+            "-Wl,-dynamic-linker,",
+            "-Wl,-dynamic-linker=",
+            "-Wl,--dynamic-linker,",
+            "-Wl,--dynamic-linker=",
+            "--dynamic-linker=",
+        ]
+        .iter()
+        .any(|p| arg.starts_with(p))
 }
 
 /// Whether `arg`, after `prev`, defines a macro: glued to `-D` (see
@@ -511,7 +591,9 @@ pub fn find_abs_paths(arg: &str, windows: bool) -> Vec<(usize, usize)> {
     let mut i = begin;
     while i < b.len() {
         let start = if windows {
-            i + 2 < b.len() && b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'/' || b[i + 2] == b'\\')
+            (i + 2 < b.len() && b[i].is_ascii_alphabetic() && b[i + 1] == b':' && (b[i + 2] == b'/' || b[i + 2] == b'\\'))
+                // A UNC path: `\\server\share`, `//server/share`.
+                || (i + 2 < b.len() && matches!(&b[i..i + 2], b"\\\\" | b"//") && b[i + 2].is_ascii_alphanumeric())
         } else {
             b[i] == b'/'
                 && (i == begin || matches!(b[i - 1], b'=' | b',' | b':' | b';' | b'@' | b'\'' | b'"') || {
@@ -763,5 +845,73 @@ mod tests {
         assert_eq!(m.map_back("/worker/exec/42/tc/lib/clang/include/stddef.h", &idx), "/home/u/tc/lib/clang/include/stddef.h");
         assert_eq!(m.map_back("/worker/exec/42/proj/build/gen/g.h", &idx), "gen/g.h");
         assert_eq!(m.map_back("/usr/include/stdio.h", &idx), "/usr/include/stdio.h");
+        // A local run's absolute paths are the host's: a system header
+        // whose path ends like a file of the tree stays what it is.
+        assert_eq!(m.map_back("/opt/tc/lib/clang/include/stddef.h", &idx), "/home/u/tc/lib/clang/include/stddef.h");
+        assert_eq!(m.map_back_local("/opt/tc/lib/clang/include/stddef.h", &idx), "/opt/tc/lib/clang/include/stddef.h");
+        assert_eq!(m.map_back_local("../src/a.c", &idx), "/home/u/proj/src/a.c");
+        assert_eq!(m.map_back_local("gen/g.h", &idx), "gen/g.h");
+    }
+
+    /// Paths the program built uses when it runs (where it writes
+    /// profiles, its dynamic linker) or records (the compilation
+    /// directory) are kept, as the paths of the libraries it loads.
+    #[test]
+    fn kept_run_time_paths() {
+        let root = ExecRoot::common(&["/home/u/proj/build".into(), "/home/u/proj/src/a.c".into()], false);
+        let mut m = PathMapper::new(root, "/home/u/proj/build", false).unwrap();
+        m.tree_path("/home/u/proj/src/a.c").unwrap();
+        let args: Vec<String> = [
+            "-fprofile-instr-generate=/home/u/proj/build/profiles/%p.profraw",
+            "-fprofile-generate=/home/u/proj/build/gcda",
+            "-fprofile-dir=/home/u/proj/build/gcda",
+            "-fdebug-compilation-dir=/home/u/proj/build",
+            "-ffile-compilation-dir=/home/u/proj/build",
+            "/clang:-fprofile-instr-generate=/home/u/proj/build/p.profraw",
+            "-Wl,--dynamic-linker,/home/u/proj/build/ld.so",
+            "-Wl,-dynamic-linker=/home/u/proj/build/ld.so",
+            "-Xlinker",
+            "--dynamic-linker",
+            "-Xlinker",
+            "/home/u/proj/build/ld.so",
+            "-fdebug-compilation-dir",
+            "/home/u/proj/build",
+            "-fprofile-use=/home/u/proj/build/default.profdata",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = m.rewrite_args(&args, false);
+        assert_eq!(out[..14], args[..14]);
+        // A profile the compiler reads is rewritten.
+        assert_eq!(out[14], "-fprofile-use=default.profdata");
+    }
+
+    /// UNC paths (`\\server\share\...`): one volume, the server's share, in
+    /// the tree and in the arguments, mapped back.
+    #[test]
+    fn unc_paths() {
+        assert_eq!(normalize_abs(r"\\Server\Share\proj\.\src\..\build", true), "//Server/Share/proj/build");
+        let root = ExecRoot::common(&["//server/share/proj/build".into(), "//SERVER/share/proj/src/a.c".into()], true);
+        assert_eq!(root.root(), Some("//server/share/proj"));
+        assert!(!root.is_fs_root());
+        assert!(ExecRoot::common(&["//server/share/a".into(), "//server/share/b".into()], true).is_fs_root());
+        let mut m = PathMapper::new(root, r"\\server\share\proj\build", true).unwrap();
+        assert_eq!(m.work_dir, "build");
+        assert_eq!(m.tree_path(r"\\server\share\proj\src\a.c").as_deref(), Some("src/a.c"));
+        assert_eq!(m.tree_path(r"\\other\share\proj\src\a.c"), None);
+        assert_eq!(m.rewrite_arg(r"-I\\server\share\proj\src"), r"-I..\src");
+        assert_eq!(m.rewrite_arg("/Fo//server/share/proj/build/obj/a.obj"), "/Foobj/a.obj");
+        assert_eq!(m.rewrite_arg(r"-I\\other\share\inc"), r"-I\\other\share\inc");
+        assert_eq!(m.rewrite_text(br"\\server\share\proj\src\a.c(3): warning"), br"..\src\a.c(3): warning");
+        let idx = TreeIndex::new(["src/a.c".to_string()], true);
+        assert_eq!(m.map_back("../src/a.c", &idx), "//server/share/proj/src/a.c");
+        assert_eq!(m.map_back("D:/worker/7/src/a.c", &idx), "//server/share/proj/src/a.c");
+        // With drives: a top-level directory for UNC paths.
+        let mixed = ExecRoot::common(&["C:/proj/build".into(), "//server/share/inc/x.h".into()], true);
+        assert_eq!(mixed.root(), None);
+        assert_eq!(mixed.to_tree("//server/share/inc/x.h").as_deref(), Some("UNC/server/share/inc/x.h"));
+        assert_eq!(mixed.to_local("UNC/server/share/inc/x.h"), "//server/share/inc/x.h");
+        assert_eq!(mixed.to_tree("C:/proj/build").as_deref(), Some("C/proj/build"));
     }
 }

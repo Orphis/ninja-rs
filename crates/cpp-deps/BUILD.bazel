@@ -7,11 +7,38 @@ rust_library(
     name = "cpp-deps",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "cpp_deps",
+    deps = ["//crates/ninja-os"],
 )
 
+# On Linux hosts, the tests against real compilers (see build.rs) run with
+# the hermetic toolchain's Clang and clang-cl (hundreds of runs: about 10 s,
+# 35 s on a busy machine); elsewhere they're ignored (on Windows, the tests
+# would have to read the runfiles manifest).
 rust_test(
     name = "cpp-deps_test",
-    size = "small",
+    size = "medium",
     crate = ":cpp-deps",
+    data = select({
+        "@platforms//os:linux": [
+            "@llvm//tools:clang++",
+            "@llvm//tools:clang-cl",
+            "@llvm//tools:clang-scan-deps",
+        ],
+        "//conditions:default": [],
+    }),
+    env = select({
+        "@platforms//os:linux": {
+            "CPP_DEPS_TEST_CLANG_CL": "$(rootpath @llvm//tools:clang-cl)",
+            "CPP_DEPS_TEST_CXX": "$(rootpath @llvm//tools:clang++)",
+        },
+        "//conditions:default": {},
+    }),
+    rustc_flags = select({
+        "@platforms//os:linux": [
+            "--cfg=cpp_deps_test_clang_cl",
+            "--cfg=cpp_deps_test_cxx",
+        ],
+        "//conditions:default": [],
+    }),
     deps = ["//crates/test-dirs"],
 )

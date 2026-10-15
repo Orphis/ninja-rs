@@ -28,3 +28,12 @@ pub mod vfs;
 
 pub use driver::Driver;
 pub use scan::{Cache, CommandMacro, Config, NoOracle, Oracle, Output, scan};
+
+/// The compiler the variable `var` names, for the tests against real ones
+/// (see build.rs): a path relative to where the tests start (Bazel's
+/// runfiles), made absolute, or a name found in PATH.
+#[cfg(test)]
+pub(crate) fn test_compiler(var: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(std::env::var_os(var).unwrap_or_else(|| panic!("{var} names no compiler to test against")));
+    if path.components().count() > 1 { std::path::absolute(&path).unwrap() } else { path }
+}

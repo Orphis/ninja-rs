@@ -20,11 +20,42 @@ use crate::options::Options;
 
 pub const ENV: &str = "NINJA_RS_PARENT";
 
-/// The lock file of the logs an invocation writes (see `LogLock`), which
-/// its commands get: one writing them again (a generator running
-/// `-t restat`, while the build waits for it) does so for the invocation,
-/// without the lock it holds.
+/// The lock files of the logs an invocation and those it runs for write
+/// (see `LogLock`), by identity (`<volume>:<file id>` in hex, comma
+/// separated), which its commands get: one writing them again (a
+/// generator running `-t restat`, while the build waits for it) does so
+/// for the invocation, appending only, without the lock it holds.
 pub const LOGS_LOCK_ENV: &str = "NINJA_RS_LOGS_LOCK";
+
+/// The remote services an invocation found unreachable, which its
+/// commands get: the invocations they run do without them at once, under
+/// the same rules (`--remote_local_fallback`), rather than try them again
+/// (a refused connection takes Windows 2 s, one never answered
+/// `--remote_timeout`). Their endpoints, separated by spaces.
+pub const UNREACHABLE_ENV: &str = "NINJA_RS_REMOTE_UNREACHABLE";
+
+/// The remote services the invocations running this one found unreachable.
+pub fn unreachable_endpoints() -> Vec<String> {
+    endpoints_in(std::env::var(UNREACHABLE_ENV).ok().as_deref())
+}
+
+/// `UNREACHABLE_ENV` for the invocations this one runs: the remote services
+/// those running it found unreachable, and `endpoint`.
+pub fn with_unreachable(endpoint: &str) -> String {
+    adding_endpoint(std::env::var(UNREACHABLE_ENV).ok().as_deref(), endpoint)
+}
+
+fn endpoints_in(value: Option<&str>) -> Vec<String> {
+    value.unwrap_or_default().split_whitespace().map(str::to_string).collect()
+}
+
+fn adding_endpoint(value: Option<&str>, endpoint: &str) -> String {
+    let mut all = endpoints_in(value);
+    if !all.iter().any(|e| e == endpoint) {
+        all.push(endpoint.to_string());
+    }
+    all.join(" ")
+}
 
 /// What an invocation passes to the invocations its commands run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -99,7 +130,9 @@ fn write_secret_flags(flags: &[String]) -> io::Result<SecretFlags> {
 }
 
 /// Writes `flags` to a new private file in `dir`, which is private too.
+/// Files there of processes that are gone (killed, crashed) are removed.
 fn write_secret_flags_in(dir: &Path, flags: &[String]) -> io::Result<SecretFlags> {
+    sweep_secret_flags(dir);
     let path = dir.join(format!("flags-{}.json", std::process::id()));
     // Left by a process that had the same id (the directory is this
     // user's): a new file gets the permissions.
@@ -109,6 +142,48 @@ fn write_secret_flags_in(dir: &Path, flags: &[String]) -> io::Result<SecretFlags
     let secret = SecretFlags(path);
     file.write_all(serde_json::to_string(flags).map_err(io::Error::other)?.as_bytes())?;
     Ok(secret)
+}
+
+/// Removes the secret flags files in `dir` whose processes are gone: a
+/// process killed (SIGKILL), or that crashed, can't remove its own.
+fn sweep_secret_flags(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let pid = name.to_str().and_then(|n| n.strip_prefix("flags-")?.strip_suffix(".json")?.parse::<u32>().ok());
+        if let Some(pid) = pid
+            && pid != std::process::id()
+            && !process_alive(pid)
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Whether process `pid` may still run: one that can't be asked about
+/// counts (another user's, on Windows; a reused id keeps a file a while).
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
+        // SAFETY: signal 0 only checks that the process exists.
+        unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+        // SAFETY: plain system calls; the handle is owned (closed) below.
+        unsafe {
+            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                return std::io::Error::last_os_error().raw_os_error() != Some(ERROR_INVALID_PARAMETER as i32);
+            }
+            let h = OwnedHandle::from_raw_handle(h);
+            WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT
+        }
+    }
 }
 
 /// Options not passed on: per invocation (ids, build events, logs written
@@ -176,23 +251,28 @@ pub fn adopt(opts: &mut Options, parent: &Parent) {
 
 /// Sets this invocation's ids (so that nested ones share them), binds the
 /// relay when this is the outermost invocation with build events, and
-/// exports `NINJA_RS_PARENT`. Call before any thread starts. The returned
-/// `SecretFlags` must live as long as the commands that may read it.
+/// exports `NINJA_RS_PARENT`: for builds and `-t exec`, whose commands may
+/// run ninja-rs (not for other tools, `-t daemon start` included: the
+/// daemon would get the secret flags). Call before any thread starts. The
+/// returned `SecretFlags` must live as long as the commands that may read
+/// it.
 pub fn export(opts: &mut Options) -> (Option<Relay>, Option<SecretFlags>) {
+    if opts.tool.as_deref().is_some_and(|t| t != "exec") {
+        return (None, None);
+    }
     let invocation_id = opts.bes.invocation_id.get_or_insert_with(crate::bes::new_uuid).clone();
     let build_request_id = opts.bes.build_request_id.get_or_insert_with(crate::bes::new_uuid).clone();
-    let relay =
-        if opts.bes.relay.is_none() && (opts.bes.backend.is_some() || opts.bes.binary_file.is_some()) && opts.tool.as_deref().is_none_or(|t| t == "exec") {
-            match Relay::bind() {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    eprintln!("ninja: warning: nested builds' events won't be reported: {e}");
-                    None
-                }
+    let relay = if opts.bes.relay.is_none() && (opts.bes.backend.is_some() || opts.bes.binary_file.is_some()) {
+        match Relay::bind() {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("ninja: warning: nested builds' events won't be reported: {e}");
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
     let is_secret = |f: &String| crate::options::SECRET_OPTIONS.iter().any(|n| f.starts_with(&format!("--{n}=")));
     let (secret, flags): (Vec<String>, Vec<String>) = exported_flags(opts).into_iter().partition(is_secret);
     let secrets = if secret.is_empty() {
@@ -301,6 +381,38 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// Files of processes that are gone (killed, crashed: they couldn't
+    /// remove them) are removed when another invocation writes its own;
+    /// those of processes still running stay.
+    #[test]
+    fn secret_flags_of_processes_gone_are_swept() {
+        let dir = test_dirs::TestDir::new("ninja-rs-secret-flags-sweep");
+        let spawn = |program: &str, args: &[&str]| std::process::Command::new(program).args(args).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let mut gone = if cfg!(windows) { spawn("cmd", &["/c", "exit"]) } else { spawn("sh", &["-c", "exit"]) };
+        gone.wait().unwrap();
+        let mut running = if cfg!(windows) { spawn("ping", &["-n", "60", "127.0.0.1"]) } else { spawn("sleep", &["60"]) };
+        let file = |pid: u32| dir.join(format!("flags-{pid}.json"));
+        for pid in [gone.id(), running.id()] {
+            std::fs::write(file(pid), "[]").unwrap();
+        }
+        let secrets = write_secret_flags_in(&dir, &["--remote_header=k=v".to_string()]).unwrap();
+        let _ = running.kill();
+        let _ = running.wait();
+        assert!(!file(gone.id()).exists(), "the file of a process gone stayed");
+        assert!(file(running.id()).exists(), "the file of a running process was removed");
+        assert!(secrets.0.exists());
+    }
+
+    /// Tools other than `-t exec` run no builds: nothing to pass on (the
+    /// daemon `-t daemon start` starts would get the secret flags).
+    #[test]
+    fn only_builds_export() {
+        let mut o = parse(&["--remote_header=k=v", "-t", "daemon", "start"]);
+        let (relay, secrets) = export(&mut o);
+        assert!(relay.is_none() && secrets.is_none());
+        assert_eq!(o.bes.invocation_id, None);
+    }
+
     /// The file has permissions of its own, this user's and the system's,
     /// none from its directory (which may let others read).
     #[cfg(windows)]
@@ -371,6 +483,15 @@ mod tests {
         assert_eq!(child.bes.invocation_id.as_deref(), Some("abc"));
         assert_eq!(child.bes.relay, parent.relay);
         assert!(child.remote.execution_log_append);
+    }
+
+    #[test]
+    fn unreachable_endpoints_add_up() {
+        assert_eq!(adding_endpoint(None, "grpc://a:1"), "grpc://a:1");
+        assert_eq!(adding_endpoint(Some("grpc://a:1"), "grpcs://b"), "grpc://a:1 grpcs://b");
+        assert_eq!(adding_endpoint(Some("grpc://a:1 grpcs://b"), "grpc://a:1"), "grpc://a:1 grpcs://b");
+        assert_eq!(endpoints_in(Some(" grpc://a:1  grpcs://b ")), ["grpc://a:1", "grpcs://b"]);
+        assert!(endpoints_in(None).is_empty());
     }
 
     #[test]

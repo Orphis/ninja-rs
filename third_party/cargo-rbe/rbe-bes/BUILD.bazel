@@ -22,6 +22,7 @@ rust_library(
     crate_name = "rbe_bes",
     deps = [
         ":build_script",
+        "//third_party/cargo-rbe/rbe-client",
         "@crates//:anyhow",
         "@crates//:prost",
         "@crates//:prost-types",
@@ -34,11 +35,13 @@ rust_library(
 
 rust_test(
     name = "rbe-bes_test",
+    size = "small",
     crate = ":rbe-bes",
 )
 
 rust_test(
     name = "uploader_test",
+    size = "small",
     srcs = ["tests/uploader.rs"],
     deps = [
         ":rbe-bes",

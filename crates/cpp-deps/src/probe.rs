@@ -11,11 +11,10 @@
 //! Results depend on the flags (`-std`, `-target`, `-O`, `-m...`, `-f...`,
 //! `/std:`, `/EH...`, `/MD`...), so callers cache them per compiler and flags.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::expr::Dialect;
 
@@ -123,52 +122,34 @@ pub struct Compiler<'a> {
 pub const TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runs `cmd` with `input` on its standard input (when piped), and waits
-/// for it at most `timeout`: then it's killed (what it started may run on,
-/// and is left to finish).
-fn output(mut cmd: Command, input: Option<String>, timeout: Duration) -> std::io::Result<std::process::Output> {
-    let mut child = cmd.spawn()?;
-    let writer = child.stdin.take().map(|mut stdin| std::thread::spawn(move || stdin.write_all(input.unwrap_or_default().as_bytes())));
-    let read = |pipe: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut out = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut out);
-            }
-            out
-        })
-    };
-    let stdout = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let stderr = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let start = Instant::now();
-    let mut pause = Duration::from_millis(1);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("timed out after {}s", timeout.as_secs_f32())));
-        }
-        std::thread::sleep(pause);
-        pause = (pause * 2).min(Duration::from_millis(50));
-    };
-    if let Some(w) = writer {
-        let _ = w.join();
-    }
-    Ok(std::process::Output { status, stdout: stdout.join().unwrap_or_default(), stderr: stderr.join().unwrap_or_default() })
+/// for it at most `timeout`: then everything it started is killed (see
+/// `ninja_os::process`).
+pub fn output(cmd: Command, input: Option<String>, timeout: Duration) -> std::io::Result<std::process::Output> {
+    ninja_os::process::output(cmd, input.map(String::into_bytes), timeout)
 }
 
-/// A temporary source file, deleted when dropped.
+/// A temporary source file, deleted when dropped: a new file with an
+/// unpredictable name (the temporary directory is shared; a file or link
+/// planted under a predictable one would be written through).
 struct TempSource(PathBuf);
 
 impl TempSource {
     fn new(input: &str, lang: &str) -> Result<TempSource, String> {
-        static N: AtomicU64 = AtomicU64::new(0);
         let ext = if lang == "c" { "c" } else { "cpp" };
-        let p = std::env::temp_dir().join(format!("cpp-deps-probe-{}-{}.{ext}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-        std::fs::write(&p, input).map_err(|e| format!("{}: {e}", p.display()))?;
-        Ok(TempSource(p))
+        let mut tries = 0;
+        loop {
+            #[allow(clippy::disallowed_methods)] // A file of the build's, not a test's.
+            let p = std::env::temp_dir().join(format!("cpp-deps-probe-{}-{:016x}.{ext}", std::process::id(), ninja_os::random_u64()));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+                Ok(mut f) => {
+                    let source = TempSource(p);
+                    f.write_all(input.as_bytes()).map_err(|e| format!("{}: {e}", source.0.display()))?;
+                    return Ok(source);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+                Err(e) => return Err(format!("{}: {e}", p.display())),
+            }
+        }
     }
 }
 
@@ -205,6 +186,26 @@ pub fn fingerprint(c: &Compiler) -> String {
 /// Runs the compiler on `input` with its flags and the `extra` flags of the
 /// operation; Err when it fails or takes too long.
 pub fn run(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, String> {
+    run_compiler(c, extra, input).map_err(|f| f.message)
+}
+
+/// Why the compiler couldn't answer.
+struct Failure {
+    message: String,
+    /// It took too long: asked again, it likely hangs again.
+    timed_out: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The compiler runs of this thread (each test's).
+    static RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn run_compiler(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, Failure> {
+    #[cfg(test)]
+    RUNS.with(|r| r.set(r.get() + 1));
+    let failed = |message: String| Failure { message, timed_out: false };
     let (compiler, lang) = (c.path, c.lang);
     let mut cmd = Command::new(compiler);
     if let Some(env) = c.env {
@@ -219,16 +220,17 @@ pub fn run(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, String> {
             cmd.args(["-x", lang]).args(extra).arg("-").stdin(Stdio::piped());
         }
         Style::ClangCl | Style::Msvc => {
-            let src = TempSource::new(input, lang)?;
+            let src = TempSource::new(input, lang).map_err(failed)?;
             cmd.arg("/nologo").arg(if lang == "c" { "/TC" } else { "/TP" }).args(extra).arg(&src.0).stdin(Stdio::null());
             _source = src;
         }
     }
-    let out = output(cmd, Some(input.to_string()), c.timeout).map_err(|e| format!("running {}: {e}", compiler.display()))?;
+    let out = output(cmd, Some(input.to_string()), c.timeout)
+        .map_err(|e| Failure { message: format!("running {}: {e}", compiler.display()), timed_out: e.kind() == std::io::ErrorKind::TimedOut })?;
     let ran = Ran { stdout: String::from_utf8_lossy(&out.stdout).into_owned(), stderr: String::from_utf8_lossy(&out.stderr).into_owned() };
     if !out.status.success() {
         let first = ran.stderr.lines().chain(ran.stdout.lines()).find(|l| l.contains("error")).unwrap_or("").to_string();
-        return Err(format!("{} failed: {first}", compiler.display()));
+        return Err(failed(format!("{} failed: {first}", compiler.display())));
     }
     Ok(ran)
 }
@@ -248,6 +250,8 @@ fn dialect(c: &Compiler) -> Dialect {
     Dialect {
         true_false: marked("#if true\nNINJA_RS_TRUE\n#endif\n", "NINJA_RS_TRUE"),
         alt_operators: marked("#if 1 and 1\nNINJA_RS_AND\n#endif\n", "NINJA_RS_AND"),
+        // (From the predefined macros: see `driver::Profile`.)
+        ms_suffixes: false,
     }
 }
 
@@ -373,8 +377,10 @@ pub fn answer(c: &Compiler, queries: &[(String, String)]) -> Result<Vec<Option<i
     };
     let mut answers = vec![None; queries.len()];
     // A query the compiler can't evaluate fails the whole run: the others
-    // are asked again in halves, so that only it stays unanswered.
-    ask(c, &all, &text, &mut answers)?;
+    // are asked again in halves, so that only it stays unanswered. A run
+    // that takes too long ends the asking (the compiler hangs: asking each
+    // half again would take as long, again and again).
+    ask(c, &all, &text, &mut answers).map_err(|f| f.message)?;
     let missing: Vec<usize> = all.into_iter().filter(|&i| answers[i].is_none()).collect();
     let as_if = |i: usize| {
         let (op, arg) = &queries[i];
@@ -385,19 +391,22 @@ pub fn answer(c: &Compiler, queries: &[(String, String)]) -> Result<Vec<Option<i
         lines.push_str(&format!("#else\n{QUERY_MARK} {i} 0\n#endif\n"));
         lines
     };
-    let _ = ask(c, &missing, &as_if, &mut answers);
-    Ok(answers)
+    match ask(c, &missing, &as_if, &mut answers) {
+        Err(f) if f.timed_out => Err(f.message),
+        _ => Ok(answers),
+    }
 }
 
 /// Asks the queries `which` (lines from `line`), splitting the batch when
-/// the compiler fails on it. Err only when the compiler fails on every
-/// query alone, which likely means it can't run at all.
-fn ask(c: &Compiler, which: &[usize], line: &dyn Fn(usize) -> String, answers: &mut [Option<i64>]) -> Result<(), String> {
+/// the compiler fails on it. Err when the compiler fails on every query
+/// alone, which likely means it can't run at all, or when a run takes too
+/// long.
+fn ask(c: &Compiler, which: &[usize], line: &dyn Fn(usize) -> String, answers: &mut [Option<i64>]) -> Result<(), Failure> {
     if which.is_empty() {
         return Ok(());
     }
     let input: String = which.iter().map(|&i| line(i)).collect();
-    match run(c, text_flags(c.style), &input) {
+    match run_compiler(c, text_flags(c.style), &input) {
         Ok(out) => {
             for (i, v) in answers_of(&out.stdout, answers.len()).into_iter().enumerate() {
                 if answers[i].is_none() {
@@ -406,11 +415,21 @@ fn ask(c: &Compiler, which: &[usize], line: &dyn Fn(usize) -> String, answers: &
             }
             Ok(())
         }
-        Err(e) if which.len() == 1 => Err(e),
+        Err(f) if f.timed_out || which.len() == 1 => Err(f),
         Err(_) => {
             let (a, b) = which.split_at(which.len() / 2);
             let ra = ask(c, a, line, answers);
+            if let Err(f) = ra.as_ref()
+                && f.timed_out
+            {
+                return ra;
+            }
             let rb = ask(c, b, line, answers);
+            if let Err(f) = rb.as_ref()
+                && f.timed_out
+            {
+                return rb;
+            }
             // Fine if some half worked.
             ra.or(rb)
         }
@@ -438,11 +457,12 @@ mod tests {
         assert_eq!(answers_of("NINJA_RS_QUERY 0 +1\nNINJA_RS_QUERY 0 +4\nNINJA_RS_QUERY 1 0\n", 2), vec![Some(5), Some(0)]);
     }
 
-    /// A compiler that never answers is given up on.
+    /// A compiler that never answers is given up on: the processes it
+    /// started are killed with it (its directory can go), and a batch of
+    /// queries is asked once, not again in halves.
     #[test]
     fn hung_compiler() {
-        let dir = std::env::temp_dir().join(format!("cpp_deps_hung_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("cpp_deps_hung");
         let script = if cfg!(windows) {
             let s = dir.join("hung.cmd");
             std::fs::write(&s, "@ping -n 30 127.0.0.1 >NUL\r\n@echo #define X 1\r\n").unwrap();
@@ -454,17 +474,24 @@ mod tests {
             std::fs::set_permissions(&s, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
             s
         };
+        // In its directory: what it started dies with it (the directory is
+        // then removed).
         let c = Compiler { path: &script, args: &[], style: Style::Gcc, lang: "c", cwd: &dir, env: None, timeout: Duration::from_millis(300) };
         let e = run(&c, &["-dM", "-E"], "").err().unwrap_or_default();
         assert!(e.contains("timed out"), "{e}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let queries: Vec<(String, String)> = (0..8).map(|i| ("__has_builtin".to_string(), format!("__builtin_q{i}"))).collect();
+        RUNS.with(|r| r.set(0));
+        let e = answer(&c, &queries).unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+        assert_eq!(RUNS.with(|r| r.get()), 1);
     }
 
-    /// Against a real compiler, when `CPP_DEPS_TEST_CXX` names one.
+    /// Against a real compiler: `CPP_DEPS_TEST_CXX`.
     #[test]
+    #[cfg_attr(not(cpp_deps_test_cxx), ignore = "needs CPP_DEPS_TEST_CXX, a GCC or Clang")]
     fn real_compiler() {
-        let Some(cxx) = std::env::var_os("CPP_DEPS_TEST_CXX") else { return };
-        let cwd = std::env::temp_dir();
+        let cxx = crate::test_compiler("CPP_DEPS_TEST_CXX");
+        let cwd = test_dirs::TestDir::new("cpp_deps_probe");
         let style = if crate::external::is_cl_style(&[cxx.to_string_lossy().into_owned()]) { Style::ClangCl } else { Style::Gcc };
         let std = [if style == Style::Gcc { "-std=c++17" } else { "/std:c++17" }.to_string()];
         let c = Compiler { path: Path::new(&cxx), args: &std, style, lang: "c++", cwd: &cwd, env: None, timeout: TIMEOUT };
@@ -501,11 +528,12 @@ mod tests {
         assert!(probe(&Compiler { env: Some(&env), ..c }).is_ok());
     }
 
-    /// Against cl.exe, when `CPP_DEPS_TEST_CL` names one.
+    /// Against cl.exe: `CPP_DEPS_TEST_CL`.
     #[test]
+    #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
     fn real_cl() {
-        let Some(cl) = std::env::var_os("CPP_DEPS_TEST_CL") else { return };
-        let cwd = std::env::temp_dir();
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let cwd = test_dirs::TestDir::new("cpp_deps_probe_cl");
         let args = ["/std:c++20".to_string(), "/EHsc".to_string()];
         let c = Compiler { path: Path::new(&cl), args: &args, style: Style::Msvc, lang: "c++", cwd: &cwd, env: None, timeout: TIMEOUT };
         let p = probe(&c).unwrap();

@@ -58,11 +58,68 @@ pub trait Status {
     fn warning(&mut self, msg: &str);
     fn error(&mut self, msg: &str);
     fn explain(&mut self, msg: &str) {
-        eprintln!("ninja explain: {msg}");
+        print_err(&format!("ninja explain: {msg}\n"));
     }
     /// The build stopped on failed commands: before saying so, name them
     /// again if other output followed them.
     fn failure_summary(&mut self) {}
+}
+
+/// Messages from work the build loop doesn't see (the remote backend,
+/// include scanners), with one prefix: while a status printer is there,
+/// it prints them on their own lines at its next update, never over its
+/// status line; else they go to standard error at once.
+pub fn message(msg: &str) {
+    queue(&MESSAGES, format!("ninja-rs: {msg}\n"));
+}
+
+/// `message`'s lines: the status printers there are, and the lines
+/// waiting for one.
+type Messages = std::sync::Mutex<(usize, Vec<String>)>;
+
+static MESSAGES: Messages = std::sync::Mutex::new((0, Vec::new()));
+
+fn queue(messages: &Messages, line: String) {
+    let mut m = messages.lock().unwrap_or_else(|e| e.into_inner());
+    if m.0 == 0 {
+        print_err(&line);
+    } else {
+        m.1.push(line);
+    }
+}
+
+/// The lines waiting, taken; `printers` added to the printers there are.
+fn take_messages(messages: &Messages, printers: isize) -> String {
+    let mut m = messages.lock().unwrap_or_else(|e| e.into_inner());
+    m.0 = m.0.saturating_add_signed(printers);
+    std::mem::take(&mut m.1).concat()
+}
+
+/// Writes `text` to stdout, as ninja's `printf` does: an error (a pipe
+/// closed by its reader, a terminal gone) loses the text, where `print!`
+/// would panic and end the build without its cleanup.
+pub fn print_out(text: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes());
+    let _ = out.flush();
+}
+
+/// [`print_out`] for stderr.
+pub fn print_err(text: &str) {
+    let _ = std::io::stderr().lock().write_all(text.as_bytes());
+}
+
+/// A write to a pipe its reader closed ends the process, as it ends ninja's
+/// tools (`-t targets all | head`; a shell says 141): Rust ignores SIGPIPE,
+/// which makes such writes fail instead. Not for builds, which go on
+/// without their output (see `print_out`). On Windows, where there is no
+/// SIGPIPE, the writes fail and are ignored, as ninja's.
+pub fn die_on_broken_pipe() {
+    // SAFETY: plain system call, restoring the default action.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
 /// Prints lines, overwriting the previous status line on smart terminals.
@@ -550,10 +607,17 @@ fn clock(secs: i64, with_hours: bool) -> String {
     if with_hours { format!("{}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60) } else { format!("{:02}:{:02}", secs / 60, secs % 60) }
 }
 
+impl Drop for StatusPrinter {
+    fn drop(&mut self) {
+        eprint!("{}", take_messages(&MESSAGES, -1));
+    }
+}
+
 impl StatusPrinter {
     /// `parallelism`: how many commands run at once (`-j`), which `%c`
     /// averages over.
     pub fn new(verbosity: Verbosity, parallelism: usize) -> Self {
+        take_messages(&MESSAGES, 1);
         let mut printer = LinePrinter::new();
         // Don't do anything fancy in verbose mode.
         if verbosity != Verbosity::Normal {
@@ -580,6 +644,16 @@ impl StatusPrinter {
             current_rate: SlidingRate::new(parallelism),
             failures: Vec::new(),
             printed_since_failure: false,
+        }
+    }
+
+    /// Prints `message`'s lines waiting, past the status line.
+    fn print_messages(&mut self) {
+        let lines = take_messages(&MESSAGES, 0);
+        if !lines.is_empty() {
+            self.printer.print_on_new_line(b"");
+            eprint!("{lines}");
+            self.printed_since_failure = true;
         }
     }
 
@@ -817,6 +891,7 @@ impl Status for StatusPrinter {
         self.eta.removed(edge);
     }
     fn build_edge_rewound(&mut self, info: &EdgeInfo, lost: &[String]) {
+        self.print_messages();
         // Not started after all: it starts again.
         self.started_edges = self.started_edges.saturating_sub(1);
         self.running_edges = self.running_edges.saturating_sub(1);
@@ -830,6 +905,7 @@ impl Status for StatusPrinter {
         }
     }
     fn build_edge_started(&mut self, info: &EdgeInfo, start_ms: i64) {
+        self.print_messages();
         self.started_edges += 1;
         self.running_edges += 1;
         self.time_millis = start_ms;
@@ -842,6 +918,7 @@ impl Status for StatusPrinter {
         }
     }
     fn build_edge_finished(&mut self, info: &EdgeInfo, end_ms: i64, exit_code: Option<i32>, kind: &ExecKind, output: &[u8]) {
+        self.print_messages();
         self.time_millis = end_ms;
         self.finished_edges += 1;
         self.cpu_time_millis += self.started_at.remove(&info.edge).map_or(0, |start| end_ms - start);
@@ -896,21 +973,25 @@ impl Status for StatusPrinter {
     }
     fn build_finished(&mut self) {
         self.printer.set_console_locked(false);
+        self.print_messages();
         self.printer.print_on_new_line(b"");
     }
     fn info(&mut self, msg: &str) {
+        self.print_messages();
         self.printer.print_on_new_line(b"");
-        println!("ninja: {msg}");
+        print_out(&format!("ninja: {msg}\n"));
         self.printed_since_failure = true;
     }
     fn warning(&mut self, msg: &str) {
+        self.print_messages();
         self.printer.print_on_new_line(b"");
-        eprintln!("ninja: warning: {msg}");
+        print_err(&format!("ninja: warning: {msg}\n"));
         self.printed_since_failure = true;
     }
     fn error(&mut self, msg: &str) {
+        self.print_messages();
         self.printer.print_on_new_line(b"");
-        eprintln!("ninja: error: {msg}");
+        print_err(&format!("ninja: error: {msg}\n"));
         self.printed_since_failure = true;
     }
     /// With many jobs, a failure scrolls away behind the output of the
@@ -1206,5 +1287,24 @@ mod tests {
         assert!(!term(Some("xterm-256color"), false));
         assert!(!term(Some("dumb"), true));
         assert_eq!(term(None, true), cfg!(windows));
+    }
+
+    /// Messages from outside the build loop wait for the status printer
+    /// while there is one (printed past its status line), and are printed
+    /// at once without one.
+    #[test]
+    fn messages_wait_for_the_printer() {
+        let messages: Messages = std::sync::Mutex::new((0, Vec::new()));
+        queue(&messages, "ninja-rs: before\n".into());
+        assert!(messages.lock().unwrap().1.is_empty());
+        take_messages(&messages, 1);
+        queue(&messages, "ninja-rs: warning: one\n".into());
+        queue(&messages, "ninja-rs: two\n".into());
+        assert_eq!(take_messages(&messages, 0), "ninja-rs: warning: one\nninja-rs: two\n");
+        assert_eq!(take_messages(&messages, 0), "");
+        queue(&messages, "ninja-rs: last\n".into());
+        assert_eq!(take_messages(&messages, -1), "ninja-rs: last\n");
+        queue(&messages, "ninja-rs: after\n".into());
+        assert_eq!(*messages.lock().unwrap(), (0, Vec::new()));
     }
 }

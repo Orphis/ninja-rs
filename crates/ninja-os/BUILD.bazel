@@ -12,7 +12,7 @@ rust_library(
         "@crates//:sha2",
     ] + select({
         "@platforms//os:windows": ["@crates//:windows-sys"],
-        "//conditions:default": [],
+        "//conditions:default": ["@crates//:libc"],
     }),
 )
 

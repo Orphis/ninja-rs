@@ -307,8 +307,8 @@ mod tests {
 
     #[test]
     fn persists() {
-        let file = test_dirs::base().join(format!("ninja-rs-remote-outputs-{}", std::process::id()));
-        let _ = std::fs::remove_file(&file);
+        let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs");
+        let file = dir.join(REMOTE_OUTPUTS_FILE);
         let s = RemoteOutputs::load(&file);
         assert!(s.is_empty());
         s.record(entry("obj/a.o", 5));
@@ -336,7 +336,8 @@ mod tests {
 
     #[test]
     fn reads_version_1() {
-        let file = test_dirs::base().join(format!("ninja-rs-remote-outputs-v1-{}", std::process::id()));
+        let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs-v1");
+        let file = dir.join(REMOTE_OUTPUTS_FILE);
         std::fs::write(
             &file,
             format!(
@@ -349,29 +350,28 @@ mod tests {
         .unwrap();
         let t = RemoteOutputs::load(&file);
         assert_eq!(t.get("obj/a.o").unwrap().mtime, 5);
-        let _ = std::fs::remove_file(&file);
     }
 
     /// Records with a malformed digest (a hash that isn't one, a negative
     /// size) are dropped, with the lines describing them.
     #[test]
     fn drops_malformed_records() {
-        let file = std::env::temp_dir().join(format!("ninja-rs-remote-outputs-malformed-{}", std::process::id()));
+        let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs-malformed");
+        let file = dir.join(REMOTE_OUTPUTS_FILE);
         let hash = "ab".repeat(32);
         let text = format!("{HEADER}\n5 {hash} -3 - obj/neg.o\n= obj/x.o\n5 ../etc 3 - obj/path.o\n+ ../a.o\n5 {hash} 3 - obj/a.o\n");
         std::fs::write(&file, text).unwrap();
         let t = RemoteOutputs::load(&file);
         assert_eq!(t.entries().iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["obj/a.o"]);
         assert_eq!(t.get("obj/a.o").unwrap().members, None);
-        let _ = std::fs::remove_file(&file);
     }
 
     /// Side outputs go with their action's output: when it's written
     /// locally or removed, their records go with its.
     #[test]
     fn side_outputs_go_with_their_output() {
-        let file = std::env::temp_dir().join(format!("ninja-rs-remote-outputs-side-{}", std::process::id()));
-        let _ = std::fs::remove_file(&file);
+        let dir = test_dirs::TestDir::new("ninja-rs-remote-outputs-side");
+        let file = dir.join(REMOTE_OUTPUTS_FILE);
         let s = RemoteOutputs::load(&file);
         s.record(entry("obj/a.o", 5));
         s.record(Entry { owner: Some("obj/a.o".into()), ..entry("obj/a.dwo", 5) });
@@ -392,7 +392,6 @@ mod tests {
         t.record(Entry { owner: Some("obj/c.o".into()), ..entry("obj/c.dwo", 6) });
         t.forget_output("obj/a.o");
         assert!(t.get("obj/c.dwo").is_some());
-        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

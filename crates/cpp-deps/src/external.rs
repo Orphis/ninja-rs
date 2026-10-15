@@ -5,9 +5,9 @@
 //! of a process per compile and, for the compiler, a full preprocess.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use crate::probe::make_deps;
+use crate::probe::{TIMEOUT, make_deps, output};
 use crate::scan::normalize;
 
 /// Whether a compiler takes `cl`-style flags (`cl.exe`, `clang-cl`, or a
@@ -18,8 +18,11 @@ pub fn is_cl_style(argv: &[String]) -> bool {
     base == "cl" || base.ends_with("clang-cl") || argv.iter().any(|a| a == "--driver-mode=cl")
 }
 
-fn run(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
-    let out = cmd.output().map_err(|e| format!("running {what}: {e}"))?;
+/// Runs a scanner (`clang-scan-deps`, the compiler) for its output, killed
+/// when it takes too long (see `probe::TIMEOUT`).
+fn run(mut cmd: Command, what: &str) -> Result<std::process::Output, String> {
+    cmd.stdin(Stdio::null());
+    let out = output(cmd, None, TIMEOUT).map_err(|e| format!("running {what}: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let first = err.lines().find(|l| l.contains("error")).or_else(|| err.lines().next()).unwrap_or("");
@@ -40,7 +43,9 @@ pub fn clang_scan_deps(argv: &[String], cwd: &Path) -> Result<Vec<PathBuf>, Stri
     if !tool.is_file() {
         return Err(format!("no clang-scan-deps next to {}", compiler.display()));
     }
-    let out = run(Command::new(&tool).args(["-format=make", "--"]).args(argv).current_dir(cwd), "clang-scan-deps")?;
+    let mut cmd = Command::new(&tool);
+    cmd.args(["-format=make", "--"]).args(argv).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = run(cmd, "clang-scan-deps")?;
     Ok(absolute(make_deps(&String::from_utf8_lossy(&out.stdout)), cwd))
 }
 
@@ -89,6 +94,15 @@ pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> 
                 if f == "c" || f == "showIncludes" || output {
                     continue;
                 }
+                // clang-cl's dependency file (CMake's `-clang:-MD
+                // -clang:-MT<obj> -clang:-MF<file>`), which the scan would
+                // write: the edge's.
+                if let Some(m) = f.strip_prefix("clang:-M") {
+                    if matches!(m, "F" | "T" | "Q" | "J") && argv.get(i).is_some_and(|v| v.starts_with("/clang:") || v.starts_with("-clang:")) {
+                        i += 1;
+                    }
+                    continue;
+                }
                 if f.starts_with("sourceDependencies") {
                     if f == "sourceDependencies" {
                         i += 1;
@@ -120,7 +134,10 @@ pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> 
     let options_end = args.iter().position(|a| a == "--").unwrap_or(args.len());
     if cl {
         args.splice(options_end..options_end, ["/E".to_string(), "/showIncludes".to_string()]);
-        let out = run(Command::new(program).args(&args).current_dir(cwd), program)?;
+        // The preprocessed text (on stdout) isn't read.
+        let mut cmd = Command::new(program);
+        cmd.args(&args).current_dir(cwd).stdout(Stdio::null()).stderr(Stdio::piped());
+        let out = run(cmd, program)?;
         let prefix = deps_prefix.unwrap_or("Note: including file:");
         // The notes are on stderr when the preprocessed text goes to stdout.
         let text = String::from_utf8_lossy(&out.stderr);
@@ -141,7 +158,9 @@ pub fn compiler_deps(argv: &[String], cwd: &Path, deps_prefix: Option<&str>) -> 
     }
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
     args.splice(options_end..options_end, ["-E", "-MD", "-MF", "-", "-o", null].map(String::from));
-    let out = run(Command::new(program).args(&args).current_dir(cwd), program)?;
+    let mut cmd = Command::new(program);
+    cmd.args(&args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = run(cmd, program)?;
     Ok(absolute(make_deps(&String::from_utf8_lossy(&out.stdout)), cwd))
 }
 
@@ -359,13 +378,37 @@ mod tests {
         assert!(!is_cl_style(&s(&["clang++", "-c", "a.cpp"])));
     }
 
-    /// Against real compilers, when `CPP_DEPS_TEST_CXX` names a Clang
-    /// (with clang-scan-deps next to it).
+    /// clang-cl's dependency file flags (CMake's) aren't given to the
+    /// scanning run, which would write the edge's dependency file.
     #[test]
+    fn cl_dependency_file_flags() {
+        let dir = test_dirs::TestDir::new("cpp_deps_external_cl_flags");
+        let compiler = if cfg!(windows) {
+            let c = dir.join("clang-cl.cmd");
+            std::fs::write(&c, "@echo %*> \"%~dp0args.txt\"\r\n").unwrap();
+            c
+        } else {
+            let c = dir.join("clang-cl");
+            std::fs::write(&c, "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/args.txt\"\n").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&c, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            c
+        };
+        std::fs::write(dir.join("main.cc"), "").unwrap();
+        let argv =
+            s(&[&compiler.to_string_lossy(), "/nologo", "-clang:-MD", "-clang:-MTx.obj", "/clang:-MF", "/clang:x.obj.d", "/Fox.obj", "-c", "--", "main.cc"]);
+        assert_eq!(compiler_deps(&argv, &dir, None).unwrap(), vec![dir.join("main.cc")]);
+        let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        assert_eq!(args.split_whitespace().collect::<Vec<_>>(), ["/nologo", "/E", "/showIncludes", "--", "main.cc"]);
+    }
+
+    /// Against real compilers: `CPP_DEPS_TEST_CXX`, a GCC or Clang (with
+    /// clang-scan-deps next to it).
+    #[test]
+    #[cfg_attr(not(cpp_deps_test_cxx), ignore = "needs CPP_DEPS_TEST_CXX, a GCC or Clang")]
     fn real_compiler() {
-        let Some(cxx) = std::env::var_os("CPP_DEPS_TEST_CXX") else { return };
-        let dir = test_dirs::base().join(format!("cpp_deps_external_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let cxx = crate::test_compiler("CPP_DEPS_TEST_CXX");
+        let dir = test_dirs::TestDir::new("cpp_deps_external");
         std::fs::write(dir.join("a.h"), "#define A 1\n").unwrap();
         std::fs::write(dir.join("main.cc"), "#include \"a.h\"\nint main() { return A; }\n").unwrap();
         let argv = vec![cxx.to_string_lossy().into_owned(), "-MD".into(), "-MF".into(), "x.d".into(), "-c".into(), "main.cc".into(), "-o".into(), "x.o".into()];
@@ -383,14 +426,14 @@ mod tests {
         let argv = vec![cxx.to_string_lossy().into_owned(), "-Wp,-MMD,y.d".into(), "-c".into(), "counter.cc".into(), "-o".into(), "y.o".into()];
         assert_eq!(deps(&argv), vec![dir.join("counter.cc"), dir.join("a.h")]);
         assert!(!dir.join("y.d").exists() && !dir.join("y.o").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Against cl.exe, when `CPP_DEPS_TEST_CL` names one.
+    /// Against cl.exe: `CPP_DEPS_TEST_CL`.
     #[test]
+    #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
     fn real_cl() {
-        let Some(cl) = std::env::var_os("CPP_DEPS_TEST_CL") else { return };
-        let dir = test_dirs::base().join(format!("cpp_deps_external_cl_{}", std::process::id()));
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let dir = test_dirs::TestDir::new("cpp_deps_external_cl");
         std::fs::create_dir_all(dir.join("inc")).unwrap();
         std::fs::write(dir.join("inc/a.h"), "#define A 1\n").unwrap();
         std::fs::write(dir.join("forced.h"), "#define F 1\n").unwrap();
@@ -402,6 +445,5 @@ mod tests {
         let deps = compiler_deps(&argv, &dir, None).unwrap();
         assert_eq!(deps, vec![dir.join("main.cc"), dir.join("forced.h"), dir.join("inc").join("a.h")]);
         assert!(!dir.join("x.obj").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

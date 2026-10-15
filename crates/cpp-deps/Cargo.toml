@@ -7,6 +7,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+ninja-os = { path = "../ninja-os" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

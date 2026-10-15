@@ -25,9 +25,8 @@ rust_library(
 rust_test(
     name = "rbe-client_test",
     size = "small",
+    # The test certificates (TLS tests).
+    compile_data = ["//crates/fake-reapi:test_certs"],
     crate = ":rbe-client",
-    deps = [
-        "//crates/test-dirs",
-        "@crates//:tempfile",
-    ],
+    deps = ["//crates/test-dirs"],
 )

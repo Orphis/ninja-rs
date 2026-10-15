@@ -1,7 +1,8 @@
 //! What ninja-rs' crates share from the operating system: file stamps and
 //! digests (what the digest caches of builds and of the daemon key on),
-//! executable bits, random numbers, and on Windows ([`windows`]) file
-//! identities and who owns files and processes.
+//! executable bits, random numbers, file identities and locks (the build
+//! logs'), programs run with a time limit ([`process`]), and on Windows
+//! ([`windows`]) who owns files and processes.
 
 use std::fs;
 use std::io::{self, Read};
@@ -10,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest as _, Sha256};
 
+pub mod process;
 #[cfg(windows)]
 pub mod windows;
 
@@ -86,6 +88,93 @@ pub fn stat(path: &Path) -> io::Result<(fs::Metadata, FileStamp)> {
     Ok((meta, stamp))
 }
 
+/// The identity of the file `f` is open on: on Unix its device and inode,
+/// on Windows its volume's serial number and file ID.
+#[cfg(unix)]
+pub fn identity(f: &fs::File) -> io::Result<(u64, u128)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = f.metadata()?;
+    Ok((meta.dev(), u128::from(meta.ino())))
+}
+
+/// The identity of the file `f` is open on: on Unix its device and inode,
+/// on Windows its volume's serial number and file ID.
+#[cfg(windows)]
+pub fn identity(f: &fs::File) -> io::Result<(u64, u128)> {
+    // FAT has no 128-bit file IDs.
+    windows::file_id(f).map_or_else(|| windows::file_index(f), Ok)
+}
+
+/// Whether `f`, opened as `path`, isn't the file there any more: another
+/// process renamed a file over it, or removed it. Unix compares
+/// identities; Windows asks whether the handle's file is deleted, which a
+/// rename over it does (a rename can't replace a file open elsewhere
+/// otherwise).
+#[cfg(unix)]
+pub fn replaced(f: &fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (f.metadata(), fs::metadata(path)) {
+        (Ok(open), Ok(named)) => (open.dev(), open.ino()) != (named.dev(), named.ino()),
+        (_, Err(e)) => e.kind() == io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+/// Whether `f`, opened as `path`, isn't the file there any more: another
+/// process renamed a file over it, or removed it. Unix compares
+/// identities; Windows asks whether the handle's file is deleted, which a
+/// rename over it does (a rename can't replace a file open elsewhere
+/// otherwise).
+#[cfg(windows)]
+pub fn replaced(f: &fs::File, _path: &Path) -> bool {
+    windows::deleted(f)
+}
+
+/// Takes an exclusive lock on the file `f` is open on, for this handle:
+/// another handle's lock excludes it, even in this process. Waits for it
+/// (`wait`), or returns false while another holds it. The lock is
+/// advisory: reads and writes through other handles go on. On Unix a
+/// `flock`; on Windows, where a lock on a file's data makes other
+/// handles' reads and writes of it fail, one on a byte far past any data
+/// (which excludes a lock on the whole file, std's). Released by
+/// [`unlock`], or when the handle is closed.
+#[cfg(unix)]
+pub fn lock(f: &fs::File, wait: bool) -> io::Result<bool> {
+    if wait {
+        return f.lock().map(|()| true);
+    }
+    match f.try_lock() {
+        Ok(()) => Ok(true),
+        Err(fs::TryLockError::WouldBlock) => Ok(false),
+        Err(fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Takes an exclusive lock on the file `f` is open on, for this handle:
+/// another handle's lock excludes it, even in this process. Waits for it
+/// (`wait`), or returns false while another holds it. The lock is
+/// advisory: reads and writes through other handles go on. On Unix a
+/// `flock`; on Windows, where a lock on a file's data makes other
+/// handles' reads and writes of it fail, one on a byte far past any data
+/// (which excludes a lock on the whole file, std's). Released by
+/// [`unlock`], or when the handle is closed.
+#[cfg(windows)]
+pub fn lock(f: &fs::File, wait: bool) -> io::Result<bool> {
+    windows::lock(f, wait)
+}
+
+/// Releases [`lock`].
+#[cfg(unix)]
+pub fn unlock(f: &fs::File) -> io::Result<()> {
+    f.unlock()
+}
+
+/// Releases [`lock`].
+#[cfg(windows)]
+pub fn unlock(f: &fs::File) -> io::Result<()> {
+    windows::unlock(f)
+}
+
 /// A file's digest, as REAPI has it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Digest {
@@ -139,6 +228,7 @@ pub fn random_u64() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::Duration;
 
     /// Waits for the file system's clock to move past `change` (a file's):
@@ -191,6 +281,43 @@ mod tests {
         assert_eq!((d.hash.as_str(), d.size), ("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", 1));
         let e = hash_file(&dir.join("b")).unwrap_err();
         assert!(e.to_string().starts_with(&format!("open {}: ", dir.join("b").display())), "{e}");
+    }
+
+    /// Locks exclude each other between handles, not reads and writes.
+    #[test]
+    fn locks() {
+        let dir = test_dirs::TestDir::new("ninja_os_locks");
+        let path = dir.join("lock");
+        let open = || fs::File::options().read(true).append(true).create(true).open(&path).unwrap();
+        let (a, b) = (open(), open());
+        assert!(lock(&a, false).unwrap());
+        assert!(!lock(&b, false).unwrap());
+        (&b).write_all(b"written").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"written");
+        unlock(&a).unwrap();
+        assert!(lock(&b, true).unwrap());
+        assert!(!lock(&a, false).unwrap());
+        drop(b);
+        assert!(lock(&a, false).unwrap());
+        assert_eq!(identity(&a).unwrap(), identity(&open()).unwrap());
+    }
+
+    /// A file renamed over, or removed: the handle open on it sees it.
+    #[test]
+    fn replaced_files() {
+        let dir = test_dirs::TestDir::new("ninja_os_replaced");
+        let path = dir.join("log");
+        fs::write(&path, "old").unwrap();
+        let f = fs::File::options().read(true).append(true).open(&path).unwrap();
+        assert!(!replaced(&f, &path));
+        fs::write(dir.join("new"), "new").unwrap();
+        fs::rename(dir.join("new"), &path).unwrap();
+        assert!(replaced(&f, &path));
+        let g = fs::File::options().read(true).append(true).open(&path).unwrap();
+        assert!(!replaced(&g, &path));
+        assert_ne!(identity(&f).unwrap(), identity(&g).unwrap());
+        fs::remove_file(&path).unwrap();
+        assert!(replaced(&g, &path));
     }
 
     #[test]

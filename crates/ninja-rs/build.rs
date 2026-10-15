@@ -8,10 +8,9 @@
 //!
 //! The manifest is linked as a resource written here directly, so that no
 //! resource compiler or mt.exe is needed (the hermetic LLVM toolchain has no
-//! working mt.exe): a compiled resource file (`.res`) for MSVC targets,
-//! which link.exe and lld-link accept, and for GNU ones (MinGW, LLVM's
-//! gnullvm), whose linkers take objects, a COFF object with the `.rsrc`
-//! section windres would make.
+//! working mt.exe): a COFF object with the `.rsrc` section windres would
+//! make, which every Windows linker takes (link.exe and lld-link for MSVC
+//! targets, the MinGW ones and LLVM's gnullvm for GNU targets).
 
 use std::path::PathBuf;
 
@@ -30,38 +29,6 @@ const RT_MANIFEST: u16 = 24;
 const CREATEPROCESS_MANIFEST_RESOURCE_ID: u16 = 1;
 /// en-US, as rc and llvm-rc use by default.
 const LANG_EN_US: u16 = 0x0409;
-/// MOVEABLE | PURE.
-const MEMORY_FLAGS: u16 = 0x0030;
-
-/// Appends one resource to a `.res` file: a 32-byte header (numeric type
-/// and name) followed by the data, padded to a 4-byte boundary.
-fn push_resource(res: &mut Vec<u8>, type_id: u16, name_id: u16, flags: u16, language: u16, data: &[u8]) {
-    let data_size = u32::try_from(data.len()).expect("resource too large");
-    res.extend_from_slice(&data_size.to_le_bytes());
-    res.extend_from_slice(&32u32.to_le_bytes()); // HeaderSize
-    for id in [type_id, name_id] {
-        res.extend_from_slice(&0xFFFFu16.to_le_bytes());
-        res.extend_from_slice(&id.to_le_bytes());
-    }
-    res.extend_from_slice(&0u32.to_le_bytes()); // DataVersion
-    res.extend_from_slice(&flags.to_le_bytes());
-    res.extend_from_slice(&language.to_le_bytes());
-    res.extend_from_slice(&0u32.to_le_bytes()); // Version
-    res.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
-    res.extend_from_slice(data);
-    while !res.len().is_multiple_of(4) {
-        res.push(0);
-    }
-}
-
-/// A `.res` file holding the manifest.
-fn res_file() -> Vec<u8> {
-    // A .res file starts with an empty resource that marks the format.
-    let mut res = Vec::new();
-    push_resource(&mut res, 0, 0, 0, 0, &[]);
-    push_resource(&mut res, RT_MANIFEST, CREATEPROCESS_MANIFEST_RESOURCE_ID, MEMORY_FLAGS, LANG_EN_US, MANIFEST.as_bytes());
-    res
-}
 
 /// A COFF object for `machine` whose `.rsrc` section holds the manifest: a
 /// resource directory (type, then name, then language), the data entry, and
@@ -132,12 +99,6 @@ fn main() {
         return;
     }
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
-    if target_env == "msvc" {
-        let out = out_dir.join("ninja-rs-manifest.res");
-        std::fs::write(&out, res_file()).expect("writing the manifest resource");
-        println!("cargo:rustc-link-arg={}", out.display());
-        return;
-    }
     // IMAGE_FILE_MACHINE_*, and IMAGE_REL_*_ADDR32NB (DIR32NB on x86).
     let (machine, addr32nb) = match std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default().as_str() {
         "x86_64" => (0x8664, 3),
@@ -149,9 +110,14 @@ fn main() {
         }
     };
     std::fs::write(out_dir.join("ninja-rs-manifest.o"), coff_object(machine, addr32nb)).expect("writing the manifest object");
-    // Found in the library path (`-l:file`, which GNU linkers take), not
-    // named by its path: Bazel's sandboxed builds move OUT_DIR between the
-    // script and the link, and fix up library paths only.
+    // Found in the library path, not named by its path: Bazel's sandboxed
+    // builds move OUT_DIR between the script and the link, and fix up
+    // library paths only. GNU linkers look there for `-l:file`; link.exe
+    // and lld-link for any input named without a directory.
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-arg=-l:ninja-rs-manifest.o");
+    if target_env == "msvc" {
+        println!("cargo:rustc-link-arg=ninja-rs-manifest.o");
+    } else {
+        println!("cargo:rustc-link-arg=-l:ninja-rs-manifest.o");
+    }
 }

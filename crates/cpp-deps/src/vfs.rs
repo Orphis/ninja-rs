@@ -251,7 +251,8 @@ impl Overlay {
             path: path.to_path_buf(),
             files: HashMap::new(),
             dirs: Vec::new(),
-            case_insensitive: v.get("case-sensitive").and_then(Value::bool) == Some(false),
+            // As Clang: insensitive by default on Windows.
+            case_insensitive: v.get("case-sensitive").and_then(Value::bool).map_or(cfg!(windows), |sensitive| !sensitive),
             redirect,
         };
         let Some(Value::List(roots)) = v.get("roots") else { return Err(at("no roots".into())) };
@@ -333,5 +334,10 @@ mod tests {
         assert_eq!(o.map(Path::new("/remap/x/Y.h")), Some(PathBuf::from("/elsewhere/x/Y.h")));
         let only = Overlay::parse("{ 'version': 0, 'fallthrough': false, 'roots': [] }", Path::new("/o.yaml"), Path::new("/")).unwrap();
         assert_eq!(only.redirect, Redirect::RedirectOnly);
+        // Case-sensitive as the host is, unless said.
+        assert_eq!(only.case_insensitive, cfg!(windows));
+        let said =
+            |v: &str| Overlay::parse(&format!("{{ 'case-sensitive': '{v}', 'roots': [] }}"), Path::new("/o.yaml"), Path::new("/")).unwrap().case_insensitive;
+        assert!(!said("true") && said("false"));
     }
 }

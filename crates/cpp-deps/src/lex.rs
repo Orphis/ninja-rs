@@ -662,9 +662,21 @@ pub fn lex(content: &[u8]) -> FileDirectives {
                     line,
                     mac: None,
                 }));
+                // `_Pragma(OPERAND)` with an operand macros make: what it
+                // does depends on the macros defined there.
+                let (pragmas, operands) = macros::pragmas(&toks, false, &[]);
+                dirs.extend(operands.into_iter().map(|operand| {
+                    let mut toks = vec![
+                        Token { kind: Kind::Ident, sym: intern::PRAGMA_OPERATOR, space: false },
+                        Token { kind: Kind::Punct(P::LParen), sym: intern::intern("("), space: false },
+                    ];
+                    toks.extend(operand);
+                    toks.push(Token { kind: Kind::Punct(P::RParen), sym: intern::intern(")"), space: false });
+                    Directive { kind: DirKind::Pragma, toks: toks.into_boxed_slice(), line, mac: None }
+                }));
                 // A pragma from a macro (`DO_PRAGMA(push_macro("M"))`,
                 // `__pragma(once)`): text isn't expanded, so it's marked.
-                if macros::pragmas(&toks, false, &[]) != macros::Pragmas::None {
+                if pragmas != macros::Pragmas::None {
                     let marker = Token { kind: Kind::Ident, sym: intern::PRAGMA_OPERATOR, space: false };
                     dirs.push(Directive { kind: DirKind::Pragma, toks: Box::new([marker]), line, mac: None });
                 }
@@ -731,7 +743,7 @@ fn pragma_operators(toks: &[Token]) -> Vec<Vec<Token>> {
 /// The macro of an include guard: the first directive is `#ifndef G` (or
 /// `#if !defined G`), whose `#endif` is the last directive, without an
 /// `#else` or `#elif` of its own.
-fn include_guard(dirs: &[Directive]) -> Option<Sym> {
+pub(crate) fn include_guard(dirs: &[Directive]) -> Option<Sym> {
     let first = dirs.first()?;
     let g = match (first.kind, &first.toks[..]) {
         (DirKind::Ifndef, [t]) => t.ident()?,
@@ -855,9 +867,12 @@ mod tests {
     fn pragmas_in_text() {
         // Written in text: run. From macros: marked (text isn't expanded).
         let fd = lex(b"_Pragma(\"push_macro(\\\"M\\\")\") int x;\nDO_PRAGMA(pop_macro(\"M\"))\n__pragma(once)\nPRAGMA(\"once\")\n\
-              PRAGMA(GCC diagnostic push)\nint push_macro_count;\nstd::call_once(flag, f); // once\nstatic_assert(false, \"T must occur \" \"once in Types\");\n");
+              PRAGMA(GCC diagnostic push)\nint push_macro_count;\nstd::call_once(flag, f); // once\nstatic_assert(false, \"T must occur \" \"once in Types\");\n\
+              _Pragma(STR(once)) int y;\n");
         let pragmas: Vec<Vec<&str>> = fd.dirs.iter().map(|d| spell(&d.toks)).collect();
-        assert_eq!(pragmas, vec![vec!["push_macro", "(", "\"M\"", ")"], vec!["_Pragma"], vec!["_Pragma"], vec!["_Pragma"]]);
+        // An operand macros make: kept for the scan, which knows them.
+        let operand = vec!["_Pragma", "(", "STR", "(", "once", ")", ")"];
+        assert_eq!(pragmas, vec![vec!["push_macro", "(", "\"M\"", ")"], vec!["_Pragma"], vec!["_Pragma"], vec!["_Pragma"], operand]);
         assert!(fd.dirs.iter().all(|d| d.kind == DirKind::Pragma));
     }
 

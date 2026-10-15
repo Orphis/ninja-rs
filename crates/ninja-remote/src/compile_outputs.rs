@@ -267,11 +267,9 @@ mod tests {
         assert!(outs("clang-cl /c a.c b.c /Foobj/ -ftime-trace", true).is_err());
         // /sourceDependencies naming a directory that is there, without a
         // trailing separator.
-        let dir = std::env::temp_dir().join(format!("ninja-rs-srcdeps-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("ninja-rs-srcdeps");
         let cmd = format!("cl.exe /c a.c /Foobj/a.obj /sourceDependencies {}", dir.to_string_lossy());
         assert!(side_outputs(&cmd.split(' ').map(str::to_string).collect::<Vec<_>>(), true).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

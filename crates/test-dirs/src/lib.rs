@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Where tests' directories go.
+#[allow(clippy::disallowed_methods)] // The one place tests ask for it.
 pub fn base() -> PathBuf {
     std::env::var_os("TEST_TMPDIR").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }

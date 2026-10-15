@@ -72,6 +72,28 @@ impl Location {
         format!(r"\\.\pipe\ninja-rs-{}-{}", short_hash(&[self.dir.to_string_lossy().as_bytes()]), self.id)
     }
 
+    /// Whether its daemon runs: it holds its lock.
+    pub fn running(&self) -> bool {
+        std::fs::File::options().write(true).open(self.lock_file()).is_ok_and(|f| matches!(f.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+    }
+
+    /// Removes the files of other daemons in its directory (of other
+    /// ninja-rs binaries: copies, locks, logs, cookies) unless they run.
+    pub fn remove_others(&self) -> io::Result<()> {
+        for e in std::fs::read_dir(&self.dir)?.flatten() {
+            let path = e.path();
+            let (Some(id), Some(kind)) = (path.file_stem().and_then(|s| s.to_str()), path.extension().and_then(|s| s.to_str())) else { continue };
+            if id == self.id || !matches!(kind, "exe" | "lock" | "log" | "cookies") {
+                continue;
+            }
+            if (Location { dir: self.dir.clone(), id: id.to_string() }).running() {
+                continue;
+            }
+            let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        }
+        Ok(())
+    }
+
     /// Creates the directories, only the user's (an existing one must be).
     pub fn create_dir(&self) -> io::Result<()> {
         #[cfg(unix)]
@@ -140,6 +162,7 @@ fn default_dir() -> io::Result<PathBuf> {
     }
     #[cfg(windows)]
     {
+        #[allow(clippy::disallowed_methods)] // The daemon's own directory, not a test's.
         let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
         Ok(base.join("ninja-rs").join("daemon"))
     }
@@ -243,11 +266,49 @@ mod platform {
     }
 
     /// Starts `exe` in the background, out of the terminal's process group
-    /// (so that Ctrl-C in the build doesn't stop it).
-    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path) -> io::Result<()> {
+    /// (so that Ctrl-C in the build doesn't stop it), without the variables
+    /// `env_remove`, nor any file of the build's: descriptors it inherited
+    /// without close-on-exec (a jobserver's, a pipe its caller reads) would
+    /// stay open as long as the daemon runs.
+    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path, env_remove: &[&str]) -> io::Result<()> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
-        Command::new(exe).args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn().map(|_| ())
+        let mut c = Command::new(exe);
+        c.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+        for v in env_remove {
+            c.env_remove(v);
+        }
+        // SAFETY: the closure only makes system calls, which are
+        // async-signal-safe.
+        unsafe {
+            c.pre_exec(|| {
+                close_on_exec_from(3);
+                Ok(())
+            })
+        };
+        c.spawn().map(|_| ())
+    }
+
+    /// Marks the descriptors from `first` on close-on-exec (std's own,
+    /// which reports a failed exec, is used until then).
+    fn close_on_exec_from(first: i32) {
+        #[cfg(target_os = "linux")]
+        {
+            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+            // SAFETY: plain system call.
+            if unsafe { libc::syscall(libc::SYS_close_range, first as libc::c_uint, libc::c_uint::MAX, CLOSE_RANGE_CLOEXEC) } == 0 {
+                return;
+            }
+        }
+        // Before Linux 5.11, and elsewhere: one by one, up to the limit (or
+        // a sane bound).
+        let mut l = libc::rlimit { rlim_cur: 1024, rlim_max: 1024 };
+        // SAFETY: a valid out-parameter (left as is on failure).
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) };
+        for fd in first..l.rlim_cur.min(1 << 16) as i32 {
+            // SAFETY: as above; a descriptor not open fails with EBADF.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
     }
 }
 
@@ -543,19 +604,96 @@ mod platform {
 
     /// Starts `exe` in the background, detached from the console (so that
     /// Ctrl-C in the build doesn't stop it), out of the build's job object
-    /// when it allows that.
-    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path) -> io::Result<()> {
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-        const DETACHED_PROCESS: u32 = 0x8;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-        let spawn = |flags: u32| {
-            Command::new(exe).args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(flags).spawn()
+    /// when it allows that, without the variables `env_remove`. It inherits
+    /// no handle: std's spawn passes on every inheritable one, the pipes the
+    /// build's output goes to included, which their reader (an IDE, `| tee`)
+    /// would then wait on until the daemon exits, hours later.
+    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path, env_remove: &[&str]) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION,
+            STARTF_USESTDHANDLES, STARTUPINFOW,
         };
-        spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
-            .or_else(|_| spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP))
-            .map(|_| ())
+        let mut line = Vec::new();
+        push_arg(&mut line, exe.as_os_str());
+        for a in args {
+            push_arg(&mut line, std::ffi::OsStr::new(a));
+        }
+        line.push(0);
+        // Sorted by name, ignoring case, as Windows wants it.
+        let mut vars: Vec<_> = std::env::vars_os().filter(|(k, _)| !env_remove.iter().any(|r| k.eq_ignore_ascii_case(r))).collect();
+        vars.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_uppercase());
+        let mut env = Vec::new();
+        for (k, v) in vars {
+            env.extend(k.encode_wide().chain(['=' as u16]).chain(v.encode_wide()).chain([0]));
+        }
+        env.extend([0, 0]);
+        let (app, dir) = (wide(exe), wide(cwd));
+        // No standard handles: the daemon writes to its log.
+        let startup = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, dwFlags: STARTF_USESTDHANDLES, ..Default::default() };
+        let spawn = |flags: u32| {
+            let mut info = PROCESS_INFORMATION::default();
+            // The call may change the command line it's given.
+            let mut line = line.clone();
+            // SAFETY: NUL-terminated strings, an environment block ending
+            // with two NULs, valid structures; no handle inherited.
+            let ok = unsafe {
+                CreateProcessW(
+                    app.as_ptr(),
+                    line.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    flags | CREATE_UNICODE_ENVIRONMENT,
+                    env.as_ptr().cast(),
+                    dir.as_ptr(),
+                    &startup,
+                    &mut info,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: handles the call returned, not used again.
+            unsafe {
+                CloseHandle(info.hThread);
+                CloseHandle(info.hProcess);
+            }
+            Ok(())
+        };
+        spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP))
+    }
+
+    /// Appends `arg` to a command line, as `CommandLineToArgvW` (and the C
+    /// runtime) read it back: quoted when it has blanks or quotes, the
+    /// backslashes before a quote doubled.
+    pub(super) fn push_arg(line: &mut Vec<u16>, arg: &std::ffi::OsStr) {
+        use std::os::windows::ffi::OsStrExt;
+        let (quote, backslash, space, tab) = ('"' as u16, '\\' as u16, ' ' as u16, '\t' as u16);
+        let arg: Vec<u16> = arg.encode_wide().collect();
+        if !line.is_empty() {
+            line.push(space);
+        }
+        if !arg.is_empty() && !arg.iter().any(|&c| c == space || c == tab || c == quote) {
+            line.extend(arg);
+            return;
+        }
+        line.push(quote);
+        let mut backslashes = 0;
+        for c in arg {
+            if c == backslash {
+                backslashes += 1;
+            } else {
+                if c == quote {
+                    line.extend(std::iter::repeat_n(backslash, backslashes + 1));
+                }
+                backslashes = 0;
+            }
+            line.push(c);
+        }
+        line.extend(std::iter::repeat_n(backslash, backslashes));
+        line.push(quote);
     }
 }
 
@@ -570,9 +708,8 @@ mod tests {
     #[test]
     fn early_closes() {
         use std::io::{Read, Write};
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_ipc_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let loc = Location { dir: dir.clone(), id: "early".into() };
+        let base = test_dirs::TestDir::new("ninja_daemon_ipc");
+        let loc = Location { dir: base.join("daemon"), id: "early".into() };
         loc.create_dir().unwrap();
         let mut listener = Listener::bind(&loc).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -599,8 +736,31 @@ mod tests {
         // Still accepting.
         let mut s = connect(&loc).unwrap();
         s.write_all(b"x").unwrap();
-        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("accepted").unwrap(), b'x');
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(60)).expect("accepted").unwrap(), b'x');
+    }
+
+    /// The files of other daemons go, unless they run (they used to go
+    /// all, those of running ones included).
+    #[test]
+    fn others_removed() {
+        let base = test_dirs::TestDir::new("ninja_daemon_others");
+        let at = |id: &str| Location { dir: base.join("daemon"), id: id.into() };
+        let (me, running, gone) = (at("me"), at("running"), at("gone"));
+        me.create_dir().unwrap();
+        for loc in [&me, &running, &gone] {
+            for f in [loc.lock_file(), loc.log_file(), loc.dir.join(format!("{}.exe", loc.id))] {
+                std::fs::write(f, "").unwrap();
+            }
+            std::fs::create_dir(loc.cookie_dir()).unwrap();
+        }
+        let lock = std::fs::File::options().write(true).open(running.lock_file()).unwrap();
+        lock.try_lock().unwrap();
+        assert!(running.running() && !gone.running());
+        me.remove_others().unwrap();
+        let mut left: Vec<String> = std::fs::read_dir(&me.dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        let expected = ["me.cookies", "me.exe", "me.lock", "me.log", "running.cookies", "running.exe", "running.lock", "running.log"];
+        assert_eq!(left, expected);
     }
 
     /// Lets everyone change `dir`.
@@ -630,6 +790,56 @@ mod tests {
         let mine = shared.join("mine");
         private(&mine).unwrap();
         private(&mine).unwrap();
+    }
+
+    /// Unix: the daemon keeps none of the build's descriptors (a pipe its
+    /// caller reads, inherited without close-on-exec), whose reader would
+    /// wait for it.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_without_descriptors() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let dir = test_dirs::TestDir::new("ninja_daemon_spawn");
+        let mut fds = [0; 2];
+        // SAFETY: a valid array for the two descriptors, owned from now on;
+        // only the end written to is inherited.
+        let (read, write) = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1]))
+        };
+        let pid_file = dir.join("pid");
+        let script = format!("echo $$ > '{}'.tmp && mv '{0}'.tmp '{0}' && exec sleep 600", pid_file.display());
+        spawn_detached(Path::new("/bin/sh"), &["-c", &script], &dir, &[]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse().ok()) {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "the process didn't start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        drop(write);
+        // The end of the pipe, though the process runs.
+        let mut pfd = libc::pollfd { fd: read.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd, then plain calls.
+        let ended = unsafe { libc::poll(&mut pfd, 1, 60_000) == 1 && pfd.revents & libc::POLLHUP != 0 };
+        // SAFETY: plain call.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(ended, "the spawned process holds the pipe");
+    }
+
+    /// Windows: arguments are read back as they were (the daemon's binary
+    /// and its directory may have blanks in their paths).
+    #[cfg(windows)]
+    #[test]
+    fn command_lines() {
+        let args = [r"C:\Program Files\ninja-rs.exe", "-t", "", "a b", r#"say "hi""#, r"dir\", r"dir with space\", r#"x\"y"#];
+        let mut line = Vec::new();
+        for a in args {
+            platform::push_arg(&mut line, std::ffi::OsStr::new(a));
+        }
+        assert_eq!(cpp_deps::external::split_windows(&String::from_utf16(&line).unwrap(), true), args);
     }
 
     /// A private file is a new one: never one someone else made first.

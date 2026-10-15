@@ -14,7 +14,7 @@ use cpp_deps::{Cache, Driver};
 use crate::files::{self, Files};
 use crate::ipc::{self, Location};
 use crate::proto::{self, Begin, PROTOCOL, Request, Response, Status};
-use crate::watch::{RootState, Watcher};
+use crate::watch::{self, RootState, Watcher};
 
 /// Builds whose environments are kept (a scan names its build's): those
 /// that used theirs last.
@@ -52,7 +52,28 @@ pub struct Daemon {
     seeded: Mutex<HashMap<PathBuf, Instant>>,
     started: Instant,
     requests: AtomicU64,
-    last_active: Mutex<Instant>,
+    activity: Mutex<Activity>,
+}
+
+/// Whether the daemon is busy: it exits when idle only between requests.
+struct Activity {
+    /// Requests in progress.
+    running: usize,
+    /// When the last one ended.
+    last: Instant,
+    /// Exiting: no request starts any more.
+    exiting: bool,
+}
+
+/// A request in progress (see `Daemon::busy`).
+struct Busy<'a>(&'a Daemon);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        let mut a = self.0.activity.lock().unwrap();
+        a.running -= 1;
+        a.last = Instant::now();
+    }
 }
 
 impl Daemon {
@@ -74,17 +95,41 @@ impl Daemon {
             seeded: Mutex::default(),
             started: Instant::now(),
             requests: AtomicU64::new(0),
-            last_active: Mutex::new(Instant::now()),
+            activity: Mutex::new(Activity { running: 0, last: Instant::now(), exiting: false }),
         })
     }
 
+    /// How long since the last request ended (none while one runs).
     pub fn idle(&self) -> Duration {
-        self.last_active.lock().unwrap().elapsed()
+        let a = self.activity.lock().unwrap();
+        if a.running > 0 { Duration::ZERO } else { a.last.elapsed() }
+    }
+
+    /// Marks a request in progress, until the guard goes; None once
+    /// exiting.
+    fn busy(&self) -> Option<Busy<'_>> {
+        let mut a = self.activity.lock().unwrap();
+        if a.exiting {
+            return None;
+        }
+        a.running += 1;
+        Some(Busy(self))
+    }
+
+    /// Whether it has been idle for `idle`, between requests: it's exiting
+    /// then, and none starts any more (one in progress, a long toolchain
+    /// walk, used to be cut).
+    pub fn exit_if_idle(&self, idle: Duration) -> bool {
+        let mut a = self.activity.lock().unwrap();
+        if a.running == 0 && a.last.elapsed() >= idle {
+            a.exiting = true;
+        }
+        a.exiting
     }
 
     pub fn handle(&self, req: Request) -> Response {
         self.requests.fetch_add(1, Ordering::Relaxed);
-        *self.last_active.lock().unwrap() = Instant::now();
+        let Some(_busy) = self.busy() else { return Response::Error("the daemon is exiting".into()) };
         match req {
             Request::Hello { .. } => Response::Hello { protocol: PROTOCOL, pid: std::process::id(), version: version().to_string() },
             Request::Begin(b) => self.begin(b),
@@ -113,9 +158,18 @@ impl Daemon {
             self.watcher.expire(before);
             self.seeded.lock().unwrap().retain(|_, named| *named >= before);
         }
-        // The one set the digests and the preprocessor's cache ask.
-        for d in std::iter::once(&b.build_dir).chain(&b.volatile) {
-            self.watcher.ignore(d);
+        // The one set the digests and the preprocessor's cache ask: the
+        // build directory, under any of its spellings, whole; the others
+        // (outputs outside it) whole unless they hold roots.
+        let key = |p: &Path| watch::key(p, self.watcher.case_insensitive());
+        let real = std::fs::canonicalize(&b.build_dir).ok().map(|r| key(&watch::strip_verbatim(r)));
+        self.watcher.ignore(&b.build_dir, true);
+        for d in &b.volatile {
+            if d.starts_with(&b.build_dir) || real.as_ref().is_some_and(|r| key(d).starts_with(r)) {
+                self.watcher.ignore(d, true);
+            } else {
+                self.watcher.ignore_outputs(d);
+            }
         }
         self.driver.cache.new_session();
         self.files.new_session();
@@ -167,6 +221,7 @@ impl Daemon {
             lexed,
             listings,
             watched_dirs: self.watcher.watched_dirs(),
+            ignored: self.watcher.ignored_dirs(),
             digests,
             trees,
             files_lexed: stats.files_lexed,
@@ -175,19 +230,50 @@ impl Daemon {
     }
 }
 
-/// A log file, restarted when it grows past 1 MiB.
-fn logger(loc: &Location) -> Box<dyn Fn(&str) + Send + Sync> {
-    let path = loc.log_file();
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
-        let _ = std::fs::remove_file(&path);
-    }
-    let file = std::fs::File::options().create(true).append(true).open(&path).ok().map(Mutex::new);
+/// How large the log grows before it starts again.
+const LOG_LIMIT: u64 = 1 << 20;
+
+/// The log file `path`, started again when it would grow past `limit`
+/// (while the daemon runs too: it may run for days).
+fn logger(path: &Path, limit: u64) -> Box<dyn Fn(&str) + Send + Sync> {
+    let path = path.to_path_buf();
+    let file = std::fs::File::options().create(true).append(true).open(&path).ok().map(|f| {
+        let len = f.metadata().map_or(0, |m| m.len());
+        Mutex::new((f, len))
+    });
     Box::new(move |msg: &str| {
-        if let Some(f) = &file {
-            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
-            let _ = writeln!(f.lock().unwrap(), "{now} [{}] {msg}", std::process::id());
+        let Some(f) = &file else { return };
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let line = format!("{now} [{}] {msg}\n", std::process::id());
+        let (f, len) = &mut *f.lock().unwrap();
+        // Emptied through another handle (one appending can't truncate on
+        // Windows): appends go to its new end.
+        if *len + line.len() as u64 > limit && std::fs::File::create(&path).is_ok() {
+            *len = 0;
+        }
+        if f.write_all(line.as_bytes()).is_ok() {
+            *len += line.len() as u64;
         }
     })
+}
+
+/// Unix: lets the daemon have as many files open as it may, up to a sane
+/// bound: out of descriptors, watches and tree walks fail, and a shell's
+/// default (1024) is soon reached by a daemon serving many builds. (The
+/// compilers it probes inherit it.)
+#[cfg(unix)]
+fn raise_file_limit() {
+    let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: a valid out-parameter, then plain calls.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut l) == 0 {
+            let wanted = l.rlim_max.min(1 << 16);
+            if l.rlim_cur < wanted {
+                l.rlim_cur = wanted;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &l);
+            }
+        }
+    }
 }
 
 /// Whether the daemon of `exe` is no longer the one at `loc`: the binary
@@ -198,6 +284,11 @@ pub fn superseded(exe: &Path, loc: &Location) -> bool {
 
 /// How long a superseded daemon waits for builds still using it.
 const SUPERSEDED_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the daemon waits after a connection failed, at first and at
+/// most.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Runs the daemon until it has been idle for `idle`, is asked to stop, or
 /// the binary it comes from (`exe`) is rebuilt: its watches go then rather
@@ -210,7 +301,9 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
         Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
         Err(std::fs::TryLockError::Error(e)) => return Err(e),
     }
-    let log = Arc::new(logger(loc));
+    #[cfg(unix)]
+    raise_file_limit();
+    let log = Arc::new(logger(&loc.log_file(), LOG_LIMIT));
     let log2 = log.clone();
     let daemon = Daemon::new(Box::new(move |m| log2(m)));
     daemon.watcher.set_cookie_dir(&loc.cookie_dir());
@@ -221,13 +314,14 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(5).min(idle));
-                if daemon.idle() >= idle {
+                if daemon.exit_if_idle(idle) {
                     log("idle: exiting");
                     std::process::exit(0);
                 }
                 if let Some(exe) = &exe
                     && daemon.idle() >= SUPERSEDED_GRACE
                     && superseded(exe, &loc)
+                    && daemon.exit_if_idle(SUPERSEDED_GRACE)
                 {
                     log(&format!("{} was rebuilt or removed: exiting", exe.display()));
                     std::process::exit(0);
@@ -235,14 +329,24 @@ pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::R
             }
         });
     }
+    // A connection that failed (a client gone, out of file descriptors)
+    // isn't the daemon's end: said once while it lasts, and tried again
+    // less and less often.
+    let (mut delay, mut failing) = (ACCEPT_RETRY, None);
     loop {
-        // A connection that failed (a client gone, out of file
-        // descriptors) isn't the daemon's end.
         let stream = match listener.accept() {
-            Ok(s) => s,
+            Ok(s) => {
+                (delay, failing) = (ACCEPT_RETRY, None);
+                s
+            }
             Err(e) => {
-                log(&format!("accepting a connection: {e}"));
-                std::thread::sleep(Duration::from_millis(100));
+                let e = e.to_string();
+                if failing.as_ref() != Some(&e) {
+                    log(&format!("accepting a connection: {e}"));
+                    failing = Some(e);
+                }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(ACCEPT_RETRY_MAX);
                 continue;
             }
         };
@@ -276,11 +380,13 @@ fn connection(daemon: &Daemon, mut stream: ipc::Stream, log: &(dyn Fn(&str) + Se
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_dirs::TestDir;
 
     /// A rebuilt (or removed) binary supersedes its daemon.
     #[test]
     fn superseded_by_a_rebuilt_binary() {
-        let exe = test_dirs::base().join(format!("ninja_daemon_exe_{}", std::process::id()));
+        let dir = TestDir::new("ninja_daemon_exe");
+        let exe = dir.join("ninja-rs");
         std::fs::write(&exe, "version 1").unwrap();
         let loc = Location::for_exe(&exe).unwrap();
         assert!(!superseded(&exe, &loc));
@@ -290,24 +396,50 @@ mod tests {
         assert!(superseded(&exe, &loc));
     }
 
+    /// The daemon exits when idle only between requests: one in progress
+    /// (a long toolchain walk) isn't cut, and none starts once it's
+    /// exiting.
+    #[test]
+    fn idle_between_requests() {
+        let daemon = Daemon::new(Box::new(|_| {}));
+        let busy = daemon.busy().unwrap();
+        assert_eq!(daemon.idle(), Duration::ZERO);
+        assert!(!daemon.exit_if_idle(Duration::ZERO));
+        drop(busy);
+        assert!(daemon.exit_if_idle(Duration::ZERO));
+        assert!(matches!(daemon.handle(Request::Status), Response::Error(_)));
+    }
+
+    /// The log starts again when it would grow past its limit, while the
+    /// daemon runs (it may run for days).
+    #[test]
+    fn log_trimmed() {
+        let dir = TestDir::new("ninja_daemon_log");
+        let path = dir.join("daemon.log");
+        let log = logger(&path, 1000);
+        for i in 0..200 {
+            log(&format!("line {i}"));
+            assert!(std::fs::metadata(&path).unwrap().len() <= 1000);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with(" line 199\n") && !text.contains(" line 0\n"), "{text}");
+    }
+
     /// A build's digests file, saved again by every build, is read once:
     /// what the daemon keeps per build directory doesn't grow per build.
     #[test]
     fn digests_read_once() {
-        let dir = test_dirs::base().join(format!("ninja_daemon_begin_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("ninja_daemon_begin");
         let digests = dir.join(".ninja_rs_digests");
         let daemon = Daemon::new(Box::new(|_| {}));
         for i in 0..3 {
             std::fs::write(&digests, format!("{}\n", files::DIGESTS_SIGNATURE)).unwrap();
             let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + i);
             std::fs::File::options().write(true).open(&digests).unwrap().set_modified(t).unwrap();
-            let b = Begin { build_dir: dir.clone(), digests_file: Some(digests.clone()), ..Default::default() };
+            let b = Begin { build_dir: dir.to_path_buf(), digests_file: Some(digests.clone()), ..Default::default() };
             assert!(matches!(daemon.handle(Request::Begin(b)), Response::Begun { .. }));
         }
         assert_eq!(daemon.seeded.lock().unwrap().len(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A build's environment is kept while it scans, however many builds
@@ -315,9 +447,7 @@ mod tests {
     /// least recently go.
     #[test]
     fn sessions_by_last_use() {
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_sessions_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TestDir::new("ninja_daemon_sessions");
         let daemon = Daemon::new(Box::new(|_| {}));
         let begin = |name: &str| match daemon.handle(Request::Begin(Begin { build_dir: dir.join(name), ..Default::default() })) {
             Response::Begun { session } => session,
@@ -327,7 +457,7 @@ mod tests {
             daemon.handle(Request::Scan {
                 session,
                 argv: vec![dir.join("no-such-cc").to_string_lossy().into_owned(), "-c".into(), "x.c".into()],
-                cwd: dir.clone(),
+                cwd: dir.to_path_buf(),
             })
         };
         let long = begin("long");
@@ -340,29 +470,30 @@ mod tests {
         }
         assert!(matches!(scan(long), Response::Scanned(_)));
         assert!(!matches!(scan(first), Response::Scanned(_)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Directories a build writes to besides its build directory aren't
     /// watched: their files are never vouched for, and their changes don't
-    /// count against others'.
+    /// count against others'. One that holds the repository (an output in
+    /// its root) only for its own files: the rest stays watched.
     #[test]
     fn volatile_dirs_unwatched() {
         if cfg!(not(any(target_os = "linux", windows))) {
             return;
         }
         use cpp_deps::scan::Watch;
-        let dir = std::env::temp_dir().join(format!("ninja_daemon_volatile_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = TestDir::new("ninja_daemon_volatile");
         for d in [".git", "src", "gen", "build"] {
-            std::fs::create_dir_all(dir.join(d)).unwrap();
+            std::fs::create_dir_all(base.join(d)).unwrap();
         }
-        let dir = crate::watch::strip_verbatim(std::fs::canonicalize(&dir).unwrap());
+        let dir = watch::strip_verbatim(std::fs::canonicalize(&*base).unwrap());
         let a = dir.join("src/a.h");
         std::fs::write(&a, "a").unwrap();
         let daemon = Daemon::new(Box::new(|_| {}));
-        let begin = || daemon.handle(Request::Begin(Begin { build_dir: dir.join("build"), volatile: vec![dir.join("gen")], ..Default::default() }));
-        begin();
+        let begin =
+            |volatile: &[PathBuf]| daemon.handle(Request::Begin(Begin { build_dir: dir.join("build"), volatile: volatile.to_vec(), ..Default::default() }));
+        let gen_and_root = [dir.join("gen"), dir.clone()];
+        begin(&gen_and_root);
         assert_eq!(daemon.watcher.token(&a), None);
         let deadline = Instant::now() + Duration::from_secs(10);
         while daemon.watcher.roots().iter().all(|(_, s)| *s != RootState::Unsynced) {
@@ -370,13 +501,16 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         daemon.watcher.token(&a);
-        begin();
+        begin(&gen_and_root);
         let t = daemon.watcher.token(&a).expect("vouched for");
         assert_eq!(daemon.watcher.token(&dir.join("gen/out.h")), None);
+        assert_eq!(daemon.watcher.token(&dir.join("compile_commands.json")), None);
         std::fs::write(dir.join("gen/out.h"), "generated").unwrap();
         // Its event, if any, came before the sync's.
-        begin();
+        begin(&gen_and_root);
         assert!(daemon.watcher.unchanged_since(t));
-        let _ = std::fs::remove_dir_all(&dir);
+        let status = daemon.status();
+        assert_eq!(status.ignored.len(), 3, "{:?}", status.ignored);
+        assert!(status.ignored.contains(&(dir.clone(), false)) && status.ignored.contains(&(dir.join("gen"), true)), "{:?}", status.ignored);
     }
 }

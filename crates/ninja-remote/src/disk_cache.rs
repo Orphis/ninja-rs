@@ -17,6 +17,11 @@
 //!                      which removes those unused for a month itself
 //! ```
 //!
+//! A directory without `VERSION` that isn't empty is another tool's (Bazel's
+//! `--disk_cache`, which a shared `.bazelrc` names, has the same `ac/` and
+//! `cas/`): it is used as it is, without writing `VERSION` there, and its
+//! garbage is left to its owner.
+//!
 //! Content-defined chunking: a blob larger than [`CHUNK_MAX`] is stored as
 //! its FastCDC 2020 chunks (REAPI's `FAST_CDC_2020` with its recommended
 //! parameters, so that chunks match those of a server that splits blobs the
@@ -68,6 +73,9 @@ pub struct DiskCache {
     root: PathBuf,
     /// Bytes written by this process (eviction only runs after writes).
     written: AtomicU64,
+    /// Another tool's cache (see the module's documentation): never
+    /// collected.
+    foreign: bool,
 }
 
 /// A file name no other writer uses: the PID, a counter and a random part.
@@ -104,20 +112,28 @@ impl DiskCache {
     /// Opens (creating it if needed) the cache at `root`.
     pub fn open(root: &Path) -> std::io::Result<Self> {
         let version = root.join("VERSION");
+        let mut foreign = false;
         match std::fs::read_to_string(&version) {
             Ok(v) if v.trim() == VERSION => {}
             Ok(v) => {
                 return Err(std::io::Error::other(format!("{} has format version {}, this ninja-rs uses {VERSION}", root.display(), v.trim())));
             }
+            Err(_) if std::fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_some()) => foreign = true,
             Err(_) => {
                 std::fs::create_dir_all(root)?;
                 std::fs::write(&version, format!("{VERSION}\n"))?;
             }
         }
-        for d in ["cas", "chunked", "ac", "tmp", "gc"] {
+        let dirs: &[&str] = if foreign { &["cas", "chunked", "ac", "tmp"] } else { &["cas", "chunked", "ac", "tmp", "gc"] };
+        for d in dirs {
             std::fs::create_dir_all(root.join(d))?;
         }
-        Ok(Self { root: root.to_path_buf(), written: AtomicU64::new(0) })
+        Ok(Self { root: root.to_path_buf(), written: AtomicU64::new(0), foreign })
+    }
+
+    /// Whether it's another tool's cache, used without collecting garbage.
+    pub fn is_foreign(&self) -> bool {
+        self.foreign
     }
 
     pub fn root(&self) -> &Path {
@@ -379,15 +395,16 @@ impl DiskCache {
         self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, data)
     }
 
-    /// Writes the blob the chunks a remote split `d` into make up to `out`,
-    /// and records that layout when they make up `d`: a server's wrong
-    /// answer is never stored. Its chunks must be stored first. Whether
-    /// they did; what was written is to be discarded when they didn't.
-    pub fn put_chunked_into(&self, d: &re::Digest, split: re::SplitBlobResponse, out: &mut dyn Write) -> std::io::Result<bool> {
+    /// A chunk's contents (marking it used), if the cache holds it.
+    pub fn read_chunk(&self, d: &re::Digest) -> Option<Vec<u8>> {
+        if d.size_bytes == 0 { Some(Vec::new()) } else { self.read_whole(d) }
+    }
+
+    /// Records the layout a remote split `d` into: its chunks must be
+    /// stored, and checked to make up `d` (a server's wrong answer is never
+    /// stored). False when the cache keeps `d` whole (it's small).
+    pub fn put_split(&self, d: &re::Digest, split: re::SplitBlobResponse) -> std::io::Result<bool> {
         if !is_chunked(d) || split.chunk_digests.iter().map(|c| c.size_bytes).sum::<i64>() != d.size_bytes {
-            return Ok(false);
-        }
-        if self.assemble(&split.chunk_digests, d, out) != Some(true) {
             return Ok(false);
         }
         self.put_layout(d, split)?;
@@ -458,6 +475,10 @@ impl DiskCache {
     /// Returns the number of files and bytes removed, or `None` when another
     /// process is collecting (this one's writes are counted next time).
     pub fn collect_garbage(&self, max: u64, target: u64) -> std::io::Result<Option<(usize, u64)>> {
+        // Another tool's: its entries are its own to collect.
+        if self.foreign {
+            return Ok(Some((0, 0)));
+        }
         let lock = std::fs::File::options().create(true).truncate(false).write(true).open(self.root.join("gc").join("lock"))?;
         match lock.try_lock() {
             Ok(()) => {}
@@ -537,9 +558,8 @@ pub fn parse_size(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
-    fn cache(name: &str) -> (DiskCache, PathBuf) {
-        let dir = test_dirs::base().join(format!("ninja-rs-disk-cache-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn cache(name: &str) -> (DiskCache, test_dirs::TestDir) {
+        let dir = test_dirs::TestDir::new(&format!("ninja-rs-disk-cache-{name}"));
         (DiskCache::open(&dir).unwrap(), dir)
     }
 
@@ -590,12 +610,11 @@ mod tests {
         let fd = c.put_file(&f, None).unwrap();
         assert_eq!(c.read_blob(&fd).unwrap(), b"file contents");
         assert!(c.bytes_written() >= 5 + 13);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn evicts_least_recently_used() {
-        let (c, dir) = cache("evict");
+        let (c, _dir) = cache("evict");
         let blobs: Vec<_> = (0..4u8)
             .map(|i| {
                 let data = vec![i; 1000];
@@ -615,12 +634,11 @@ mod tests {
         assert_eq!(c.read_size_estimate(), Some(2000));
         assert!(c.contains_blob(&blobs[0]) && c.contains_blob(&blobs[3]));
         assert!(!c.contains_blob(&blobs[1]) && !c.contains_blob(&blobs[2]));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn walks_only_when_the_estimate_passes_the_limit() {
-        let (c, dir) = cache("estimate");
+        let (c, _dir) = cache("estimate");
         let small = vec![1u8; 100];
         c.put_bytes(&rbe_client::digest_of(&small), &small).unwrap();
         assert_eq!(c.collect_garbage(1000, 900).unwrap(), Some((0, 0)));
@@ -639,7 +657,6 @@ mod tests {
         let (removed, _) = c.collect_garbage(1000, 900).unwrap().unwrap();
         assert!(removed >= 1);
         assert!(c.read_size_estimate().unwrap() <= 900);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -656,7 +673,6 @@ mod tests {
         assert!(c.collect_garbage(1000, 900).unwrap().is_some());
         // Closed first: Windows doesn't remove open files.
         drop((c, other));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Incompressible, reproducible data (xorshift).
@@ -690,7 +706,7 @@ mod tests {
 
     #[test]
     fn large_blobs_share_chunks() {
-        let (c, dir) = cache("chunks");
+        let (c, _dir) = cache("chunks");
         let a = noise(8 << 20, 1);
         let da = rbe_client::digest_of(&a);
         c.put_bytes(&da, &a).unwrap();
@@ -719,7 +735,6 @@ mod tests {
         // Storing it again restores the chunk.
         c.put_bytes(&db, &b).unwrap();
         assert_eq!(c.read_blob(&db).unwrap(), b);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -738,7 +753,6 @@ mod tests {
         std::fs::write(&f, &small).unwrap();
         let d = c.put_file(&f, None).unwrap();
         assert!(c.blob_path(&d.hash).unwrap().exists() && !c.layout_path(&d.hash).unwrap().exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A layout whose chunks are each right and add up to the size, but
@@ -756,10 +770,8 @@ mod tests {
         c.put_chunk_bytes(&da, a).unwrap();
         c.put_chunk_bytes(&db, b).unwrap();
         let split = re::SplitBlobResponse { chunk_digests: vec![da, db], chunking_function: FAST_CDC };
-        let mut sink = Vec::new();
-        assert!(!c.put_chunked_into(&d, split.clone(), &mut sink).unwrap());
         assert!(!c.contains_blob(&d));
-        // Stored anyway: it looks present until read.
+        // Stored (by another writer): it looks present until read.
         c.put_layout(&d, split.clone()).unwrap();
         assert!(c.contains_blob(&d));
         assert!(c.read_blob(&d).is_none());
@@ -778,7 +790,6 @@ mod tests {
         assert!(!c.read_blob_into(&d2, &mut Vec::new()));
         assert_eq!(c.put_file(&f, None).unwrap(), d2);
         assert_eq!(c.read_blob(&d2).unwrap(), other);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A download stored with its known digest: the same layout as hashing
@@ -798,12 +809,11 @@ mod tests {
         let short = re::Digest { hash: "ab".repeat(32), size_bytes: d.size_bytes + 1 };
         assert!(c.put_file_with_digest(&f, &short).is_err());
         assert!(!c.contains_blob(&short));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn evicts_chunks_no_longer_used() {
-        let (c, dir) = cache("chunk-evict");
+        let (c, _dir) = cache("chunk-evict");
         let a = noise(6 << 20, 5);
         let da = rbe_client::digest_of(&a);
         c.put_bytes(&da, &a).unwrap();
@@ -817,7 +827,6 @@ mod tests {
         assert!(removed >= 2);
         assert!(!c.contains_blob(&da));
         assert_eq!(c.read_blob(&db).unwrap(), b);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Writers sharing a cache and a PID (containers on one volume): each
@@ -845,7 +854,30 @@ mod tests {
         std::fs::File::options().write(true).open(&stale).unwrap().set_modified(SystemTime::now() - 2 * STALE_TMP).unwrap();
         c.collect_garbage(u64::MAX, u64::MAX).unwrap();
         assert!(!stale.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another tool's cache (Bazel's, named by a shared `.bazelrc`): used
+    /// as it is, without a `VERSION` of ours, and its entries never
+    /// collected. An empty directory becomes ours.
+    #[test]
+    fn another_tools_cache() {
+        let dir = test_dirs::TestDir::new("ninja-rs-disk-cache-bazel");
+        let theirs = vec![7u8; 1000];
+        let d = rbe_client::digest_of(&theirs);
+        let blob = dir.join("cas").join(&d.hash[..2]).join(&d.hash);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, &theirs).unwrap();
+        let c = DiskCache::open(&dir).unwrap();
+        assert!(c.is_foreign() && !dir.join("VERSION").exists());
+        assert_eq!(c.read_blob(&d).unwrap(), theirs);
+        let ours = vec![8u8; 1000];
+        c.put_bytes(&rbe_client::digest_of(&ours), &ours).unwrap();
+        assert_eq!(c.collect_garbage(0, 0).unwrap(), Some((0, 0)));
+        assert!(blob.exists() && c.contains_blob(&rbe_client::digest_of(&ours)));
+        let empty = test_dirs::TestDir::new("ninja-rs-disk-cache-empty");
+        assert!(!DiskCache::open(&empty).unwrap().is_foreign());
+        assert!(empty.join("VERSION").exists());
+        assert!(!DiskCache::open(&empty.join("new")).unwrap().is_foreign());
     }
 
     #[test]
@@ -853,7 +885,6 @@ mod tests {
         let (_, dir) = cache("version");
         std::fs::write(dir.join("VERSION"), "99\n").unwrap();
         assert!(DiskCache::open(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

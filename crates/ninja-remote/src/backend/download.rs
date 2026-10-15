@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ninja_core::status::message;
 use rbe_client::Client;
 use rbe_client::proto as re;
+use sha2::{Digest as _, Sha256};
 
 use super::{DiskMiss, Inner, blocking};
 use crate::disk_cache::DiskCache;
@@ -30,7 +32,9 @@ const SMALL_GROUP: i64 = 4 << 20;
 /// ...and groups one download reads at once.
 const SMALL_GROUPS: usize = 4;
 
-/// Chunks of a large blob fetched at once: they are in memory until stored.
+/// Chunks of a large blob fetched at once: they are in memory until
+/// written. A blob split into a larger chunk is fetched whole, as it
+/// arrives.
 const CHUNK_GROUP: i64 = 16 << 20;
 
 /// How old a temporary file next to outputs must be for a sweep to remove
@@ -60,17 +64,28 @@ fn grouped<T>(blobs: Vec<T>, size: impl Fn(&T) -> i64, bytes: i64) -> Vec<Vec<T>
 }
 
 /// A disk cache write that may fail (a full disk, a read-only shared
-/// cache): the build goes on without it. Said once, and whether it worked.
+/// cache): the build goes on without it. Said once (`warned` then set),
+/// and whether it worked.
 pub(super) fn disk_store(warned: &std::sync::atomic::AtomicBool, write: impl FnOnce() -> Result<()>) -> bool {
     match write() {
         Ok(()) => true,
         Err(e) => {
             if !warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("ninja-rs: warning: the disk cache can't store results: {e:#}");
+                message(&format!("warning: the disk cache can't store results: {e:#}"));
             }
             false
         }
     }
+}
+
+/// The time of the file system holding `dir`, now: a new file's
+/// modification time there (a network file system's clock may not be the
+/// host's). The host's when no file can be made there.
+pub(super) fn fs_now(dir: &Path) -> std::time::SystemTime {
+    let probe = dir.join(format!("{TEMP_MARK}{}", crate::disk_cache::unique_name()));
+    let made = std::fs::File::options().write(true).create_new(true).open(&probe).and_then(|f| f.metadata()?.modified());
+    let _ = std::fs::remove_file(&probe);
+    made.unwrap_or_else(|_| std::time::SystemTime::now())
 }
 
 impl Inner {
@@ -260,9 +275,10 @@ impl Drop for Fetched {
 
 /// Fetches a large blob from the remote into a file next to `dest`, and
 /// stores it in the disk cache. As the chunks the remote splits it into
-/// when it does, those the disk cache lacks, then assembled from the disk
-/// cache; else as it arrives. Returns the file, removed if dropped (the
-/// task stopped: a race lost, a build interrupted).
+/// when it does (those the disk cache lacks), unless a disk cache write
+/// failed (`warned`): it wouldn't keep them. Else as it arrives. Returns
+/// the file, removed if dropped (the task stopped: a race lost, a build
+/// interrupted).
 async fn fetch_into_file(
     client: &Client,
     disk: Option<&DiskCache>,
@@ -276,14 +292,15 @@ async fn fetch_into_file(
     let path = temp.0.clone().expect("a path");
     if let Some(disk) = disk
         && client.chunking().split
+        && !warned.load(std::sync::atomic::Ordering::Relaxed)
     {
-        match fetch_chunks(client, disk, d, &path, budget).await {
+        match fetch_chunks(client, disk, d, &path, budget, warned).await {
             Ok(true) => return Ok(temp),
             // Not split by the server, or not right: fetched whole.
             Ok(false) => {}
             Err(e) => {
                 if verbose {
-                    eprintln!("ninja-rs: fetching {} as chunks: {e:#}", rbe_client::digest_str(d));
+                    message(&format!("fetching {} as chunks: {e:#}", rbe_client::digest_str(d)));
                 }
             }
         }
@@ -314,25 +331,71 @@ impl Drop for TempFile {
 }
 
 /// Fetches a large blob into `path` as the chunks the remote splits it
-/// into, downloading those the disk cache lacks a group at a time (within
-/// the downloads' memory `budget`), and stores the layout in the disk
-/// cache once the chunks are checked to make it up. False when the remote
-/// can't split it, or its chunks aren't the blob.
-async fn fetch_chunks(client: &Client, disk: &DiskCache, d: &re::Digest, path: &Path, budget: &tokio::sync::Semaphore) -> Result<bool> {
+/// into, in order: those the disk cache has from there, the others
+/// downloaded a group at a time (within the downloads' memory `budget`) and
+/// stored. Its layout is stored once the chunks are checked to make up the
+/// blob, if the disk cache kept them all: a chunk it can't store (a full
+/// disk, a read-only shared cache) is written all the same, never
+/// downloaded twice. False when the remote can't split it, splits it into
+/// chunks larger than a group (fetched whole then), or its chunks aren't
+/// the blob.
+async fn fetch_chunks(
+    client: &Client,
+    disk: &DiskCache,
+    d: &re::Digest,
+    path: &Path,
+    budget: &tokio::sync::Semaphore,
+    warned: &std::sync::atomic::AtomicBool,
+) -> Result<bool> {
+    use std::io::Write as _;
     let Some(split) = client.split_blob(d).await? else { return Ok(false) };
-    let lacking: Vec<re::Digest> = blocking(|| split.chunk_digests.iter().filter(|c| !disk.contains_chunk(c)).cloned().collect());
-    for chunks in grouped(lacking, |c| c.size_bytes, CHUNK_GROUP) {
-        let _held = budget.acquire_many(budget_kib(chunks.iter().map(|c| c.size_bytes).sum())).await?;
-        // Each read is checked to be its digest.
-        let read = client.read_blobs(&chunks).await?;
-        blocking(|| -> Result<()> {
-            for c in &chunks {
-                disk.put_chunk_bytes(c, read.get(&c.hash).with_context(|| format!("chunk {} wasn't read", rbe_client::digest_str(c)))?)?;
-            }
-            Ok(())
-        })?;
+    let sizes = || split.chunk_digests.iter().map(|c| c.size_bytes);
+    if sizes().any(|size| !(0..=CHUNK_GROUP).contains(&size)) || sizes().sum::<i64>() != d.size_bytes {
+        return Ok(false);
     }
-    Ok(blocking(|| std::fs::File::create(path).and_then(|mut f| disk.put_chunked_into(d, split, &mut f)))?)
+    let mut file = blocking(|| std::fs::File::create(path))?;
+    let (mut whole, mut stored) = (Sha256::new(), true);
+    for group in grouped(split.chunk_digests.clone(), |c| c.size_bytes, CHUNK_GROUP) {
+        let mut seen = std::collections::HashSet::new();
+        let lacking: Vec<re::Digest> = blocking(|| group.iter().filter(|c| seen.insert(c.hash.clone()) && !disk.contains_chunk(c)).cloned().collect());
+        let _held = budget.acquire_many(budget_kib(lacking.iter().map(|c| c.size_bytes).sum())).await?;
+        // Each read is checked to be its digest.
+        let read = if lacking.is_empty() { HashMap::new() } else { client.read_blobs(&lacking).await? };
+        let whole_group = blocking(|| -> Result<bool> {
+            for c in &group {
+                let kept;
+                let data = match read.get(&c.hash) {
+                    Some(data) => {
+                        stored = stored && disk_store(warned, || Ok(disk.put_chunk_bytes(c, data)?));
+                        data
+                    }
+                    None if lacking.iter().any(|l| l.hash == c.hash) => anyhow::bail!("chunk {} wasn't read", rbe_client::digest_str(c)),
+                    // One the disk cache has; gone meanwhile (collected),
+                    // the blob is fetched whole.
+                    None => match disk.read_chunk(c) {
+                        Some(data) => {
+                            kept = data;
+                            &kept
+                        }
+                        None => return Ok(false),
+                    },
+                };
+                whole.update(data);
+                file.write_all(data)?;
+            }
+            Ok(true)
+        })?;
+        if !whole_group {
+            return Ok(false);
+        }
+    }
+    if hex::encode(whole.finalize()) != d.hash {
+        return Ok(false);
+    }
+    if stored {
+        blocking(|| disk_store(warned, || if disk.put_split(d, split)? { Ok(()) } else { Ok(disk.put_file_with_digest(path, d)?) }));
+    }
+    Ok(true)
 }
 
 /// Writes an output atomically, through a temporary file of its own:
@@ -397,8 +460,7 @@ mod tests {
     /// rewound producer): the file ends whole, and no write fails.
     #[test]
     fn concurrent_output_writes() {
-        let dir = test_dirs::base().join(format!("ninja-rs-outputs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("ninja-rs-outputs");
         let out = dir.join("obj").join("a.o");
         for _ in 0..50 {
             std::thread::scope(|s| {
@@ -409,16 +471,13 @@ mod tests {
             assert_eq!(std::fs::read(&out).unwrap(), b"object");
         }
         assert_eq!(std::fs::read_dir(dir.join("obj")).unwrap().count(), 1, "temporary files left");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Temporary files interrupted writes left next to outputs go once
     /// old; those of writes going on, and outputs, stay.
     #[test]
     fn sweeps_old_temporary_files() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-sweep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("ninja-rs-sweep");
         let old = temp_next_to(&dir.join("a.o")).unwrap();
         let fresh = temp_next_to(&dir.join("b.o")).unwrap();
         for f in [&old, &fresh, &dir.join("a.o")] {
@@ -430,7 +489,22 @@ mod tests {
         }
         sweep_temp_files(&dir, STALE_TEMP);
         assert!(!old.exists() && fresh.exists() && dir.join("a.o").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file system's clock is a new file's time there: an output left
+    /// as it was gets it, not the host's, which a network file system's may
+    /// be behind of.
+    #[test]
+    fn file_system_time() {
+        let dir = test_dirs::TestDir::new("ninja-rs-fs-now");
+        let t = fs_now(&dir);
+        std::fs::write(dir.join("after"), "").unwrap();
+        assert!(t <= std::fs::metadata(dir.join("after")).unwrap().modified().unwrap());
+        // The probe goes.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // Without a directory: the host's.
+        let before = std::time::SystemTime::now();
+        assert!(fs_now(&dir.join("missing")) >= before);
     }
 
     #[test]

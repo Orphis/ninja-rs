@@ -143,6 +143,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "cpp-deps"
 version = "0.1.0"
 dependencies = [
+ "ninja-os",
  "serde_json",
  "test-dirs",
 ]
@@ -656,6 +657,7 @@ name = "ninja-core"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ninja-os",
  "test-dirs",
  "tokio",
  "windows-sys 0.61.2",
@@ -681,6 +683,7 @@ name = "ninja-os"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "sha2",
  "test-dirs",
  "windows-sys 0.61.2",
@@ -935,6 +938,7 @@ dependencies = [
  "prost",
  "prost-types",
  "protox",
+ "rbe-client",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -953,7 +957,6 @@ dependencies = [
  "ninja-os",
  "prost",
  "sha2",
- "tempfile",
  "test-dirs",
  "tokio",
  "tokio-stream",

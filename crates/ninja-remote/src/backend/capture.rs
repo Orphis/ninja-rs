@@ -2,18 +2,19 @@
 //! form a remote execution would have given: only one the action's key
 //! describes (see `Capture::store`).
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use ninja_core::clparser::{DEFAULT_DEPS_PREFIX, filter_show_includes};
 use ninja_core::depfile::parse_depfile;
 use ninja_core::runner::{LocalCapture, Task, TaskResult};
+use ninja_core::status::message;
 use rbe_client::proto as re;
 
 use super::{Inner, escape_make};
 use crate::action::Prepared;
-use crate::store::Store;
 
 /// Stores the result of an action that ran locally after a disk cache miss,
 /// in the form a remote execution would have given (paths relative to the
@@ -32,7 +33,7 @@ impl LocalCapture for Capture {
         if let Err(e) = self.store(&result.output)
             && self.inner.config.verbose
         {
-            eprintln!("ninja-rs: not cached: {e:#}");
+            message(&format!("not cached: {e:#}"));
         }
     }
 }
@@ -44,23 +45,26 @@ const INLINE_STDOUT_MAX: usize = 64 << 10;
 impl Capture {
     /// Stores the result of the command, run locally on a cache miss, in the
     /// disk cache and the remote cache (when the server accepts results).
-    /// Runs on a blocking thread.
+    /// Runs on a blocking thread; the upload goes on in the background (see
+    /// `Backend::finish_uploads`).
     ///
     /// Only a result the action's key describes, one its remote execution
     /// would give: not after steps on the host, nor with a variable its
-    /// tools read that it can't carry, nor when an input changed while the
-    /// command ran, nor when the command read files its inputs lack. The
-    /// remote cache, which other machines read, only gets those whose reads
-    /// were checked (a depfile or `/showIncludes` lists them), of tools the
-    /// toolchains file declares; others stay in the disk cache.
+    /// tools read that it can't carry, nor when an input it read changed
+    /// since the key was computed, nor when the command read files its
+    /// inputs lack. The remote cache, which other machines read, only gets
+    /// those whose reads were checked (a depfile or `/showIncludes` lists
+    /// them), of tools the toolchains file declares; others stay in the
+    /// disk cache.
     fn store(&mut self, output: &[u8]) -> Result<()> {
         let disk = self.inner.disk.clone();
         let upload = self.inner.upload && self.inner.client.is_some();
         if disk.is_none() && !upload {
             return Ok(());
         }
+        let msvc = self.task.deps.as_deref() == Some("msvc");
         // What the remote cache refuses, before any work when it's all.
-        let checkable = self.task.deps.as_deref() == Some("msvc") || self.prepared.depfile.is_some();
+        let checkable = msvc || self.prepared.depfile.is_some();
         let remote_refusal = if !self.prepared.toolchain_declared {
             Some("the command runs a tool the toolchains file doesn't declare")
         } else if !checkable {
@@ -76,26 +80,33 @@ impl Capture {
         if !self.prepared.local_before.is_empty() || !self.prepared.local_after.is_empty() {
             bail!("the command runs steps on the host");
         }
-        if let Some(var) = &self.prepared.env_refused {
+        if let Some(why) = &self.prepared.env_refused {
             if !self.inner.env_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("ninja-rs: warning: local results aren't cached: {var} is set, which their actions can't have (--action_env={var} gives it them)");
+                message(&format!("warning: local results aren't cached: {why}"));
             }
-            bail!("{var} is set");
+            bail!("{why}");
         }
-        // As Bazel guards against concurrent changes: an input edited after
-        // the key was computed, while the command waited or ran.
-        if let Some(changed) = changed_input(&self.prepared, &self.inner.shared.store) {
-            bail!("{changed} changed while the command ran");
-        }
-        let mut checked = false;
-        if self.task.deps.as_deref() == Some("msvc") {
+        // What the command read, as its `/showIncludes` lines or depfile
+        // list them: all among the action's inputs.
+        let depfile_data = self.prepared.depfile.as_ref().and_then(|(_, local)| std::fs::read(local).ok());
+        let read: Option<Vec<String>> = if msvc {
             let prefix = if self.task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { self.task.msvc_deps_prefix.as_str() };
             let text = String::from_utf8_lossy(output);
-            let included = text.lines().filter_map(|l| filter_show_includes(l.trim_end_matches('\r'), prefix)).filter(|p| !p.is_empty());
-            if let Some(dep) = undeclared(&mut self.prepared, included) {
-                bail!("{dep} isn't among the action's inputs");
-            }
-            checked = true;
+            Some(text.lines().filter_map(|l| filter_show_includes(l.trim_end_matches('\r'), prefix)).filter(|p| !p.is_empty()).map(str::to_string).collect())
+        } else if let Some(data) = &depfile_data {
+            let local = &self.prepared.depfile.as_ref().expect("a depfile").1;
+            Some(parse_depfile(data).map_err(|e| anyhow::anyhow!("{}: {e}", local.display()))?.ins)
+        } else {
+            None
+        };
+        if let Some(dep) = read.as_ref().and_then(|read| undeclared(&mut self.prepared, read.iter().map(String::as_str))) {
+            bail!("{dep} isn't among the action's inputs");
+        }
+        // As Bazel guards against concurrent changes: an input edited after
+        // the key was computed, while the command waited or ran (even when
+        // edited back).
+        if let Some(changed) = changed_input(&self.prepared, read.as_deref()) {
+            bail!("{changed} changed while the command ran");
         }
         let digests = Some(&self.inner.shared.store.digests as &dyn rbe_client::tree::DigestCache);
         let mut blobs = rbe_client::BlobSet::default();
@@ -127,15 +138,8 @@ impl Capture {
                 files.push(re::OutputFile { path: rel.clone(), digest: Some(digest), is_executable: false, ..Default::default() });
             }
         }
-        if let Some((rel, local)) = self.prepared.depfile.clone()
-            && let Ok(data) = std::fs::read(&local)
-        {
-            let deps = parse_depfile(&data).map_err(|e| anyhow::anyhow!("{}: {e}", local.display()))?;
-            if let Some(dep) = undeclared(&mut self.prepared, deps.ins.iter().map(String::as_str)) {
-                bail!("{dep} isn't among the action's inputs");
-            }
-            checked = true;
-            let data = self.depfile_to_remote(&data);
+        if let (Some((rel, _)), Some(data)) = (self.prepared.depfile.clone(), &depfile_data) {
+            let data = self.depfile_to_remote(data);
             let digest = rbe_client::digest_of(&data);
             if let Some(disk) = &disk {
                 disk.put_bytes(&digest, &data)?;
@@ -143,7 +147,7 @@ impl Capture {
             blobs.insert(digest.clone(), rbe_client::BlobSource::Bytes(data));
             files.push(re::OutputFile { path: rel, digest: Some(digest), ..Default::default() });
         }
-        let stdout = if self.task.deps.as_deref() == Some("msvc") { self.show_includes_to_remote(output) } else { output.to_vec() };
+        let stdout = if msvc { self.show_includes_to_remote(output) } else { output.to_vec() };
         // Paths in diagnostics as a remote execution prints them: another
         // checkout replaying them gets them relative to its build directory.
         let stdout = self.prepared.mapper.rewrite_text(&stdout);
@@ -161,10 +165,10 @@ impl Capture {
             return Ok(());
         }
         // A depfile the command didn't write lists nothing.
-        let why = remote_refusal.or((!checked).then_some("what the command read can't be checked (the depfile is missing)"));
+        let why = remote_refusal.or(read.is_none().then_some("what the command read can't be checked (the depfile is missing)"));
         if let Some(why) = why {
             if self.inner.config.verbose {
-                eprintln!("ninja-rs: in the disk cache only: {why}");
+                message(&format!("in the disk cache only: {why}"));
             }
             return Ok(());
         }
@@ -184,14 +188,23 @@ impl Capture {
                 blobs.insert(digest.clone(), src.clone());
             }
         }
-        // The outputs first, then the entry pointing at them.
-        let store = &self.inner.shared.store;
-        let to_upload = store.filter_unknown(blobs);
-        tokio::runtime::Handle::current().block_on(async {
-            client.upload_blobs(&to_upload).await?;
-            client.update_action_result(&self.prepared.action_digest, result).await
-        })?;
-        store.mark_uploaded(to_upload.0.keys());
+        // The outputs first, then the entry pointing at them: in the
+        // background, while the build goes on.
+        let inner = self.inner.clone();
+        let action = self.prepared.action_digest.clone();
+        let to_upload = inner.shared.store.filter_unknown(blobs);
+        let uploaded = async move {
+            let stored = async {
+                client.upload_blobs(&to_upload).await?;
+                client.update_action_result(&action, result).await
+            };
+            match stored.await {
+                Ok(()) => inner.shared.store.mark_uploaded(to_upload.0.keys()),
+                Err(e) if inner.config.verbose => message(&format!("not in the remote cache: {e:#}")),
+                Err(_) => {}
+            }
+        };
+        self.inner.uploads.lock().unwrap().spawn_on(uploaded, &tokio::runtime::Handle::current());
         Ok(())
     }
 
@@ -241,12 +254,33 @@ fn undeclared<'a>(p: &mut Prepared, deps: impl IntoIterator<Item = &'a str>) -> 
     deps.into_iter().find(|d| !p.mapper.tree_path(d).is_some_and(|t| p.tree_index.contains(&t, windows))).map(str::to_string)
 }
 
-/// The first input read from the host whose contents aren't those in the
-/// action's key anymore, if any. Through the digest cache: a file whose
-/// stamp didn't change isn't read again.
-fn changed_input(p: &Prepared, store: &Store) -> Option<String> {
-    p.local_inputs
-        .iter()
-        .find(|(path, d)| !rbe_client::tree::file_digest(path, Some(&store.digests)).is_ok_and(|now| now == *d))
-        .map(|(path, _)| path.display().to_string())
+/// The first input read from the host that changed since its digest was
+/// taken for the key, if any: its stamp isn't the same (an edit undone
+/// meanwhile is a change too). Those the command read: the compile's
+/// sources and what `read` (its depfile or `/showIncludes` lines) lists, or
+/// every input when nothing lists them. One metadata call each.
+fn changed_input(p: &Prepared, read: Option<&[String]>) -> Option<String> {
+    let changed = |path: &Path, stamp: &ninja_os::FileStamp| ninja_os::stat(path).ok().map(|(_, s)| s) != Some(*stamp);
+    let Some(read) = read else {
+        return p.local_inputs.iter().find(|(path, stamp)| changed(path, stamp)).map(|(path, _)| path.display().to_string());
+    };
+    let windows = p.mapper.windows;
+    let key = |path: &Path| {
+        let s = path.to_string_lossy().replace('\\', "/");
+        if windows { s.to_ascii_lowercase() } else { s }
+    };
+    let stamps: HashMap<String, &(PathBuf, ninja_os::FileStamp)> = p.local_inputs.iter().map(|input| (key(&input.0), input)).collect();
+    let build_dir = Path::new(&p.mapper.build_dir);
+    let mut seen = HashSet::new();
+    let read = read.iter().map(|r| crate::scanner::normalize(&build_dir.join(r)));
+    for path in p.sources.iter().cloned().chain(read) {
+        let k = key(&path);
+        if seen.insert(k.clone())
+            && let Some((input, stamp)) = stamps.get(&k)
+            && changed(input, stamp)
+        {
+            return Some(input.display().to_string());
+        }
+    }
+    None
 }

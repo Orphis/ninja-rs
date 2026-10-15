@@ -270,28 +270,163 @@ const CHANGE_HINT: &str = ": make it yours and not writable by others (chmod go-
 #[cfg(windows)]
 const CHANGE_HINT: &str = ": take others' write access away (icacls), or give it with --ninjars=FILE";
 
-/// A directory shared by every user, as `/tmp` is: writable by all, with
-/// the sticky bit. (Writable by all alone is how WSL shows Windows drives,
-/// on a single-user host.)
+/// A directory others can write to: writable by all, as `/tmp` (or a tree
+/// made so with `chmod -R 777`). Not a Windows drive under WSL, whose
+/// permissions are made up (see `wsl`).
 #[cfg(unix)]
 fn writable_by_others(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o1002 == 0o1002)
+    std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o002 != 0) && !wsl::windows_drive(dir)
 }
 
 /// A file only the user and root can change: owned by either, not writable
-/// by its group or others. Unless the permissions are those of every file
-/// in a directory writable by all without the sticky bit, as WSL shows
-/// Windows drives (which keep no Unix permissions): anyone who can write to
-/// the file could replace it there anyway.
+/// by others, nor by its group unless it is the user's own (a user private
+/// group: under the umask 002 that goes with them, Fedora's and Debian's
+/// `usergroups`, files are writable by it). On a Windows drive under WSL,
+/// whose permissions are made up (see `wsl`), the owner alone counts.
 #[cfg(unix)]
 fn trusted_file(file: &Path) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     let Ok(m) = std::fs::metadata(file) else { return false };
-    let open_dir = || file.parent().and_then(|d| std::fs::metadata(d).ok()).is_some_and(|d| d.permissions().mode() & 0o1002 == 0o0002);
-    (m.uid() == uid || m.uid() == 0) && (m.mode() & 0o022 == 0 || open_dir())
+    let owned = m.uid() == uid || m.uid() == 0;
+    let by_others = m.mode() & 0o002 != 0 || (m.mode() & 0o020 != 0 && !account::private_group(uid, m.gid()));
+    owned && (!by_others || wsl::windows_drive(file))
+}
+
+/// Accounts and groups, from the system's databases (`/etc/passwd` and
+/// `/etc/group`, or what NSS serves).
+#[cfg(unix)]
+mod account {
+    use std::ffi::CStr;
+
+    /// Whether `gid` is the user's private group: their primary group, named
+    /// after them, of which they are the only member.
+    pub fn private_group(uid: libc::uid_t, gid: libc::gid_t) -> bool {
+        let (Some((user, primary)), Some((group, members))) = (user(uid), group(gid)) else { return false };
+        is_private(&user, primary, gid, &group, &members)
+    }
+
+    /// `private_group`, from the entries.
+    pub fn is_private(user: &str, primary: libc::gid_t, gid: libc::gid_t, group: &str, members: &[String]) -> bool {
+        gid == primary && group == user && members.iter().all(|m| m == user)
+    }
+
+    /// Calls `lookup` with buffers growing until they hold the entry.
+    fn with_buffer<T>(mut lookup: impl FnMut(&mut [libc::c_char]) -> Result<Option<T>, i32>) -> Option<T> {
+        let mut size = 1024;
+        loop {
+            let mut buf = vec![0 as libc::c_char; size];
+            match lookup(&mut buf) {
+                Err(libc::ERANGE) if size < 1 << 20 => size *= 4,
+                Ok(entry) => return entry,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// The user's name and primary group.
+    fn user(uid: libc::uid_t) -> Option<(String, libc::gid_t)> {
+        with_buffer(|buf| {
+            // SAFETY: all zeroes is a valid `passwd` (null pointers).
+            let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+            let mut found = std::ptr::null_mut();
+            // SAFETY: the buffer's size is given; the entry's strings point
+            // into it, read before it is freed.
+            unsafe {
+                match libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found) {
+                    0 if found.is_null() => Ok(None),
+                    0 => Ok(Some((CStr::from_ptr(entry.pw_name).to_string_lossy().into_owned(), entry.pw_gid))),
+                    e => Err(e),
+                }
+            }
+        })
+    }
+
+    /// A group's name and members (not those whose primary group it is).
+    fn group(gid: libc::gid_t) -> Option<(String, Vec<String>)> {
+        with_buffer(|buf| {
+            // SAFETY: all zeroes is a valid `group` (null pointers).
+            let mut entry: libc::group = unsafe { std::mem::zeroed() };
+            let mut found = std::ptr::null_mut();
+            // SAFETY: as in `user`; `gr_mem` is a null-terminated array.
+            unsafe {
+                match libc::getgrgid_r(gid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found) {
+                    0 if found.is_null() => Ok(None),
+                    0 => {
+                        let mut members = Vec::new();
+                        let mut member = entry.gr_mem;
+                        while !member.is_null() && !(*member).is_null() {
+                            members.push(CStr::from_ptr(*member).to_string_lossy().into_owned());
+                            member = member.add(1);
+                        }
+                        Ok(Some((CStr::from_ptr(entry.gr_name).to_string_lossy().into_owned(), members)))
+                    }
+                    e => Err(e),
+                }
+            }
+        })
+    }
+}
+
+/// Windows drives under WSL (`/mnt/c`): 9p mounts of `drvfs` (WSL 2), or
+/// drvfs ones (WSL 1). Their files keep no Unix permissions: all show as
+/// writable by all, and Windows' own decide who may change them. Told by
+/// the file system, not by those permissions, which a `chmod -R 777` tree
+/// shares.
+#[cfg(unix)]
+mod wsl {
+    use std::path::{Path, PathBuf};
+
+    /// Whether `path` is on a Windows drive.
+    pub fn windows_drive(path: &Path) -> bool {
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
+        let (Ok(real), Ok(mounts)) = (std::fs::canonicalize(path), std::fs::read_to_string("/proc/self/mountinfo")) else { return false };
+        mount_of(&mounts, &real).is_some_and(|(fs, options)| fs == "drvfs" || (fs == "9p" && options.split([',', ';']).any(|o| o == "aname=drvfs")))
+    }
+
+    /// The file system type and options of the mount holding `path` (the
+    /// last of those mounted on the longest prefix), from `mountinfo`.
+    pub fn mount_of<'a>(mountinfo: &'a str, path: &Path) -> Option<(&'a str, &'a str)> {
+        let mut found: Option<(usize, &str, &str)> = None;
+        for line in mountinfo.lines() {
+            // "36 35 98:0 / /mnt/c rw,noatime - 9p C:\134 rw,aname=drvfs;..."
+            let Some((mount, fs)) = line.split_once(" - ") else { continue };
+            let Some(point) = mount.split(' ').nth(4).map(unescape) else { continue };
+            let mut fs = fs.split(' ');
+            let (Some(kind), Some(_source)) = (fs.next(), fs.next()) else { continue };
+            let depth = point.components().count();
+            if path.starts_with(&point) && found.is_none_or(|(d, ..)| depth >= d) {
+                found = Some((depth, kind, fs.next().unwrap_or("")));
+            }
+        }
+        found.map(|(_, kind, options)| (kind, options))
+    }
+
+    /// A path with `mountinfo`'s octal escapes (`\040` for a space).
+    fn unescape(s: &str) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let octal = b.get(i + 1..i + 4).filter(|d| b[i] == b'\\' && d.iter().all(|c| (b'0'..=b'7').contains(c)));
+            match octal {
+                Some(d) => {
+                    out.push(d.iter().fold(0u8, |n, c| n.wrapping_mul(8) + (c - b'0')));
+                    i += 4;
+                }
+                None => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            }
+        }
+        PathBuf::from(std::ffi::OsString::from_vec(out))
+    }
 }
 
 /// A directory in which someone other than the user and the administrators
@@ -583,6 +718,9 @@ pub struct Expanded {
     /// Options of lines shared with Bazel skipped as Bazel's, with where:
     /// `--announce_rc` prints them (a misspelt option of ninja-rs's is one).
     pub skipped: Vec<String>,
+    /// `--action_env` options of Bazel's files, with where: they apply to
+    /// every remote action, which `--announce_rc` says.
+    pub bazel_action_env: Vec<String>,
     /// `--announce_rc` was given (last value).
     pub announce: bool,
 }
@@ -685,6 +823,7 @@ pub fn expand(rc: &RcFiles, levels: &[&[&str]], cmdline: &[String], end: usize, 
         out.announcements.extend(platform.announcements);
         out.notes.extend(platform.notes);
         out.skipped.extend(platform.skipped);
+        out.bazel_action_env.extend(platform.bazel_action_env);
         out.args.splice(files_end..files_end, platform.args);
         out.explicit.splice(files_end..files_end, platform.explicit);
     }
@@ -692,6 +831,9 @@ pub fn expand(rc: &RcFiles, levels: &[&[&str]], cmdline: &[String], end: usize, 
     out.announce = last_bool(&out.args[..options_end], "announce_rc") == Some(true);
     for s in &out.skipped {
         out.announcements.push(format!("skipped, not an option of ninja-rs (Bazel's?): {s}"));
+    }
+    for a in &out.bazel_action_env {
+        out.announcements.push(format!("from Bazel's files, set in every remote action (and its key): {a}"));
     }
     Ok(out)
 }
@@ -750,6 +892,9 @@ fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<St
         }
         match options::check_rc_option(group) {
             Ok(()) => {
+                if line.bazel {
+                    bazel_action_env(line, group, out);
+                }
                 for a in group {
                     out.push(a, false);
                 }
@@ -770,6 +915,32 @@ fn expand_line(rc: &RcFiles, levels: &[&[&str]], line: &Line, stack: &mut Vec<St
         }
     }
     Ok(())
+}
+
+/// Notes an `--action_env` option of a Bazel file (`group`, on `line`),
+/// which ninja-rs applies too: listed for `--announce_rc` (by name: values
+/// may be secrets), and the host's `PATH`, which puts this machine's in
+/// every action's key, said once.
+fn bazel_action_env(line: &Line, group: &[String], out: &mut Expanded) {
+    let value = match group {
+        [a] => a.strip_prefix("--action_env="),
+        [a, v] if a == "--action_env" => Some(v.as_str()),
+        _ => None,
+    };
+    let Some(value) = value else { return };
+    let name = value.split_once('=').map_or(value, |(n, _)| n);
+    let entry = format!("{}: --action_env {name}", line.origin);
+    if !out.bazel_action_env.contains(&entry) {
+        out.bazel_action_env.push(entry);
+    }
+    let path = if cfg!(windows) { name.eq_ignore_ascii_case("PATH") } else { name == "PATH" };
+    const PATH_NOTE: &str = "puts this machine's PATH in every remote action";
+    if path && !value.contains('=') && !out.notes.iter().any(|n| n.contains(PATH_NOTE)) {
+        out.notes.push(format!(
+            "{}: '--action_env={name}' (a line Bazel reads too) {PATH_NOTE}: their keys then change with it, from one machine or shell to another",
+            line.origin
+        ));
+    }
 }
 
 /// How many words the option at `args[i]` takes: with no targets in
@@ -1111,6 +1282,56 @@ import %workspace%/tools/bazel.rc
         assert!(e.announcements.iter().any(|a| a.contains(".ninjars:1: '--remote_jbos=4'")), "{:?}", e.announcements);
     }
 
+    /// `--action_env` lines of Bazel's files still apply, but
+    /// `--announce_rc` lists them, and the host's PATH is said once.
+    #[test]
+    fn bazel_action_env_is_announced() {
+        let dir = tree(
+            "bazel_action_env",
+            &[
+                (
+                    ".ninjars",
+                    "import .bazelrc
+build --action_env=PATH
+",
+                ),
+                (
+                    ".bazelrc",
+                    "build --action_env=PATH --action_env=CC=clang
+build --action_env PATH
+",
+                ),
+            ],
+        );
+        let e = expand_in(&dir, "", &["--announce_rc"]).unwrap();
+        assert_eq!(e.args, strings(&["--action_env=PATH", "--action_env=CC=clang", "--action_env", "PATH", "--action_env=PATH", "--announce_rc"]));
+        let listed: Vec<&String> = e.announcements.iter().filter(|a| a.starts_with("from Bazel's files")).collect();
+        assert_eq!(listed.len(), 3, "{:?}", e.announcements);
+        assert!(listed[0].ends_with(".bazelrc:1: --action_env PATH") && listed[1].ends_with(".bazelrc:1: --action_env CC"), "{listed:?}");
+        assert_eq!(e.notes.len(), 1, "{:?}", e.notes);
+        assert!(e.notes[0].contains(".bazelrc:1: '--action_env=PATH'"), "{:?}", e.notes);
+        // A value of its own isn't the host's; ninja-rs's own lines are its.
+        let dir = tree(
+            "bazel_action_env_value",
+            &[
+                (
+                    ".ninjars",
+                    "import .bazelrc
+build --action_env=PATH
+",
+                ),
+                (
+                    ".bazelrc",
+                    "build --action_env=PATH=/usr/bin
+",
+                ),
+            ],
+        );
+        let e = expand_in(&dir, "", &[]).unwrap();
+        assert!(e.notes.is_empty(), "{:?}", e.notes);
+        assert_eq!(e.bazel_action_env.len(), 1);
+    }
+
     /// The search stops at the home directory however its path is spelt:
     /// its file is the user's (`--nohome_rc` leaves it out).
     #[test]
@@ -1146,26 +1367,77 @@ import %workspace%/tools/bazel.rc
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// On Unix, a file the user owns that others can write to isn't read;
-    /// unless every file of its directory looks so (writable by all, no
-    /// sticky bit: WSL's view of Windows drives).
+    /// On Unix, a file the user owns that others can write to isn't read:
+    /// writable by all, or by a group that isn't the user's own. One in a
+    /// directory writable by all (a `chmod -R 777` tree) isn't either.
     #[cfg(unix)]
     #[test]
     fn writable_files_are_skipped() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let dir = tree("writable", &[(".ninjars", ""), ("build/x", "")]);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut warnings = Vec::new();
         assert_eq!(workspace_file(&dir.join("build"), &mut warnings), Some(dir.join(FILE_NAME)));
-        for mode in [0o664, 0o646] {
+        for mode in [0o646, 0o666] {
             std::fs::set_permissions(dir.join(FILE_NAME), std::fs::Permissions::from_mode(mode)).unwrap();
             warnings.clear();
             assert_eq!(workspace_file(&dir.join("build"), &mut warnings), None, "{mode:o}");
             assert!(warnings[0].contains("skipped: other users can change it"), "{warnings:?}");
         }
+        // Writable by its group: read when it is the user's private group
+        // (its files get 664 under the umask 002 that goes with it).
+        std::fs::set_permissions(dir.join(FILE_NAME), std::fs::Permissions::from_mode(0o664)).unwrap();
+        // SAFETY: getuid has no preconditions.
+        let private = account::private_group(unsafe { libc::getuid() }, std::fs::metadata(dir.join(FILE_NAME)).unwrap().gid());
+        warnings.clear();
+        let read = workspace_file(&dir.join("build"), &mut warnings);
+        assert_eq!(read.is_some(), private, "group-writable, in a private group: {private}; {warnings:?}");
+        // In a directory writable by all.
         std::fs::set_permissions(dir.join(FILE_NAME), std::fs::Permissions::from_mode(0o777)).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert_eq!(workspace_file(&dir.join("build"), &mut warnings), Some(dir.join(FILE_NAME)));
+        warnings.clear();
+        assert_eq!(workspace_file(&dir.join("build"), &mut warnings), None);
+        assert!(warnings[0].contains("skipped: other users can write to"), "{warnings:?}");
+    }
+
+    /// A user private group: the user's primary group, named after them,
+    /// without other members.
+    #[cfg(unix)]
+    #[test]
+    fn private_groups() {
+        let ann = |gid, group: &str, members: &[&str]| {
+            let members: Vec<String> = members.iter().map(|m| m.to_string()).collect();
+            account::is_private("ann", 1000, gid, group, &members)
+        };
+        assert!(ann(1000, "ann", &[]));
+        assert!(ann(1000, "ann", &["ann"]));
+        assert!(!ann(1000, "ann", &["ann", "bob"]), "another member");
+        assert!(!ann(1000, "users", &[]), "a shared primary group");
+        assert!(!ann(1001, "ann", &[]), "not the primary group");
+    }
+
+    /// WSL's Windows drives are told by their file system: their files all
+    /// show as writable by all.
+    #[cfg(unix)]
+    #[test]
+    fn windows_drives_under_wsl() {
+        let mountinfo = r"81 66 8:48 / / rw,relatime - ext4 /dev/sdd rw,discard
+78 81 0:35 / /usr/lib/wsl/drivers ro,nosuid - 9p drivers ro,aname=drivers;fmask=222;dmask=222
+132 81 0:70 / /mnt/c rw,noatime - 9p C:\134 rw,aname=drvfs;path=C:\;uid=1000;gid=1000
+133 132 0:71 / /mnt/c/over rw - tmpfs none rw
+134 81 0:72 / /mnt/d\040e rw - drvfs D:\134 rw,noatime
+";
+        let fs = |p: &str| wsl::mount_of(mountinfo, Path::new(p)).map(|(kind, options)| (kind, options.contains("aname=drvfs")));
+        assert_eq!(fs("/mnt/c/src/.ninjars"), Some(("9p", true)));
+        assert_eq!(fs("/mnt/cc"), Some(("ext4", false)));
+        assert_eq!(fs("/mnt/c/over/x"), Some(("tmpfs", false)));
+        assert_eq!(fs("/usr/lib/wsl/drivers/x"), Some(("9p", false)));
+        assert_eq!(fs("/mnt/d e/x"), Some(("drvfs", false)));
+        // A real one, here.
+        if Path::new("/mnt/c/Windows").is_dir() {
+            assert!(wsl::windows_drive(Path::new("/mnt/c")) && !writable_by_others(Path::new("/mnt/c")));
+        }
+        assert!(!wsl::windows_drive(&tree("not_wsl", &[])));
     }
 
     #[test]

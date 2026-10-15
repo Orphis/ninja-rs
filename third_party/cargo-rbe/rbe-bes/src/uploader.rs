@@ -3,30 +3,35 @@
 //!
 //! - **Lifecycle events** (optional, like `--bes_lifecycle_events`):
 //!   `BuildEnqueued` and `InvocationAttemptStarted` before the stream, as
-//!   Bazel sends them (within `START_TIMEOUT`: a slow lifecycle service
-//!   doesn't hold the events back long), `InvocationAttemptFinished` and
-//!   `BuildFinished` once it went through, through `PublishLifecycleEvent`.
-//!   They don't fail the upload: what failed is in
-//!   `UploadSummary::lifecycle_error`.
+//!   Bazel sends them, `InvocationAttemptFinished` and `BuildFinished` once
+//!   it went through (and those before it did: the service knows of the
+//!   build), through `PublishLifecycleEvent`. Each pair within
+//!   `LIFECYCLE_TIMEOUT`, those before the stream made again once at most,
+//!   those after it not: a slow or failing lifecycle service holds neither
+//!   the events nor the end of the build back long. They don't fail the
+//!   upload: what failed is in `UploadSummary::lifecycle_error`.
 //! - **Build tool stream:** one `PublishBuildToolEventStream` call carrying
 //!   each event as an `OrderedBuildEvent` with consecutive sequence numbers,
 //!   ending with `ComponentStreamFinished`. The server acks sequence numbers;
 //!   events stay buffered until acked and are resent, in order, after a
-//!   reconnect.
+//!   reconnect. A stream closed once every event was acked (a proxy closing
+//!   idle streams) isn't a failure: the next event opens another.
 //!
 //! Events are queued without blocking and sent by a background task, which
 //! connects first, so a slow or unavailable backend never slows the build
 //! down. Every call has a deadline (`BesConfig::rpc_timeout`), and a
 //! backend that never answered anything isn't called again (but for a
-//! connection that broke, twice): the upload fails instead of waiting for
-//! it.
+//! connection that broke once made, once: see `rbe_client::fault`): the
+//! upload fails instead of waiting for it.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
+use rbe_client::fault::{FIRST_CONTACT_RETRIES, broken_connection, from_server, no_answer};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -97,14 +102,10 @@ pub struct UploadSummary {
     pub lifecycle_error: Option<String>,
 }
 
-/// How long the lifecycle events before the stream may take: the stream
-/// waits for them.
-const START_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Calls a backend that never answered anything gets again when the
-/// connection broke (reset, refused): one restarting, or a load balancer's
-/// hiccup.
-const FIRST_CONTACT_RETRIES: u32 = 2;
+/// How long the two lifecycle events before the stream may take together
+/// (the stream waits for them), and the two after it (the end of the build
+/// waits for them).
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum Cmd {
     Event(Box<bep::BuildEvent>, SystemTime),
@@ -114,6 +115,17 @@ enum Cmd {
 pub struct BesUploader {
     tx: mpsc::UnboundedSender<Cmd>,
     task: tokio::task::JoinHandle<Result<UploadSummary>>,
+    acked: Acked,
+}
+
+/// Whether every build event was acked (see [`BesUploader::acked`]).
+#[derive(Clone, Debug, Default)]
+pub struct Acked(Arc<AtomicBool>);
+
+impl Acked {
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 impl BesUploader {
@@ -131,14 +143,24 @@ impl BesUploader {
     {
         TRACE.store(config.trace, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            let mut rx = rx;
-            let headers = metadata(&config.headers)?;
-            let channel = connect.await?;
-            trace(format_args!("connected"));
-            Upload { client: PublishBuildEventClient::new(channel), config, headers, answered: AtomicBool::new(false) }.run(&mut rx).await
+        let acked = Acked::default();
+        let task = tokio::spawn({
+            let acked = acked.clone();
+            async move {
+                let mut rx = rx;
+                let headers = config.headers.iter().map(|(k, v)| rbe_client::header(k, v)).collect::<Result<Headers>>()?;
+                let channel = connect.await?;
+                trace(format_args!("connected"));
+                Upload { client: PublishBuildEventClient::new(channel), config, headers, answered: AtomicBool::new(false), acked }.run(&mut rx).await
+            }
         });
-        Self { tx, task }
+        Self { tx, task, acked }
+    }
+
+    /// Whether every build event was acked: of an upload whose end wasn't
+    /// waited for long enough, whether only lifecycle events were left.
+    pub fn acked(&self) -> Acked {
+        self.acked.clone()
     }
 
     /// Whether the upload ended (it failed): events sent go nowhere.
@@ -239,60 +261,17 @@ pub fn pack(event: &bep::BuildEvent) -> Event {
     Event::BazelEvent(prost_types::Any { type_url: BAZEL_EVENT_TYPE_URL.into(), value: event.encode_to_vec() })
 }
 
-/// Extra gRPC headers as metadata.
+/// Extra gRPC headers as metadata (`BesConfig::headers`: a name or value
+/// that isn't valid fails the upload, as an invalid `--remote_header`
+/// fails remote calls).
 type Headers = Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>;
 
-/// `BesConfig::headers` as metadata: a name or value that isn't valid
-/// fails the upload, as an invalid `--remote_header` fails remote calls.
-fn metadata(headers: &[(String, String)]) -> Result<Headers> {
-    headers
-        .iter()
-        .map(|(k, v)| {
-            let key = tonic::metadata::AsciiMetadataKey::from_bytes(k.to_ascii_lowercase().as_bytes()).with_context(|| format!("invalid header name `{k}`"))?;
-            let value = v.parse().with_context(|| format!("invalid value for header `{k}`"))?;
-            Ok((key, value))
-        })
-        .collect()
-}
-
-/// What a call left unanswered fails with (see `no_answer`): its status's
-/// source, which tells it apart from a broken connection's.
-#[derive(Debug)]
-struct NoAnswer;
-
-impl std::fmt::Display for NoAnswer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("no answer")
-    }
-}
-
-impl std::error::Error for NoAnswer {}
-
-/// Whether `s` stands for a connection that broke (reset, refused, closed:
-/// it carries the transport's error), not for an answer, a call left
-/// unanswered or a connection attempt that timed out.
-fn broken_connection(s: &tonic::Status) -> bool {
-    let mut cause = std::error::Error::source(s);
-    if cause.is_none() {
-        return false;
-    }
-    while let Some(e) = cause {
-        let text = e.to_string().to_ascii_lowercase();
-        if e.is::<NoAnswer>() || text.contains("timed out") || text.contains("timeout") || text.contains("certificate") {
-            return false;
-        }
-        cause = e.source();
-    }
-    true
-}
-
-/// Notes that the backend answered, when `status` is its own: one standing
-/// for a broken connection has the transport's error as its source, one
-/// for a call left unanswered `NoAnswer`. Until the backend answered
-/// something, failures aren't retried (but for a connection that broke): it
-/// is gone, or isn't a BES.
+/// Notes that the backend answered, when `status` is its own (see
+/// `rbe_client::fault::from_server`). Until the backend answered
+/// something, failures aren't retried (but for a connection that broke):
+/// it is gone, or isn't a BES.
 fn note_answer(answered: &AtomicBool, status: &tonic::Status) {
-    if std::error::Error::source(status).is_none() {
+    if from_server(status) {
         answered.store(true, Ordering::Relaxed);
     }
 }
@@ -317,30 +296,40 @@ struct Upload {
     headers: Headers,
     /// Whether the backend answered anything yet (see `note_answer`).
     answered: AtomicBool,
+    /// Set once every build event was acked.
+    acked: Acked,
 }
 
 impl Upload {
     async fn run(&self, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<UploadSummary> {
         let config = &self.config;
         let mut lifecycle_error = None;
+        // Whether the lifecycle events before the stream went through.
+        let mut started = false;
         if config.lifecycle_events {
-            // Before the stream, as Bazel sends them, but within
-            // START_TIMEOUT and without retries: the build's events don't
-            // wait long for a slow or failing lifecycle service.
+            // Before the stream, as Bazel sends them, but made again once
+            // at most (until the service answered, only for a connection
+            // that broke): the build's events don't wait long for a slow
+            // or failing lifecycle service.
             let requests = lifecycle_requests(config, None, SystemTime::now());
-            if let Err(e) = self.publish_lifecycle(requests, 0, config.rpc_timeout.min(START_TIMEOUT)).await {
-                trace(format_args!("{e:#}"));
-                lifecycle_error = Some(format!("{e:#}"));
+            match self.publish_lifecycle(requests, FIRST_CONTACT_RETRIES).await {
+                Ok(()) => started = true,
+                Err(e) => {
+                    trace(format_args!("{e:#}"));
+                    lifecycle_error = Some(format!("{e:#}"));
+                }
             }
         }
         let (mut summary, outcome) = self.stream_events(rx).await?;
-        if config.lifecycle_events {
-            // Whenever the stream went through: a lifecycle UI closes the
-            // invocation, whatever became of the events before it.
+        self.acked.0.store(true, Ordering::Relaxed);
+        // Only for an invocation the lifecycle service knows of (one that
+        // failed or didn't answer those events would hold the end of every
+        // build back for nothing), and without retries.
+        if started {
             let requests = lifecycle_requests(config, Some(outcome), SystemTime::now());
-            if let Err(e) = self.publish_lifecycle(requests, config.max_retries, config.rpc_timeout).await {
+            if let Err(e) = self.publish_lifecycle(requests, 0).await {
                 trace(format_args!("{e:#}"));
-                lifecycle_error.get_or_insert(format!("{e:#}"));
+                lifecycle_error = Some(format!("{e:#}"));
             }
         }
         summary.lifecycle_error = lifecycle_error;
@@ -348,8 +337,8 @@ impl Upload {
     }
 
     /// Makes a call until it succeeds, fails for good, or failed `retries`
-    /// times. Each call may take `deadline`.
-    async fn with_retries<T, F, Fut>(&self, what: &str, retries: u32, deadline: Duration, mut f: F) -> Result<T>
+    /// times, all by `deadline`.
+    async fn with_retries<T, F, Fut>(&self, what: &str, retries: u32, deadline: tokio::time::Instant, mut f: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T, tonic::Status>>,
@@ -357,7 +346,7 @@ impl Upload {
         let mut backoff = self.config.initial_backoff;
         let mut attempt = 0;
         loop {
-            let e = match tokio::time::timeout(deadline, f()).await {
+            let e = match tokio::time::timeout_at(deadline, f()).await {
                 Ok(Ok(v)) => {
                     self.answered.store(true, Ordering::Relaxed);
                     return Ok(v);
@@ -366,33 +355,41 @@ impl Upload {
                     note_answer(&self.answered, &e);
                     e
                 }
-                Err(_) => no_answer(deadline),
+                Err(_) => no_answer(format!("no answer within {:?}", self.lifecycle_timeout())),
             };
             if attempt >= self.budget(&e, retries) || !retryable(&e) {
                 bail!("{what}: {e}");
             }
             attempt += 1;
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + backoff)).await;
             backoff *= 2;
         }
     }
 
     /// How many times a call failing with `e` is made again, of `retries`:
-    /// none until the backend answered something, but twice for a
-    /// connection that broke (a call left unanswered would cost a deadline
-    /// each time).
+    /// until the backend answered something, none, but once for a
+    /// connection that broke once made (a call left unanswered would cost a
+    /// deadline each time, one refused as much again).
     fn budget(&self, e: &tonic::Status, retries: u32) -> u32 {
         if self.answered.load(Ordering::Relaxed) {
             retries
         } else if broken_connection(e) {
-            FIRST_CONTACT_RETRIES.min(self.config.max_retries)
+            FIRST_CONTACT_RETRIES.min(retries)
         } else {
             0
         }
     }
 
-    /// Sends lifecycle events, in order, until one fails.
-    async fn publish_lifecycle(&self, requests: Vec<bes::PublishLifecycleEventRequest>, retries: u32, deadline: Duration) -> Result<()> {
+    /// How long the lifecycle events before the stream, or after it, may
+    /// take: `LIFECYCLE_TIMEOUT`, or `rpc_timeout` if shorter.
+    fn lifecycle_timeout(&self) -> Duration {
+        self.config.rpc_timeout.min(LIFECYCLE_TIMEOUT)
+    }
+
+    /// Sends lifecycle events, in order, until one fails, all within
+    /// `lifecycle_timeout`, each made again up to `retries` times.
+    async fn publish_lifecycle(&self, requests: Vec<bes::PublishLifecycleEventRequest>, retries: u32) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + self.lifecycle_timeout();
         for r in requests {
             let what = r.build_event.as_ref().and_then(|e| e.event.as_ref()).and_then(|e| e.event.as_ref()).map(|e| match e {
                 Event::BuildEnqueued(_) => "BuildEnqueued",
@@ -511,9 +508,25 @@ impl Upload {
                             _ => break tonic::Status::unavailable("stream closed before every event was acked"),
                         },
                     },
-                    () = tokio::time::sleep_until(waiting + config.rpc_timeout), if !pending.is_empty() => break no_answer(config.rpc_timeout),
+                    () = tokio::time::sleep_until(waiting + config.rpc_timeout), if !pending.is_empty() => {
+                        break no_answer(format!("no answer within {:?}", config.rpc_timeout));
+                    }
                 }
             };
+            // The last event acked too: done.
+            if let (Some(o), true) = (outcome, pending.is_empty()) {
+                return Ok((summary, o));
+            }
+            // Closed with every event acked (a proxy closing idle streams):
+            // no failure, and the next event opens another stream. Opening
+            // one before would have the proxy close it too, again and again
+            // through a long build step saying nothing.
+            if pending.is_empty() {
+                trace(format_args!("stream closed while idle: {err}"));
+                let next = rx.recv().await.unwrap_or_else(abandoned);
+                accept(next, config, &mut pending, &mut next_seq, &mut outcome, &mut summary);
+                continue;
+            }
             failures += 1;
             trace(format_args!("stream failed ({} pending): {err}", pending.len()));
             if failures > self.budget(&err, config.max_retries) || !retryable(&err) {
@@ -525,13 +538,6 @@ impl Upload {
             backoff *= 2;
         }
     }
-}
-
-/// A call the backend didn't answer within `deadline`.
-fn no_answer(deadline: Duration) -> tonic::Status {
-    let mut s = tonic::Status::deadline_exceeded(format!("no answer within {deadline:?}"));
-    s.set_source(std::sync::Arc::new(NoAnswer));
-    s
 }
 
 /// Whether `trace` prints: `BesConfig::trace` of the last uploader started.

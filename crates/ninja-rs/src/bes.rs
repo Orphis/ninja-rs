@@ -38,7 +38,7 @@ use bep::build_event::Payload;
 use ninja_core::build::{Plan, Want};
 use ninja_core::graph::{EdgeId, NodeId, State};
 use ninja_core::runner::ExecKind;
-use ninja_core::status::{EdgeInfo, Status, StatusPrinter};
+use ninja_core::status::{EdgeInfo, Status, StatusPrinter, print_err};
 use ninja_remote::Store;
 use ninja_remote::remote_outputs::RemoteOutputs;
 use ninja_remote::targets::{Configuration, Targets};
@@ -515,7 +515,7 @@ impl Bes {
             if let Some(stream) = relay.as_mut() {
                 for e in &events {
                     if let Err(err) = crate::nested::write_frame(stream, &e.encode_to_vec()) {
-                        eprintln!("ninja: warning: sending build events to the invocation running this one failed: {err}");
+                        print_err(&format!("ninja: warning: sending build events to the invocation running this one failed: {err}\n"));
                         *relay = None;
                         break;
                     }
@@ -529,7 +529,7 @@ impl Bes {
             if let Some(f) = file.as_mut()
                 && let Err(err) = f.write_all(&e.encode_length_delimited_to_vec())
             {
-                eprintln!("ninja: warning: writing build events failed: {err}");
+                print_err(&format!("ninja: warning: writing build events failed: {err}\n"));
                 *file = None;
             }
             if let Some(u) = uploader.as_ref() {
@@ -977,9 +977,9 @@ impl Bes {
 
     /// Ends the stream (targets that never completed are aborted, then the
     /// build's end and metrics), and waits for the upload, up to
-    /// `--bes_timeout`.
-    pub async fn finish(&self, exit_code: i32) {
-        let interrupted = exit_code == crate::EXIT_INTERRUPTED;
+    /// `--bes_timeout`. `interrupted`: the user stopped the invocation,
+    /// whatever its exit code (a command may exit with 130 by itself).
+    pub async fn finish(&self, exit_code: i32, interrupted: bool) {
         if interrupted {
             self.interrupted();
         }
@@ -1043,8 +1043,8 @@ impl Bes {
                 }],
             };
             let (name, code) = match exit_code {
+                _ if interrupted => ("INTERRUPTED", 8),
                 0 => ("SUCCESS", 0),
-                c if c == crate::EXIT_INTERRUPTED => ("INTERRUPTED", 8),
                 _ => ("BUILD_FAILURE", 1),
             };
             out.extend(i.stream.post(
@@ -1084,33 +1084,54 @@ impl Bes {
             let outcome = BuildOutcome { success: exit_code == 0, exit_code };
             // Zero waits as long as it takes, as Bazel's --bes_timeout=0.
             let timeout = Some(self.flags.timeout).filter(|t| !t.is_zero()).unwrap_or(Duration::MAX);
+            let acked = u.acked();
             match tokio::time::timeout(timeout, u.finish(outcome)).await {
                 Ok(Ok(summary)) => {
                     if let Some(e) = summary.lifecycle_error {
                         let off =
                             if e.contains("UNIMPLEMENTED") || e.contains("Unimplemented") { " (--nobes_lifecycle_events stops sending them)" } else { "" };
-                        eprintln!("ninja: warning: build events were uploaded, not all their lifecycle events: {e}{off}");
+                        print_err(&format!("ninja: warning: build events were uploaded, not all their lifecycle events: {e}{off}\n"));
                     }
                 }
                 Ok(Err(e)) => {
                     let e = format!("{e:#}");
                     let first_contact = e.contains("never answered") || e.contains("connecting to");
                     let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls, first_contact)).unwrap_or_default();
-                    eprintln!("ninja: warning: build event upload failed: {e}{hint}");
+                    print_err(&format!("ninja: warning: build event upload failed: {e}{hint}\n"));
                 }
-                Err(_) => eprintln!("ninja: warning: build event upload didn't finish within {timeout:?}"),
+                Err(_) if acked.get() => {
+                    print_err(&format!("ninja: warning: build events were uploaded, their lifecycle events didn't finish within {timeout:?}\n"))
+                }
+                Err(_) => print_err(&format!("ninja: warning: build event upload didn't finish within {timeout:?}\n")),
             }
             if let Some(url) = &self.flags.results_url {
-                eprintln!("ninja: streaming build results to: {url}{}", self.ids.invocation_id);
+                print_err(&format!("ninja: streaming build results to: {url}{}\n", self.ids.invocation_id));
             }
         }
     }
 }
 
-/// A `file://` URI for an absolute path: `file:///C:/x` on Windows.
+/// A `file://` URI for an absolute path: `file:///C:/x` on Windows, and
+/// `file://server/share/x` for a UNC path (`\\server\share\x`).
 fn file_uri(abs: &str) -> String {
+    file_uri_for(abs, cfg!(windows))
+}
+
+/// `file_uri`, for Windows paths (`windows`) or Unix ones.
+fn file_uri_for(abs: &str, windows: bool) -> String {
+    if !windows {
+        return format!("file://{abs}");
+    }
     let path = abs.replace('\\', "/");
-    if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") }
+    // Verbatim and device paths: `\\?\C:\x`, `\\?\UNC\server\share\x`.
+    let path = match path.strip_prefix("//?/").or_else(|| path.strip_prefix("//./")) {
+        Some(rest) => rest.strip_prefix("UNC/").map_or_else(|| rest.to_string(), |unc| format!("//{unc}")),
+        None => path,
+    };
+    match path.strip_prefix("//") {
+        Some(unc) => format!("file://{unc}"),
+        None => format!("file:///{}", path.trim_start_matches('/')),
+    }
 }
 
 /// Targets whose artifacts are hashed at once.
@@ -1280,16 +1301,17 @@ mod tests {
         let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         match crate::options::parse_args(&v).unwrap() {
             crate::options::ParseOutcome::Run(o) => *o,
-            crate::options::ParseOutcome::Exit(m, _) => panic!("exit: {m}"),
+            crate::options::ParseOutcome::Exit(m, ..) => panic!("exit: {m}"),
         }
     }
 
-    fn test_dir(name: &str) -> std::path::PathBuf {
-        let dir = test_dirs::base().join(format!("ninja_rs_bes_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir(name: &str) -> test_dirs::TestDir {
+        test_dirs::TestDir::new(&format!("ninja-rs-bes-{name}"))
     }
+
+    /// How long tests wait for what a healthy run does at once: only a
+    /// broken one gets there (the machine may be busy).
+    const PATIENCE: Duration = Duration::from_secs(60);
 
     /// A build of one target, up to date, whose artifact is `artifact`:
     /// the graph and the requested node.
@@ -1313,9 +1335,8 @@ mod tests {
         let bes = Bes::start(&opts, &InvocationIds::default(), None, store.clone(), None).await;
         let (state, node) = artifact_graph(&artifact);
         bes.plan(&state, &Plan::default(), &[node], Default::default(), &[], None);
-        bes.finish(0).await;
+        bes.finish(0, false).await;
         assert!(store.digests.entries().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1336,11 +1357,11 @@ mod tests {
             b.plan(&state, &Plan::default(), &[node], Default::default(), &[], None);
             b.message("ninja: no work to do.\n");
         });
-        let planned = tokio::time::timeout(Duration::from_secs(5), planned).await;
+        let planned = tokio::time::timeout(PATIENCE, planned).await;
         let writer = std::thread::spawn(move || std::fs::write(&artifact, "hello"));
         planned.expect("the build waited for the artifact's digest").unwrap();
         writer.join().unwrap().unwrap();
-        bes.finish(0).await;
+        bes.finish(0, false).await;
         let digests: Vec<String> = read_binary_file(&file)
             .unwrap()
             .into_iter()
@@ -1351,7 +1372,6 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(digests, [rbe_client::digest_of(b"hello").hash]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1364,13 +1384,13 @@ mod tests {
             let held: Vec<_> = listener.incoming().collect();
             drop(held);
         });
-        let opts = options(&[&format!("--bes_backend=grpcs://127.0.0.1:{port}"), "--bes_timeout=1s"]);
-        let started = tokio::time::timeout(Duration::from_secs(5), Bes::start(&opts, &InvocationIds::default(), None, Store::new(), None)).await;
+        // Only --bes_timeout bounds the wait for the upload: calls could
+        // take an hour.
+        let opts = options(&[&format!("--bes_backend=grpcs://127.0.0.1:{port}"), "--bes_timeout=1s", "--bes_rpc_timeout=1h"]);
+        let started = tokio::time::timeout(PATIENCE, Bes::start(&opts, &InvocationIds::default(), None, Store::new(), None)).await;
         let bes = started.expect("the build waited for the backend");
         // The end waits for the upload as long as --bes_timeout says.
-        let start = Instant::now();
-        bes.finish(0).await;
-        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        tokio::time::timeout(PATIENCE, bes.finish(0, false)).await.expect("the end waited for the upload beyond --bes_timeout");
     }
 
     /// A build of up-to-date targets, each with one artifact edge: the
@@ -1425,13 +1445,12 @@ mod tests {
         let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
         let (state, nodes) = targets_graph(&[("app", &artifact)]);
         bes.plan(&state, &Plan::default(), &nodes, Default::default(), &[], None);
-        let finished = tokio::time::timeout(Duration::from_secs(5), bes.finish(crate::EXIT_INTERRUPTED)).await;
+        let finished = tokio::time::timeout(PATIENCE, bes.finish(crate::EXIT_INTERRUPTED, true)).await;
         // Unblocks the hashing, if it started.
         writer.write_all(b"hello").unwrap();
         drop(writer);
         finished.expect("the end waited for the artifact's digest");
         assert_eq!(completed(&file), [("//:app".to_string(), false)]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1454,14 +1473,13 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        let hashed = tokio::time::timeout(Duration::from_secs(5), hashed).await;
+        let hashed = tokio::time::timeout(PATIENCE, hashed).await;
         writer.write_all(b"slow").unwrap();
         drop(writer);
         hashed.expect("the targets were hashed one at a time");
-        bes.finish(0).await;
+        bes.finish(0, false).await;
         // Reported in order all the same.
         assert_eq!(completed(&file), [("//:a_slow".to_string(), true), ("//:b_quick".to_string(), true)]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1470,7 +1488,7 @@ mod tests {
         let file = dir.join("events.bep");
         let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
         bes.announce(&[]);
-        bes.finish(0).await;
+        bes.finish(0, false).await;
         // A message, a nested invocation's event relayed late.
         bes.message("ninja: late\n");
         let source = RelaySource::new(&dir, &dir.join("nested").to_string_lossy(), 1);
@@ -1481,7 +1499,6 @@ mod tests {
         };
         bes.relayed(&source, late);
         rbe_bes::events::validate(&read_binary_file(&file).unwrap()).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1515,13 +1532,48 @@ mod tests {
         assert!(!done(), "the target completed with b still to run");
         run(1, &b);
         assert!(done());
-        bes.finish(0).await;
-        let _ = std::fs::remove_dir_all(&dir);
+        bes.finish(0, false).await;
+    }
+
+    /// The build's end, and its targets' aborts, say whether the user
+    /// interrupted it, not its exit code: a failed command may exit with
+    /// 130 by itself (and the build with it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interruptions_are_told_apart_from_exit_codes() {
+        let dir = test_dir("interrupted_or_not");
+        let (state, nodes) = targets_graph(&[("app", &dir.join("app.bin"))]);
+        for (code, interrupted, name, reason) in [
+            (130, false, "BUILD_FAILURE", bep::aborted::AbortReason::Skipped),
+            (1, true, "INTERRUPTED", bep::aborted::AbortReason::UserInterrupted),
+            (crate::EXIT_INTERRUPTED, true, "INTERRUPTED", bep::aborted::AbortReason::UserInterrupted),
+        ] {
+            let file = dir.join(format!("{code}-{interrupted}.bep"));
+            let bes =
+                Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+            let mut plan = Plan::default();
+            plan.want.insert(EdgeId(0), Want::ToStart);
+            bes.plan(&state, &plan, &nodes, Default::default(), &[], None);
+            bes.finish(code, interrupted).await;
+            let events = read_binary_file(&file).unwrap();
+            let finished = events.iter().find_map(|e| match &e.payload {
+                Some(Payload::Finished(f)) => f.exit_code.as_ref().map(|c| c.name.clone()),
+                _ => None,
+            });
+            let aborted = events.iter().find_map(|e| match &e.payload {
+                Some(Payload::Aborted(a)) => Some(a.reason),
+                _ => None,
+            });
+            assert_eq!((finished.as_deref(), aborted), (Some(name), Some(reason as i32)), "exit code {code}, interrupted: {interrupted}");
+        }
     }
 
     #[test]
     fn file_uris() {
-        assert_eq!(file_uri("/home/u/out/app"), "file:///home/u/out/app");
-        assert_eq!(file_uri(r"C:\b\out\app.exe"), "file:///C:/b/out/app.exe");
+        assert_eq!(file_uri_for("/home/u/out/app", false), "file:///home/u/out/app");
+        assert_eq!(file_uri_for(r"C:\b\out\app.exe", true), "file:///C:/b/out/app.exe");
+        // UNC paths name their server as the host, verbatim or not.
+        assert_eq!(file_uri_for(r"\\server\share\out\app.exe", true), "file://server/share/out/app.exe");
+        assert_eq!(file_uri_for(r"\\?\UNC\server\share\app.exe", true), "file://server/share/app.exe");
+        assert_eq!(file_uri_for(r"\\?\C:\b\app.exe", true), "file:///C:/b/app.exe");
     }
 }

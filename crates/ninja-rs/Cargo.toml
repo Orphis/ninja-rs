@@ -43,6 +43,10 @@ windows-sys = { workspace = true, features = [
 fake-reapi = { path = "../fake-reapi" }
 test-dirs = { path = "../test-dirs" }
 
+# The peak memory of builds (remote_e2e).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus"] }
+
 [[test]]
 name = "remote_e2e"
 harness = false

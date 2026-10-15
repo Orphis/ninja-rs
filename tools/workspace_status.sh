@@ -1,6 +1,10 @@
 #!/bin/sh
 # Bazel's workspace status (--workspace_status_command, see .bazelrc): the
-# commit, which stamped builds (--stamp) put in the ninja-rs version.
-# Nothing outside a git checkout.
-commit=$(git rev-parse --short=12 HEAD 2>/dev/null) && echo "STABLE_GIT_COMMIT $commit"
-exit 0
+# commit, which stamped builds (--stamp) put in the ninja-rs version, with
+# .dirty after it when tracked files differ from it (or git can't tell).
+# Nothing outside a git checkout of its own (sources copied into another
+# repository).
+[ -z "$(git rev-parse --show-cdup 2>/dev/null || echo no)" ] || exit 0
+commit=$(git rev-parse --short=12 HEAD 2>/dev/null) || exit 0
+changes=$(git --no-optional-locks status --porcelain --untracked-files=no 2>/dev/null) || changes=unknown
+echo "STABLE_GIT_COMMIT $commit${changes:+.dirty}"

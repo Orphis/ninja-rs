@@ -64,10 +64,11 @@ rust_test(
 
 # End-to-end remote execution and build event tests against the in-process
 # fake REAPI and BES server: a few minutes, split in shards (the harness
-# honours TEST_SHARD_INDEX, and --test_filter).
+# honours TEST_SHARD_INDEX, and --test_filter) of under a minute each, a
+# few on a busy machine.
 rust_test(
     name = "remote_e2e",
-    size = "large",
+    size = "medium",
     srcs = [
         "tests/harness/mod.rs",
         "tests/remote_e2e.rs",
@@ -112,6 +113,7 @@ rust_test(
     use_libtest_harness = False,
     deps = [
         ":ninja_rs_lib",
+        "//crates/ninja-core",
         "//crates/test-dirs",
     ] + select({
         "@platforms//os:windows": ["@crates//:windows-sys"],

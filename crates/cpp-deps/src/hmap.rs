@@ -1,6 +1,6 @@
 //! Clang header maps (`.hmap` files given as `-I` or `-iquote`
-//! directories, as Xcode builds use): include names mapped to paths,
-//! looked up case-insensitively.
+//! directories, as Xcode builds use): include names mapped to paths (or,
+//! relative, to other names), looked up case-insensitively.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,8 +10,10 @@ use crate::scan::normalize;
 #[derive(Debug, Default)]
 pub struct HeaderMap {
     pub path: PathBuf,
-    /// Lowercased include name → path.
-    entries: HashMap<String, PathBuf>,
+    /// What relative destinations of names a destination maps are against.
+    pub cwd: PathBuf,
+    /// Lowercased include name → destination.
+    entries: HashMap<String, String>,
 }
 
 const MAGIC: u32 = u32::from_le_bytes(*b"pamh");
@@ -24,7 +26,7 @@ impl HeaderMap {
         std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && (magic == *b"pamh" || magic == *b"hmap")
     }
 
-    /// Reads a header map; relative results are against `cwd`.
+    /// Reads a header map; relative paths are against `cwd`.
     pub fn load(path: &Path, cwd: &Path) -> Result<HeaderMap, String> {
         let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         HeaderMap::parse(&data, path, cwd).map_err(|e| format!("{}: {e}", path.display()))
@@ -62,13 +64,15 @@ impl HeaderMap {
             let (Some(k), Some(prefix), Some(suffix)) = (string(key), u32_at(at + 4).and_then(string), u32_at(at + 8).and_then(string)) else {
                 return Err("bad string offset".into());
             };
-            entries.insert(k.to_lowercase(), normalize(&cwd.join(format!("{prefix}{suffix}"))));
+            entries.insert(k.to_lowercase(), format!("{prefix}{suffix}"));
         }
-        Ok(HeaderMap { path: path.to_path_buf(), entries })
+        Ok(HeaderMap { path: path.to_path_buf(), cwd: normalize(cwd), entries })
     }
 
-    pub fn lookup(&self, name: &str) -> Option<&PathBuf> {
-        self.entries.get(&name.to_lowercase())
+    /// Where the map sends `name`: a path when absolute, else another name
+    /// (see `scan`).
+    pub fn lookup(&self, name: &str) -> Option<&str> {
+        self.entries.get(&name.to_lowercase()).map(String::as_str)
     }
 }
 
@@ -113,8 +117,8 @@ mod tests {
     fn reads_header_maps() {
         let data = build(&[("Foo/Bar.h", "/src/foo/", "bar.h"), ("rel.h", "gen/", "rel.h")]);
         let m = HeaderMap::parse(&data, Path::new("/b/x.hmap"), Path::new("/b")).unwrap();
-        assert_eq!(m.lookup("foo/bar.h"), Some(&PathBuf::from("/src/foo/bar.h")));
-        assert_eq!(m.lookup("rel.h"), Some(&PathBuf::from("/b/gen/rel.h")));
+        assert_eq!(m.lookup("foo/bar.h"), Some("/src/foo/bar.h"));
+        assert_eq!(m.lookup("rel.h"), Some("gen/rel.h"));
         assert_eq!(m.lookup("other.h"), None);
         assert!(HeaderMap::parse(b"nope", Path::new("x"), Path::new("/")).is_err());
     }

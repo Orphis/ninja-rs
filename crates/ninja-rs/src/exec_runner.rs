@@ -77,11 +77,12 @@ impl LocalSlots {
     }
 
     /// A slot only if one is free now: tasks waiting for one keep it (the
-    /// semaphore hands released permits to its waiters first).
+    /// semaphore hands released permits to its waiters first, and the
+    /// jobserver client its tokens).
     fn try_acquire(&self) -> Option<LocalSlot<'_>> {
         let held = match &self.kind {
             SlotKind::Count(s) => Held::Count(s.try_acquire().ok()?),
-            SlotKind::Jobserver(c) => Held::Jobserver(c.try_acquire()?),
+            SlotKind::Jobserver(c) => Held::Jobserver(c.try_acquire_in_turn()?),
         };
         Some(self.slot(held))
     }
@@ -220,11 +221,12 @@ fn with_env(env: &[(String, String)], cmd: &LocalCommand) -> Vec<(String, String
 
 /// The local branch of a raced task. After `delay`, and once the remote
 /// branch prepared the action (a local run uses its command, so that both
-/// write the same bytes), it starts when a local slot is free, without
-/// queueing for one (local tasks keep priority); when the remote branch
-/// gave up, it queues like any local task, with the task's own command if
-/// the action couldn't be prepared. `None` when the remote branch won, or
-/// the inputs couldn't be fetched while the remote branch still runs.
+/// write the same bytes), its inputs are fetched, and it starts when a
+/// local slot is free, without queueing for one (local tasks keep
+/// priority); when the remote branch gave up, it queues like any local
+/// task, with the task's own command if the action couldn't be prepared.
+/// `None` when the remote branch won, or the inputs couldn't be fetched
+/// while the remote branch still runs.
 async fn race_local(
     task: &Task,
     slots: &LocalSlots,
@@ -240,6 +242,24 @@ async fn race_local(
         _ = rx.wait_for(|s| s.local_needed || s.winner.is_some()) => {}
     }
     let _ = rx.wait_for(|s| s.command.is_some() || s.local_needed || s.winner.is_some()).await;
+    if race.state().winner.is_some() {
+        return None;
+    }
+    // Before taking a slot, which a download would keep idle.
+    if let Err(e) = backend.materialize(task).await {
+        if !race.state().local_needed {
+            return None;
+        }
+        let output = format!("ninja-rs: fetching inputs: {}\n", e.message).into_bytes();
+        return Some(TaskResult {
+            edge: task.edge,
+            status: ExitStatus::Failure(1),
+            output,
+            kind: ExecKind::Local,
+            cas_outputs: Vec::new(),
+            lost_inputs: e.lost,
+        });
+    }
     let _slot = loop {
         let state = race.state();
         if state.winner.is_some() {
@@ -258,20 +278,6 @@ async fn race_local(
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     };
-    if let Err(e) = backend.materialize(task).await {
-        if !race.state().local_needed {
-            return None;
-        }
-        let output = format!("ninja-rs: fetching inputs: {}\n", e.message).into_bytes();
-        return Some(TaskResult {
-            edge: task.edge,
-            status: ExitStatus::Failure(1),
-            output,
-            kind: ExecKind::Local,
-            cas_outputs: Vec::new(),
-            lost_inputs: e.lost,
-        });
-    }
     if !race.start_local() {
         return None;
     }
@@ -511,11 +517,21 @@ impl CommandRunner for ExecRunner {
             self.active.clear();
         })
     }
+
+    /// Only a backend reads them: remote actions send them, and those of
+    /// local commands that exist remotely only are downloaded first.
+    fn wants_inputs(&self) -> bool {
+        self.remote.is_some()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How long tests wait for what a healthy run does at once: only a
+    /// broken one gets there (the machine may be busy).
+    const PATIENCE: Duration = Duration::from_secs(60);
 
     #[tokio::test]
     async fn raced_runs_only_take_free_slots() {
@@ -538,37 +554,130 @@ mod tests {
         assert!(slots.try_acquire().is_some());
     }
 
-    #[tokio::test]
-    async fn abort_waits_for_every_local_process() {
-        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-abort", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // The command's grandchild writes the marker after about 2 s.
-        let marker = dir.join("late.txt");
-        let command = if cfg!(windows) {
-            // `waitfor` stops on Ctrl-Break; the marker is written only if it
-            // timed out.
-            format!("cmd /c cmd /v:on /c \"waitfor /t 2 ninjarsabort{} >nul 2>&1 & if !errorlevel! == 1 echo late> {}\"", std::process::id(), marker.display())
-        } else {
-            format!("sh -c 'sh -c \"sleep 2; echo late > {}\"; true'", marker.display())
-        };
-        let interrupt = Interrupt::new();
-        let mut runner = ExecRunner::new(2, None, interrupt.clone());
-        runner.start_command(Task { command, ..Default::default() }).unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        interrupt.trigger();
-        assert_eq!(runner.wait_for_command().await.map(|r| r.status), Some(ExitStatus::Interrupted));
-        let start = std::time::Instant::now();
-        runner.abort().await;
-        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        assert!(!marker.exists(), "a process of the command kept running");
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A backend whose inputs take until `release` to download, saying when
+    /// they start (`started`).
+    struct SlowInputs {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
     }
 
-    /// A backend whose action is a step on the host.
+    impl RemoteBackend for SlowInputs {
+        fn wants(&self, _: &Task) -> bool {
+            true
+        }
+        fn execute(&self, _: Task) -> ninja_core::runner::RemoteFuture {
+            Box::pin(std::future::pending())
+        }
+        fn max_jobs(&self) -> usize {
+            1
+        }
+        fn materialize(&self, _: &Task) -> ninja_core::runner::MaterializeFuture {
+            let (started, release) = (self.started.clone(), self.release.clone());
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(())
+            })
+        }
+    }
+
+    /// A raced local run fetches its inputs before it takes a local slot:
+    /// other local tasks use the slot meanwhile.
+    #[tokio::test]
+    async fn raced_runs_fetch_inputs_before_taking_a_slot() {
+        let slots = LocalSlots::new(SlotKind::Count(Semaphore::new(1)));
+        let started = Arc::new(Notify::new());
+        let backend: Arc<dyn RemoteBackend> = Arc::new(SlowInputs { started: started.clone(), release: Arc::new(Notify::new()) });
+        let race = Race::new();
+        // The remote branch gave up: the local one runs.
+        race.need_local();
+        let (task, stop) = (Task::default(), Stop::new());
+        let local = race_local(&task, &slots, &[], &backend, &race, Duration::ZERO, &stop);
+        tokio::pin!(local);
+        tokio::select! {
+            _ = &mut local => panic!("ran before its inputs were fetched"),
+            _ = started.notified() => {}
+        }
+        assert!(slots.try_acquire().is_some(), "a slot held while the inputs download");
+    }
+
+    /// Run by `abort_waits_for_every_local_process` as a command's child:
+    /// writes its process id, then sleeps for longer than the test waits.
+    #[test]
+    #[ignore = "run by abort_waits_for_every_local_process"]
+    fn sleeper() {
+        let Some(pid_file) = std::env::var_os("NINJA_RS_TEST_SLEEPER").map(std::path::PathBuf::from) else { return };
+        let tmp = pid_file.with_extension("tmp");
+        std::fs::write(&tmp, std::process::id().to_string()).unwrap();
+        std::fs::rename(&tmp, &pid_file).unwrap();
+        std::thread::sleep(2 * PATIENCE);
+    }
+
+    /// Whether process `pid` still runs (a zombie doesn't).
+    fn alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 only checks that the process exists.
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                return false;
+            }
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            stat.rsplit_once(')').is_none_or(|(_, rest)| !rest.trim_start().starts_with('Z'))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+            use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+            // SAFETY: plain system calls; the handle is owned (closed) below.
+            unsafe {
+                let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+                if h.is_null() {
+                    return false;
+                }
+                let h = OwnedHandle::from_raw_handle(h);
+                WaitForSingleObject(h.as_raw_handle(), 0) == WAIT_TIMEOUT
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_waits_for_every_local_process() {
+        let dir = test_dirs::TestDir::new("ninja-rs-runner-abort");
+        let pid_file = dir.join("sleeper.pid");
+        // The command's child sleeps for longer than the test waits.
+        let sleeper = format!("\"{}\" --exact exec_runner::tests::sleeper --ignored --nocapture", std::env::current_exe().unwrap().display());
+        let command = if cfg!(windows) { format!("cmd /c \"{sleeper}\"") } else { format!("sh -c '{sleeper}; true'") };
+        let interrupt = Interrupt::new();
+        let mut runner = ExecRunner::new(2, None, interrupt.clone());
+        runner.set_env(vec![("NINJA_RS_TEST_SLEEPER".into(), pid_file.to_string_lossy().into_owned())]);
+        runner.start_command(Task { command, ..Default::default() }).unwrap();
+        while !pid_file.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        interrupt.trigger();
+        assert_eq!(runner.wait_for_command().await.map(|r| r.status), Some(ExitStatus::Interrupted));
+        tokio::time::timeout(PATIENCE, runner.abort()).await.expect("the abort waited for the command to end by itself");
+        let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        // On Windows, a job counts a terminated process out a moment before
+        // it is gone (it runs no more code then).
+        if cfg!(windows) {
+            let _ = tokio::time::timeout(PATIENCE, async {
+                while alive(pid) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+        }
+        assert!(!alive(pid), "a process of the command kept running");
+    }
+
+    /// A backend whose action is a step on the host, run in `dir`.
     #[cfg(unix)]
-    struct HostStep(String);
+    struct HostStep {
+        step: String,
+        dir: std::path::PathBuf,
+    }
 
     #[cfg(unix)]
     impl RemoteBackend for HostStep {
@@ -576,10 +685,11 @@ mod tests {
             true
         }
         fn execute(&self, task: Task) -> ninja_core::runner::RemoteFuture {
-            let argv = vec!["sh".to_string(), "-c".to_string(), self.0.clone()];
+            let argv = vec!["sh".to_string(), "-c".to_string(), self.step.clone()];
+            let dir = self.dir.clone();
             Box::pin(async move {
                 let stop = ninja_core::runner::host_stop();
-                let (status, output) = run_argv(&argv, &std::env::temp_dir(), &[], &stop).await;
+                let (status, output) = run_argv(&argv, &dir, &[], &stop).await;
                 RemoteOutcome::Done(TaskResult { edge: task.edge, status, output, kind: ExecKind::Remote, cas_outputs: Vec::new(), lost_inputs: Vec::new() })
             })
         }
@@ -593,13 +703,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn abort_stops_host_steps() {
-        let dir = std::env::temp_dir().join(format!("ninja-rs-test-{}-abort-host", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("ninja-rs-runner-abort-host");
         let (ready, stopped) = (dir.join("ready"), dir.join("stopped"));
         let step = format!("trap 'echo > {}; exit 1' INT; echo > {}; while :; do sleep 0.1; done", stopped.display(), ready.display());
         let interrupt = Interrupt::new();
-        let mut runner = ExecRunner::new(2, Some(Arc::new(HostStep(step))), interrupt.clone());
+        let mut runner = ExecRunner::new(2, Some(Arc::new(HostStep { step, dir: dir.to_path_buf() })), interrupt.clone());
         runner.start_command(Task::default()).unwrap();
         while !ready.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -608,6 +716,5 @@ mod tests {
         assert_eq!(runner.wait_for_command().await.map(|r| r.status), Some(ExitStatus::Interrupted));
         runner.abort().await;
         assert!(stopped.exists(), "the step didn't get the interrupt's signal before the build went on");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

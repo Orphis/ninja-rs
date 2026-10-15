@@ -34,7 +34,8 @@ pub struct Task {
     /// Explicit and implicit inputs (no order-only), canonical paths, and
     /// the deps earlier builds discovered. Those of an edge that was dirty
     /// before reading them aren't in the graph; they are hints, and may name
-    /// files that are gone.
+    /// files that are gone. Empty for a runner that doesn't read them
+    /// (`CommandRunner::wants_inputs`).
     pub inputs: Vec<String>,
     pub restat: bool,
     pub generator: bool,
@@ -343,6 +344,11 @@ pub trait CommandRunner: Send {
     /// Stops everything running. Completes once the commands started have
     /// exited, so that none writes the outputs the engine deletes next.
     fn abort(&mut self) -> AbortFuture<'_>;
+    /// Whether it reads `Task::inputs` (a remote backend does): the engine
+    /// doesn't gather them otherwise.
+    fn wants_inputs(&self) -> bool {
+        true
+    }
 }
 
 /// `-n`: pretends every command succeeded.
@@ -376,6 +382,9 @@ impl CommandRunner for DryRunRunner {
     fn abort(&mut self) -> AbortFuture<'_> {
         self.finished.clear();
         Box::pin(std::future::ready(()))
+    }
+    fn wants_inputs(&self) -> bool {
+        false
     }
 }
 

@@ -212,7 +212,9 @@ fn main() {
             Some(e) if results.iter().all(Result::is_err) => println!("{:<26} not available: {e}", "clang-scan-deps"),
             _ => row("clang-scan-deps, per compile", cold, None, &results),
         }
-        match scan_deps_batch(&compiles, threads, &std::env::temp_dir()) {
+        #[allow(clippy::disallowed_methods)] // The benchmark's scratch files, not a test's.
+        let scratch = std::env::temp_dir();
+        match scan_deps_batch(&compiles, threads, &scratch) {
             Ok(t) => println!("{:<26} {:>9.0}ms {:>9.2}ms", "clang-scan-deps, one batch", t.as_secs_f64() * 1000.0, t.as_secs_f64() * 1000.0 / n as f64),
             Err(e) => println!("{:<26} {e}", "clang-scan-deps, one batch"),
         }

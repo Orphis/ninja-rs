@@ -18,6 +18,7 @@ use ninja_core::runner::{
     CasOutput, ExecKind, ExitStatus, LocalCommand, MapBack, MaterializeError, MaterializeFuture, Race, RemoteBackend, RemoteFuture, RemoteOutcome, Task,
     TaskResult,
 };
+use ninja_core::status::message;
 use rbe_client::proto as re;
 use rbe_client::{ActionMeta, Client};
 
@@ -28,7 +29,7 @@ use crate::store::Store;
 use crate::targets::Targets;
 use crate::toolchains::Toolchains;
 use capture::Capture;
-use download::{DOWNLOAD_BUDGET_KIB, Fetched, disk_store, write_output};
+use download::{DOWNLOAD_BUDGET_KIB, Fetched, disk_store, fs_now, write_output};
 
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
@@ -104,13 +105,18 @@ struct Inner {
     lost: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Whether the build was told why local results aren't cached.
     env_warned: std::sync::atomic::AtomicBool,
-    /// Whether it was told the disk cache can't store blobs.
+    /// Whether a disk cache write failed (and the build was told): blobs
+    /// aren't fetched as chunks from then on, for a disk cache that can't
+    /// keep them.
     disk_warned: Arc<std::sync::atomic::AtomicBool>,
     /// Bytes downloads hold in memory, in KiB (see `DOWNLOAD_BUDGET_KIB`).
     download_budget: Arc<tokio::sync::Semaphore>,
     /// Directories this build wrote outputs to, swept of temporary files
     /// interrupted writes left (see `sweep`).
     swept: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    /// Local results going to the remote cache (see `Capture`), which the
+    /// build waits for at its end (`Backend::finish_uploads`).
+    uploads: std::sync::Mutex<tokio::task::JoinSet<()>>,
 }
 
 /// Remote-only outputs being downloaded, by path (see `Inner::materializing`).
@@ -201,6 +207,9 @@ impl Backend {
             action_env: config.action_env.clone(),
         };
         shared.store.new_build();
+        // No command runs yet: copies of response files nothing used for
+        // a while can go (a local run writes again those it needs).
+        sweep_rsp_copies(&config.build_dir.join(RSP_COPIES), RSP_COPIES_UNUSED);
         if shared.include_scanner == crate::action::IncludeScanner::Preprocessor {
             let p = shared.store.preprocessor(&shared.build_dir, windows);
             for d in &shared.volatile {
@@ -221,8 +230,20 @@ impl Backend {
                 disk_warned: Default::default(),
                 download_budget: Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_BUDGET_KIB)),
                 swept: Default::default(),
+                uploads: Default::default(),
             }),
         })
+    }
+
+    /// Waits for the local results going to the remote cache (`wait`), or
+    /// gives them up (an interrupted build).
+    pub async fn finish_uploads(&self, wait: bool) {
+        let mut uploads = std::mem::take(&mut *self.inner.uploads.lock().unwrap());
+        if wait {
+            while uploads.join_next().await.is_some() {}
+        } else {
+            uploads.shutdown().await;
+        }
     }
 
     /// Whether results of commands run locally go to the remote cache.
@@ -392,6 +413,30 @@ fn local_command(p: &Prepared, task: &Task, build_dir: &Path, windows: bool) -> 
     })
 }
 
+/// Where local runs keep private copies of response files (see
+/// `local_rsp_files`), in the build directory.
+const RSP_COPIES: &str = ".ninja_rs_rsp";
+
+/// How long a copy of a response file stays unused before a build removes
+/// it.
+const RSP_COPIES_UNUSED: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Removes the copies of response files in `dir` (named by their contents'
+/// hash) written more than `age` ago, and temporary files left by
+/// interrupted writes of them, before any command of the build runs: one
+/// that needs a copy again writes it again. Nothing else in `dir` goes.
+fn sweep_rsp_copies(dir: &Path, age: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let hash = name.split('.').next().unwrap_or_default();
+        let ours = hash.len() == 32 && hash.bytes().all(|c| c.is_ascii_hexdigit()) && (name.ends_with(".rsp") || name.contains(".tmp."));
+        if ours && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| now.duration_since(t).unwrap_or_default() > age) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Where a local run of the action reads its response files, rewritten as
 /// the remote action reads them, and the command naming them. The task's
 /// own (ninja's `rspfile`) is rewritten in place: it is the edge's. Any
@@ -406,7 +451,7 @@ fn local_rsp_files(p: &Prepared, task: &Task, build_dir: &Path, windows: bool) -
         if windows { s.to_ascii_lowercase() } else { s }
     };
     let own = task.rspfile.as_ref().map(|(r, _)| key(&build_dir.join(r)));
-    let private_dir = build_dir.join(".ninja_rs_rsp");
+    let private_dir = build_dir.join(RSP_COPIES);
     let copies: HashMap<String, PathBuf> = p
         .rsp_files
         .iter()
@@ -446,21 +491,23 @@ struct LocalMapBack {
 
 impl MapBack for LocalMapBack {
     fn map_back(&self, task: &Task, result: &mut TaskResult) {
+        // Its absolute paths are already the host's.
+        let map = |path: &str| self.mapper.map_back_local(path, &self.tree_index);
         if let Some(depfile) = &task.depfile
             && let Ok(data) = std::fs::read(depfile)
         {
-            let _ = std::fs::write(depfile, map_depfile(&data, &self.mapper, &self.tree_index));
+            let _ = std::fs::write(depfile, map_depfile(&data, &map));
         }
         if task.deps.as_deref() == Some("msvc") {
-            result.output = map_show_includes(&result.output, task, &self.mapper, &self.tree_index, &self.build_dir);
+            result.output = map_show_includes(&result.output, task, &map, &self.build_dir);
         }
     }
 }
 
-/// A depfile in remote form (paths of the remote action) with local paths.
-fn map_depfile(data: &[u8], mapper: &crate::paths::PathMapper, tree_index: &crate::paths::TreeIndex) -> Vec<u8> {
+/// A depfile in remote form (paths of the remote action) with local paths
+/// (`map` gives a path's).
+fn map_depfile(data: &[u8], map: &dyn Fn(&str) -> String) -> Vec<u8> {
     let Ok(d) = parse_depfile(data) else { return data.to_vec() };
-    let map = |s: &str| mapper.map_back(s, tree_index);
     let mut out = String::new();
     let outs: Vec<String> = d.outs.iter().map(|o| map(o)).collect();
     out.push_str(&outs.iter().map(|o| escape_make(o)).collect::<Vec<_>>().join(" "));
@@ -473,14 +520,9 @@ fn map_depfile(data: &[u8], mapper: &crate::paths::PathMapper, tree_index: &crat
     out.into_bytes()
 }
 
-/// `/showIncludes` lines in remote form with local paths.
-fn map_show_includes(
-    stdout: &[u8],
-    task: &Task,
-    mapper: &crate::paths::PathMapper,
-    tree_index: &crate::paths::TreeIndex,
-    build_dir: &std::path::Path,
-) -> Vec<u8> {
+/// `/showIncludes` lines in remote form with local paths (`map` gives a
+/// path's).
+fn map_show_includes(stdout: &[u8], task: &Task, map: &dyn Fn(&str) -> String, build_dir: &std::path::Path) -> Vec<u8> {
     let prefix = if task.msvc_deps_prefix.is_empty() { DEFAULT_DEPS_PREFIX } else { task.msvc_deps_prefix.as_str() };
     let text = String::from_utf8_lossy(stdout);
     let mut out = String::new();
@@ -489,7 +531,7 @@ fn map_show_includes(
         let ending = &line[body.len()..];
         match filter_show_includes(body, prefix) {
             Some(path) if !path.is_empty() => {
-                let mapped = mapper.map_back(path, tree_index);
+                let mapped = map(path);
                 let mapped = if !crate::paths::is_abs(&mapped, cfg!(windows)) {
                     // Relative to the build dir: make it absolute so that
                     // ninja's normalization sees what a local cl.exe prints.
@@ -700,7 +742,7 @@ impl Inner {
                 let unusable = hit.as_ref().and_then(|(r, _)| check_result(&prepared, r).err());
                 if let Some(e) = unusable {
                     if self.config.verbose {
-                        eprintln!("ninja-rs: disk cache entry {} ignored: {e}", digest.hash);
+                        message(&format!("disk cache entry {} ignored: {e}", digest.hash));
                     }
                     if let Some(disk) = &self.disk {
                         disk.remove_action_result(&digest);
@@ -763,7 +805,7 @@ impl Inner {
             && let Err(e) = check_result(&prepared, r)
         {
             if self.config.verbose {
-                eprintln!("ninja-rs: remote cache entry {} ignored: {e}", digest.hash);
+                message(&format!("remote cache entry {} ignored: {e}", digest.hash));
             }
             cached = None;
             stale = true;
@@ -797,7 +839,7 @@ impl Inner {
             },
         };
         let mut retried = false;
-        let downloaded = loop {
+        let staged = loop {
             // An execution's result must be usable too: nothing is written
             // from one that isn't (the action runs locally instead).
             check_result(&prepared, &result).map_err(|e| Failure::Infra(anyhow::anyhow!("unusable result for {}: {e}", digest.hash)))?;
@@ -809,15 +851,13 @@ impl Inner {
                     lost.remove(&d.hash);
                 }
             }
-            let keep = self.disk.is_some() && result.exit_code == 0;
-            claim(race).await?;
-            let downloaded = self.download(Some(&client), task, &prepared, &result, keep).await;
-            match downloaded {
+            match self.fetch_outputs(Some(&client), task, &prepared, &result, false).await {
                 // A hit whose outputs the CAS no longer has (evicted since it
-                // was stored, or checked) is a miss: the action runs again.
+                // was stored, or checked) is a miss: the action runs again,
+                // while a raced local run goes on.
                 Err(e) if hit && !retried && is_not_found(&e) => {
                     if self.config.verbose {
-                        eprintln!("ninja-rs: remote cache entry {} ignored: {e:#}", digest.hash);
+                        message(&format!("remote cache entry {} ignored: {e:#}", digest.hash));
                     }
                     if self.config.cache_only {
                         return Err(Failure::RunLocally(Box::new(prepared)));
@@ -828,10 +868,14 @@ impl Inner {
                         Executed::InputsLost(r) => return Ok(r),
                     };
                 }
-                d => break d.map_err(Failure::Infra)?,
+                staged => break staged.map_err(Failure::Infra)?,
             }
         };
-        output.extend(downloaded);
+        // Racing: its outputs are claimed once fetched, before anything is
+        // written on the host.
+        claim(race).await?;
+        let keep = self.disk.is_some() && result.exit_code == 0;
+        output.extend(blocking(|| self.write_staged(staged, task, &prepared, &result, keep)).map_err(Failure::Infra)?);
         let kind = if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote };
         if result.exit_code == 0
             && let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await
@@ -876,19 +920,15 @@ impl Inner {
         remote: bool,
     ) -> Result<Option<TaskResult>, Failure> {
         let digest = &prepared.action_digest;
-        claim(race).await?;
-        let mut output = Vec::new();
-        if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
-            return Ok(Some(failed));
-        }
         // Outputs left remote are recorded as a remote hit's would be
-        // (thin archives' members read from the remote CAS).
+        // (thin archives' members read from the remote CAS). The blobs are
+        // fetched first: a miss then has run nothing on the host.
         let client = if remote { self.client.as_ref().map(|c| c.for_action(meta, &digest.hash)) } else { None };
-        match self.download(client.as_ref(), task, prepared, &result, false).await {
-            Ok(o) => output.extend(o),
+        let staged = match self.fetch_outputs(client.as_ref(), task, prepared, &result, !prepared.local_before.is_empty()).await {
+            Ok(staged) => staged,
             Err(e) if e.is::<DiskMiss>() => {
                 if self.config.verbose {
-                    eprintln!("ninja-rs: disk cache entry {} ignored: {e}", digest.hash);
+                    message(&format!("disk cache entry {} ignored: {e}", digest.hash));
                 }
                 if let Some(disk) = &self.disk {
                     disk.remove_action_result(digest);
@@ -896,7 +936,13 @@ impl Inner {
                 return Ok(None);
             }
             Err(e) => return Err(Failure::Infra(e)),
+        };
+        claim(race).await?;
+        let mut output = Vec::new();
+        if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
+            return Ok(Some(failed));
         }
+        output.extend(blocking(|| self.write_staged(staged, task, prepared, &result, false)).map_err(Failure::Infra)?);
         if let Some(mut failed) = self.run_local_steps(task, &prepared.local_after, &mut output).await {
             failed.kind = ExecKind::DiskCacheHit;
             return Ok(Some(failed));
@@ -1030,11 +1076,13 @@ impl Inner {
         None
     }
 
-    /// Writes the outputs of an action result, from the disk cache or the
-    /// remote one (skipping files that are already up to date, so that
-    /// `restat` works) and returns the combined stdout/stderr. With `keep`,
-    /// the result and its outputs are stored in the disk cache.
-    async fn download(&self, client: Option<&Client>, task: &Task, p: &Prepared, result: &re::ActionResult, keep: bool) -> Result<Vec<u8>> {
+    /// Fetches the outputs of an action result, from the disk cache or the
+    /// remote one, into files next to them (but those already up to date,
+    /// so that `restat` works, and those left remote): nothing is written
+    /// on the host until `write_staged`. `steps_first`: steps on the host
+    /// run before then, and may change what's there (delete an output):
+    /// those up to date are fetched too.
+    async fn fetch_outputs(&self, client: Option<&Client>, task: &Task, p: &Prepared, result: &re::ActionResult, steps_first: bool) -> Result<Staged> {
         let (stdout, stderr) = match client {
             Some(c) => (
                 c.output_bytes(&result.stdout_raw, result.stdout_digest.as_ref()).await?,
@@ -1075,44 +1123,45 @@ impl Inner {
         // recorded, unless they are deliverables, named on the command line,
         // or the depfile (which the build reads).
         let minimal = client.is_some() && result.output_directories.is_empty();
-        let may_stay_remote = |_: &PathBuf, f: &re::OutputFile| minimal && !self.must_download(task, p, &f.path);
+        let mut staged =
+            Staged { stdout, stderr, files: Vec::new(), fetched: Fetched::default(), minimal, thin: Default::default(), download_anyway: Default::default() };
         // A thin archive left remote is recorded with its members, read with
         // ranged reads, so that the actions reading it get them without
         // downloading it. When that fails, it's downloaded. Archives are
         // recognized by their archiver's flags, or else by their name.
         let thin_command = crate::archive::creates_thin(&p.command.arguments);
-        let mut thin: std::collections::HashMap<String, Arc<Vec<String>>> = Default::default();
-        let mut download_anyway: std::collections::HashSet<String> = Default::default();
         if let Some(c) = client {
             for (local, f) in &files {
                 let d = f.digest.clone().unwrap_or_default();
                 let named_like_archive = [".a", ".lib"].iter().any(|ext| f.path.to_ascii_lowercase().ends_with(ext));
-                if !may_stay_remote(local, f) || !(thin_command || named_like_archive) || blocking(|| same_content(local, &d, &self.shared.store)) {
+                if !self.may_stay_remote(&staged, task, p, f)
+                    || !(thin_command || named_like_archive)
+                    || (!steps_first && blocking(|| same_content(local, &d, &self.shared.store)))
+                {
                     continue;
                 }
                 match self.remote_thin_members(c, &d).await {
                     Ok(Some(members)) => {
-                        thin.insert(f.path.clone(), Arc::new(members));
+                        staged.thin.insert(f.path.clone(), Arc::new(members));
                     }
                     Ok(None) => {}
                     Err(e) => {
                         if self.config.verbose {
-                            eprintln!("ninja-rs: reading the members of {}: {e:#}; downloading it", f.path);
+                            message(&format!("reading the members of {}: {e:#}; downloading it", f.path));
                         }
-                        download_anyway.insert(f.path.clone());
+                        staged.download_anyway.insert(f.path.clone());
                     }
                 }
             }
         }
-        let stays_remote = |local: &PathBuf, f: &re::OutputFile| may_stay_remote(local, f) && !download_anyway.contains(&f.path);
         let needed = blocking(|| {
             let mut needed = Vec::new();
             for (local, f) in &files {
                 let d = f.digest.clone().unwrap_or_default();
-                if Some(local) != depfile_local.as_ref() && same_content(local, &d, &self.shared.store) {
+                if !steps_first && Some(local) != depfile_local.as_ref() && same_content(local, &d, &self.shared.store) {
                     continue;
                 }
-                if stays_remote(local, f) {
+                if self.stays_remote(&staged, task, p, f) {
                     continue;
                 }
                 if f.contents.is_empty() {
@@ -1121,9 +1170,33 @@ impl Inner {
             }
             needed
         });
-        let mut fetched = self.fetch_blobs(client, &needed).await?;
+        staged.fetched = self.fetch_blobs(client, &needed).await?;
+        staged.files = files;
+        Ok(staged)
+    }
+
+    /// Whether this build may leave an output of a result remote (minimal
+    /// downloads; see `must_download`).
+    fn may_stay_remote(&self, staged: &Staged, task: &Task, p: &Prepared, f: &re::OutputFile) -> bool {
+        staged.minimal && !self.must_download(task, p, &f.path)
+    }
+
+    /// Whether it does: a thin archive whose members couldn't be read is
+    /// downloaded.
+    fn stays_remote(&self, staged: &Staged, task: &Task, p: &Prepared, f: &re::OutputFile) -> bool {
+        self.may_stay_remote(staged, task, p, f) && !staged.download_anyway.contains(&f.path)
+    }
+
+    /// Writes the outputs `fetch_outputs` fetched, and records those left
+    /// remote. Returns the combined stdout/stderr. With `keep`, the result
+    /// and its outputs are stored in the disk cache.
+    fn write_staged(&self, mut staged: Staged, task: &Task, p: &Prepared, result: &re::ActionResult, keep: bool) -> Result<Vec<u8>> {
+        let mut fetched = std::mem::take(&mut staged.fetched);
+        let staged = &staged;
+        let (stdout, stderr, files) = (&staged.stdout, &staged.stderr, &staged.files);
         let mut left_remote: std::collections::HashSet<&str> = Default::default();
-        blocking(|| self.write_outputs(p, task.restat, &files, &mut fetched, &stays_remote, &thin, &mut left_remote))?;
+        let stays_remote = |_: &PathBuf, f: &re::OutputFile| self.stays_remote(staged, task, p, f);
+        self.write_outputs(p, task.restat, files, &mut fetched, &stays_remote, &staged.thin, &mut left_remote)?;
         // The disk cache keeps the result with the outputs it can hold;
         // those left remote stay in the remote CAS (see `try_execute`).
         // Without them all (the disk can't take them), it doesn't.
@@ -1131,35 +1204,33 @@ impl Inner {
             && result.output_directories.is_empty()
             && let Some(disk) = &self.disk
         {
-            blocking(|| {
-                disk_store(&self.disk_warned, || {
-                    // Fetched blobs are stored already; the others are the
-                    // local files they matched, or inline.
-                    for (local, f) in &files {
-                        let d = f.digest.clone().unwrap_or_default();
-                        if left_remote.contains(f.path.as_str()) {
-                            continue;
-                        }
-                        if !f.contents.is_empty() {
-                            disk.put_bytes(&d, &f.contents)?;
-                        } else if !disk.contains_blob(&d) {
-                            disk.put_file(local, Some(&self.shared.store.digests))?;
-                        }
+            disk_store(&self.disk_warned, || {
+                // Fetched blobs are stored already; the others are the
+                // local files they matched, or inline.
+                for (local, f) in files {
+                    let d = f.digest.clone().unwrap_or_default();
+                    if left_remote.contains(f.path.as_str()) {
+                        continue;
                     }
-                    let mut stored = result.clone();
-                    stored.stdout_raw = stdout.clone();
-                    stored.stderr_raw = stderr.clone();
-                    stored.stdout_digest = None;
-                    stored.stderr_digest = None;
-                    Ok(disk.put_action_result(&p.action_digest, &stored)?)
-                })
+                    if !f.contents.is_empty() {
+                        disk.put_bytes(&d, &f.contents)?;
+                    } else if !disk.contains_blob(&d) {
+                        disk.put_file(local, Some(&self.shared.store.digests))?;
+                    }
+                }
+                let mut stored = result.clone();
+                stored.stdout_raw = stdout.clone();
+                stored.stderr_raw = stderr.clone();
+                stored.stdout_digest = None;
+                stored.stderr_digest = None;
+                Ok(disk.put_action_result(&p.action_digest, &stored)?)
             });
         }
-        let mut out = stdout;
+        let mut out = stdout.clone();
         if task.deps.as_deref() == Some("msvc") {
             out = self.map_show_includes(&out, task, p);
         }
-        out.extend_from_slice(&stderr);
+        out.extend_from_slice(stderr);
         Ok(out)
     }
 
@@ -1179,6 +1250,10 @@ impl Inner {
         left_remote: &mut std::collections::HashSet<&'f str>,
     ) -> Result<()> {
         let depfile_local = p.depfile.as_ref().map(|(_, l)| l.clone());
+        // The file system's time, for outputs left as they were and records
+        // (its clock, not the host's: a network file system's may differ).
+        let mut fs_time: Option<std::time::SystemTime> = None;
+        let mut now = |dir: &Path| *fs_time.get_or_insert_with(|| fs_now(dir));
         // The records this result replaces, side outputs it lacks included.
         let previous: HashMap<&str, Entry> = match &self.config.remote_outputs {
             Some(outputs) => {
@@ -1203,7 +1278,7 @@ impl Inner {
                 // written: an output older than an input would be dirty
                 // forever. Unless restat compares its time, not the inputs'.
                 if !restat && let Ok(file) = std::fs::File::options().write(true).open(local) {
-                    let _ = file.set_modified(std::time::SystemTime::now());
+                    let _ = file.set_modified(now(local.parent().unwrap_or(Path::new("."))));
                 }
                 continue;
             }
@@ -1215,7 +1290,7 @@ impl Inner {
                 if let Some(outputs) = &self.config.remote_outputs {
                     let mtime = match previous.get(f.path.as_str()) {
                         Some(e) if restat && e.digest == d => e.mtime,
-                        _ => ninja_core::disk::now_ns(),
+                        _ => ninja_core::disk::system_time_to_ns(now(local.parent().unwrap_or(Path::new(".")))),
                     };
                     let side = p.side_outputs.iter().any(|(rel, _)| *rel == f.path);
                     outputs.record(Entry {
@@ -1364,10 +1439,10 @@ impl Inner {
 
     /// Rewrites a depfile written by the remote compiler to local paths.
     fn map_depfile(&self, data: &[u8], p: &Prepared) -> Vec<u8> {
-        map_depfile(data, &p.mapper, &p.tree_index)
+        map_depfile(data, &|path| p.mapper.map_back(path, &p.tree_index))
     }
     fn map_show_includes(&self, stdout: &[u8], task: &Task, p: &Prepared) -> Vec<u8> {
-        map_show_includes(stdout, task, &p.mapper, &p.tree_index, &self.shared.build_dir)
+        map_show_includes(stdout, task, &|path| p.mapper.map_back(path, &p.tree_index), &self.shared.build_dir)
     }
 }
 
@@ -1503,6 +1578,21 @@ fn same_content(local: &std::path::Path, d: &re::Digest, store: &Store) -> bool 
     }
 }
 
+/// A result's outputs fetched, not yet written (see `Inner::fetch_outputs`).
+struct Staged {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    /// Each output's local path, and what the result says of it.
+    files: Vec<(PathBuf, re::OutputFile)>,
+    fetched: Fetched,
+    /// Outputs may stay remote (minimal downloads).
+    minimal: bool,
+    /// The members of thin archives left remote.
+    thin: std::collections::HashMap<String, Arc<Vec<String>>>,
+    /// Thin archives downloaded all the same.
+    download_anyway: std::collections::HashSet<String>,
+}
+
 /// Escapes a path for a Makefile-style depfile.
 fn escape_make(p: &str) -> String {
     let mut out = String::new();
@@ -1612,6 +1702,27 @@ mod tests {
         t.use_console = true;
         assert!(!policy_wants(&t, &s));
         assert!(policy_wants(&task(&[("rbe_mnemonic", "CXXArchive")]), &["Compile".into(), "Archive".into()]));
+    }
+
+    /// Copies of response files unused for a while go, with temporary
+    /// files of interrupted writes; recent ones and other files stay.
+    #[test]
+    fn sweeps_old_rsp_copies() {
+        let dir = test_dirs::TestDir::new("ninja-rs-rsp-copies");
+        let hash = "0123456789abcdef0123456789abcdef";
+        let files = [format!("{hash}.rsp"), format!("{hash}.tmp.12.3"), format!("{}.rsp", "f".repeat(32)), "notes.rsp".into(), format!("{hash}.txt")];
+        for f in &files {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        let old = std::time::SystemTime::now() - 2 * RSP_COPIES_UNUSED;
+        for f in [&files[0], &files[1], &files[3], &files[4]] {
+            std::fs::File::options().write(true).open(dir.join(f)).unwrap().set_modified(old).unwrap();
+        }
+        sweep_rsp_copies(&dir, RSP_COPIES_UNUSED);
+        let left: Vec<bool> = files.iter().map(|f| dir.join(f).exists()).collect();
+        assert_eq!(left, [false, false, true, true, true]);
+        // No directory: nothing to do.
+        sweep_rsp_copies(&dir.join("missing"), RSP_COPIES_UNUSED);
     }
 
     #[test]

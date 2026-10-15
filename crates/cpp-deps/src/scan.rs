@@ -5,12 +5,13 @@
 //! malformed expression) processes every branch it can't rule out, and the
 //! result is marked inexact: it's then likely a superset, but no guarantee.
 
+use ninja_os::FileStamp;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::SystemTime;
 
 use crate::expr;
 use crate::hmap::HeaderMap;
@@ -103,6 +104,9 @@ pub struct Config {
     /// include by a relative path: `__FILE__` is then spelled relative,
     /// unlike the scan's paths.
     pub relative_paths: bool,
+    /// The source is assembly (`.S`): text may be an assembler's
+    /// `.include`, which reads a file the preprocessor doesn't see.
+    pub assembler: bool,
 }
 
 /// A file processed before the main one, and how the compiler finds it.
@@ -164,38 +168,33 @@ pub struct Stats {
 /// A directory's files (None: not a directory), and the session it's from.
 type Listing = (u64, Option<Arc<HashSet<String>>>);
 
-/// What tells a file's versions apart: its size and modification time,
-/// and its change time and inode on Unix (a file replaced by one of the
-/// same size with its modification time restored, as `cp -p` or an
-/// archive extraction leaves it), its creation time on Windows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Stamp {
-    len: u64,
-    mtime: Option<SystemTime>,
-    change: u64,
-    inode: u64,
+/// A file's identity: its volume's serial number and file ID (Windows),
+/// its device and inode (Unix); zeros when the file system has none.
+pub type FileId = (u64, u128);
+
+/// A file's stamp (what tells its versions apart: see `ninja_os::FileStamp`,
+/// which sees a file rewritten in place with its size and modification
+/// time restored, as an archive extracted over it leaves it) and identity,
+/// when it's a file.
+fn stat(p: &Path) -> Option<(FileStamp, FileId)> {
+    let (meta, stamp) = ninja_os::stat(p).ok().filter(|(m, _)| m.is_file())?;
+    #[cfg(unix)]
+    let id = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), u128::from(meta.ino()))
+    };
+    #[cfg(not(unix))]
+    let id = {
+        let _ = meta;
+        (stamp.volume, stamp.id)
+    };
+    Some((stamp, id))
 }
 
-impl Stamp {
-    fn of(meta: &std::fs::Metadata) -> Stamp {
-        #[cfg(unix)]
-        let (change, inode) = {
-            use std::os::unix::fs::MetadataExt;
-            ((meta.ctime() as u64).wrapping_mul(1_000_000_000).wrapping_add(meta.ctime_nsec() as u64), meta.ino())
-        };
-        #[cfg(windows)]
-        let (change, inode) = {
-            use std::os::windows::fs::MetadataExt;
-            (meta.creation_time(), 0)
-        };
-        #[cfg(not(any(unix, windows)))]
-        let (change, inode) = (0, 0);
-        Stamp { len: meta.len(), mtime: meta.modified().ok(), change, inode }
-    }
-}
-
-/// A file's key and stamp.
-type Version = (PathBuf, Stamp);
+/// A file's key and stamp (what tells its versions apart: a file replaced
+/// by one of the same size with its modification time restored, as `cp -p`
+/// or an archive extraction leaves it, has a new one).
+type Version = (PathBuf, FileStamp);
 type Lexing = Arc<OnceLock<Option<Arc<FileDirectives>>>>;
 
 /// The session of entries a watch vouches for: valid until it reports a
@@ -203,7 +202,8 @@ type Lexing = Arc<OnceLock<Option<Arc<FileDirectives>>>>;
 const WATCHED: u64 = u64::MAX;
 
 struct Entry {
-    stamp: Stamp,
+    stamp: FileStamp,
+    id: FileId,
     /// The session it was last checked in, or `WATCHED`.
     session: AtomicU64,
     fd: Arc<FileDirectives>,
@@ -238,17 +238,34 @@ pub enum Change {
     Tree,
 }
 
+/// Removes `key` and the entries under it from `map`: a path's descendants
+/// sort right after it (paths compare by components), so those are all
+/// that's looked at, however much else the map holds. Returns how many
+/// there were.
+pub fn remove_under<V>(map: &mut BTreeMap<PathBuf, V>, key: &Path) -> usize {
+    let under: Vec<PathBuf> =
+        map.range::<Path, _>((Bound::Included(key), Bound::Unbounded)).map(|(k, _)| k).take_while(|k| k.starts_with(key)).cloned().collect();
+    for k in &under {
+        map.remove(k);
+    }
+    under.len()
+}
+
 /// Lexed files and directory listings, shared by every scan (and thread).
 /// Within a session, files and directories outside the volatile ones are
 /// assumed unchanged; a new session checks them again, except for those a
 /// watch vouches for (`set_watch`). Lookups only take read locks, so that
-/// concurrent scans don't wait for each other.
+/// concurrent scans don't wait for each other. Ordered by path, so that
+/// what's under a directory goes without going through the rest.
 pub struct Cache {
-    files: RwLock<HashMap<PathBuf, Arc<Entry>>>,
-    /// Files being lexed (key, size, modification time): concurrent scans
-    /// wait for the one lexing.
+    files: RwLock<BTreeMap<PathBuf, Arc<Entry>>>,
+    /// Files being lexed (key and stamp): concurrent scans wait for the one
+    /// lexing.
     lexing: Mutex<HashMap<Version, Lexing>>,
-    dirs: RwLock<HashMap<PathBuf, Listing>>,
+    dirs: RwLock<BTreeMap<PathBuf, Listing>>,
+    /// Whether a path is a symbolic link leading elsewhere than its own
+    /// directory (see `dotdot_after_link`), and the session it's from.
+    links: RwLock<HashMap<PathBuf, (u64, bool)>>,
     session: AtomicU64,
     /// As keys (see `key`), with when a build last named each: looked up
     /// by ancestor, however many there are (CMake's `try_compile` names
@@ -268,6 +285,7 @@ impl Cache {
             files: RwLock::default(),
             lexing: Mutex::default(),
             dirs: RwLock::default(),
+            links: RwLock::default(),
             session: AtomicU64::new(1),
             volatile: RwLock::default(),
             case_insensitive,
@@ -288,11 +306,6 @@ impl Cache {
         self.volatile.write().unwrap().insert(key, std::time::Instant::now());
     }
 
-    /// Forgets the volatile directories not named since `before`.
-    pub fn expire_volatile(&self, before: std::time::Instant) {
-        self.volatile.write().unwrap().retain(|_, named| *named >= before);
-    }
-
     /// Lets `watch` vouch for files (once).
     pub fn set_watch(&self, watch: Arc<dyn Watch>) {
         let _ = self.watch.set(watch);
@@ -310,8 +323,8 @@ impl Cache {
                 self.dirs.write().unwrap().remove(key.as_ref());
             }
             Change::Tree => {
-                self.files.write().unwrap().retain(|k, _| !k.starts_with(&key));
-                self.dirs.write().unwrap().retain(|k, _| !k.starts_with(&key));
+                remove_under(&mut self.files.write().unwrap(), &key);
+                remove_under(&mut self.dirs.write().unwrap(), &key);
             }
         }
     }
@@ -417,6 +430,11 @@ impl Cache {
 
     /// A file's directives, lexed once per version.
     pub fn directives(&self, p: &Path) -> Option<Arc<FileDirectives>> {
+        self.file(p).map(|(fd, _, _)| fd)
+    }
+
+    /// A file's directives (lexed once per version), stamp and identity.
+    fn file(&self, p: &Path) -> Option<(Arc<FileDirectives>, FileStamp, FileId)> {
         let key = self.key(p);
         let volatile = self.is_volatile(p);
         let known = self.files.read().unwrap().get(key.as_ref()).cloned();
@@ -425,17 +443,16 @@ impl Cache {
             && self.current(e.session.load(Ordering::Relaxed))
         {
             self.files_reused.fetch_add(1, Ordering::Relaxed);
-            return Some(e.fd.clone());
+            return Some((e.fd.clone(), e.stamp, e.id));
         }
         let token = if volatile { None } else { self.token(p) };
-        let meta = std::fs::metadata(p).ok().filter(|m| m.is_file())?;
-        let stamp = Stamp::of(&meta);
+        let (stamp, id) = stat(p)?;
         if let Some(e) = known
             && e.stamp == stamp
         {
             e.session.store(self.checked(token), Ordering::Relaxed);
             self.files_reused.fetch_add(1, Ordering::Relaxed);
-            return Some(e.fd.clone());
+            return Some((e.fd.clone(), stamp, id));
         }
         let version = (key.into_owned(), stamp);
         let cell = self.lexing.lock().unwrap().entry(version.clone()).or_default().clone();
@@ -448,7 +465,7 @@ impl Cache {
                 // The token compared under the lock: an event counted after
                 // it drops the entry once it's in.
                 let mut files = self.files.write().unwrap();
-                files.insert(version.0.clone(), Arc::new(Entry { stamp, session: AtomicU64::new(self.checked(token)), fd: fd.clone() }));
+                files.insert(version.0.clone(), Arc::new(Entry { stamp, id, session: AtomicU64::new(self.checked(token)), fd: fd.clone() }));
                 Some(fd)
             })
             .clone();
@@ -457,8 +474,65 @@ impl Cache {
         } else {
             self.files_reused.fetch_add(1, Ordering::Relaxed);
         }
-        fd
+        fd.map(|fd| (fd, stamp, id))
     }
+
+    /// `dotdot_after_link`, with what links are taken once per session.
+    pub fn dotdot_after_link(&self, p: &Path) -> Option<PathBuf> {
+        dotdot_after(p, &mut |link| {
+            let session = self.session();
+            let key = self.key(link);
+            if let Some((s, elsewhere)) = self.links.read().unwrap().get(key.as_ref())
+                && *s == session
+            {
+                return *elsewhere;
+            }
+            let elsewhere = link_elsewhere(link);
+            self.links.write().unwrap().insert(key.into_owned(), (session, elsewhere));
+            elsewhere
+        })
+    }
+}
+
+/// Where a `..` of `p` comes after a symbolic link that leads elsewhere
+/// than its own directory: compilers go to the parent of the link's target
+/// (`lnk/../b.h` is `real/b.h`), unlike remote workers, whose inputs are
+/// plain directories, and unlike `normalize`.
+pub fn dotdot_after_link(p: &Path) -> Option<PathBuf> {
+    dotdot_after(p, &mut |link| link_elsewhere(link))
+}
+
+fn dotdot_after(p: &Path, elsewhere: &mut dyn FnMut(&Path) -> bool) -> Option<PathBuf> {
+    if !p.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+    let mut prefix = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                if elsewhere(&prefix) {
+                    return Some(prefix);
+                }
+                if !prefix.pop() {
+                    prefix.push("..");
+                }
+            }
+            Component::CurDir => {}
+            c => prefix.push(c.as_os_str()),
+        }
+    }
+    None
+}
+
+/// Whether `p` is a symbolic link (or junction) to somewhere not in its own
+/// directory.
+fn link_elsewhere(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink())
+        && match (std::fs::canonicalize(p), p.parent().map(std::fs::canonicalize)) {
+            (Ok(target), Some(Ok(dir))) => target.parent() != Some(dir.as_path()),
+            // Dangling: compilers find nothing there.
+            _ => true,
+        }
 }
 
 /// `p` without `.` components and with `..` applied lexically (as
@@ -487,11 +561,16 @@ struct Frame {
     dir: PathBuf,
     /// Where the file was found in the search chain (for `#include_next`).
     found_at: Option<usize>,
+    /// Clang's other possible place for it (see `State::resolve_from`).
+    alt_at: Option<Option<usize>>,
     /// Found next to an includer (or in the working directory).
     relative: bool,
     line: u32,
     /// A `#line` changed `__LINE__` and `__FILE__`.
     line_set: bool,
+    /// Its identity and size (for `#pragma once`).
+    id: FileId,
+    len: u64,
 }
 
 /// A file found by a lookup: its path as the preprocessor knows it, its
@@ -500,6 +579,7 @@ struct Found {
     path: PathBuf,
     real: PathBuf,
     at: Option<usize>,
+    alt_at: Option<Option<usize>>,
     relative: bool,
 }
 
@@ -518,7 +598,18 @@ struct State<'a> {
     pushed: HashMap<Sym, Vec<Option<Arc<Macro>>>>,
     /// The macros that macros defined so far push or pop, in text.
     pushed_in_text: HashSet<Sym>,
+    /// The macros the `_Pragma` operands of macros defined so far were
+    /// expanded with (see `macros::operand_pragmas`), and those macros:
+    /// classified again when one changes.
+    pragma_users: HashMap<Sym, Vec<Sym>>,
+    /// The files with `#pragma once` (or `#import`ed), by key, and their
+    /// paths, identities and sizes (see `once_elsewhere`).
     once: HashSet<String>,
+    once_files: Vec<(PathBuf, FileId, u64)>,
+    /// Files whose contents were compared, and whether they're the same.
+    compared: HashMap<(PathBuf, PathBuf), bool>,
+    /// What lookups noted that makes the scan inexact (see `join`).
+    notes: std::cell::RefCell<Vec<String>>,
     seen: HashSet<String>,
     stack: Vec<Frame>,
     /// The main file's directory while forced includes are processed, an
@@ -586,7 +677,7 @@ impl Context for State<'_> {
     }
 
     fn has_include(&mut self, name: &str, angled: bool, next: bool) -> bool {
-        match self.resolve(name, angled, next) {
+        match self.resolve_checked(name, angled, next) {
             Some(f) => {
                 if !self.out.found.contains(&f.real) {
                     self.out.found.push(f.real);
@@ -671,11 +762,52 @@ impl State<'_> {
 
     fn candidate(&self, path: PathBuf, at: Option<usize>) -> Option<Found> {
         let real = self.locate(&path)?;
-        Some(Found { path, real, at, relative: false })
+        Some(Found { path, real, at, alt_at: None, relative: false })
+    }
+
+    /// `dir/name`, `..` applied lexically: as compilers spell the paths
+    /// they report, and as remote workers (whose inputs are plain
+    /// directories) find them. A `..` after a symbolic link leads elsewhere
+    /// on this machine: noted (the scan is then inexact).
+    fn join(&self, dir: &Path, name: &Path) -> PathBuf {
+        let joined = dir.join(name);
+        if let Some(link) = self.cache.dotdot_after_link(&joined) {
+            let note = format!("{}: `..` after the symbolic link {}", self.here(), link.display());
+            let mut notes = self.notes.borrow_mut();
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+        }
+        normalize(&joined)
     }
 
     /// Finds an included file.
     fn resolve(&self, name: &str, angled: bool, next: bool) -> Option<Found> {
+        let from = self.stack.last().map_or((None, false), |f| (f.found_at, f.relative));
+        self.resolve_from(name, angled, next, from)
+    }
+
+    /// `resolve`, from a file whose place for `#include_next` Clang may take
+    /// one of two ways (see `resolve_from`): inexact when they find
+    /// different files.
+    fn resolve_checked(&mut self, name: &str, angled: bool, next: bool) -> Option<Found> {
+        let found = self.resolve(name, angled, next);
+        let alt = self.stack.last().filter(|_| next).and_then(|f| f.alt_at.map(|at| (at, f.relative)));
+        if let Some(from) = alt {
+            let other = self.resolve_from(name, angled, true, from);
+            let place = |f: &Option<Found>| f.as_ref().map(|f| (f.real.clone(), f.at));
+            if place(&other) != place(&found) {
+                let why = "#include_next in a header found next to an outer includer (where Clang goes on depends on -Wmicrosoft-include)";
+                self.inexact(format!("{}: {why}", self.here()));
+            }
+        }
+        found
+    }
+
+    /// Finds an included file; for `#include_next`, `from` is where the
+    /// current file was found in the chain, and whether next to an
+    /// includer.
+    fn resolve_from(&self, name: &str, angled: bool, next: bool, (found_at, relative): (Option<usize>, bool)) -> Option<Found> {
         let p = Path::new(name);
         if p.is_absolute() {
             return self.candidate(normalize(p), None);
@@ -684,15 +816,12 @@ impl State<'_> {
         // found in, `<...>` or not. From a file found otherwise, GCC starts
         // at the head of the chain when it was found next to its includer,
         // and searches as `#include` does when it's the main file or was
-        // found by its absolute path; Clang searches as `#include` (a file
-        // it found next to an includer has the includer's place).
-        let after = match self.stack.last() {
-            Some(f) if next => match f.found_at {
-                Some(i) => Some(i + 1),
-                None if f.relative && self.cfg.family == Family::Gcc => Some(0),
-                None => None,
-            },
-            _ => None,
+        // found by its absolute path; Clang searches as `#include`.
+        let after = match (next, found_at) {
+            (false, _) => None,
+            (true, Some(i)) => Some(i + 1),
+            (true, None) if relative && self.cfg.family == Family::Gcc => Some(0),
+            (true, None) => None,
         };
         if !angled && after.is_none() {
             let dirs: Vec<&PathBuf> = if self.cfg.msvc_lookup {
@@ -700,20 +829,37 @@ impl State<'_> {
             } else {
                 self.stack.last().map(|f| &f.dir).into_iter().collect()
             };
-            // Clang's lookup leaves the includer's place as the found
-            // file's, wherever along the includers it was found.
-            let at = if self.cfg.family == Family::Clang { self.stack.last().and_then(|f| f.found_at) } else { None };
-            for d in dirs {
-                if let Some(f) = self.candidate(normalize(&d.join(p)), at) {
-                    return Some(Found { relative: true, ..f });
-                }
+            let current = self.stack.last().and_then(|f| f.found_at);
+            for (k, d) in dirs.into_iter().enumerate() {
+                let Some(f) = self.candidate(self.join(d, p), None) else { continue };
+                // Clang: a file found next to the current file has its place
+                // in the chain. Next to an outer includer (MSVC's lookup;
+                // `base`, after the working directory, for `-include`), Clang
+                // goes on along the chain when -Wmicrosoft-include is on (as
+                // by default, outside system headers): the place of the first
+                // directory with that name, if any; else the current file's.
+                let (at, alt_at) = match self.cfg.family {
+                    Family::Clang if k > 0 || self.stack.is_empty() => {
+                        let warned = self.search_chain(name, 0).and_then(|f| f.at);
+                        (warned, (warned != current).then_some(current))
+                    }
+                    Family::Clang => (current, None),
+                    _ => (None, None),
+                };
+                return Some(Found { relative: true, at, alt_at, ..f });
             }
         }
         let start = after.unwrap_or(if angled { self.cfg.quote_dirs.len() } else { 0 });
+        self.search_chain(name, start)
+    }
+
+    /// Searches the chain, from its entry `start`, for `name`.
+    fn search_chain(&self, name: &str, start: usize) -> Option<Found> {
+        let mut name = Cow::Borrowed(name);
         let chain = self.cfg.quote_dirs.iter().chain(&self.cfg.angled_dirs).enumerate().skip(start);
         for (i, d) in chain {
             let found = match d {
-                SearchDir::Dir(d) => self.candidate(normalize(&d.join(p)), Some(i)),
+                SearchDir::Dir(d) => self.candidate(self.join(d, Path::new(name.as_ref())), Some(i)),
                 SearchDir::Framework(d) => {
                     // Only `Framework/Header.h` names are in frameworks: the
                     // search goes on with the next directory.
@@ -722,7 +868,19 @@ impl State<'_> {
                         .iter()
                         .find_map(|sub| self.candidate(normalize(&d.join(format!("{framework}.framework")).join(sub).join(rest)), Some(i)))
                 }
-                SearchDir::HeaderMap(m) => m.lookup(name).and_then(|f| self.candidate(f.clone(), Some(i))),
+                SearchDir::HeaderMap(m) => match m.lookup(&name) {
+                    None => None,
+                    Some(dest) if Path::new(dest).is_absolute() => self.candidate(normalize(Path::new(dest)), Some(i)),
+                    // A relative destination is another name, which Clang
+                    // looks up in the map again (a file there, relative to
+                    // the working directory), and searches the directories
+                    // after it for.
+                    Some(dest) => {
+                        let found = m.lookup(dest).and_then(|again| self.candidate(normalize(&m.cwd.join(again)), Some(i)));
+                        name = Cow::Owned(dest.to_string());
+                        found
+                    }
+                },
             };
             if found.is_some() {
                 return found;
@@ -739,7 +897,7 @@ impl State<'_> {
             return self.locate(&normalize(p));
         }
         let current = if angled { None } else { self.stack.last().map(|f| &f.dir) };
-        current.into_iter().chain(&self.cfg.embed_dirs).find_map(|d| self.locate(&normalize(&d.join(p))))
+        current.into_iter().chain(&self.cfg.embed_dirs).find_map(|d| self.locate(&self.join(d, p)))
     }
 
     fn record(&mut self, p: &Path) {
@@ -749,16 +907,19 @@ impl State<'_> {
     }
 
     fn include_file(&mut self, f: Found, import: bool) {
-        let Found { path, real, at: found_at, relative } = f;
+        let Found { path, real, at: found_at, alt_at, relative } = f;
         let key = self.key(&real);
         if self.once.contains(&key) {
             return;
         }
-        let Some(fd) = self.cache.directives(&real) else {
+        let Some((fd, stamp, id)) = self.cache.file(&real) else {
             self.out.missing.push(path.to_string_lossy().into_owned());
             return;
         };
         self.record(&real);
+        if self.once_elsewhere(&real, &fd, stamp.len, id) {
+            return;
+        }
         if fd.utf16 {
             self.inexact(format!("{}: UTF-16 text isn't scanned", real.display()));
             return;
@@ -769,7 +930,7 @@ impl State<'_> {
         if fd.lone_cr && self.cfg.family == Family::Msvc {
             self.inexact(format!("{}: cl doesn't end lines at a lone carriage return", real.display()));
         }
-        if fd.asm_include {
+        if fd.asm_include && self.cfg.assembler {
             self.inexact(format!("{}: an assembler's .include or .incbin", real.display()));
         }
         if let Some(g) = fd.guard
@@ -778,16 +939,82 @@ impl State<'_> {
             return;
         }
         if import {
-            self.once.insert(key);
+            self.mark_once(key, real.clone(), id, stamp.len);
         }
         if self.stack.len() >= 200 {
             self.inexact(format!("{}: #include nested too deeply", self.here()));
             return;
         }
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        self.stack.push(Frame { path, real, dir, found_at, relative, line: 0, line_set: false });
+        self.stack.push(Frame { path, real, dir, found_at, alt_at, relative, line: 0, line_set: false, id, len: stamp.len });
         self.run(&fd);
         self.stack.pop();
+    }
+
+    fn mark_once(&mut self, key: String, real: PathBuf, id: FileId, len: u64) {
+        if self.once.insert(key) {
+            self.once_files.push((real, id, len));
+        }
+    }
+
+    /// Whether `real` is a file with `#pragma once` (or `#import`ed) under
+    /// another name (a link), or has the contents of one (which GCC takes
+    /// for it, given the same modification time): the compiler skips it
+    /// here, but remote copies may differ (links not kept, identical files
+    /// linked, other times): inexact, unless including it again changes
+    /// nothing.
+    fn once_elsewhere(&mut self, real: &Path, fd: &FileDirectives, len: u64, id: FileId) -> bool {
+        let known = id != (0, 0);
+        let candidates: Vec<(PathBuf, bool)> =
+            self.once_files.iter().filter(|(_, i, l)| (known && *i == id) || *l == len).map(|(p, i, _)| (p.clone(), known && *i == id)).collect();
+        for (other, same_file) in candidates {
+            if !same_file && !self.same_contents(&other, real) {
+                continue;
+            }
+            if !self.again_changes_nothing(fd) {
+                self.inexact(format!(
+                    "{}: the same as {}, which has #pragma once: whether it's read again depends on the file system",
+                    real.display(),
+                    other.display()
+                ));
+            }
+            return true;
+        }
+        false
+    }
+
+    fn same_contents(&mut self, a: &Path, b: &Path) -> bool {
+        let key = (a.to_path_buf(), b.to_path_buf());
+        if let Some(&same) = self.compared.get(&key) {
+            return same;
+        }
+        let same = matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y);
+        self.compared.insert(key, same);
+        same
+    }
+
+    /// Whether including a file again would change nothing the scan sees:
+    /// its include guard is defined (after its `#pragma once`), or it has
+    /// nothing but `#pragma once`, conditionals and directives that change
+    /// nothing.
+    fn again_changes_nothing(&self, fd: &FileDirectives) -> bool {
+        let once = |d: &Directive| d.kind == DirKind::Pragma && d.toks.first().is_some_and(|t| t.sym == intern::ONCE);
+        let after_once = fd.dirs.iter().position(|d| !once(d)).unwrap_or(fd.dirs.len());
+        fd.guard.or_else(|| lex::include_guard(&fd.dirs[after_once..])).is_some_and(|g| self.macros.contains_key(&g))
+            || fd.dirs.iter().all(|d| match d.kind {
+                DirKind::Pragma => d.toks.first().is_some_and(|t| t.sym == intern::ONCE),
+                DirKind::If
+                | DirKind::Ifdef
+                | DirKind::Ifndef
+                | DirKind::Elif
+                | DirKind::Elifdef
+                | DirKind::Elifndef
+                | DirKind::Else
+                | DirKind::Endif
+                | DirKind::Line
+                | DirKind::Other => true,
+                _ => false,
+            })
     }
 
     /// `#if`-family conditions: true, false, or unknown.
@@ -843,7 +1070,7 @@ impl State<'_> {
             self.inexact(format!("{}: malformed #include", self.here()));
             return;
         };
-        match self.resolve(&name, angled, next) {
+        match self.resolve_checked(&name, angled, next) {
             Some(f) => self.include_file(f, d.kind == DirKind::Import),
             None => self.out.missing.push(name),
         }
@@ -869,7 +1096,17 @@ impl State<'_> {
     fn pragma(&mut self, d: &Directive) {
         let Some(first) = d.toks.first() else { return };
         if first.sym == intern::PRAGMA_OPERATOR {
-            self.inexact(format!("{}: a pragma from a macro in text", self.here()));
+            // `_Pragma(OPERAND)` in text, its operand made by macros (see
+            // `macros::operand_pragmas`), or a pragma run through a macro.
+            let pragmas = match &d.toks[..] {
+                [_, l, operand @ .., r] if l.is(P::LParen) && r.is(P::RParen) => macros::operand_pragmas(operand, None, &[], self).0,
+                _ => Pragmas::Other,
+            };
+            match pragmas {
+                Pragmas::None => {}
+                Pragmas::Macros(names) => self.pushed_in_text.extend(names.iter().copied()),
+                Pragmas::Other => self.inexact(format!("{}: a pragma from a macro in text", self.here())),
+            }
             return;
         }
         if first.sym == intern::INCLUDE_ALIAS {
@@ -877,9 +1114,9 @@ impl State<'_> {
             return;
         }
         if first.sym == intern::ONCE {
-            let key = self.stack.last().map(|f| self.key(&f.real));
-            if let Some(k) = key {
-                self.once.insert(k);
+            if let Some(f) = self.stack.last() {
+                let (key, real, id, len) = (self.key(&f.real), f.real.clone(), f.id, f.len);
+                self.mark_once(key, real, id, len);
             }
             return;
         }
@@ -904,6 +1141,7 @@ impl State<'_> {
                     self.macros.remove(&name);
                 }
             }
+            self.changed(name);
         }
     }
 
@@ -912,6 +1150,36 @@ impl State<'_> {
     fn changing(&mut self, name: Sym) {
         if self.pushed_in_text.contains(&name) {
             self.inexact(format!("{}: {} changes while macros in text may push or pop it", self.here(), name.as_str()));
+        }
+    }
+
+    /// After a macro's definition changed: the macros whose `_Pragma`
+    /// operands were expanded with it are classified again.
+    fn changed(&mut self, name: Sym) {
+        let Some(users) = self.pragma_users.get(&name).cloned() else { return };
+        for u in users {
+            if let Some(m) = self.macros.get(&u).cloned() {
+                self.classify(&m);
+            }
+        }
+    }
+
+    /// What a macro does through pragmas where text uses it (which isn't
+    /// expanded), with the macros defined now.
+    fn classify(&mut self, m: &Macro) {
+        let (pragmas, deps) = m.pragmas_in(self);
+        for d in deps {
+            let users = self.pragma_users.entry(d).or_default();
+            if !users.contains(&m.name) {
+                users.push(m.name);
+            }
+        }
+        match pragmas {
+            Pragmas::None => {}
+            // Pushing and popping macros never changed in between does
+            // nothing.
+            Pragmas::Macros(names) => self.pushed_in_text.extend(names.iter().copied()),
+            Pragmas::Other => self.inexact(format!("{}: {} may run a pragma in text", self.here(), m.name.as_str())),
         }
     }
 
@@ -959,15 +1227,13 @@ impl State<'_> {
                 _ if !active => {}
                 DirKind::Define => {
                     if let Some(m) = &d.mac {
-                        match &m.pragmas {
-                            Pragmas::None => {}
-                            // Pushing and popping macros never changed in
-                            // between does nothing.
-                            Pragmas::Macros(names) => self.pushed_in_text.extend(names.iter().copied()),
-                            Pragmas::Other => self.inexact(format!("{}: {} may run a pragma in text", self.here(), m.name.as_str())),
+                        // (Defined again the same: no change.)
+                        if self.macros.get(&m.name).is_none_or(|old| **old != **m) {
+                            self.changing(m.name);
+                            self.macros.insert(m.name, m.clone());
+                            self.classify(m);
+                            self.changed(m.name);
                         }
-                        self.changing(m.name);
-                        self.macros.insert(m.name, m.clone());
                     }
                 }
                 DirKind::Undef => {
@@ -975,6 +1241,7 @@ impl State<'_> {
                         && self.macros.remove(&n).is_some()
                     {
                         self.changing(n);
+                        self.changed(n);
                     }
                 }
                 DirKind::Include | DirKind::IncludeNext | DirKind::Import => self.include(d),
@@ -1041,7 +1308,11 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
         macros: (*cfg.predefined).clone(),
         pushed: HashMap::new(),
         pushed_in_text: HashSet::new(),
+        pragma_users: HashMap::new(),
         once: HashSet::new(),
+        once_files: Vec::new(),
+        compared: HashMap::new(),
+        notes: Default::default(),
         seen: HashSet::new(),
         stack: Vec::new(),
         base: None,
@@ -1055,9 +1326,12 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
             real: PathBuf::new(),
             dir: PathBuf::new(),
             found_at: None,
+            alt_at: None,
             relative: false,
             line: 0,
             line_set: false,
+            id: (0, 0),
+            len: 0,
         };
         st.stack.push(frame);
         st.run(&fd);
@@ -1070,7 +1344,7 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
         st.base = main.parent().map(Path::to_path_buf);
     }
     for f in &cfg.forced {
-        let at = |st: &State, path: PathBuf, relative| st.locate(&path).map(|real| Found { path, real, at: None, relative });
+        let at = |st: &State, path: PathBuf, relative| st.locate(&path).map(|real| Found { path, real, at: None, alt_at: None, relative });
         let found = match f {
             Forced::Path(p) => at(&st, normalize(p), false),
             Forced::Gcc { cwd, name } => at(&st, normalize(&cwd.join(name)), true).or_else(|| st.resolve(name, false, false)),
@@ -1089,7 +1363,10 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
         st.out.missing.push(main.to_string_lossy().into_owned());
         return st.out;
     };
-    st.include_file(Found { path: main, real, at: None, relative: false }, false);
+    st.include_file(Found { path: main, real, at: None, alt_at: None, relative: false }, false);
+    for note in st.notes.take() {
+        st.inexact(note);
+    }
     // The main file first.
     st.out
 }
@@ -1101,29 +1378,26 @@ mod tests {
     #[test]
     fn many_volatile_dirs() {
         let cache = Cache::new(Vec::new(), false);
-        for i in 0..5000 {
+        for i in 0..50_000 {
             cache.add_volatile(&PathBuf::from(format!("/b/try_compile/{i}")));
         }
+        // A lookup per ancestor: milliseconds, where going through the
+        // directories takes over a minute (far from what a busy machine
+        // makes of the former).
         let start = std::time::Instant::now();
         for _ in 0..10_000 {
             assert!(!cache.is_volatile(Path::new("/src/include/a.h")));
         }
-        assert!(start.elapsed() < std::time::Duration::from_millis(500), "{:?}", start.elapsed());
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
         assert!(cache.is_volatile(Path::new("/b/try_compile/4321/x.h")));
-        assert!(!cache.is_volatile(Path::new("/b/try_compile/43210/x.h")));
-        // Not named since: forgotten.
-        cache.expire_volatile(std::time::Instant::now() + std::time::Duration::from_millis(1));
-        assert!(!cache.is_volatile(Path::new("/b/try_compile/4321/x.h")));
+        assert!(!cache.is_volatile(Path::new("/b/try_compile/432100/x.h")));
     }
 
-    struct Dir(PathBuf);
+    struct Dir(test_dirs::TestDir);
 
     impl Dir {
         fn new(name: &str) -> Dir {
-            let d = test_dirs::base().join(format!("cpp_deps_{name}_{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).unwrap();
-            Dir(d)
+            Dir(test_dirs::TestDir::new(&format!("cpp_deps_{name}")))
         }
         fn file(&self, rel: &str, content: &str) -> PathBuf {
             let p = self.0.join(rel);
@@ -1133,12 +1407,6 @@ mod tests {
         }
         fn rel(&self, files: &[PathBuf]) -> Vec<String> {
             files.iter().map(|p| p.strip_prefix(&self.0).unwrap().to_string_lossy().replace('\\', "/")).collect()
-        }
-    }
-
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -1355,9 +1623,13 @@ mod tests {
         assert!(scan(&Cache::new(vec![], false), &c, &NoOracle, &import).exact());
         c.family = Family::Msvc;
         assert!(!scan(&Cache::new(vec![], false), &c, &NoOracle, &import).exact());
-        // An assembler's .include reads what the preprocessor doesn't.
+        // An assembler's .include reads what the preprocessor doesn't; in C,
+        // it's a designated initializer.
         let asm = d.file("blake3.S", "#include \"x.tlb\"\n.include \"macros.s\"\n");
-        assert!(!scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &asm).exact());
+        let assembler = Config { assembler: true, ..cfg(&d) };
+        assert!(!scan(&Cache::new(vec![], false), &assembler, &NoOracle, &asm).exact());
+        let c = d.file("init.c", "#include \"x.tlb\"\nstruct o { int include; } x = {\n    .include = 1,\n};\n");
+        assert!(scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &c).exact());
     }
 
     #[test]
@@ -1383,7 +1655,29 @@ mod tests {
         assert!(!exact("generic.c", "#define DO_PRAGMA(x) _Pragma(#x)\nDO_PRAGMA(push_macro(\"M\"))\n"));
         assert!(!exact("generic2.c", "#define PRAGMA(x) _Pragma(x)\nPRAGMA(\"once\")\n"));
         assert!(!exact("operand.c", "#define ONCE_STR \"once\"\n_Pragma(ONCE_STR)\n"));
+        assert!(!exact("operand2.c", "#define ONCE_STR \"once\"\n#define ONCE _Pragma(ONCE_STR)\nONCE\n"));
         assert!(exact("diagnostic.c", "#define DO_PRAGMA(x) _Pragma(#x)\n#define PUSH _Pragma(\"GCC diagnostic push\")\nDO_PRAGMA(GCC diagnostic pop)\n"));
+        // Operands macros make, read with the macros defined: libc++'s,
+        // Boost's and GLib's diagnostics and messages are harmless.
+        let libcxx = "#define TOSTR2(x) #x\n#define TOSTR(x) TOSTR2(x)\n#define IGNORED(str) _Pragma(TOSTR(clang diagnostic ignored str))\n";
+        assert!(exact("libcxx.cc", &format!("{libcxx}IGNORED(\"-Wfoo\")\n#include \"a.h\"\n")));
+        let boost = "#define BOOST_DO_STRINGIZE(X) #X\n#define BOOST_STRINGIZE(X) BOOST_DO_STRINGIZE(X)\n#define BOOST_PRAGMA_MESSAGE(x) _Pragma(BOOST_STRINGIZE(message(x)))\n";
+        assert!(exact("boost.cc", &format!("{boost}BOOST_PRAGMA_MESSAGE(\"hi\")\n")));
+        let glib = "#define G_STRINGIFY(m) G_STRINGIFY_ARG (m)\n#define G_STRINGIFY_ARG(c) #c\n#define _GLIB_GNUC_DO_PRAGMA(x) _Pragma(G_STRINGIFY (x))\n";
+        assert!(exact("glib.c", &format!("{glib}#define DEPRECATED _GLIB_GNUC_DO_PRAGMA(GCC warning \"deprecated\")\n")));
+        assert!(!exact("glib2.c", &format!("{glib}#define ONCE _GLIB_GNUC_DO_PRAGMA(once)\n")));
+        assert!(exact("text.c", "#define S \"GCC diagnostic push\"\n_Pragma(S)\n"));
+        // A macro an operand used changes: what the pragma does too.
+        assert!(!exact("changed.c", "#define S \"clang diagnostic push\"\n#define P _Pragma(S)\n#undef S\n#define S \"once\"\nP\n"));
+        assert!(exact("same.c", "#define S \"clang diagnostic push\"\n#define P _Pragma(S)\n#define S \"clang diagnostic push\"\nP\n"));
+        // One defined later (libc++'s _LIBCPP_VERSION, in the ABI tag of a
+        // `clang attribute` pragma): what it does then.
+        assert!(exact("later.c", "#define P _Pragma(S)\n#define S \"clang diagnostic push\"\nP\n"));
+        assert!(!exact("later2.c", "#define P _Pragma(S)\n#define S \"once\"\nP\n"));
+        assert!(exact(
+            "version.cc",
+            &format!("{libcxx}#define SIG TOSTR(V)\n#define END _Pragma(TOSTR(clang attribute X.push(__abi_tag__(SIG))))\n#define V 230100\nEND\n")
+        ));
     }
 
     #[test]
@@ -1708,21 +2002,173 @@ mod tests {
         assert!(!Arc::ptr_eq(&cache.directives(&p).unwrap(), &first));
     }
 
+    /// Waits for the file system's clock to move past `change` (a file's
+    /// change time): changes within one of its ticks get the same one.
+    fn tick_past(dir: &Path, change: u64) {
+        let probe = dir.join("tick");
+        loop {
+            std::fs::write(&probe, "").unwrap();
+            if ninja_os::stat(&probe).unwrap().1.change > change {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// A file replaced by one of the same size with its modification time
-    /// restored (`cp -p`, an archive extracted over it): lexed again.
-    #[cfg(unix)]
+    /// restored (`cp -p`, an archive extracted over it), in place or created
+    /// again (NTFS gives it the old one's creation time back): lexed again.
     #[test]
     fn same_size_and_time() {
         let d = Dir::new("stamp");
         let p = d.file("x.h", "#include \"a.h\"\n");
         let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
-        let cache = Cache::new(vec![], false);
-        let first = cache.directives(&p).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        d.file("x.h", "#include \"b.h\"\n");
-        std::fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
-        cache.new_session();
-        assert!(!Arc::ptr_eq(&cache.directives(&p).unwrap(), &first));
+        let cache = Cache::new(vec![], cfg!(windows));
+        let mut last = cache.directives(&p).unwrap();
+        for (recreate, text) in [(false, "#include \"b.h\"\n"), (true, "#include \"c.h\"\n")] {
+            tick_past(&d.0, ninja_os::stat(&p).unwrap().1.change);
+            if recreate {
+                std::fs::remove_file(&p).unwrap();
+            }
+            d.file("x.h", text);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+            cache.new_session();
+            let now = cache.directives(&p).unwrap();
+            assert!(!Arc::ptr_eq(&now, &last), "recreated: {recreate}");
+            last = now;
+        }
+    }
+
+    /// What's under a directory goes, nothing beside it (`a/b-x`, `a/b.h`
+    /// and `a/b0` sort among `a/b/...` as strings, not as paths).
+    #[test]
+    fn subtrees() {
+        let paths = ["a", "a/b", "a/b/c", "a/b/c/d", "a/b-x", "a/b.h", "a/b0", "a/bb/c", "b"];
+        let mut m: BTreeMap<PathBuf, ()> = paths.iter().map(|p| (PathBuf::from(p), ())).collect();
+        assert_eq!(remove_under(&mut m, Path::new("a/b")), 3);
+        assert_eq!(m.keys().map(|k| k.to_str().unwrap()).collect::<Vec<_>>(), ["a", "a/b-x", "a/b.h", "a/b0", "a/bb/c", "b"]);
+        assert_eq!(remove_under(&mut m, Path::new("a/c")), 0);
+    }
+
+    /// A link to a directory: a symbolic link on Unix, a junction on
+    /// Windows (which needs no privilege). False when it can't be made.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(target, link).is_ok();
+        #[cfg(windows)]
+        return std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("mklink")
+            .arg("/J")
+            .arg(normalize(link))
+            .arg(normalize(target))
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        #[cfg(not(any(unix, windows)))]
+        false
+    }
+
+    /// A `..` after a link to a directory elsewhere: compilers go to the
+    /// target's parent, remote workers (plain directories) to the link's:
+    /// inexact.
+    #[test]
+    fn dotdot_after_links() {
+        let d = Dir::new("dotdot");
+        let main = d.file("main.c", "#include \"lnk/a.h\"\n");
+        d.file("real/sub/a.h", "#include \"../b.h\"\n");
+        d.file("b.h", "");
+        d.file("real/b.h", "");
+        assert!(link_dir(&d.0.join("real/sub"), &d.0.join("lnk")), "can't link a directory");
+        let out = scan(&Cache::new(vec![], cfg!(windows)), &cfg(&d), &NoOracle, &main);
+        assert!(out.inexact.iter().any(|w| w.contains("after the symbolic link")), "{:?}", out.inexact);
+        // Without a link, `..` is the same everywhere.
+        let plain = d.file("plain.c", "#include \"real/sub/a.h\"\n");
+        let out = scan(&Cache::new(vec![], cfg!(windows)), &cfg(&d), &NoOracle, &plain);
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert_eq!(d.rel(&out.files), vec!["plain.c", "real/sub/a.h", "real/b.h"]);
+        // The command line's: falls back.
+        let argv: Vec<String> = ["cc", "-Ilnk/../inc", "-c", "main.c"].iter().map(|a| a.to_string()).collect();
+        assert!(crate::driver::parse(&argv, &d.0).unwrap_err().contains("symbolic link"));
+    }
+
+    /// `#pragma once` is about the file, not its path: the same file under
+    /// another name (a link) is skipped by the compiler here, maybe not
+    /// remotely, as an identical copy is by GCC: inexact, unless including
+    /// it again changes nothing.
+    #[test]
+    fn pragma_once_by_file() {
+        let d = Dir::new("once_file");
+        let once = "#pragma once\n#ifdef SEEN\n#include \"second.h\"\n#endif\n#define SEEN\n";
+        d.file("a.h", once);
+        d.file("second.h", "");
+        std::fs::hard_link(d.0.join("a.h"), d.0.join("lnk.h")).unwrap();
+        let scanned = |name: &str, text: &str| scan(&Cache::new(vec![], cfg!(windows)), &cfg(&d), &NoOracle, &d.file(name, text));
+        let linked = scanned("linked.c", "#include \"a.h\"\n#include \"lnk.h\"\n");
+        assert!(!linked.exact());
+        assert_eq!(d.rel(&linked.files), vec!["linked.c", "a.h", "lnk.h"]);
+        d.file("copy.h", once);
+        assert!(!scanned("copied.c", "#include \"a.h\"\n#include \"copy.h\"\n").exact());
+        // Another file, or one whose second inclusion does nothing.
+        d.file("other.h", "#pragma once\n#define OTHER\n");
+        assert!(scanned("other.c", "#include \"a.h\"\n#include \"other.h\"\n").exact());
+        d.file("stub.h", "#pragma once\n");
+        d.file("stub2.h", "#pragma once\n");
+        assert!(scanned("stubs.c", "#include \"stub.h\"\n#include \"stub2.h\"\n").exact());
+        d.file("guarded.h", "#pragma once\n#ifndef G\n#define G\n#endif\n");
+        d.file("guarded2.h", "#pragma once\n#ifndef G\n#define G\n#endif\n");
+        let out = scanned("guarded.c", "#include \"guarded.h\"\n#include \"guarded2.h\"\n");
+        assert!(out.exact(), "{:?}", out.inexact);
+    }
+
+    /// Clang: a header found next to an outer includer (MSVC's lookup)
+    /// takes the place of the first directory of the chain with its name
+    /// with -Wmicrosoft-include (on by default), the current file's
+    /// without: an `#include_next` from it is inexact when they differ.
+    #[test]
+    fn clang_msvc_lookup_places() {
+        let d = Dir::new("msvc_places");
+        let main = d.file("src/main.cc", "#include <sub/a.h>\n");
+        d.file("other/sub/a.h", "#include \"x.h\"\n");
+        d.file("src/x.h", "#include_next <x.h>\n");
+        for f in ["inc/x.h", "other/x.h", "third/x.h"] {
+            d.file(f, "");
+        }
+        let mut c = cfg(&d);
+        c.angled_dirs = vec![d.0.join("inc").into(), d.0.join("other").into(), d.0.join("third").into()];
+        c.family = Family::Clang;
+        c.msvc_lookup = true;
+        // other/x.h with the warning, third/x.h without.
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &main);
+        assert!(out.inexact.iter().any(|w| w.contains("-Wmicrosoft-include")), "{:?}", out.inexact);
+        // Both ways the same: exact.
+        std::fs::remove_file(d.0.join("other/x.h")).unwrap();
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &main);
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert_eq!(d.rel(&out.files), vec!["src/main.cc", "other/sub/a.h", "src/x.h", "third/x.h"]);
+        // Next to the current file: its place.
+        let near = d.file("near/main.cc", "#include <sub/n.h>\n");
+        d.file("inc/sub/n.h", "#include \"n2.h\"\n");
+        d.file("inc/sub/n2.h", "#include_next <x.h>\n");
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &near);
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert_eq!(d.rel(&out.files), vec!["near/main.cc", "inc/sub/n.h", "inc/sub/n2.h", "third/x.h"]);
+    }
+
+    /// A header map's relative destination is another name, searched for in
+    /// the directories after it (as Clang does).
+    #[test]
+    fn header_map_renames() {
+        let d = Dir::new("hmap_rename");
+        let main = d.file("main.c", "#include \"Old.h\"\n");
+        d.file("inc/new/name.h", "");
+        d.file("new/name.h", "");
+        let hmap = d.0.join("x.hmap");
+        std::fs::write(&hmap, crate::hmap::build(&[("Old.h", "new/", "name.h")])).unwrap();
+        let mut c = cfg(&d);
+        c.quote_dirs = vec![SearchDir::HeaderMap(Arc::new(HeaderMap::load(&hmap, &d.0).unwrap()))];
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &main);
+        assert_eq!(d.rel(&out.files), vec!["main.c", "inc/new/name.h"]);
     }
 
     /// A listing with a symbolic link holds for a session only: whether the

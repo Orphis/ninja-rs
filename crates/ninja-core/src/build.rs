@@ -1353,8 +1353,18 @@ impl<'a> Builder<'a> {
         Ok(bindings)
     }
 
-    /// Runs the build. `runner` executes commands.
+    /// Runs the build. `runner` executes commands. However it ends, the
+    /// file whose time outputs are recorded with (`.ninja_lock`) is
+    /// removed, as ninja's `Cleanup` does.
     pub async fn build(&mut self, runner: &mut dyn CommandRunner) -> Result<(), BuildError> {
+        let result = self.run(runner).await;
+        if self.disk.stat(&self.lock_file_path).unwrap_or(0) > 0 {
+            let _ = self.disk.remove_file(&self.lock_file_path);
+        }
+        result
+    }
+
+    async fn run(&mut self, runner: &mut dyn CommandRunner) -> Result<(), BuildError> {
         debug_assert!(!self.already_up_to_date());
         self.compute_critical_path();
         self.schedule_initial_edges();
@@ -1370,14 +1380,6 @@ impl<'a> Builder<'a> {
                 let mut capacity = runner.can_run_more();
                 while capacity > 0 {
                     let Some(edge) = self.find_work() else { break };
-                    // As in ninja: a generator (CMake) may run `-t restat`,
-                    // which replaces the build log; records go to the new
-                    // one, reopened when the next is written.
-                    if self.state.edge_binding_bool(edge, "generator")
-                        && let Some(log) = self.build_log.as_deref_mut()
-                    {
-                        log.close();
-                    }
                     if let Err(e) = self.start_edge(edge, runner) {
                         self.cleanup(runner).await;
                         self.status.build_finished();
@@ -1442,7 +1444,6 @@ impl<'a> Builder<'a> {
             return Err(BuildError { exit_code: if self.failure_code != 0 { self.failure_code } else { 1 }, ..BuildError::new(msg) });
         }
         self.status.build_finished();
-        let _ = self.disk.remove_file(&self.lock_file_path);
         Ok(())
     }
 
@@ -1491,32 +1492,7 @@ impl<'a> Builder<'a> {
             rsp = Some((rspfile, content));
         }
 
-        // A phony input stands for its inputs (CMake's `install` depends on
-        // `all`): those are what the command reads. A phony with none names
-        // a file (CMake's rules for headers that may go away).
-        let mut inputs: Vec<String> = Vec::new();
-        let mut stack: Vec<NodeId> = self.state.edge(edge).non_order_only_inputs().iter().rev().copied().collect();
-        let mut seen = std::collections::HashSet::new();
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n) {
-                continue;
-            }
-            match self.state.node(n).in_edge {
-                Some(e) if self.state.is_phony(e) && !self.state.edge(e).non_order_only_inputs().is_empty() => {
-                    stack.extend(self.state.edge(e).non_order_only_inputs().iter().rev().copied());
-                }
-                _ => inputs.push(self.state.path(n).to_string()),
-            }
-        }
-        if !self.state.edge(edge).deps_added && !self.config.dry_run {
-            // Deps an earlier build discovered, as hints: remote actions
-            // send them, local ones download them first.
-            for p in self.scanner().discovered_dep_paths(edge) {
-                if !inputs.contains(&p) {
-                    inputs.push(p);
-                }
-            }
-        }
+        let inputs = if runner.wants_inputs() { self.task_inputs(edge) } else { Vec::new() };
         let bindings = self.task_bindings(edge)?;
         let deps = self.state.edge_binding(edge, "deps")?;
         let task = Task {
@@ -1536,6 +1512,38 @@ impl<'a> Builder<'a> {
             bindings,
         };
         runner.start_command(task).map_err(|e| format!("command '{}' failed: {e}", info.command))
+    }
+
+    /// What `edge`'s command reads (see `Task::inputs`). A phony input
+    /// stands for its inputs (CMake's `install` depends on `all`): those
+    /// are what the command reads. A phony with none names a file (CMake's
+    /// rules for headers that may go away).
+    fn task_inputs(&mut self, edge: EdgeId) -> Vec<String> {
+        let mut inputs: Vec<String> = Vec::new();
+        let mut stack: Vec<NodeId> = self.state.edge(edge).non_order_only_inputs().iter().rev().copied().collect();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n) {
+                continue;
+            }
+            match self.state.node(n).in_edge {
+                Some(e) if self.state.is_phony(e) && !self.state.edge(e).non_order_only_inputs().is_empty() => {
+                    stack.extend(self.state.edge(e).non_order_only_inputs().iter().rev().copied());
+                }
+                _ => inputs.push(self.state.path(n).to_string()),
+            }
+        }
+        if !self.state.edge(edge).deps_added && !self.config.dry_run {
+            // Deps an earlier build discovered, as hints: remote actions
+            // send them, local ones download them first.
+            let mut listed: std::collections::HashSet<String> = inputs.iter().cloned().collect();
+            for p in self.scanner().discovered_dep_paths(edge) {
+                if listed.insert(p.clone()) {
+                    inputs.push(p);
+                }
+            }
+        }
+        inputs
     }
 
     /// Action rewinding: `edge` couldn't read `lost` inputs, outputs of
@@ -1775,9 +1783,6 @@ impl<'a> Builder<'a> {
             if !depfile.is_empty() {
                 let _ = self.disk.remove_file(&depfile);
             }
-        }
-        if self.disk.stat(&self.lock_file_path).unwrap_or(0) > 0 {
-            let _ = self.disk.remove_file(&self.lock_file_path);
         }
     }
 }

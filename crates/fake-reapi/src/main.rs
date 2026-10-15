@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 fn main() {
     let mut port = 0u16;
+    #[allow(clippy::disallowed_methods)] // A standalone server's, not a test's.
     let mut work = std::env::temp_dir().join(format!("fake-reapi-{}", std::process::id()));
     let (mut cert, mut key, mut client_ca) = (None, None, None);
     let mut args = std::env::args().skip(1);

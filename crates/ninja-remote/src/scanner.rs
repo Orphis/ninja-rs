@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use cpp_deps::lex::{DirKind, Kind, P, Token};
@@ -72,7 +72,8 @@ pub struct CompileInfo {
     /// `--embed-dir`: searched by `#embed`.
     pub embed_dirs: Vec<PathBuf>,
     /// MSVC's lookup (cl, clang-cl, and Clang for the MSVC ABI): `#include
-    /// "..."` searches every includer's directory.
+    /// "..."` searches every includer's directory. From the flags; the
+    /// compiler's predefined macros decide (see `Scanner::msvc_lookup`).
     pub msvc_lookup: bool,
 }
 
@@ -157,9 +158,44 @@ pub fn decode_rsp(content: &[u8]) -> String {
 }
 
 /// Parses a compile command (after response file expansion).
+/// The sysroot of headers: the last `-isysroot`, else the last
+/// `--sysroot`.
+fn header_sysroot(argv: &[String]) -> Option<String> {
+    let (mut sysroot, mut isysroot) = (None, None);
+    for (i, a) in argv.iter().enumerate() {
+        match a.as_str() {
+            "--sysroot" => sysroot = argv.get(i + 1).cloned(),
+            "-isysroot" => isysroot = argv.get(i + 1).cloned(),
+            _ => {
+                if let Some(v) = a.strip_prefix("--sysroot=") {
+                    sysroot = Some(v.to_string());
+                } else if let Some(v) = a.strip_prefix("-isysroot").filter(|v| !v.is_empty()) {
+                    isysroot = Some(v.to_string());
+                }
+            }
+        }
+    }
+    isysroot.or(sysroot)
+}
+
 pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
     let mut info = CompileInfo { style: argv.first().and_then(|a| compiler_style(a, argv)), ..Default::default() };
     let msvc = info.style == Some(Style::Msvc);
+    // cl.exe, not clang-cl (whose `/FI` is GCC's `-include`).
+    let cl_exe = msvc && argv.first().is_some_and(|a| a.rsplit(['/', '\\']).next().unwrap_or(a).to_ascii_lowercase().trim_end_matches(".exe") == "cl");
+    // A directory: `=` at its start stands for the sysroot, when given;
+    // else GCC takes it as its configured one (none: `/inc`), Clang
+    // literally (`cwd/=/inc`): both.
+    let sysroot = header_sysroot(argv);
+    let dirs = |v: &str| -> Vec<PathBuf> {
+        match (v.strip_prefix('=').or_else(|| v.strip_prefix("$SYSROOT")), &sysroot) {
+            (Some(rest), Some(root)) => vec![abs(&format!("{root}/{}", rest.trim_start_matches(['/', '\\'])), cwd)],
+            (Some(rest), None) => vec![abs(rest, cwd), abs(v, cwd)],
+            (None, _) => vec![abs(v, cwd)],
+        }
+    };
+    // `-iprefix`, which `-iwithprefix` directories follow.
+    let mut prefix = String::new();
     // Forced includes as given, and `-f[no-]ms-compatibility`'s last.
     let (mut forced, mut ms_compat): (Vec<String>, Option<bool>) = (Vec::new(), None);
     let mut i = 1;
@@ -174,7 +210,6 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
         "-MT",
         "-MQ",
         "-MJ",
-        "-Xclang",
         "-Xlinker",
         "-Xpreprocessor",
         "-Xassembler",
@@ -187,9 +222,6 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
         "-l",
         "-F",
         "-iframework",
-        "-iprefix",
-        "-iwithprefix",
-        "-iwithprefixbefore",
         "-dependency-file",
         "-Xarch_host",
         "-Xarch_device",
@@ -215,29 +247,54 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             }
             None
         };
+        // A directory's flag, whose `=` stands for the sysroot.
+        let dir_opt = |prefixes: &[&str], i: &mut usize| -> Option<Vec<PathBuf>> {
+            for p in prefixes {
+                if a == *p {
+                    return Some(take(i).map(|v| dirs(&v)).unwrap_or_default());
+                }
+                if let Some(v) = a.strip_prefix(p)
+                    && !v.is_empty()
+                {
+                    return Some(dirs(v));
+                }
+            }
+            None
+        };
         // Order matters: longer prefixes first.
-        if let Some(v) = opt(&["-isystem-after"], &mut i) {
+        if let Some(v) = dir_opt(&["-isystem-after"], &mut i) {
+            info.after_dirs.extend(v);
+            continue;
+        }
+        if let Some(v) = dir_opt(&["-isystem", "-cxx-isystem", "-stdlib++-isystem", "-imsvc", "/imsvc", "/external:I", "-external:I"], &mut i) {
+            info.system_dirs.extend(v);
+            continue;
+        }
+        if let Some(v) = dir_opt(&["-iquote"], &mut i) {
+            info.quote_dirs.extend(v);
+            continue;
+        }
+        if let Some(v) = dir_opt(&["-idirafter"], &mut i) {
+            info.after_dirs.extend(v);
+            continue;
+        }
+        // The sysroot's, and the prefix's (Clang's and GCC's `-iprefix`).
+        if let Some(v) = opt(&["-iwithsysroot"], &mut i) {
             if let Some(v) = v {
-                info.after_dirs.push(abs(&v, cwd));
+                info.system_dirs.extend(dirs(&format!("={v}")));
             }
             continue;
         }
-        if let Some(v) = opt(&["-isystem", "-cxx-isystem", "-imsvc", "/imsvc", "/external:I", "-external:I"], &mut i) {
-            if let Some(v) = v {
-                info.system_dirs.push(abs(&v, cwd));
-            }
+        if let Some(v) = opt(&["-iprefix"], &mut i) {
+            prefix = v.unwrap_or_default();
             continue;
         }
-        if let Some(v) = opt(&["-iquote"], &mut i) {
-            if let Some(v) = v {
-                info.quote_dirs.push(abs(&v, cwd));
-            }
+        if let Some(v) = opt(&["-iwithprefixbefore"], &mut i) {
+            info.user_dirs.extend(v.map(|v| abs(&format!("{prefix}{v}"), cwd)));
             continue;
         }
-        if let Some(v) = opt(&["-idirafter"], &mut i) {
-            if let Some(v) = v {
-                info.after_dirs.push(abs(&v, cwd));
-            }
+        if let Some(v) = opt(&["-iwithprefix"], &mut i) {
+            info.after_dirs.extend(v.map(|v| abs(&format!("{prefix}{v}"), cwd)));
             continue;
         }
         // (Files flags name are `read_paths`'.)
@@ -269,15 +326,17 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             }
             continue;
         }
-        if let Some(v) = opt(&["-I", "/I", "--include-directory"], &mut i) {
+        if let Some(v) = opt(&["--include-directory"], &mut i) {
+            info.user_dirs.extend(v.map(|v| abs(&v, cwd)));
+            continue;
+        }
+        if let Some(v) = dir_opt(&["-I", "/I"], &mut i) {
             // On POSIX "/I..." is a path, not a flag.
             if a.starts_with('/') && !msvc {
                 info.sources.extend(source_if_any(&a, cwd));
                 continue;
             }
-            if let Some(v) = v {
-                info.user_dirs.push(abs(&v, cwd));
-            }
+            info.user_dirs.extend(v);
             continue;
         }
         // Flags that change the built-in include directories, normalized to
@@ -297,6 +356,7 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             false
         };
         if builtin("--target", &["--target", "-target"], "=", &mut i)
+            || builtin("--config", &["--config"], "=", &mut i)
             || builtin("--gcc-toolchain", &["--gcc-toolchain", "-gcc-toolchain"], "=", &mut i)
             || builtin("-resource-dir", &["-resource-dir"], "=", &mut i)
             || builtin("--driver-mode", &["--driver-mode"], "=", &mut i)
@@ -361,6 +421,16 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             i += 3;
             continue;
         }
+        if a == "-Xclang" {
+            // cc1's MSVC compatibility, which the compiler's answer shows
+            // (see `Scanner::msvc_lookup`).
+            if let Some(v) = argv.get(i).filter(|v| matches!(v.as_str(), "-fms-compatibility" | "-fno-ms-compatibility")) {
+                ms_compat = Some(v == "-fms-compatibility");
+                info.builtin_flags.extend([a.clone(), v.clone()]);
+            }
+            i += 1;
+            continue;
+        }
         if opt(&["-ivfsoverlay", "-vfsoverlay", "--vfsoverlay"], &mut i).is_some() {
             continue;
         }
@@ -376,32 +446,36 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
     if info.lang.is_none() {
         info.lang = info.sources.iter().find_map(|s| lang_of_source(&s.to_string_lossy()));
     }
-    // Clang for the MSVC ABI: given as the target, or the host's (Windows
-    // hosts' Clang targets it), unless flags say otherwise.
-    let target = info.builtin_flags.iter().find_map(|f| f.strip_prefix("--target="));
+    // Clang for the MSVC ABI: given as the target (the last), or the
+    // host's (Windows hosts' Clang targets it), unless flags say otherwise.
+    let target = info.builtin_flags.iter().rev().find_map(|f| f.strip_prefix("--target="));
     let clang = argv.first().is_some_and(|a| a.rsplit(['/', '\\']).next().unwrap_or(a).to_ascii_lowercase().contains("clang"));
     info.msvc_lookup = msvc
         || ms_compat.unwrap_or(match target {
             Some(t) => msvc_target(t),
             None => cfg!(windows) && clang,
         });
-    // A forced include is found in the working directory, else as an
-    // `#include "..."` in the source (cl's /FI first next to it): every
+    // A forced include is found in the working directory (but by cl.exe,
+    // which searches it as an `#include "..."` in the source), else as an
+    // `#include "..."` in the source (MSVC's lookup next to it first): every
     // place it may be.
     for name in forced {
         let p = abs(&name, cwd);
-        if p.is_file() || Path::new(&name).is_absolute() {
+        if Path::new(&name).is_absolute() || (!cl_exe && p.is_file()) {
             info.forced_includes.push(p);
             continue;
         }
         let source_dirs = info.sources.iter().filter_map(|s| s.parent()).filter(|_| info.msvc_lookup);
+        // cl.exe's built-in directories are INCLUDE's.
+        let include = if cl_exe { std::env::var_os("INCLUDE").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default() } else { Vec::new() };
         let dirs: Vec<PathBuf> = source_dirs
             .map(Path::to_path_buf)
             .chain(info.quote_dirs.iter().chain(&info.user_dirs).chain(&info.system_dirs).chain(&info.after_dirs).cloned())
+            .chain(include)
             .collect();
         let found: Vec<PathBuf> = dirs.iter().map(|d| normalize(&d.join(&name))).filter(|p| p.is_file()).collect();
         // None: where the build may make it.
-        info.forced_includes.extend(if found.is_empty() { vec![p] } else { found });
+        info.forced_includes.extend(if found.is_empty() && !cl_exe { vec![p] } else { found });
     }
     let (files, dirs) = cpp_deps::driver::read_paths(argv, cwd);
     info.extra_files.extend(files);
@@ -570,15 +644,26 @@ pub struct Resolved {
     pub files: Vec<PathBuf>,
     /// The file's directives about macros (see `Directives`).
     pub directives: Arc<Directives>,
+    /// A candidate's `..` after a symbolic link (see `candidates`).
+    pub linked: Option<PathBuf>,
 }
+
+/// A compiler's built-in directories, and whether it searches includers'
+/// directories (when it said: see `Scanner::msvc_lookup`).
+type Builtin = (Arc<Vec<PathBuf>>, Option<bool>);
 
 /// Scanner caches, shared across actions (and builds, in a daemon).
 #[derive(Default)]
 pub struct ScanCache {
     directives: Mutex<HashMap<PathBuf, (u64, Option<SystemTime>, Arc<Directives>)>>,
     resolutions: Mutex<HashMap<(FileKey, u64), Arc<Resolved>>>,
-    listings: Mutex<HashMap<PathBuf, Option<Arc<HashSet<String>>>>>,
-    builtin: Mutex<HashMap<String, Arc<Vec<PathBuf>>>>,
+    listings: RwLock<HashMap<PathBuf, Option<Arc<HashSet<String>>>>>,
+    /// MSVC's lookups (see `Scanner::msvc_candidates`): by directory, the file
+    /// each name is there (outside the build directory).
+    msvc: RwLock<HashMap<PathBuf, HashMap<String, Option<PathBuf>>>>,
+    /// The compilers' built-in directories, and whether they search
+    /// includers' directories (see `Builtin`).
+    builtin: Mutex<HashMap<String, Builtin>>,
     pub stats: Mutex<ScanStats>,
     /// Compiles another scanner left to this one, by reason (see
     /// `fell_back`).
@@ -625,9 +710,15 @@ impl ScanCache {
 pub struct ScanResult {
     /// Every file the compile may read (sources, headers, forced includes).
     pub files: BTreeSet<PathBuf>,
-    /// Directories to send whole (computed includes).
+    /// Directories whose files to send (computed includes the scan can't
+    /// name: see `crate::store::dir_files`).
     pub dirs: BTreeSet<PathBuf>,
     pub warnings: Vec<String>,
+    /// Why the compile can't run remotely, if so: a computed include in
+    /// the build directory (whose files the build is writing), or a `..`
+    /// after a symbolic link (which the compiler resolves elsewhere than a
+    /// remote worker).
+    pub local: Option<String>,
 }
 
 pub struct Scanner<'a> {
@@ -692,13 +783,13 @@ impl Scanner<'_> {
     }
 
     fn listing(&self, dir: &Path) -> Option<Arc<HashSet<String>>> {
-        if let Some(l) = self.cache.listings.lock().unwrap().get(dir) {
+        if let Some(l) = self.cache.listings.read().unwrap().get(dir) {
             return l.clone();
         }
         let l = std::fs::read_dir(dir)
             .ok()
             .map(|rd| Arc::new(rd.filter_map(|e| e.ok()).map(|e| self.name_key(&e.file_name().to_string_lossy())).collect::<HashSet<_>>()));
-        self.cache.listings.lock().unwrap().insert(dir.to_path_buf(), l.clone());
+        self.cache.listings.write().unwrap().insert(dir.to_path_buf(), l.clone());
         l
     }
 
@@ -730,45 +821,73 @@ impl Scanner<'_> {
 
     /// The files `inc` may name, from a file in `from_dir`: in the
     /// directories that may change during the build (`volatile`), or in the
-    /// others.
-    fn candidates(&self, inc: &Include, from_dir: &Path, sp: &SearchPath, volatile: bool, out: &mut Vec<PathBuf>) {
+    /// others. A `..` after a symbolic link, which the compiler resolves
+    /// elsewhere than a remote worker (whose inputs are plain directories),
+    /// is noted in `linked` when a file is there either way.
+    fn candidates(&self, inc: &Include, from_dir: &Path, sp: &SearchPath, volatile: bool, out: &mut Vec<PathBuf>, linked: &mut Option<PathBuf>) {
         let name = &inc.name;
         let np = Path::new(name);
-        let mut try_path = |p: PathBuf| {
+        let mut try_path = |joined: PathBuf| {
+            let p = normalize(&joined);
+            if linked.is_none()
+                && let Some(link) = cpp_deps::scan::dotdot_after_link(&joined)
+                && (joined.is_file() || p.is_file())
+            {
+                *linked = Some(link);
+            }
             if self.is_volatile(&p) == volatile && self.is_file(&p) {
                 out.push(p);
             }
         };
         if np.is_absolute() || (self.windows && name.len() > 2 && name.as_bytes()[1] == b':') {
-            try_path(normalize(np));
+            try_path(np.to_path_buf());
             return;
         }
         let quote = if inc.angled { None } else { Some(std::iter::once(from_dir).chain(sp.quote.iter().map(PathBuf::as_path))) };
         for d in quote.into_iter().flatten().chain(sp.angled.iter().map(PathBuf::as_path)) {
-            try_path(normalize(&d.join(np)));
+            try_path(d.join(np));
         }
     }
 
     /// The files MSVC's lookup may find that weren't looked for yet: the
     /// new names in every directory, the others in the new directories.
-    fn msvc_lookup(&self, m: &mut MsvcLookup) -> Vec<PathBuf> {
+    fn msvc_candidates(&self, m: &mut MsvcLookup) -> Vec<PathBuf> {
         let (new_dirs, new_names) = (std::mem::take(&mut m.new_dirs), std::mem::take(&mut m.new_names));
         let mut found = Vec::new();
         let mut look = |dir: &Path, names: &[String]| {
-            // A plain name is looked up in the directory's listing (taken
-            // once), others as paths.
-            let listing = if self.is_volatile(dir) { None } else { self.listing(dir) };
-            for n in names {
-                let plain = !n.contains(['/', '\\']);
+            // The file a name is in a directory, looked up once (outside the
+            // build directory): a plain name in the directory's listing,
+            // others as paths.
+            let find = |n: &String, listing: &Option<Arc<HashSet<String>>>| {
                 let p = normalize(&dir.join(n));
-                let exists = match &listing {
-                    Some(l) if plain => l.contains(&self.name_key(n)) && p.is_file(),
+                let exists = match listing {
+                    Some(l) if !n.contains(['/', '\\']) => l.contains(&self.name_key(n)) && p.is_file(),
                     _ => self.is_file(&p),
                 };
-                if exists {
-                    found.push(p);
-                }
+                exists.then_some(p)
+            };
+            if self.is_volatile(dir) {
+                found.extend(names.iter().filter_map(|n| find(n, &None)));
+                return;
             }
+            let mut unknown = Vec::new();
+            if let Some(known) = self.cache.msvc.read().unwrap().get(dir) {
+                for n in names {
+                    match known.get(n) {
+                        Some(f) => found.extend(f.iter().cloned()),
+                        None => unknown.push(n),
+                    }
+                }
+            } else {
+                unknown.extend(names);
+            }
+            if unknown.is_empty() {
+                return;
+            }
+            let listing = self.listing(dir);
+            let looked: Vec<(String, Option<PathBuf>)> = unknown.into_iter().map(|n| (n.clone(), find(n, &listing))).collect();
+            found.extend(looked.iter().filter_map(|(_, f)| f.clone()));
+            self.cache.msvc.write().unwrap().entry(dir.to_path_buf()).or_default().extend(looked);
         };
         for d in &m.dirs {
             look(d, &new_names);
@@ -795,13 +914,13 @@ impl Scanner<'_> {
         self.cache.stats.lock().unwrap().resolution_misses += 1;
         let d = self.directives(p, &key);
         let from_dir = p.parent().unwrap_or(Path::new(""));
-        let mut files = Vec::new();
+        let (mut files, mut linked) = (Vec::new(), None);
         for inc in d.includes.iter().chain(&d.define_candidates) {
-            self.candidates(inc, from_dir, sp, false, &mut files);
+            self.candidates(inc, from_dir, sp, false, &mut files, &mut linked);
         }
         files.sort();
         files.dedup();
-        let r = Arc::new(Resolved { files, directives: d.clone() });
+        let r = Arc::new(Resolved { files, directives: d.clone(), linked });
         self.cache.resolutions.lock().unwrap().insert(ck, r.clone());
         r
     }
@@ -812,6 +931,7 @@ impl Scanner<'_> {
         let mut files = BTreeSet::new();
         let mut dirs = BTreeSet::new();
         let mut warnings = Vec::new();
+        let mut linked = None;
         let mut queue: VecDeque<PathBuf> = roots.iter().cloned().collect();
         // Computed includes, and the macros the scanned files define.
         let mut computed: Vec<(PathBuf, Vec<String>)> = Vec::new();
@@ -819,7 +939,7 @@ impl Scanner<'_> {
         let mut aliases: Vec<(String, String)> = Vec::new();
         let volatile_search = sp.quote.iter().chain(&sp.angled).any(|d| self.is_volatile(d));
         // MSVC's lookup: the quoted names, and the directories of the files
-        // reached, each tried with every other (see `msvc_lookup`).
+        // reached, each tried with every other (see `msvc_candidates`).
         let mut msvc = MsvcLookup::default();
         loop {
             while let Some(f) = queue.pop_front() {
@@ -827,6 +947,9 @@ impl Scanner<'_> {
                     continue;
                 }
                 let r = self.resolve_file(&f, sp, sp_id);
+                if linked.is_none() {
+                    linked.clone_from(&r.linked);
+                }
                 if !r.directives.computed.is_empty() {
                     computed.push((f.clone(), r.directives.computed.clone()));
                 }
@@ -837,7 +960,7 @@ impl Scanner<'_> {
                 let mut found = r.files.clone();
                 if volatile_search || self.is_volatile(from_dir) {
                     for inc in r.directives.includes.iter().chain(&r.directives.define_candidates) {
-                        self.candidates(inc, from_dir, sp, true, &mut found);
+                        self.candidates(inc, from_dir, sp, true, &mut found, &mut linked);
                     }
                 }
                 if sp.msvc {
@@ -848,7 +971,7 @@ impl Scanner<'_> {
             if !sp.msvc {
                 break;
             }
-            queue.extend(self.msvc_lookup(&mut msvc).into_iter().filter(|f| !files.contains(f)));
+            queue.extend(self.msvc_candidates(&mut msvc).into_iter().filter(|f| !files.contains(f)));
             if queue.is_empty() {
                 break;
             }
@@ -866,50 +989,78 @@ impl Scanner<'_> {
             }
         }
         // A computed include whose macro names a header is covered: the
-        // header was followed as a candidate. Otherwise its directory goes
-        // whole.
+        // header was followed as a candidate. Otherwise its directory's
+        // files go (not its subdirectories'); not those of the build
+        // directory, which the build is writing (objects, logs): the
+        // compile runs locally then.
+        let mut local = linked.map(|l| format!("`..` after the symbolic link {}, which the compiler resolves elsewhere than a remote worker", l.display()));
         for (f, macros) in computed {
             if macros.iter().all(|m| header_macros.contains(m)) {
                 continue;
             }
-            if let Some(parent) = f.parent()
-                && dirs.insert(parent.to_path_buf())
-            {
-                warnings.push(format!("computed #include in {}: sending {} whole", f.display(), parent.display()));
+            let Some(parent) = f.parent() else { continue };
+            if self.is_volatile(parent) {
+                local.get_or_insert_with(|| format!("computed #include in {}, in the build directory", f.display()));
+            } else if dirs.insert(parent.to_path_buf()) {
+                warnings.push(format!("computed #include in {}: sending the files of {}", f.display(), parent.display()));
             }
         }
-        ScanResult { files, dirs, warnings }
+        ScanResult { files, dirs, warnings, local }
+    }
+
+    /// Whether the compiler searches includers' directories (MSVC's lookup),
+    /// as its predefined macros say (`_MSC_VER` and `__clang__`: Clang for
+    /// the MSVC ABI, which its driver's name, configuration files or cc1's
+    /// flags may choose) when `builtin_dirs` could ask it; else from the
+    /// flags.
+    pub fn msvc_lookup(&self, compiler: &Path, info: &CompileInfo) -> bool {
+        let answer = self.cache.builtin.lock().unwrap().get(&builtin_key(compiler, info)).and_then(|(_, msvc)| *msvc);
+        info.style == Some(Style::Msvc) || answer.unwrap_or(info.msvc_lookup)
     }
 
     /// The compiler's built-in include directories, from `-v` output
     /// (cached per compiler, relevant flags and language).
     pub fn builtin_dirs(&self, compiler: &Path, info: &CompileInfo) -> Result<Arc<Vec<PathBuf>>, String> {
-        if info.no_builtin_includes {
-            return Ok(Arc::new(Vec::new()));
-        }
-        let lang = info.lang.unwrap_or(Lang::Cxx);
-        let key = format!("{}|{:?}|{:?}|{}", compiler.display(), info.style, lang, info.builtin_flags.join("\u{1}"));
-        if let Some(d) = self.cache.builtin.lock().unwrap().get(&key) {
+        let key = builtin_key(compiler, info);
+        if let Some((d, _)) = self.cache.builtin.lock().unwrap().get(&key) {
             return Ok(d.clone());
         }
-        let dirs = Arc::new(discover_builtin_dirs(compiler, info, lang)?);
-        self.cache.builtin.lock().unwrap().insert(key, dirs.clone());
+        // (Asked with `-nostdinc` too, for `msvc_lookup`.)
+        let (dirs, msvc) = match discover_builtin_dirs(compiler, info, info.lang.unwrap_or(Lang::Cxx)) {
+            Err(_) if info.no_builtin_includes => (Vec::new(), None),
+            found => found?,
+        };
+        let dirs = Arc::new(if info.no_builtin_includes { Vec::new() } else { dirs });
+        self.cache.builtin.lock().unwrap().insert(key, (dirs.clone(), msvc));
         Ok(dirs)
     }
 }
 
+/// The key of a compiler's built-in directories: it, the flags that change
+/// them, and the language.
+fn builtin_key(compiler: &Path, info: &CompileInfo) -> String {
+    format!("{}|{:?}|{:?}|{}", compiler.display(), info.style, info.lang.unwrap_or(Lang::Cxx), info.builtin_flags.join("\u{1}"))
+}
+
 /// Runs `<compiler> -E -v` on an empty input and parses the include search
-/// list it prints.
-pub fn discover_builtin_dirs(compiler: &Path, info: &CompileInfo, lang: Lang) -> Result<Vec<PathBuf>, String> {
+/// list it prints; for GCC-style drivers, with `-dM`: whether the compiler
+/// is Clang for the MSVC ABI (`_MSC_VER` and `__clang__`), which searches
+/// includers' directories. Killed when it takes too long.
+pub fn discover_builtin_dirs(compiler: &Path, info: &CompileInfo, lang: Lang) -> Result<(Vec<PathBuf>, Option<bool>), String> {
+    discover_builtin_dirs_for(compiler, info, lang, cpp_deps::probe::TIMEOUT)
+}
+
+fn discover_builtin_dirs_for(compiler: &Path, info: &CompileInfo, lang: Lang, timeout: std::time::Duration) -> Result<(Vec<PathBuf>, Option<bool>), String> {
     let base = compiler.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if base == "cl" {
         // MSVC's cl.exe has no -v; it uses the INCLUDE environment variable.
-        return Ok(std::env::var_os("INCLUDE").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default());
+        return Ok((std::env::var_os("INCLUDE").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default(), None));
     }
     let mut cmd = std::process::Command::new(compiler);
     cmd.args(&info.builtin_flags);
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    if info.style == Some(Style::Msvc) {
+    let gcc = info.style != Some(Style::Msvc);
+    if !gcc {
         cmd.arg("-v").arg("-E").arg(if lang == Lang::C { "/TC" } else { "/TP" }).arg(null);
     } else {
         let l = match lang {
@@ -919,16 +1070,21 @@ pub fn discover_builtin_dirs(compiler: &Path, info: &CompileInfo, lang: Lang) ->
             Lang::ObjCxx => "objective-c++",
             Lang::Asm => "assembler-with-cpp",
         };
-        cmd.arg("-E").arg("-x").arg(l).arg("-v").arg(null);
+        cmd.arg("-E").arg("-x").arg(l).arg("-v").arg("-dM").arg(null);
     }
-    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped());
-    let out = cmd.output().map_err(|e| format!("running {} -v: {e}", compiler.display()))?;
+    let stdout = if gcc { std::process::Stdio::piped() } else { std::process::Stdio::null() };
+    cmd.stdin(std::process::Stdio::null()).stdout(stdout).stderr(std::process::Stdio::piped());
+    let out = ninja_os::process::output(cmd, None, timeout).map_err(|e| format!("running {} -v: {e}", compiler.display()))?;
     let text = String::from_utf8_lossy(&out.stderr);
     let dirs = parse_search_list(&text);
-    if dirs.is_empty() {
+    if dirs.is_empty() && !info.no_builtin_includes {
         return Err(format!("could not find the include search list in `{} -v` output (exit {:?})", compiler.display(), out.status.code()));
     }
-    Ok(dirs)
+    let macros = String::from_utf8_lossy(&out.stdout);
+    let defined = |m: &str| {
+        macros.lines().any(|l| l.strip_prefix("#define ").and_then(|d| d.strip_prefix(m)).is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')))
+    };
+    Ok((dirs, gcc.then(|| defined("_MSC_VER") && defined("__clang__"))))
 }
 
 pub fn parse_search_list(text: &str) -> Vec<PathBuf> {
@@ -1034,8 +1190,7 @@ mod tests {
 
     #[test]
     fn computed_includes_of_known_macros() {
-        let dir = test_dirs::base().join(format!("ninja_rs_scan_computed_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("ninja_rs_scan_computed");
         std::fs::create_dir_all(dir.join("inc/ft")).unwrap();
         std::fs::write(dir.join("main.c"), "#include <config.h>\n#include FT_HEADER\n#include \"other.h\"\n").unwrap();
         std::fs::write(dir.join("inc/config.h"), "#define FT_IMPL <ft/impl.h>\n#define FT_HEADER FT_IMPL\n").unwrap();
@@ -1050,12 +1205,11 @@ mod tests {
         let rel: Vec<String> = r.files.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect();
         assert_eq!(rel, vec!["inc/config.h", "inc/ft/impl.h", "main.c", "other.h"]);
         assert!(r.dirs.is_empty() && r.warnings.is_empty(), "{:?} {:?}", r.dirs, r.warnings);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn parse_gcc_command() {
-        let cwd = std::env::temp_dir();
+        let cwd = test_dirs::TestDir::new("ninja_rs_scan_parse");
         let src = cwd.join("ninja_rs_scan_test_main.cc");
         std::fs::write(&src, "").unwrap();
         let argv = s(&[
@@ -1118,8 +1272,7 @@ mod tests {
 
     #[test]
     fn scan_tree() {
-        let dir = test_dirs::base().join(format!("ninja_rs_scan_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("ninja_rs_scan");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("inc/sub")).unwrap();
         std::fs::create_dir_all(dir.join("sys")).unwrap();
@@ -1133,7 +1286,7 @@ mod tests {
         std::fs::write(dir.join("comp/c.h"), "#include COMPUTED\n").unwrap();
         let cache = ScanCache::default();
         let scanner = Scanner { cache: &cache, windows: false, volatile_roots: vec![] };
-        let sp = SearchPath { quote: vec![dir.clone()], angled: vec![dir.join("inc"), dir.join("sys")], msvc: false };
+        let sp = SearchPath { quote: vec![dir.to_path_buf()], angled: vec![dir.join("inc"), dir.join("sys")], msvc: false };
         let r = scanner.scan(&[dir.join("src/main.c")], &sp);
         let rel: Vec<String> = r.files.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect();
         assert_eq!(rel, vec!["comp/c.h", "inc/a.h", "inc/sub/b.h", "src/local.h", "src/main.c", "sys/a.h"]);
@@ -1143,13 +1296,11 @@ mod tests {
         let before = cache.stats.lock().unwrap().resolution_hits;
         scanner.scan(&[dir.join("src/main.c")], &sp);
         assert!(cache.stats.lock().unwrap().resolution_hits > before);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A tree of files under a new temporary directory.
-    fn tree(name: &str, files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ninja_rs_scan_{name}_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    /// A tree of files under a new test directory.
+    fn tree(name: &str, files: &[(&str, &str)]) -> test_dirs::TestDir {
+        let dir = test_dirs::TestDir::new(&format!("ninja_rs_scan_{name}"));
         for (f, text) in files {
             std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
             std::fs::write(dir.join(f), text).unwrap();
@@ -1209,7 +1360,6 @@ mod tests {
         // cl's /FI is looked up as `#include "..."` in the source.
         let (_, files) = scanned(&["cl.exe", "/FIpre/pre.h", "/c", "src/main.cc"]);
         assert!(files.contains(&"src/pre/pre.h".to_string()) && files.contains(&"src/pre/p.h".to_string()), "{files:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1225,7 +1375,6 @@ mod tests {
         std::fs::create_dir_all(dir.join("build")).unwrap();
         std::fs::write(dir.join("build/config.h"), "").unwrap();
         assert_eq!(rel(&dir, &scanner.scan(&[dir.join("src/main.c")], &sp).files), vec!["build/config.h", "inc/config.h", "src/main.c"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1250,7 +1399,6 @@ mod tests {
         assert_eq!(info.extra_dirs, vec![dir.join("gcda")]);
         assert_eq!(info.embed_dirs, vec![dir.join("data")]);
         assert_eq!(info.sources, vec![dir.join("a.cc")]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1272,15 +1420,200 @@ mod tests {
         );
     }
 
+    /// A fake GCC-style compiler in `dir` named `name`, whose `-E -v -dM`
+    /// says the search list `inc` and prints `macros`.
+    fn fake_compiler(dir: &Path, name: &str, macros: &[&str]) -> PathBuf {
+        let inc = dir.join("builtin");
+        std::fs::create_dir_all(&inc).unwrap();
+        let list = format!("#include <...> search starts here:\n {}\nEnd of search list.\n", inc.display());
+        let defines: String = macros.iter().map(|m| format!("#define {m} 1\n")).collect();
+        if cfg!(windows) {
+            let echo = |text: &str, to: &str| text.lines().map(|l| format!("@echo {}{to}\r\n", if l.is_empty() { "." } else { l })).collect::<String>();
+            let c = dir.join(format!("{name}.cmd"));
+            std::fs::write(&c, format!("{}{}", echo(&list.replace('<', "^<").replace('>', "^>"), " 1>&2"), echo(&defines, ""))).unwrap();
+            c
+        } else {
+            let c = dir.join(name);
+            std::fs::write(&c, format!("#!/bin/sh\nprintf '%s' '{list}' >&2\nprintf '%s' '{defines}'\n")).unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&c, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            c
+        }
+    }
+
+    /// Whether the compiler searches includers' directories is the
+    /// compiler's to say (Clang for the MSVC ABI: a driver named after its
+    /// target, a configuration file, cc1's flags), not the flags'.
+    #[test]
+    fn msvc_lookup_from_the_compiler() {
+        let dir = test_dirs::TestDir::new("ninja_rs_scan_msvc_compiler");
+        std::fs::write(dir.join("a.cc"), "").unwrap();
+        let cache = ScanCache::default();
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![] };
+        let lookup = |compiler: &Path, flags: &[&str]| {
+            let argv: Vec<String> = [compiler.to_string_lossy().into_owned()].into_iter().chain(s(flags)).chain(s(&["-c", "a.cc"])).collect();
+            let info = parse_compile(&argv, &dir);
+            assert_eq!(*scanner.builtin_dirs(compiler, &info).unwrap(), vec![dir.join("builtin")]);
+            scanner.msvc_lookup(compiler, &info)
+        };
+        let msvc = fake_compiler(&dir, "x86_64-pc-windows-msvc-clang++", &["__clang__", "_MSC_VER"]);
+        assert!(lookup(&msvc, &[]));
+        let gnu = fake_compiler(&dir, "clang++", &["__clang__"]);
+        assert!(!lookup(&gnu, &["--target=x86_64-pc-windows-msvc"]));
+        let gcc = fake_compiler(&dir, "g++", &["__GNUC__"]);
+        assert!(!lookup(&gcc, &[]));
+    }
+
+    /// cl.exe searches a relative `/FI` as an `#include "..."` in the source,
+    /// never the working directory (unless it's one of those); clang-cl, as
+    /// `-include`, the working directory first.
+    #[test]
+    fn cl_forced_includes() {
+        let dir = tree("cl_forced", &[("build/pre.h", "/*build*/\n"), ("inc/pre.h", "/*inc*/\n"), ("src/main.cc", ""), ("src/pre2.h", "")]);
+        let forced = |compiler: &str, fi: &str| {
+            let argv = s(&[compiler, "/nologo", &format!("/FI{fi}"), "/I../inc", "/c", "../src/main.cc"]);
+            rel(&dir, &parse_compile(&argv, &dir.join("build")).forced_includes.into_iter().collect())
+        };
+        assert_eq!(forced("cl.exe", "pre.h"), ["inc/pre.h"]);
+        assert_eq!(forced("cl.exe", "pre2.h"), ["src/pre2.h"]);
+        assert_eq!(forced("clang-cl", "pre.h"), ["build/pre.h"]);
+    }
+
+    /// `=` at the start of a directory stands for the sysroot; without one,
+    /// GCC's default and Clang's literal reading are both searched. And the
+    /// directories other flags make.
+    #[test]
+    fn sysroot_and_prefix_dirs() {
+        let cwd = test_dirs::TestDir::new("ninja_rs_scan_sysroot");
+        let info = |flags: &[&str]| {
+            let argv: Vec<String> = s(&["clang++"]).into_iter().chain(s(flags)).chain(s(&["-c", "a.cc"])).collect();
+            parse_compile(&argv, &cwd)
+        };
+        let a = |p: &str| abs(p, &cwd);
+        let i = info(&["--sysroot=sr", "-I=/inc", "-isystem=/sys", "-iquote", "=/q", "-idirafter=/after", "-iwithsysroot", "/ws"]);
+        assert_eq!((i.user_dirs, i.quote_dirs, i.after_dirs), (vec![a("sr/inc")], vec![a("sr/q")], vec![a("sr/after")]));
+        assert_eq!(i.system_dirs, vec![a("sr/sys"), a("sr/ws")]);
+        assert_eq!(info(&["-I=/inc", "-isysroot", "isr", "--sysroot=sr"]).user_dirs, vec![a("isr/inc")]);
+        assert_eq!(info(&["-I=/inc"]).user_dirs, vec![a("/inc"), a("=/inc")]);
+        let i = info(&["-stdlib++-isystem", "cxx", "-iprefix", "pre/", "-iwithprefix", "after", "-iwithprefixbefore", "before"]);
+        assert_eq!((i.system_dirs, i.after_dirs, i.user_dirs), (vec![a("cxx")], vec![a("pre/after")], vec![a("pre/before")]));
+    }
+
+    /// A computed include the scan can't name sends its directory's files,
+    /// not its subdirectories' (a source root holding the build directory),
+    /// and, in the build directory, makes the compile run locally.
+    #[test]
+    fn computed_include_directories() {
+        let dir = tree(
+            "computed_dirs",
+            &[
+                ("main.cpp", "#define STR(x) #x\n#define HDR(x) STR(x.h)\n#include HDR(gen)\n"),
+                ("gen.h", ""),
+                ("build/.ninja_log", "LOG"),
+                ("build/app.exe", "EXE"),
+                ("build/gen/main.cpp", "#include HDR(gen)\n"),
+            ],
+        );
+        let cache = ScanCache::default();
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![dir.join("build")] };
+        let sp = SearchPath::default();
+        let r = scanner.scan(&[dir.join("main.cpp")], &sp);
+        assert!(r.local.is_none());
+        assert_eq!(rel(&dir, &crate::store::dir_files(&r.dirs).unwrap().into_iter().collect()), ["gen.h", "main.cpp"]);
+        let r = scanner.scan(&[dir.join("build/gen/main.cpp")], &sp);
+        assert!(r.local.is_some_and(|why| why.contains("build directory")));
+        // Too many to send: run locally.
+        let big = dir.join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..=crate::store::DIR_FILES_MAX {
+            std::fs::write(big.join(format!("{i}.h")), "").unwrap();
+        }
+        assert!(crate::store::dir_files(&BTreeSet::from([big])).is_err());
+    }
+
+    /// MSVC's lookup across rounds: a name seen early is found in a
+    /// directory reached later, and a name seen later in a directory reached
+    /// early.
+    #[test]
+    fn msvc_lookup_rounds() {
+        let dir = tree(
+            "msvc_rounds",
+            &[
+                // Round 1: main.cc reaches inc/l1/a.h; its "b.h" is found next
+                // to main.cc (an includer's directory).
+                ("src/main.cc", "#include <l1/a.h>\n#include \"zz.h\"\n"),
+                ("inc/l1/a.h", "#include \"b.h\"\n"),
+                ("src/b.h", "#include \"deep/c.h\"\n"),
+                // Round 2: deep/c.h is reached; zz.h, named in round 1, is in
+                // its directory, and y.h, named now, in inc/l1 (round 1's).
+                ("src/deep/c.h", "#include \"y.h\"\n"),
+                ("src/deep/zz.h", ""),
+                ("inc/l1/y.h", ""),
+            ],
+        );
+        let cache = ScanCache::default();
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![] };
+        let sp = SearchPath { quote: vec![], angled: vec![dir.join("inc")], msvc: true };
+        let files = rel(&dir, &scanner.scan(&[dir.join("src/main.cc")], &sp).files);
+        assert_eq!(files, ["inc/l1/a.h", "inc/l1/y.h", "src/b.h", "src/deep/c.h", "src/deep/zz.h", "src/main.cc"]);
+        // Looked up once: a scan again finds what was found.
+        std::fs::remove_file(dir.join("inc/l1/y.h")).unwrap();
+        let again = rel(&dir, &scanner.scan(&[dir.join("src/main.cc")], &sp).files);
+        assert_eq!(again, files);
+    }
+
+    /// A `..` after a symbolic link: the compiler reads elsewhere than a
+    /// remote worker would: local.
+    #[test]
+    fn dotdot_after_links() {
+        let dir = tree("dotdot", &[("main.c", "#include \"lnk/a.h\"\n"), ("real/sub/a.h", "#include \"../b.h\"\n"), ("b.h", ""), ("real/b.h", "")]);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("real/sub"), dir.join("lnk")).unwrap();
+        #[cfg(windows)]
+        assert!(
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(normalize(&dir.join("lnk")))
+                .arg(normalize(&dir.join("real/sub")))
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let cache = ScanCache::default();
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![] };
+        let r = scanner.scan(&[dir.join("main.c")], &SearchPath::default());
+        assert!(r.local.is_some_and(|why| why.contains("symbolic link")));
+    }
+
+    /// The compiler's run for its built-in directories is given up on when
+    /// it hangs.
+    #[test]
+    fn builtin_dirs_time_out() {
+        let dir = test_dirs::TestDir::new("ninja_rs_scan_hung");
+        let compiler = if cfg!(windows) {
+            let c = dir.join("hung.cmd");
+            std::fs::write(&c, "@ping -n 30 127.0.0.1 >NUL\r\n").unwrap();
+            c
+        } else {
+            let c = dir.join("hung");
+            std::fs::write(&c, "#!/bin/sh\nsleep 30\n").unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&c, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            c
+        };
+        let info = CompileInfo { style: Some(Style::Gcc), ..Default::default() };
+        let e = discover_builtin_dirs_for(&compiler, &info, Lang::C, std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(e.contains("timed out"), "{e}");
+    }
+
     #[test]
     fn rsp_expansion() {
-        let dir = test_dirs::base().join(format!("ninja_rs_rsp_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("ninja_rs_rsp");
         std::fs::write(dir.join("a.rsp"), "-Ifoo \"-I bar\" @b.rsp").unwrap();
         std::fs::write(dir.join("b.rsp"), "-DX").unwrap();
         let (args, files) = expand_response_files(&s(&["cc", "@a.rsp", "x.c"]), &dir, false);
         assert_eq!(args, s(&["cc", "-Ifoo", "-I bar", "-DX", "x.c"]));
         assert_eq!(files.len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
