@@ -956,6 +956,7 @@ dependencies = [
  "hex",
  "ninja-os",
  "prost",
+ "rustls",
  "sha2",
  "test-dirs",
  "tokio",

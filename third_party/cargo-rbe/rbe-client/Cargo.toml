@@ -15,6 +15,7 @@ fastcdc.workspace = true
 hex.workspace = true
 ninja-os = { path = "../../../crates/ninja-os" }
 prost.workspace = true
+rustls.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

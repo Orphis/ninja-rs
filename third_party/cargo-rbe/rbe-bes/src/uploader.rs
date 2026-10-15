@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
-use rbe_client::fault::{FIRST_CONTACT_RETRIES, broken_connection, from_server, no_answer};
+use rbe_client::fault::{FIRST_CONTACT_RETRIES, broken_connection, certificate, from_server, no_answer};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -104,8 +104,9 @@ pub struct UploadSummary {
 
 /// How long the two lifecycle events before the stream may take together
 /// (the stream waits for them), and the two after it (the end of the build
-/// waits for them).
-const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// waits for them). Callers waiting for the connection at the start bound
+/// it the same way.
+pub const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 enum Cmd {
     Event(Box<bep::BuildEvent>, SystemTime),
@@ -369,9 +370,12 @@ impl Upload {
     /// How many times a call failing with `e` is made again, of `retries`:
     /// until the backend answered something, none, but once for a
     /// connection that broke once made (a call left unanswered would cost a
-    /// deadline each time, one refused as much again).
+    /// deadline each time, one refused as much again). A certificate
+    /// refused, none: it would be again.
     fn budget(&self, e: &tonic::Status, retries: u32) -> u32 {
-        if self.answered.load(Ordering::Relaxed) {
+        if certificate(e).is_some() {
+            0
+        } else if self.answered.load(Ordering::Relaxed) {
             retries
         } else if broken_connection(e) {
             FIRST_CONTACT_RETRIES.min(retries)
@@ -530,13 +534,44 @@ impl Upload {
             failures += 1;
             trace(format_args!("stream failed ({} pending): {err}", pending.len()));
             if failures > self.budget(&err, config.max_retries) || !retryable(&err) {
-                let never = if answered.load(Ordering::Relaxed) { "" } else { " (the backend never answered)" };
-                bail!("BES upload failed after {failures} attempts{never}: {err}");
+                let answered = answered.load(Ordering::Relaxed);
+                let never = if answered { "" } else { " (the backend never answered)" };
+                return Err(Failed { message: format!("BES upload failed after {failures} attempts{never}: {err}"), status: err, answered }.into());
             }
             summary.reconnects += 1;
             tokio::time::sleep(backoff).await;
             backoff *= 2;
         }
+    }
+}
+
+/// An upload whose stream failed for good: what it says (the status in
+/// words), with the status's causes as its own, for what they say about the
+/// connection (`rbe_client::fault`): a certificate refused, say.
+#[derive(Debug)]
+pub struct Failed {
+    message: String,
+    status: tonic::Status,
+    answered: bool,
+}
+
+impl Failed {
+    /// Whether the backend answered anything before (an upload failing
+    /// otherwise, the connection's, never got an answer).
+    pub fn answered(&self) -> bool {
+        self.answered
+    }
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.status)
     }
 }
 

@@ -59,7 +59,10 @@ rust_test(
         "//:MODULE.bazel",
     ],
     version = module_version(),
-    deps = ["//crates/test-dirs"],
+    deps = [
+        "//crates/fake-reapi",
+        "//crates/test-dirs",
+    ],
 )
 
 # End-to-end remote execution and build event tests against the in-process

@@ -480,10 +480,13 @@ impl Client {
     /// broke once made (reset, closed) is, once (the call reconnects): a
     /// server leaving calls unanswered (one accepting connections and
     /// saying nothing, as a hung one does) would cost `--remote_timeout`
-    /// each time, one refusing connections as much again.
+    /// each time, one refusing connections as much again. A certificate
+    /// refused never is: connecting again would be refused the same way.
     fn retry_after(&self, e: &anyhow::Error, attempt: u32) -> Option<Duration> {
         let status = status_of(e)?;
-        let budget = if self.answered.load(Ordering::Relaxed) {
+        let budget = if fault::certificate(status).is_some() {
+            0
+        } else if self.answered.load(Ordering::Relaxed) {
             self.retries
         } else if broken_connection(status) {
             self.retries.min(FIRST_CONTACT_RETRIES)
@@ -1408,7 +1411,8 @@ impl Client {
             }
             let following = operation.is_some();
             let budget = if following { &mut follow_ups } else { &mut executions };
-            if *budget >= self.retries || !(lost || transient(status.code())) {
+            // A certificate refused would be again (see `retry_after`).
+            if *budget >= self.retries || !(lost || transient(status.code())) || fault::certificate(&status).is_some() {
                 return Err(anyhow::Error::from(status).context(format!("executing {}", digest_str(action))));
             }
             tokio::time::sleep(backoff(if following { pauses } else { *budget })).await;
@@ -1945,6 +1949,24 @@ mod tests {
         assert_eq!(cas.0.capabilities_calls.load(Ordering::SeqCst), 1);
     }
 
+    /// A call failing for a certificate refused connecting again (a server
+    /// that rotated its CA) isn't made again, even once the server
+    /// answered: it would be refused the same way, as many times.
+    #[tokio::test]
+    async fn certificates_refused_arent_tried_again() {
+        let c = client().with_retries(5, Duration::from_secs(10));
+        c.answer();
+        let failed = |e: Box<dyn std::error::Error + Send + Sync>| {
+            let mut s = tonic::Status::unknown("transport error");
+            s.set_source(Arc::from(e));
+            anyhow::Error::from(s).context("GetCapabilities")
+        };
+        let refused = rustls::Error::AlertReceived(rustls::AlertDescription::UnknownCA);
+        assert_eq!(c.retry_after(&failed(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, refused))), 0), None);
+        // A connection that broke is.
+        assert!(c.retry_after(&failed(Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))), 0).is_some());
+    }
+
     // The test certificates (crates/fake-reapi/testdata/tls).
     const CA: &[u8] = include_bytes!("../../../../crates/fake-reapi/testdata/tls/ca.pem");
     const SERVER: &[u8] = include_bytes!("../../../../crates/fake-reapi/testdata/tls/server.pem");
@@ -1982,13 +2004,18 @@ mod tests {
             let before = accepted.load(Ordering::SeqCst);
             let err = Client::connect(ConnectOptions { ca_pem: ca, ..options(&ep) }).await.err().expect("an untrusted server");
             assert_eq!(fault::fault(err.as_ref()), Fault::Refused, "{err:#}");
+            assert_eq!(fault::certificate(err.as_ref()), Some(fault::Certificate::Server), "{err:#}");
             assert!(format!("{err:#}").contains("UnknownIssuer"), "{err:#}");
             assert_eq!(accepted.load(Ordering::SeqCst) - before, 1);
         }
-        // Checked against another name: refused.
-        let other_name = ConnectOptions { ca_pem: Some(CA.to_vec()), authority_override: Some("other.test".into()), ..options(&ep) };
-        let err = Client::connect(other_name).await.err().expect("a server of another name");
-        assert!(format!("{err:#}").contains("not valid for name \"other.test\""), "{err:#}");
+        // Checked against another name: refused, whatever words the name
+        // holds (`timeouts` isn't a timeout).
+        for name in ["other.test", "rbe-timeouts.test"] {
+            let other_name = ConnectOptions { ca_pem: Some(CA.to_vec()), authority_override: Some(name.into()), ..options(&ep) };
+            let err = Client::connect(other_name).await.err().expect("a server of another name");
+            assert!(format!("{err:#}").contains(&format!("not valid for name \"{name}\"")), "{err:#}");
+            assert_eq!((fault::fault(err.as_ref()), fault::certificate(err.as_ref())), (Fault::Refused, Some(fault::Certificate::Server)), "{err:#}");
+        }
     }
 
     #[tokio::test]
@@ -2015,7 +2042,10 @@ mod tests {
             };
             let connections = accepted.load(Ordering::SeqCst) - before;
             match fault::fault(err.as_ref()) {
-                Fault::Refused => assert!(format!("{err:#}").contains("alert") && connections == 1, "{connections} connections: {err:#}"),
+                Fault::Refused => {
+                    assert!(format!("{err:#}").contains("alert") && connections == 1, "{connections} connections: {err:#}");
+                    assert_eq!(fault::certificate(err.as_ref()), Some(fault::Certificate::Client), "{err:#}");
+                }
                 Fault::Broke => assert_eq!(connections, 2, "{err:#}"),
                 other => panic!("{other:?}: {err:#}"),
             }

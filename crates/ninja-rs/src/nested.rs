@@ -34,6 +34,24 @@ pub const LOGS_LOCK_ENV: &str = "NINJA_RS_LOGS_LOCK";
 /// `--remote_timeout`). Their endpoints, separated by spaces.
 pub const UNREACHABLE_ENV: &str = "NINJA_RS_REMOTE_UNREACHABLE";
 
+/// The certificate files an invocation warned about, expiring soon, which
+/// its commands get: the invocations they run don't warn about them again.
+/// Paths, separated as in `PATH`.
+pub const TLS_WARNED_ENV: &str = "NINJA_RS_TLS_WARNED";
+
+/// The certificate files the invocations running this one warned about.
+pub fn tls_warned() -> Vec<String> {
+    let value = std::env::var_os(TLS_WARNED_ENV).unwrap_or_default();
+    std::env::split_paths(&value).filter(|p| !p.as_os_str().is_empty()).map(|p| p.to_string_lossy().into_owned()).collect()
+}
+
+/// `TLS_WARNED_ENV` for `files` (those that can't be listed, holding the
+/// separator, left out).
+pub fn tls_warned_value(files: &[String]) -> String {
+    let listed = files.iter().filter(|f| std::env::join_paths([f.as_str()]).is_ok());
+    std::env::join_paths(listed).ok().and_then(|v| v.into_string().ok()).unwrap_or_default()
+}
+
 /// The remote services the invocations running this one found unreachable.
 pub fn unreachable_endpoints() -> Vec<String> {
     endpoints_in(std::env::var(UNREACHABLE_ENV).ok().as_deref())

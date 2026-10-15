@@ -683,7 +683,10 @@ impl Inner {
             }
             Err(Failure::Infra(e)) => {
                 let reason = format!("remote execution failed: {e:#}");
-                if !self.config.local_fallback || self.config.strict {
+                // A certificate refused (the server's, or this client's)
+                // fails every remote action alike, and must be seen to:
+                // not hidden behind local runs.
+                if !self.config.local_fallback || self.config.strict || certificate_refused(&e) {
                     return failed(format!("ninja-rs: {reason}\n"));
                 }
                 match self.allow_fallback(&reason) {
@@ -1591,6 +1594,12 @@ struct Staged {
     thin: std::collections::HashMap<String, Arc<Vec<String>>>,
     /// Thin archives downloaded all the same.
     download_anyway: std::collections::HashSet<String>,
+}
+
+/// Whether a remote call failed for a certificate refused, connecting again:
+/// the server's, or this client's (see `rbe_client::fault::certificate`).
+fn certificate_refused(e: &anyhow::Error) -> bool {
+    rbe_client::fault::certificate(e.as_ref()).is_some()
 }
 
 /// Escapes a path for a Makefile-style depfile.

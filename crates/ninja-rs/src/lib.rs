@@ -6,6 +6,7 @@
 //! would keep it alive across builds. There is no global state.
 
 pub mod bes;
+pub mod certs;
 pub mod daemon;
 pub mod exec_runner;
 pub mod jobserver;
@@ -62,6 +63,9 @@ pub struct Service {
     /// than wait for again, and so do the invocations their commands run
     /// (see `nested::UNREACHABLE_ENV`).
     remote_unreachable: Option<(String, String)>,
+    /// The certificate files warned about as expiring soon, by the current
+    /// invocation or those running it (see `nested::TLS_WARNED_ENV`).
+    tls_warned: Vec<String>,
     /// The disk cache, kept across builds (keyed by its directory).
     disk_cache: Option<(String, Arc<ninja_remote::disk_cache::DiskCache>)>,
     digests_loaded: bool,
@@ -104,6 +108,7 @@ impl Service {
             interrupt,
             remote_client: None,
             remote_unreachable: None,
+            tls_warned: Vec::new(),
             disk_cache: None,
             digests_loaded: false,
             remote_verbose: false,
@@ -171,12 +176,30 @@ impl Service {
         self.remote_verbose = opts.remote.verbose;
         // Tried again by each invocation (not by the manifest's rebuilds).
         self.remote_unreachable = None;
+        self.tls_warned = nested::tls_warned();
         self.racing = opts.remote.racing.then(|| exec_runner::Racing { delay: Duration::from_millis(opts.remote.racing_delay_ms), stats: Arc::default() });
         self.ids = InvocationIds::new(&opts.bes);
         // Build events cover builds and `-t exec`, not the other tools.
         let bes = if opts.bes.enabled() && opts.tool.as_deref().is_none_or(|t| t == "exec") {
+            // The certificates are checked before anything connects.
+            let mut warnings = Vec::new();
+            let tls = match opts.bes.backend.as_deref().filter(|b| options::uses_tls(b)) {
+                Some(_) => match self.load_tls(opts, |w| warnings.push(format!("ninja: warning: {w}\n"))) {
+                    Ok(tls) => tls,
+                    Err(e) => {
+                        ninja_core::status::print_err(&format!("ninja: error: {e}\n"));
+                        return EXIT_FAILURE;
+                    }
+                },
+                None => ninja_remote::Tls::default(),
+            };
             let bytestream = opts.remote.endpoint().map(|e| bes::bytestream_prefix(e, &opts.remote.instance_name));
-            Some(Bes::start(opts, &self.ids, bytestream, self.store.clone(), self.relay.take()).await)
+            let b = Bes::start(opts, tls, &self.ids, bytestream, self.store.clone(), self.relay.take()).await;
+            for w in warnings {
+                ninja_core::status::print_err(&w);
+                b.message(&w);
+            }
+            Some(b)
         } else {
             None
         };
@@ -194,14 +217,32 @@ impl Service {
         }
         *self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = bes.clone();
         let mut status = ReportingStatus { printer: &mut printer, bes: bes.clone() };
-        let code = self.run_build_invocation(opts, &mut status).await;
+        let mut code = self.run_build_invocation(opts, &mut status).await;
         self.logs_lock = None;
-        if let Some(b) = bes {
-            // Interrupted, not a command exiting with 130.
-            b.finish(code, code != EXIT_SUCCESS && self.interrupt.is_set()).await;
+        // Interrupted, not a command exiting with 130. A certificate refused
+        // meanwhile fails the invocation, whatever the build did.
+        if let Some(b) = bes
+            && b.finish(code, code != EXIT_SUCCESS && self.interrupt.is_set()).await
+            && code == EXIT_SUCCESS
+        {
+            code = EXIT_FAILURE;
         }
         self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         code
+    }
+
+    /// The TLS settings, for an endpoint connecting with TLS (see
+    /// `TlsFlags::load`). A certificate expiring soon is warned about
+    /// (`warn`) once per invocation, and not by the invocations it runs.
+    fn load_tls(&mut self, opts: &Options, mut warn: impl FnMut(&str)) -> Result<ninja_remote::Tls, String> {
+        let loaded = opts.tls.load()?;
+        for (file, warning) in loaded.expiring {
+            if !self.tls_warned.contains(&file) {
+                warn(&warning);
+                self.tls_warned.push(file);
+            }
+        }
+        Ok(loaded.tls)
     }
 
     async fn run_build_invocation(&mut self, opts: &Options, status: &mut ReportingStatus<'_>) -> i32 {
@@ -216,7 +257,15 @@ impl Service {
         {
             return match t.as_str() {
                 "daemon" => daemon::tool(&opts.tool_args),
-                "exec" => exec(opts, status, &self.interrupt).await,
+                "exec" => {
+                    if let Some(b) = status.bes.clone()
+                        && let Err(e) = b.connected().await
+                    {
+                        status.error(&e);
+                        return EXIT_FAILURE;
+                    }
+                    exec(opts, status, &self.interrupt, &self.tls_warned).await
+                }
                 "wincodepage" => tools::tool_wincodepage(&opts.tool_args),
                 _ => tools::tool_restat_after_flags(&opts.tool_args),
             };
@@ -356,8 +405,21 @@ impl Service {
             let remote_outputs = (opts.remote.endpoint().is_some() && !opts.dry_run)
                 .then(|| Arc::new(RemoteOutputs::load(std::path::Path::new(&in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE)))));
             let requested = requested_paths(&state, &deps_log, &opts.targets);
-            let backend = match self.remote_backend(&state, opts, targets.clone(), remote_outputs.clone(), &requested, status).await {
-                Ok(r) => r,
+            // The build event service's connection, made meanwhile, before
+            // any command runs: a certificate refused ends the invocation.
+            let events = status.bes.clone();
+            let (backend, connected) = tokio::join!(self.remote_backend(&state, opts, targets.clone(), remote_outputs.clone(), &requested, status), async {
+                match &events {
+                    Some(b) => b.connected().await,
+                    None => Ok(()),
+                }
+            });
+            if let Err(e) = &connected {
+                status.error(e);
+            }
+            let backend = match backend {
+                Ok(r) if connected.is_ok() => r,
+                Ok(_) => return EXIT_FAILURE,
                 Err(e) => {
                     status.error(&e);
                     return EXIT_FAILURE;
@@ -642,7 +704,10 @@ impl Service {
             }
             Some(endpoint) => {
                 if self.remote_client.as_ref().is_none_or(|(k, _)| *k != key) {
-                    let connect = opts.tls.load()?.connect_options(endpoint, &opts.remote.instance_name, &opts.remote.headers);
+                    // Certificates are checked before connecting: one that
+                    // expired fails the build, unreachable or not.
+                    let tls = if options::uses_tls(endpoint) { self.load_tls(opts, |w| status.warning(w))? } else { ninja_remote::Tls::default() };
+                    let connect = tls.connect_options(endpoint, &opts.remote.instance_name, &opts.remote.headers);
                     match ninja_remote::Client::connect_retrying(connect, opts.remote.retries).await {
                         Ok(client) => self.remote_client = Some((key.clone(), client)),
                         // No connection, or no answer: done without. A
@@ -878,6 +943,10 @@ impl Service {
         if let Some((_, endpoint)) = &self.remote_unreachable {
             env.push((nested::UNREACHABLE_ENV.into(), nested::with_unreachable(endpoint)));
         }
+        // Nor warn about the certificates this one warned about.
+        if !self.tls_warned.is_empty() {
+            env.push((nested::TLS_WARNED_ENV.into(), nested::tls_warned_value(&self.tls_warned)));
+        }
         if !env.is_empty() {
             r.set_env(env);
         }
@@ -1034,7 +1103,7 @@ fn remote_fetch(backend: Option<Arc<ninja_remote::Backend>>) -> impl Fn(&str) ->
 /// external projects, a script) whose ninja-rs invocations take this one's
 /// options and report under its invocation, as nested invocations do (see
 /// `nested`). Returns the command's exit code.
-async fn exec(opts: &Options, status: &mut ReportingStatus<'_>, interrupt: &Arc<Interrupt>) -> i32 {
+async fn exec(opts: &Options, status: &mut ReportingStatus<'_>, interrupt: &Arc<Interrupt>, tls_warned: &[String]) -> i32 {
     let args = match opts.tool_args.split_first() {
         Some((dashes, rest)) if dashes == "--" => rest,
         _ => &opts.tool_args[..],
@@ -1053,7 +1122,13 @@ async fn exec(opts: &Options, status: &mut ReportingStatus<'_>, interrupt: &Arc<
     {
         status.warning(&format!("can't write the execution log {log}: {e}"));
     }
-    let mut child = match tokio::process::Command::new(program).args(rest).spawn() {
+    let mut command = tokio::process::Command::new(program);
+    command.args(rest);
+    // The invocations it runs don't warn about the certificates this one did.
+    if !tls_warned.is_empty() {
+        command.env(nested::TLS_WARNED_ENV, nested::tls_warned_value(tls_warned));
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             status.error(&format!("{program}: {e}"));

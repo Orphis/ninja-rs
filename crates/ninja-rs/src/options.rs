@@ -284,29 +284,69 @@ pub struct TlsFlags {
     pub authority_override: Option<String>,
 }
 
+/// What `TlsFlags::load` read.
+#[derive(Debug)]
+pub struct LoadedTls {
+    pub tls: ninja_remote::Tls,
+    /// The files holding a certificate that expires soon, with the warning
+    /// about it (see `certs::check`).
+    pub expiring: Vec<(String, String)>,
+}
+
 impl TlsFlags {
     /// Reads the certificate files, which must hold PEM: certificates, and
     /// a private key for `--tls_client_key`. Anything else (a DER file)
-    /// would leave the CAs trusted none, or the client without a key.
-    pub fn load(&self) -> Result<ninja_remote::Tls, String> {
-        let read = |flag: &str, p: &Option<String>, key: bool| -> Result<Option<Vec<u8>>, String> {
+    /// would leave the CAs trusted none, or the client without a key. The
+    /// certificates' dates are checked now (see `certs::check`): before
+    /// connecting, which a certificate refused may end with no more than a
+    /// connection closed.
+    pub fn load(&self) -> Result<LoadedTls, String> {
+        self.load_at(std::time::SystemTime::now())
+    }
+
+    /// `load`, the certificates' dates checked at `now`.
+    pub fn load_at(&self, now: std::time::SystemTime) -> Result<LoadedTls, String> {
+        let mut expiring = Vec::new();
+        // `kind` names the certificates' (`client`, `CA`); none for a key.
+        let mut read = |flag: &str, p: &Option<String>, kind: Option<&str>| -> Result<Option<Vec<u8>>, String> {
             let Some(p) = p else { return Ok(None) };
             let data = std::fs::read(p).map_err(|e| format!("--{flag}={p}: {e}"))?;
-            // The sections rustls reads: PKCS#8, PKCS#1 and SEC1 keys.
-            let found = pem_labels(&data).any(|l| if key { ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"].contains(&l) } else { l == "CERTIFICATE" });
+            let found = match kind {
+                Some(kind) => {
+                    let certs = crate::certs::pem_certificates(&data).map_err(|e| format!("--{flag}={p}: {e}"))?;
+                    if let Some(warning) = crate::certs::check(kind, &format!("--{flag}={p}"), &certs, now)? {
+                        expiring.push((p.clone(), warning));
+                    }
+                    !certs.is_empty()
+                }
+                // The sections rustls reads: PKCS#8, PKCS#1 and SEC1 keys.
+                None => pem_labels(&data).any(|l| ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"].contains(&l)),
+            };
             if !found {
-                let (what, convert) = if key { ("private key", "openssl pkey") } else { ("certificate", "openssl x509") };
+                let (what, convert) = if kind.is_none() { ("private key", "openssl pkey") } else { ("certificate", "openssl x509") };
                 return Err(format!("--{flag}={p}: no PEM {what} in it (`{convert} -inform der` converts a DER one)"));
             }
             Ok(Some(data))
         };
-        Ok(ninja_remote::Tls {
-            ca: read("tls_certificate", &self.certificate, false)?,
-            client_cert: read("tls_client_certificate", &self.client_certificate, false)?,
-            client_key: read("tls_client_key", &self.client_key, true)?,
+        let tls = ninja_remote::Tls {
+            ca: read("tls_certificate", &self.certificate, Some("CA"))?,
+            client_cert: read("tls_client_certificate", &self.client_certificate, Some("client"))?,
+            client_key: read("tls_client_key", &self.client_key, None)?,
             authority_override: self.authority_override.clone(),
-        })
+        };
+        Ok(LoadedTls { tls, expiring })
     }
+}
+
+/// Whether `endpoint` connects with TLS: `grpcs://`, `https://`, or no
+/// scheme (as the REAPI client takes it).
+pub fn uses_tls(endpoint: &str) -> bool {
+    tls_host(endpoint).is_some()
+}
+
+/// What follows the scheme of an endpoint connecting with TLS (`host:port`).
+fn tls_host(endpoint: &str) -> Option<&str> {
+    endpoint.strip_prefix("grpcs://").or_else(|| endpoint.strip_prefix("https://")).or_else(|| (!endpoint.contains("://")).then_some(endpoint))
 }
 
 /// The labels of the PEM sections in `data` (`CERTIFICATE`, `PRIVATE KEY`).
@@ -315,26 +355,41 @@ fn pem_labels(data: &[u8]) -> impl Iterator<Item = &str> {
 }
 
 /// Explains a failed connection to a `grpcs://` endpoint (or one without a
-/// scheme, which means TLS): what was sent, and what the error usually
-/// means. Empty for other errors. A connection closed is only explained
-/// when the server never answered anything (`first_contact`): with TLS 1.3,
-/// a server refusing the client's certificate may just close it after the
+/// scheme, which means TLS): whose certificate was refused, the client's
+/// (by the server, whose alert says why) or the server's (by this client),
+/// what was sent or checked, and what the error usually means. Empty for
+/// other errors. A connection closed is only explained when the server
+/// never answered anything (`first_contact`): with TLS 1.3, a server
+/// refusing the client's certificate may just close it after the
 /// handshake; later, it's a broken connection (made again already). An
-/// alert comes first: one saying the client's certificate expired isn't
-/// about the server's.
+/// alert comes first: one saying a certificate expired is about the
+/// client's, not the server's.
 pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool) -> String {
-    let Some(rest) =
-        endpoint.strip_prefix("grpcs://").or_else(|| endpoint.strip_prefix("https://")).or_else(|| (!endpoint.contains("://")).then_some(endpoint))
-    else {
+    let Some(rest) = tls_host(endpoint) else {
         return String::new();
     };
-    let e = error.to_ascii_lowercase();
+    // The words of the error, not those of the endpoint it names.
+    let e = error.replace(endpoint, "").to_ascii_lowercase();
     let cert = match &tls.client_certificate {
         Some(c) => format!("the client certificate {c}"),
         None => "no client certificate (--tls_client_certificate)".to_string(),
     };
-    let hint = if e.contains("alert") && ["certificate", "unknownca", "accessdenied", "handshakefailure"].iter().any(|a| e.contains(a)) {
-        format!("the server refused the client's certificate: sent {cert}")
+    // The alert the server sent, as rustls names them (`CertificateExpired`).
+    let alert = e.split_once("alert: ").map(|(_, a)| a.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or_default());
+    let client_refused = |why: &str| format!("the server refused the client's certificate{why}: sent {cert}");
+    let hint = if let Some(alert) = alert.filter(|a| a.contains("certificate") || ["unknownca", "accessdenied", "handshakefailure", "decrypterror"].contains(a))
+    {
+        match alert {
+            "certificaterequired" | "nocertificate" if tls.client_certificate.is_none() => {
+                "the server requires a client certificate: --tls_client_certificate and --tls_client_key give one".to_string()
+            }
+            "certificateexpired" => client_refused(" as expired, or not valid yet (is the clock right?)"),
+            "unknownca" => client_refused(", whose issuer it doesn't trust"),
+            "certificaterevoked" => client_refused(" as revoked"),
+            _ => client_refused(""),
+        }
+    } else if e.contains("keymismatch") {
+        format!("{cert} and its key (--tls_client_key) don't match")
     } else if e.contains("unknownissuer") || e.contains("unknown issuer") {
         let ca = match &tls.certificate {
             Some(c) => format!("{c} only"),
@@ -350,8 +405,12 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
             }
         });
         format!("the server's certificate isn't valid for {name} (--tls_authority_override checks it against another name)")
-    } else if e.contains("expired") || e.contains("notvalidyet") || e.contains("not valid yet") {
-        "the server's certificate has expired, or isn't valid yet (is the clock right?)".to_string()
+    } else if e.contains("notvalidyet") || e.contains("not valid yet") {
+        "the server's certificate isn't valid yet (is the clock right?)".to_string()
+    } else if e.contains("expired") {
+        "the server's certificate has expired (is the clock right?)".to_string()
+    } else if e.contains("invalidpurpose") || e.contains("extended key usage") {
+        "the server's certificate isn't one for a server (its extended key usage)".to_string()
     } else if e.contains("invalid peer certificate") {
         "the server's certificate was refused".to_string()
     } else if first_contact
@@ -1266,7 +1325,42 @@ mod tests {
         assert!(expired.contains("has expired") && !expired.contains("trusted"), "{expired}");
         // The client's certificate expired, as the server says it.
         let expired = hint("transport error: connection error: received fatal alert: CertificateExpired", "grpcs://h:1", true);
-        assert!(expired.contains("refused the client's certificate"), "{expired}");
+        assert!(expired.contains("refused the client's certificate as expired"), "{expired}");
+        // Whose certificate, and what of it, as rustls says it.
+        for (error, said) in [
+            (
+                "invalid peer certificate: certificate expired: verification time 2 (UNIX), but certificate is not valid after 1 (1 seconds ago)",
+                "the server's certificate has expired",
+            ),
+            (
+                "invalid peer certificate: certificate not valid yet: verification time 1 (UNIX), but certificate is not valid before 2 (1 seconds in future)",
+                "the server's certificate isn't valid yet",
+            ),
+            ("invalid peer certificate: NotValidYet", "the server's certificate isn't valid yet"),
+            (
+                "invalid peer certificate: certificate not valid for name \"h\"; certificate is only valid for DnsName(\"x\")",
+                "the server's certificate isn't valid for h",
+            ),
+            (
+                "invalid peer certificate: certificate does not allow extended key usage for server authentication, allows client authentication",
+                "isn't one for a server",
+            ),
+            ("invalid peer certificate: BadSignature", "the server's certificate was refused"),
+            ("received fatal alert: UnknownCA", "refused the client's certificate, whose issuer it doesn't trust: sent the client certificate /c.pem"),
+            ("received fatal alert: CertificateRevoked", "refused the client's certificate as revoked"),
+            ("received fatal alert: BadCertificate", "refused the client's certificate: sent"),
+            ("keys may not be consistent: KeyMismatch", "the client certificate /c.pem and its key (--tls_client_key) don't match"),
+        ] {
+            let h = hint(&format!("transport error: {error}"), "grpcs://h:1", true);
+            assert!(h.contains(said), "{error}: {h}");
+        }
+        let required = tls_hint("received fatal alert: CertificateRequired", "h:1", &TlsFlags::default(), true);
+        assert!(required.contains("the server requires a client certificate"), "{required}");
+        // The endpoint's words don't count.
+        let named = "grpcs://expired-unknownissuer.example:1";
+        assert_eq!(hint(&format!("connecting to {named}: transport error: connection refused"), named, true), "");
+        // Which endpoints use the certificates at all.
+        assert!(uses_tls("grpcs://h:1") && uses_tls("https://h:1") && uses_tls("h:1") && !uses_tls("grpc://h:1") && !uses_tls("http://h:1"));
         // Windows' words for a connection reset, or aborted.
         for e in [
             "An existing connection was forcibly closed by the remote host. (os error 10054)",
@@ -1286,12 +1380,15 @@ mod tests {
             std::fs::write(&p, data).unwrap();
             Some(p.to_string_lossy().into_owned())
         };
-        let cert = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let now = std::time::SystemTime::now();
+        let cert = fake_reapi::certs::made_up(now - DAY, now + 365 * DAY);
+        let cert = cert.as_bytes();
         let key = b"-----BEGIN EC PRIVATE KEY-----\r\nMHcC\r\n-----END EC PRIVATE KEY-----\r\n";
         let tls = TlsFlags { certificate: file("ca.pem", cert), client_certificate: file("c.pem", cert), client_key: file("k.pem", key), ..Default::default() };
         let loaded = tls.load().unwrap();
-        assert_eq!(loaded.ca.as_deref(), Some(&cert[..]));
-        assert_eq!(loaded.client_key.as_deref(), Some(&key[..]));
+        assert_eq!(loaded.tls.ca.as_deref(), Some(cert));
+        assert_eq!(loaded.tls.client_key.as_deref(), Some(&key[..]));
+        assert!(loaded.expiring.is_empty());
         // DER, or a key where a certificate goes: said so, not an empty
         // trust store.
         let der = file("ca.der", &[0x30, 0x82, 0x01, 0x0a, 0x02, 0x82]);
@@ -1301,6 +1398,61 @@ mod tests {
         assert!(err.contains("--tls_client_certificate=") && err.contains("no PEM certificate"), "{err}");
         let err = TlsFlags { client_certificate: tls.client_certificate.clone(), client_key: der, ..Default::default() }.load().unwrap_err();
         assert!(err.contains("--tls_client_key=") && err.contains("no PEM private key"), "{err}");
+        // PEM that isn't a certificate.
+        let err = TlsFlags { certificate: file("garbled.pem", b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"), ..Default::default() }
+            .load()
+            .unwrap_err();
+        assert!(err.contains("--tls_certificate=") && err.contains("garbled.pem) can't be read"), "{err}");
+    }
+
+    const DAY: std::time::Duration = std::time::Duration::from_secs(86400);
+
+    /// The certificates' dates are checked as they're read: one expired or
+    /// not valid yet is an error, one expiring within 14 days a warning
+    /// (one per file), every certificate of a bundle counting.
+    #[test]
+    fn tls_certificate_dates() {
+        let dir = test_dirs::TestDir::new("ninja-rs-tls-dates");
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_856_000);
+        assert_eq!(crate::certs::format_time(1_790_856_000), "2026-10-01 12:00 UTC");
+        let file = |name: &str, certs: &[(std::time::SystemTime, std::time::SystemTime)]| {
+            let p = dir.join(name);
+            std::fs::write(&p, certs.iter().map(|(from, to)| fake_reapi::certs::made_up(*from, *to)).collect::<String>()).unwrap();
+            Some(p.to_string_lossy().into_owned())
+        };
+        let key = file("key.pem", &[]);
+        std::fs::write(key.as_ref().unwrap(), "-----BEGIN PRIVATE KEY-----\nMC4C\n-----END PRIVATE KEY-----\n").unwrap();
+        let (year, expired, early, soon) =
+            ((now - DAY, now + 365 * DAY), (now - 365 * DAY, now - DAY), (now + DAY, now + 365 * DAY), (now - DAY, now + 3 * DAY));
+        let client = |name: &str, cert| TlsFlags { client_certificate: file(name, &[cert]), client_key: key.clone(), ..Default::default() }.load_at(now);
+        let ca = |name: &str, certs: &[_]| TlsFlags { certificate: file(name, certs), ..Default::default() }.load_at(now);
+
+        assert!(client("year.pem", year).unwrap().expiring.is_empty());
+        let err = client("expired.pem", expired).unwrap_err();
+        assert!(err.starts_with("the client certificate (--tls_client_certificate=") && err.ends_with("expired.pem) expired on 2026-09-30 12:00 UTC"), "{err}");
+        let err = client("early.pem", early).unwrap_err();
+        assert!(err.ends_with("early.pem) is not valid until 2026-10-02 12:00 UTC (is the clock right? it says 2026-10-01 12:00 UTC)"), "{err}");
+        let loaded = client("soon.pem", soon).unwrap();
+        assert_eq!(loaded.expiring.len(), 1);
+        let (file_warned, warning) = &loaded.expiring[0];
+        assert!(file_warned.ends_with("soon.pem") && warning.ends_with("soon.pem) expires on 2026-10-04 12:00 UTC, in 3 days"), "{warning}");
+
+        // A bundle: each certificate counts.
+        assert!(ca("bundle-ok.pem", &[year, year]).unwrap().expiring.is_empty());
+        let warned = ca("bundle-soon.pem", &[year, soon, (now - DAY, now + 5 * DAY)]).unwrap().expiring;
+        assert!(warned.len() == 1 && warned[0].1.starts_with("CA certificate 2 of 3 (--tls_certificate="), "{warned:?}");
+        let err = ca("bundle-expired.pem", &[year, soon, expired]).unwrap_err();
+        assert!(err.starts_with("CA certificate 3 of 3 (--tls_certificate=") && err.contains(" expired on "), "{err}");
+        // Both files expiring: a warning each.
+        let both = TlsFlags {
+            certificate: file("ca-soon.pem", &[soon]),
+            client_certificate: file("client-soon.pem", &[soon]),
+            client_key: key.clone(),
+            ..Default::default()
+        };
+        assert_eq!(both.load_at(now).unwrap().expiring.len(), 2);
+        // No date to check without the files.
+        assert!(TlsFlags::default().load_at(now).unwrap().expiring.is_empty());
     }
 
     #[test]

@@ -527,6 +527,7 @@ fn ninja_command(f: &Fixture, endpoint: Option<&str>, extra: &[&str]) -> std::pr
     c.arg("-C").arg(&f.build).arg("--ignore_all_rc_files").args(build_args(endpoint, extra));
     c.env_remove(ninja_rs::nested::ENV)
         .env_remove(ninja_rs::nested::UNREACHABLE_ENV)
+        .env_remove(ninja_rs::nested::TLS_WARNED_ENV)
         .env_remove("MAKEFLAGS")
         .env_remove("NINJA_STATUS")
         .env_remove("NINJA_RS_DAEMON");
@@ -1878,6 +1879,9 @@ fn test_mtls() -> Result<(), String> {
             // checking it once the client finished its handshake).
             ("a refused client certificate", &ep, vec![&ca, &other_cert, &other_key], "client's certificate"),
             ("a CA in DER", &ep, vec![&der], "no PEM certificate"),
+            // A certificate of another name, whatever words the name holds:
+            // not a timeout (unreachable).
+            ("a name holding `timeout`", &ep, vec![&ca, &cert, &key, "--tls_authority_override=rbe-timeouts.test"], "isn't valid for rbe-timeouts.test"),
             ("plaintext to a TLS server", &plain, vec![], "remote execution: GetCapabilities"),
             ("a misspelt scheme", &misspelt, vec![], "unsupported endpoint scheme"),
         ] {
@@ -1889,6 +1893,246 @@ fn test_mtls() -> Result<(), String> {
     })();
     drop(server);
     rt.shutdown_background();
+    r
+}
+
+const DAY: std::time::Duration = std::time::Duration::from_secs(86400);
+
+/// A fake server with TLS (`server.pem`, unless `cert_pem` replaces it),
+/// not asking for client certificates, on a runtime of its own.
+fn tls_fake_server(f: &Fixture, name: &str, cert_pem: Option<Vec<u8>>) -> (tokio::runtime::Runtime, FakeServer) {
+    let read = |n: &str| std::fs::read(tls_file(n)).unwrap();
+    let tls = fake_reapi::ServerTls { cert_pem: cert_pem.unwrap_or_else(|| read("server.pem")), key_pem: read("server-key.pem"), client_ca_pem: None };
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    let server = rt.block_on(FakeServer::start_with(&f.root.join(name), 0, Some(tls))).unwrap();
+    (rt, server)
+}
+
+/// An expired client certificate is said so before anything connects: to
+/// the remote service or the build event service (their listener gets no
+/// connection), with --remote_local_fallback too. Without an endpoint
+/// using TLS, the certificate doesn't matter.
+fn test_expired_certificate_before_connecting() -> Result<(), String> {
+    let f = fixture("expired_certificate", true);
+    let now = std::time::SystemTime::now();
+    let expired = f.root.join("expired.pem");
+    write(&expired, &fake_reapi::certs::made_up(now - 365 * DAY, now - DAY));
+    let cert = format!("--tls_client_certificate={}", expired.display());
+    let key = format!("--tls_client_key={}", tls_file("client-key.pem"));
+    let server = SilentServer::start();
+    let ep = format!("grpcs://{}", server.addr);
+    let bes = format!("--bes_backend={ep}");
+    for (what, endpoint, flags) in [("remote execution", Some(ep.as_str()), vec![&cert, &key]), ("build events", None, vec![&cert, &key, &bes])] {
+        let flags: Vec<&str> = flags.iter().map(|s| s.as_str()).collect();
+        let (code, out) = run_ninja_output(&f, endpoint, &flags);
+        let said = out.contains(&format!("the client certificate ({cert}) expired on "));
+        check(code == 1 && said && !out.contains("building locally"), &format!("{what}: exited with {code}:\n{out}"))?;
+    }
+    let accepted = server.accepted.load(std::sync::atomic::Ordering::SeqCst);
+    check(accepted == 0 && !f.build.join("obj/main.o").exists(), &format!("{accepted} connections, or commands ran"))?;
+    let (code, out) = run_ninja_output(&f, None, &[&cert, &key]);
+    check(code == 0 && !out.contains("expired on"), &format!("a build without remote services exited with {code}:\n{out}"))
+}
+
+/// A client certificate expiring in 3 days: builds work, warned about it
+/// once, though remote execution, build events and the builds nested in
+/// the build all use it.
+fn test_certificate_expiring_soon() -> Result<(), String> {
+    let f = fixture("expiring_certificate", true);
+    let inner = f.build.join("inner");
+    for file in ["CMakeFiles/rbe_toolchains.json", "CMakeFiles/rbe_targets.json"] {
+        write(&inner.join(file), &std::fs::read_to_string(f.build.join(file)).unwrap());
+    }
+    let (cc, inc) = (f.compiler.to_string_lossy(), f.root.join("include").to_string_lossy().to_string());
+    let rbe = "rbe_version = 1\nrbe_toolchains = CMakeFiles/rbe_toolchains.json\nrbe_targets = CMakeFiles/rbe_targets.json\n";
+    let lib = ninja_escape_path(&f.root.join("src/lib.c").to_string_lossy());
+    let main = ninja_escape_path(&f.root.join("src/main.c").to_string_lossy());
+    write(
+        &inner.join("build.ninja"),
+        &format!(
+            "{rbe}rule CC\n  command = {cc} -I{inc} -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
+             build obj/lib.o: CC {lib}\n  rbe_mnemonic = CCompile\nbuild obj/main.o: CC {main}\n  rbe_mnemonic = CCompile\n"
+        ),
+    );
+    write(
+        &f.build.join("build.ninja"),
+        &format!(
+            "{rbe}rule CC\n  command = {cc} -I{inc} -MD -MF $out.d -c $in -o $out\n  depfile = $out.d\n  deps = gcc\n\
+             rule NESTED\n  command = \"{}\" -C inner $target\n\
+             build obj/main.o: CC {main}\n  rbe_mnemonic = CCompile\n\
+             build inner/obj/lib.o: NESTED\n  target = obj/lib.o\nbuild inner/obj/main.o: NESTED || inner/obj/lib.o\n  target = obj/main.o\n",
+            ninja_exe().display()
+        ),
+    );
+    let now = std::time::SystemTime::now();
+    let soon = f.root.join("soon.pem");
+    let client = std::fs::read(tls_file("client.pem")).map_err(|e| e.to_string())?;
+    // The server doesn't ask for it: its signature no longer holds.
+    write(&soon, &fake_reapi::certs::with_validity(&client, now - DAY, now + 3 * DAY));
+    let (rt, server) = tls_fake_server(&f, "server", None);
+    let r = (|| {
+        let ep = server.endpoint.clone();
+        let flags = [
+            format!("--tls_certificate={}", tls_file("ca.pem")),
+            format!("--tls_client_certificate={}", soon.display()),
+            format!("--tls_client_key={}", tls_file("client-key.pem")),
+            format!("--bes_backend={ep}"),
+            "--remote_strict".to_string(),
+        ];
+        let (code, out) = run_ninja_output(&f, Some(&ep), &flags.iter().map(String::as_str).collect::<Vec<_>>());
+        check(code == 0, &format!("the build failed:\n{out}"))?;
+        let warning = format!("warning: the client certificate (--tls_client_certificate={}) expires on ", soon.display());
+        check(out.matches(&warning).count() == 1 && out.matches("expires on").count() == 1, &format!("not warned once:\n{out}"))?;
+        check(out.contains(" days\n"), &format!("no days left said:\n{out}"))?;
+        let stats = server.stats();
+        check(stats.executions == 3 && !server.state.build_events.lock().unwrap().is_empty(), &format!("{stats:?}"))
+    })();
+    drop(server);
+    rt.shutdown_background();
+    r
+}
+
+/// A build event service whose certificate isn't trusted (its CA not
+/// given), or a client certificate rustls refuses (a key that isn't its
+/// own): the invocation ends before any command runs, saying why. Other
+/// failures to connect (plaintext to a TLS service) are warnings, as they
+/// were: the build goes on.
+fn test_build_events_untrusted_server() -> Result<(), String> {
+    let f = fixture("bes_untrusted", false);
+    let (rt, server) = tls_fake_server(&f, "server", None);
+    let r = (|| {
+        let bes = format!("--bes_backend={}", server.endpoint);
+        let (code, out) = run_ninja_output(&f, None, &[&bes]);
+        check(code == 1 && out.contains("build events: ") && out.contains("the server's certificate isn't trusted"), &format!("exited with {code}:\n{out}"))?;
+        check(!f.build.join("obj/main.o").exists() && server.state.build_events.lock().unwrap().is_empty(), "commands ran, or events went")?;
+        // A client certificate and a key that don't go together.
+        let ca = format!("--tls_certificate={}", tls_file("ca.pem"));
+        let cert = format!("--tls_client_certificate={}", tls_file("client.pem"));
+        let key = format!("--tls_client_key={}", tls_file("other-client-key.pem"));
+        let (code, out) = run_ninja_output(&f, None, &[&bes, &ca, &cert, &key]);
+        check(code == 1 && out.contains("and its key (--tls_client_key) don't match"), &format!("a key of another certificate: exited with {code}:\n{out}"))?;
+        check(!f.build.join("obj/main.o").exists(), "commands ran")?;
+        let plaintext = format!("--bes_backend={}", server.endpoint.replace("grpcs://", "grpc://"));
+        let (code, out) = run_ninja_output(&f, None, &[&plaintext, "--bes_timeout=20s"]);
+        check(code == 0 && out.contains("warning: build event upload failed"), &format!("plaintext to a TLS service: exited with {code}:\n{out}"))
+    })();
+    drop(server);
+    rt.shutdown_background();
+    r
+}
+
+/// A TCP proxy sending connections to `first`, then, once rotated, to
+/// `then`, closing those it made before: a service whose certificate
+/// changes under a build. Counts the connections sent to `then`.
+struct RotatingProxy {
+    port: u16,
+    rotated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    to_then: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    open: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RotatingProxy {
+    fn start(first: std::net::SocketAddr, then: std::net::SocketAddr) -> RotatingProxy {
+        use std::sync::atomic::Ordering::SeqCst;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy = RotatingProxy { port, rotated: Default::default(), to_then: Default::default(), open: Default::default(), stop: Default::default() };
+        let (rotated, to_then, open, stop) = (proxy.rotated.clone(), proxy.to_then.clone(), proxy.open.clone(), proxy.stop.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                if stop.load(SeqCst) {
+                    break;
+                }
+                let target = if rotated.load(SeqCst) { then } else { first };
+                if target == then {
+                    to_then.fetch_add(1, SeqCst);
+                }
+                let Ok(upstream) = std::net::TcpStream::connect(target) else { continue };
+                let (Ok(c), Ok(u)) = (client.try_clone(), upstream.try_clone()) else { continue };
+                open.lock().unwrap().extend([c, u]);
+                for (mut from, mut to) in [(client.try_clone().unwrap(), upstream.try_clone().unwrap()), (upstream, client)] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(std::net::Shutdown::Write);
+                    });
+                }
+            }
+        });
+        proxy
+    }
+
+    fn rotate(&self) {
+        self.rotated.store(true, std::sync::atomic::Ordering::SeqCst);
+        for s in self.open.lock().unwrap().drain(..) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for RotatingProxy {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        self.rotate();
+    }
+}
+
+/// The remote service's certificate expires during the build (a proxy
+/// sends the connections made again to a server whose certificate expired):
+/// the action fails, saying why, rather than run locally, and isn't sent
+/// again on new connections. The build event service's: the build works,
+/// and the invocation fails at its end, saying why.
+fn test_certificate_refused_during_build() -> Result<(), String> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let f = fixture("certificate_rotation", true);
+    let now = std::time::SystemTime::now();
+    let server_pem = std::fs::read(tls_file("server.pem")).map_err(|e| e.to_string())?;
+    let expired = fake_reapi::certs::with_validity(&server_pem, now - 730 * DAY, now - 365 * DAY);
+    let (rt, good) = tls_fake_server(&f, "good", None);
+    let (rt2, bad) = tls_fake_server(&f, "bad", Some(expired.into_bytes()));
+    let addr = |s: &FakeServer| -> std::net::SocketAddr { format!("127.0.0.1:{}", s.endpoint.rsplit(':').next().unwrap()).parse().unwrap() };
+    let ca = format!("--tls_certificate={}", tls_file("ca.pem"));
+    // Builds `obj/main.o`, whose execution waits until `proxy` sent the
+    // connections elsewhere: the exit code, and what the build printed.
+    let rotating = |proxy: &RotatingProxy, endpoint: &str, flags: &[&str]| -> Result<(Option<i32>, String), String> {
+        let rotated = proxy.rotated.clone();
+        good.state.set_execute_gate(Some(std::sync::Arc::new(move || rotated.load(SeqCst))));
+        let before = good.stats().execute_calls;
+        let mut args = vec![ca.as_str(), "obj/main.o"];
+        args.extend(flags);
+        let child = ninja_command(&f, Some(endpoint), &args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn();
+        let child = child.map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + harness::PATIENCE;
+        while good.stats().execute_calls == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        proxy.rotate();
+        let o = child.wait_with_output().map_err(|e| e.to_string())?;
+        Ok((o.status.code(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))))
+    };
+    let r = (|| {
+        let proxy = RotatingProxy::start(addr(&good), addr(&bad));
+        let (code, out) = rotating(&proxy, &format!("grpcs://localhost:{}", proxy.port), &[])?;
+        check(code == Some(1) && out.contains("invalid peer certificate"), &format!("exited with {code:?}:\n{out}"))?;
+        check(!f.build.join("obj/main.o").exists(), &format!("the action ran locally:\n{out}"))?;
+        let again = proxy.to_then.load(SeqCst);
+        check(again == 1, &format!("{again} connections to the server refused:\n{out}"))?;
+        // The build event service's: the build works, the invocation fails.
+        good.state.clear_action_cache();
+        let proxy = RotatingProxy::start(addr(&good), addr(&bad));
+        let bes = format!("--bes_backend=grpcs://localhost:{}", proxy.port);
+        let (code, out) = rotating(&proxy, &good.endpoint, &[&bes])?;
+        let said = out.contains("ninja: error: build event upload failed: ") && out.contains("the server's certificate has expired");
+        check(code == Some(1) && said && f.build.join("obj/main.o").exists(), &format!("exited with {code:?}:\n{out}"))?;
+        // Not made again once refused (but after a stream that broke).
+        let attempts = out.split("BES upload failed after ").nth(1).and_then(|r| r.split(' ').next()?.parse::<u32>().ok());
+        check(attempts.is_some_and(|n| n <= 2), &format!("{attempts:?} attempts:\n{out}"))
+    })();
+    good.state.set_execute_gate(None);
+    drop((good, bad));
+    rt.shutdown_background();
+    rt2.shutdown_background();
     r
 }
 
@@ -2866,6 +3110,10 @@ fn main() -> ExitCode {
         ("racing_evicted_hit", test_racing_evicted_hit),
         ("unreachable_nested", test_unreachable_nested),
         ("unreachable_after_minimal_downloads", test_unreachable_after_minimal_downloads),
+        ("expired_certificate_before_connecting", test_expired_certificate_before_connecting),
+        ("certificate_expiring_soon", test_certificate_expiring_soon),
+        ("build_events_untrusted_server", test_build_events_untrusted_server),
+        ("certificate_refused_during_build", test_certificate_refused_during_build),
     ];
     // `cargo test --test remote_e2e -- NAME`: the tests whose name has NAME.
     harness::run("e2e", tests)

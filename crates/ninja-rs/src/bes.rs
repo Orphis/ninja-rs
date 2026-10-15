@@ -26,7 +26,9 @@
 //!   `BuildMetrics`.
 //! - **Console:** status lines, command output and messages, as `Progress`.
 //!
-//! Build events never fail the build: problems are warnings.
+//! Build events never fail the build: problems are warnings, but for a
+//! certificate refused (the server's, or the client's), which ends the
+//! invocation before the build when connecting, or fails it at the end.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -47,6 +49,7 @@ use rbe_bes::events::{EventStream, id};
 use rbe_bes::proto::build_event_stream as bep;
 use rbe_bes::proto::command_line as cl;
 use rbe_bes::uploader::{BesConfig, BesUploader, BuildOutcome};
+use rbe_client::fault::{self, Fault};
 
 use crate::options::BesFlags;
 
@@ -237,6 +240,11 @@ pub struct Bes {
     bytestream: Option<String>,
     store: Arc<Store>,
     uploader: Mutex<Option<BesUploader>>,
+    /// The backend's connection, once made or failed: the error ending the
+    /// invocation, if any (see `connected`).
+    connection: Option<tokio::sync::watch::Receiver<Option<Option<String>>>>,
+    /// How long `connected` waits for it.
+    connect_deadline: tokio::time::Instant,
     /// Completed targets waiting for their artifacts' digests (see
     /// `report_targets`).
     hashing: tokio::sync::mpsc::UnboundedSender<Hashing>,
@@ -263,11 +271,14 @@ pub struct Bes {
 
 impl Bes {
     /// Opens the file (when given) and starts the upload to the backend,
-    /// which connects in the background: the build doesn't wait for it. The
-    /// events describing the invocation go first, once the build's targets
-    /// are known (`announce`), or with the first other event.
+    /// which connects in the background (with `tls`, the settings
+    /// `TlsFlags::load` read for a `grpcs://` backend): the build only waits
+    /// for that connection a while (`connected`). The events describing the
+    /// invocation go first, once the build's targets are known
+    /// (`announce`), or with the first other event.
     pub async fn start(
         opts: &crate::options::Options,
+        tls_settings: ninja_remote::Tls,
         ids: &InvocationIds,
         bytestream: Option<String>,
         store: Arc<Store>,
@@ -284,23 +295,33 @@ impl Bes {
                 None
             }
         });
-        let mut uploader = None;
+        let (mut uploader, mut connection) = (None, None);
         if let Some(backend) = &flags.backend {
-            match tls.load() {
-                Ok(t) => {
-                    let connect = t.connect_options(backend, "", &[]);
-                    let mut config = BesConfig::new(&flags.instance_name, &ids.build_request_id, &ids.invocation_id);
-                    config.keywords = flags.keywords.clone();
-                    config.keywords.extend([format!("command_name={command}"), "protocol_name=BEP".to_string()]);
-                    config.lifecycle_events = flags.lifecycle_events;
-                    config.headers = flags.headers.clone();
-                    config.rpc_timeout = flags.rpc_timeout;
-                    config.trace = std::env::var_os("NINJA_RS_BES_DEBUG").is_some_and(|v| !v.is_empty());
-                    // A failed connection is reported at the end (`finish`).
-                    uploader = Some(BesUploader::connecting(async move { rbe_client::connect_channel(&connect).await }, config));
-                }
-                Err(e) => eprintln!("ninja: warning: build events won't be uploaded: {e}"),
-            }
+            let connect = tls_settings.connect_options(backend, "", &[]);
+            let mut config = BesConfig::new(&flags.instance_name, &ids.build_request_id, &ids.invocation_id);
+            config.keywords = flags.keywords.clone();
+            config.keywords.extend([format!("command_name={command}"), "protocol_name=BEP".to_string()]);
+            config.lifecycle_events = flags.lifecycle_events;
+            config.headers = flags.headers.clone();
+            config.rpc_timeout = flags.rpc_timeout;
+            config.trace = std::env::var_os("NINJA_RS_BES_DEBUG").is_some_and(|v| !v.is_empty());
+            // A certificate refused, or settings that can't connect (nothing
+            // was contacted), end the invocation (`connected`); a backend
+            // that can't be reached, or speaks something else, is reported
+            // at the end (`finish`).
+            let (made, outcome) = tokio::sync::watch::channel(None);
+            let (backend, tls) = (backend.clone(), tls.clone());
+            let connecting = async move {
+                let channel = rbe_client::connect_channel(&connect).await;
+                let fatal = channel.as_ref().err().filter(|e| fault::certificate(e.as_ref()).is_some() || fault::fault(e.as_ref()) == Fault::None).map(|e| {
+                    let e = format!("{e:#}");
+                    format!("build events: {e}{}", crate::options::tls_hint(&e, &backend, &tls, true))
+                });
+                made.send_replace(Some(fatal));
+                channel
+            };
+            uploader = Some(BesUploader::connecting(connecting, config));
+            connection = Some(outcome);
         }
         let file = flags.binary_file.as_ref().and_then(|p| match std::fs::File::create(p) {
             Ok(f) => Some(std::io::BufWriter::new(f)),
@@ -322,6 +343,8 @@ impl Bes {
             bytestream,
             store,
             uploader: Mutex::new(uploader),
+            connection,
+            connect_deadline: tokio::time::Instant::now() + flags.rpc_timeout.min(rbe_bes::uploader::LIFECYCLE_TIMEOUT),
             hashing,
             hurry,
             file: Mutex::new(file),
@@ -348,6 +371,29 @@ impl Bes {
     /// was sent: they start with the build's targets).
     pub fn leave_relay(&self) {
         self.relay_out.lock().unwrap().take();
+    }
+
+    /// Waits for the backend's connection (its TLS handshake), as long as
+    /// the opening of an upload may take (5 s, or `--bes_rpc_timeout` if
+    /// shorter, from `start`). A certificate refused, the server's or the
+    /// client's, or settings that can't connect, are the invocation's error,
+    /// before the build runs anything: the upload is over then. A backend
+    /// that can't be reached, or hasn't answered yet, isn't: the upload's
+    /// end says how it went (`finish`).
+    pub async fn connected(&self) -> Result<(), String> {
+        let Some(mut outcome) = self.connection.clone() else { return Ok(()) };
+        let fatal = match tokio::time::timeout_at(self.connect_deadline, outcome.wait_for(Option::is_some)).await {
+            Ok(Ok(made)) => made.clone().flatten(),
+            _ => None,
+        };
+        match fatal {
+            Some(e) => {
+                // Said once: not again at the end.
+                self.uploader.lock().unwrap().take();
+                Err(e)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Accepts nested invocations' connections: each sends its build
@@ -979,7 +1025,9 @@ impl Bes {
     /// build's end and metrics), and waits for the upload, up to
     /// `--bes_timeout`. `interrupted`: the user stopped the invocation,
     /// whatever its exit code (a command may exit with 130 by itself).
-    pub async fn finish(&self, exit_code: i32, interrupted: bool) {
+    /// Whether the upload failed for a certificate refused (connecting
+    /// again during the build): an error, which fails the invocation.
+    pub async fn finish(&self, exit_code: i32, interrupted: bool) -> bool {
         if interrupted {
             self.interrupted();
         }
@@ -1080,6 +1128,7 @@ impl Bes {
             let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(10))).await;
         }
         let uploader = self.uploader.lock().unwrap().take();
+        let mut refused = false;
         if let Some(u) = uploader {
             let outcome = BuildOutcome { success: exit_code == 0, exit_code };
             // Zero waits as long as it takes, as Bazel's --bes_timeout=0.
@@ -1094,10 +1143,14 @@ impl Bes {
                     }
                 }
                 Ok(Err(e)) => {
+                    refused = fault::certificate(e.as_ref()).is_some();
+                    // The stream's failure says whether the backend answered;
+                    // any other failure came before it could.
+                    let first_contact = e.downcast_ref::<rbe_bes::uploader::Failed>().is_none_or(|f| !f.answered());
                     let e = format!("{e:#}");
-                    let first_contact = e.contains("never answered") || e.contains("connecting to");
                     let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls, first_contact)).unwrap_or_default();
-                    print_err(&format!("ninja: warning: build event upload failed: {e}{hint}\n"));
+                    let level = if refused { "error" } else { "warning" };
+                    print_err(&format!("ninja: {level}: build event upload failed: {e}{hint}\n"));
                 }
                 Err(_) if acked.get() => {
                     print_err(&format!("ninja: warning: build events were uploaded, their lifecycle events didn't finish within {timeout:?}\n"))
@@ -1108,6 +1161,7 @@ impl Bes {
                 print_err(&format!("ninja: streaming build results to: {url}{}\n", self.ids.invocation_id));
             }
         }
+        refused
     }
 }
 
@@ -1332,7 +1386,7 @@ mod tests {
         std::fs::write(&artifact, "hello").unwrap();
         let opts = options(&[&format!("--build_event_binary_file={}", dir.join("missing").join("events.bep").display())]);
         let store = Store::new();
-        let bes = Bes::start(&opts, &InvocationIds::default(), None, store.clone(), None).await;
+        let bes = Bes::start(&opts, Default::default(), &InvocationIds::default(), None, store.clone(), None).await;
         let (state, node) = artifact_graph(&artifact);
         bes.plan(&state, &Plan::default(), &[node], Default::default(), &[], None);
         bes.finish(0, false).await;
@@ -1349,7 +1403,15 @@ mod tests {
         // SAFETY: a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
         let file = dir.join("events.bep");
-        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+        let bes = Bes::start(
+            &options(&[&format!("--build_event_binary_file={}", file.display())]),
+            Default::default(),
+            &InvocationIds::default(),
+            None,
+            Store::new(),
+            None,
+        )
+        .await;
         let (state, node) = artifact_graph(&artifact);
         // The build goes on, and so do other events (relayed ones).
         let b = bes.clone();
@@ -1387,8 +1449,12 @@ mod tests {
         // Only --bes_timeout bounds the wait for the upload: calls could
         // take an hour.
         let opts = options(&[&format!("--bes_backend=grpcs://127.0.0.1:{port}"), "--bes_timeout=1s", "--bes_rpc_timeout=1h"]);
-        let started = tokio::time::timeout(PATIENCE, Bes::start(&opts, &InvocationIds::default(), None, Store::new(), None)).await;
+        let started = tokio::time::timeout(PATIENCE, Bes::start(&opts, Default::default(), &InvocationIds::default(), None, Store::new(), None)).await;
         let bes = started.expect("the build waited for the backend");
+        // The handshake is waited for 5 s at most, and its silence doesn't
+        // stop the build.
+        let connected = tokio::time::timeout(PATIENCE, bes.connected()).await.expect("the build waited for the handshake beyond 5 s");
+        assert_eq!(connected, Ok(()));
         // The end waits for the upload as long as --bes_timeout says.
         tokio::time::timeout(PATIENCE, bes.finish(0, false)).await.expect("the end waited for the upload beyond --bes_timeout");
     }
@@ -1442,7 +1508,15 @@ mod tests {
         let artifact = dir.join("app.bin");
         let mut writer = fifo(&artifact);
         let file = dir.join("events.bep");
-        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+        let bes = Bes::start(
+            &options(&[&format!("--build_event_binary_file={}", file.display())]),
+            Default::default(),
+            &InvocationIds::default(),
+            None,
+            Store::new(),
+            None,
+        )
+        .await;
         let (state, nodes) = targets_graph(&[("app", &artifact)]);
         bes.plan(&state, &Plan::default(), &nodes, Default::default(), &[], None);
         let finished = tokio::time::timeout(PATIENCE, bes.finish(crate::EXIT_INTERRUPTED, true)).await;
@@ -1464,7 +1538,15 @@ mod tests {
         std::fs::File::options().write(true).open(&quick).unwrap().set_modified(SystemTime::now() - Duration::from_secs(3600)).unwrap();
         let file = dir.join("events.bep");
         let store = Store::new();
-        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, store.clone(), None).await;
+        let bes = Bes::start(
+            &options(&[&format!("--build_event_binary_file={}", file.display())]),
+            Default::default(),
+            &InvocationIds::default(),
+            None,
+            store.clone(),
+            None,
+        )
+        .await;
         let (state, nodes) = targets_graph(&[("a_slow", &slow), ("b_quick", &quick)]);
         bes.plan(&state, &Plan::default(), &nodes, Default::default(), &[], None);
         // The second target's artifact is hashed while the first waits.
@@ -1486,7 +1568,15 @@ mod tests {
     async fn events_after_the_end_go_nowhere() {
         let dir = test_dir("after_the_end");
         let file = dir.join("events.bep");
-        let bes = Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+        let bes = Bes::start(
+            &options(&[&format!("--build_event_binary_file={}", file.display())]),
+            Default::default(),
+            &InvocationIds::default(),
+            None,
+            Store::new(),
+            None,
+        )
+        .await;
         bes.announce(&[]);
         bes.finish(0, false).await;
         // A message, a nested invocation's event relayed late.
@@ -1506,7 +1596,7 @@ mod tests {
         let dir = test_dir("dyndep");
         let (a, b, d) = (dir.join("a.o"), dir.join("b.o"), dir.join("d.o"));
         let (state, nodes) = targets_graph(&[("app", &a), ("app", &b), ("app", &d)]);
-        let bes = Bes::start(&options(&[]), &InvocationIds::default(), None, Store::new(), None).await;
+        let bes = Bes::start(&options(&[]), Default::default(), &InvocationIds::default(), None, Store::new(), None).await;
         // The plan wants a and b; a dyndep file brings d later.
         let mut plan = Plan::default();
         for e in [EdgeId(0), EdgeId(1)] {
@@ -1548,8 +1638,15 @@ mod tests {
             (crate::EXIT_INTERRUPTED, true, "INTERRUPTED", bep::aborted::AbortReason::UserInterrupted),
         ] {
             let file = dir.join(format!("{code}-{interrupted}.bep"));
-            let bes =
-                Bes::start(&options(&[&format!("--build_event_binary_file={}", file.display())]), &InvocationIds::default(), None, Store::new(), None).await;
+            let bes = Bes::start(
+                &options(&[&format!("--build_event_binary_file={}", file.display())]),
+                Default::default(),
+                &InvocationIds::default(),
+                None,
+                Store::new(),
+                None,
+            )
+            .await;
             let mut plan = Plan::default();
             plan.want.insert(EdgeId(0), Want::ToStart);
             bes.plan(&state, &plan, &nodes, Default::default(), &[], None);

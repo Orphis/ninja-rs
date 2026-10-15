@@ -24,6 +24,8 @@
 //! zstd compression is off by default too; [`State::set_compression`]
 //! advertises it for ByteStream, batch reads and batch updates.
 
+pub mod certs;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;

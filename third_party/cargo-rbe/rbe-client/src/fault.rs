@@ -74,12 +74,16 @@ impl Fault {
 /// What `e`, with its causes, says about the connection.
 pub fn fault(e: &(dyn Error + 'static)) -> Fault {
     use std::io::ErrorKind::*;
+    if certificate(e).is_some() {
+        return Fault::Refused;
+    }
     // Past the contexts (which name the endpoint), the transport's own
-    // errors: their words count.
+    // errors: their types and kinds first, then their words, whole (an
+    // error's words may hold a host's name: `rbe-timeouts.corp`).
     let mut transport = false;
     let mut cause = Some(e);
     while let Some(c) = cause {
-        if c.is::<NoAnswer>() {
+        if c.is::<NoAnswer>() || c.is::<tonic::TimeoutExpired>() {
             return Fault::NoAnswer;
         }
         if let Some(s) = c.downcast_ref::<tonic::Status>() {
@@ -94,27 +98,25 @@ pub fn fault(e: &(dyn Error + 'static)) -> Fault {
                 ConnectionRefused | HostUnreachable | NetworkUnreachable | NetworkDown | AddrNotAvailable | NotConnected => return Fault::NoConnection,
                 TimedOut => return Fault::NoAnswer,
                 ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof => return Fault::Broke,
-                // rustls's: a certificate refused, an alert received.
+                // rustls's: an alert received, a message it can't read.
                 InvalidData => return Fault::Refused,
                 _ => {}
             }
         }
         if transport {
             let text = c.to_string().to_ascii_lowercase();
-            // hyper's connector's: a name that doesn't resolve has no
-            // error kind of its own.
-            if text.contains("dns error") || text.contains("tcp connect error") {
-                return Fault::NoConnection;
-            }
-            // tonic's TLS handshake timeout.
-            if text.contains("timed out") || text.contains("timeout") {
-                return Fault::NoAnswer;
-            }
-            // tonic's TLS errors (a certificate, HTTP/2 not negotiated), and
-            // an HTTP/2 protocol error found here (`error detected`, not
-            // `received`): the other end speaks something else.
-            if text.contains("certificate") || text.contains("not negotiated") || text.contains("error detected") {
-                return Fault::Refused;
+            match text.as_str() {
+                // hyper's connector's: a name that doesn't resolve has no
+                // error kind of its own.
+                "dns error" | "tcp connect error" => return Fault::NoConnection,
+                // tonic's TLS handshake timeout.
+                "tls handshake timeout." => return Fault::NoAnswer,
+                // tonic's TLS without HTTP/2, and an HTTP/2 protocol error
+                // found here (`detected`, not `received`): the other end
+                // speaks something else.
+                "http/2 was not negotiated." => return Fault::Refused,
+                t if t.starts_with("connection error detected: ") || t.starts_with("stream error detected: ") => return Fault::Refused,
+                _ => {}
             }
         }
         cause = c.source();
@@ -122,6 +124,71 @@ pub fn fault(e: &(dyn Error + 'static)) -> Fault {
     // A transport error saying no more (hyper's "connection closed"): it
     // broke.
     if transport { Fault::Broke } else { Fault::None }
+}
+
+/// Whose certificate a connection was refused for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Certificate {
+    /// The server's, by this client: not trusted, expired, for another
+    /// name, or none at all.
+    Server,
+    /// This client's, by the server, whose alert says why: none sent where
+    /// one is required, one it doesn't trust, expired, revoked...
+    Client,
+}
+
+/// The alerts of a server refusing the client's certificate.
+const CLIENT_CERTIFICATE_ALERTS: [rustls::AlertDescription; 8] = {
+    use rustls::AlertDescription::*;
+    [BadCertificate, UnsupportedCertificate, CertificateRevoked, CertificateExpired, CertificateUnknown, UnknownCA, CertificateRequired, AccessDenied]
+};
+
+/// Whether `e`, with its causes, is a certificate refused, and whose: a
+/// `Fault::Refused` that no other server, nor calling again, would fix.
+/// Told from rustls's error, which tokio-rustls wraps in an `io::Error`
+/// (reached with `get_ref`: that error's `source` skips it), or from its
+/// words, all that is left of it once the connection was made (h2 keeps
+/// an `io::Error`'s kind and words only). Not every refusal says so: a
+/// server may close the connection right after its alert, which Windows
+/// then resets before the client read it, or close it without one; that is
+/// a connection that broke (`Fault::Broke`).
+pub fn certificate(e: &(dyn Error + 'static)) -> Option<Certificate> {
+    let mut cause = Some(e);
+    while let Some(c) = cause {
+        if let Some(tls) = c.downcast_ref::<rustls::Error>() {
+            return whose(tls);
+        }
+        if let Some(io) = c.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::InvalidData
+            && let Some(inner) = io.get_ref()
+        {
+            return match inner.downcast_ref::<rustls::Error>() {
+                Some(tls) => whose(tls),
+                None => whose_words(&inner.to_string()),
+            };
+        }
+        cause = c.source();
+    }
+    None
+}
+
+/// Whose certificate rustls's error `e` is about, if it's one refused.
+fn whose(e: &rustls::Error) -> Option<Certificate> {
+    match e {
+        // On a client, the server's.
+        rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented => Some(Certificate::Server),
+        rustls::Error::AlertReceived(alert) if CLIENT_CERTIFICATE_ALERTS.contains(alert) => Some(Certificate::Client),
+        _ => None,
+    }
+}
+
+/// `whose`, from the words of rustls's error, whole but for what its
+/// certificate errors add (which may name a host).
+fn whose_words(text: &str) -> Option<Certificate> {
+    if let Some(alert) = text.strip_prefix("received fatal alert: ") {
+        return CLIENT_CERTIFICATE_ALERTS.iter().any(|a| format!("{a:?}") == alert).then_some(Certificate::Client);
+    }
+    (text.starts_with("invalid peer certificate: ") || text == "peer sent no certificates").then_some(Certificate::Server)
 }
 
 /// Whether `e` is the service saying it can't serve now: UNAVAILABLE from
@@ -192,5 +259,71 @@ mod tests {
         assert!(unavailable(e.as_ref()));
         assert!(!unavailable(&status(io(std::io::ErrorKind::ConnectionReset))));
         assert!(!unavailable(&tonic::Status::permission_denied("no")));
+    }
+
+    /// An error saying `text`, caused by `source`: a level of a chain.
+    #[derive(Debug)]
+    struct Said(&'static str, Box<dyn Error + Send + Sync>);
+
+    impl std::fmt::Display for Said {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl Error for Said {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(self.1.as_ref())
+        }
+    }
+
+    /// Certificates refused are told from rustls's errors, wrapped in an
+    /// `io::Error` as tokio-rustls does: the server's, the client's (the
+    /// server's alert), and what isn't one.
+    #[test]
+    fn certificates_refused() {
+        use rustls::{AlertDescription, CertificateError};
+        let tls = |e: rustls::Error| {
+            let mut s = tonic::Status::unknown("transport error");
+            s.set_source(Arc::new(Said("connection error", Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))));
+            s
+        };
+        for (e, whose) in [
+            (rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer), Some(Certificate::Server)),
+            (rustls::Error::InvalidCertificate(CertificateError::Expired), Some(Certificate::Server)),
+            (rustls::Error::NoCertificatesPresented, Some(Certificate::Server)),
+            (rustls::Error::AlertReceived(AlertDescription::CertificateRequired), Some(Certificate::Client)),
+            (rustls::Error::AlertReceived(AlertDescription::CertificateExpired), Some(Certificate::Client)),
+            (rustls::Error::AlertReceived(AlertDescription::UnknownCA), Some(Certificate::Client)),
+            // Refused, but not for a certificate: another server may do.
+            (rustls::Error::AlertReceived(AlertDescription::HandshakeFailure), None),
+            (rustls::Error::AlertReceived(AlertDescription::ProtocolVersion), None),
+            (rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType), None),
+        ] {
+            let s = tls(e.clone());
+            assert_eq!((certificate(&s), fault(&s)), (whose, Fault::Refused), "{e:?}");
+            // Once the connection was made, h2 keeps its words only.
+            let mut s = tonic::Status::unknown("transport error");
+            s.set_source(Arc::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())));
+            assert_eq!((certificate(&s), fault(&s)), (whose, Fault::Refused), "{e}");
+        }
+        // Words don't count, whatever names they hold: a certificate of
+        // another name than `rbe-timeouts.corp` isn't a timeout.
+        let name = Said(
+            "invalid peer certificate: certificate not valid for name \"rbe-timeouts.corp\"",
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, rustls::Error::InvalidCertificate(CertificateError::NotValidForName))),
+        );
+        let mut s = tonic::Status::unknown("transport error");
+        s.set_source(Arc::new(name));
+        assert_eq!((certificate(&s), fault(&s)), (Some(Certificate::Server), Fault::Refused));
+        let mut s = tonic::Status::unknown("transport error");
+        s.set_source(Arc::new(Said("tls handshake timeout of rbe-timeouts.corp", "x".into())));
+        assert_eq!(fault(&s), Fault::Broke);
+        // A connection reset carries no rustls error, nor does the server's
+        // own answer.
+        let mut reset = tonic::Status::unknown("transport error");
+        reset.set_source(Arc::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset)));
+        assert_eq!((certificate(&reset), fault(&reset)), (None, Fault::Broke));
+        assert_eq!(certificate(&tonic::Status::permission_denied("certificate")), None);
     }
 }

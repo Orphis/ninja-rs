@@ -6,7 +6,10 @@ package(default_visibility = ["//visibility:public"])
 
 rust_library(
     name = "fake-reapi",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/certs.rs",
+        "src/lib.rs",
+    ],
     crate_name = "fake_reapi",
     deps = [
         "//third_party/cargo-rbe/rbe-bes",
