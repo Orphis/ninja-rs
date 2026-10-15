@@ -298,7 +298,9 @@ mod tests {
         assert!(lock(&b, true).unwrap());
         assert!(!lock(&a, false).unwrap());
         drop(b);
-        assert!(lock(&a, false).unwrap());
+        // Waited for: a child another test forks meanwhile shares the
+        // closed handle's lock until it starts its program (Unix).
+        assert!(lock(&a, true).unwrap());
         assert_eq!(identity(&a).unwrap(), identity(&open()).unwrap());
     }
 

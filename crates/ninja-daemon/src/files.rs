@@ -1,8 +1,7 @@
 //! File digests and directory trees, kept until the watcher reports a
 //! change (or, for what it doesn't watch, checked once per build).
 
-use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +12,7 @@ use cpp_deps::scan::Watch;
 use ninja_os::{Digest, FileStamp};
 
 use crate::proto::{FileInfo, TreeInfo};
-use crate::watch::{Change, Listener, Watcher, has_under, key, remove_under, strip_verbatim, walk_skips};
+use crate::watch::{Change, Listener, PathMap, Watcher, key, strip_verbatim, walk_skips};
 
 /// The session of entries the watcher vouches for.
 const WATCHED: u64 = u64::MAX;
@@ -52,13 +51,13 @@ pub struct Files {
     watcher: Arc<Watcher>,
     case_insensitive: bool,
     session: AtomicU64,
-    /// Ordered by path, as the watcher's maps: what's under a directory
-    /// goes without going through the rest.
-    files: RwLock<BTreeMap<PathBuf, Arc<FileEntry>>>,
-    trees: RwLock<BTreeMap<PathBuf, Arc<TreeEntry>>>,
+    /// As the watcher's maps: what's under a directory goes without going
+    /// through the rest.
+    files: RwLock<PathMap<Arc<FileEntry>>>,
+    trees: RwLock<PathMap<Arc<TreeEntry>>>,
     /// Digests by real path (keys): links to a file (LLVM's tools) are
     /// hashed once, and digests saved by builds reused.
-    hashes: Mutex<BTreeMap<PathBuf, Kept>>,
+    hashes: Mutex<PathMap<Kept>>,
     /// Digests being computed, by real path (key) and stamp: concurrent
     /// requests for a file (every action's compiler) wait for the one
     /// hashing it.
@@ -119,7 +118,10 @@ impl Files {
     pub fn seed(&self, entries: impl IntoIterator<Item = (PathBuf, FileStamp, String)>) {
         let mut hashes = self.hashes.lock().unwrap();
         for (p, stamp, hash) in entries {
-            hashes.entry(key(&p, self.case_insensitive)).or_insert(Kept::Saved(stamp, Digest { hash, size: stamp.len }));
+            let k = key(&p, self.case_insensitive);
+            if !hashes.contains_key(&k) {
+                hashes.insert(k, Kept::Saved(stamp, Digest { hash, size: stamp.len }));
+            }
         }
     }
 
@@ -199,16 +201,17 @@ impl Files {
         let is_link = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
         let real = if is_link { std::fs::canonicalize(p).map(strip_verbatim).unwrap_or_else(|_| p.to_path_buf()) } else { p.to_path_buf() };
         let k = key(&real, self.case_insensitive);
-        let seen = match self.hashes.lock().unwrap().entry(k.clone()) {
-            Entry::Occupied(e) => match e.get() {
-                Kept::Hashed(s, d) | Kept::Saved(s, d) if *s == stamp => return Ok(d.clone()),
-                Kept::Changed(n) => Some(*n),
-                _ => None,
-            },
-            // A change while it's hashed has an entry to mark.
-            Entry::Vacant(e) => {
-                e.insert(Kept::Changed(0));
-                Some(0)
+        let seen = {
+            let mut hashes = self.hashes.lock().unwrap();
+            match hashes.get(&k) {
+                Some(Kept::Hashed(s, d) | Kept::Saved(s, d)) if *s == stamp => return Ok(d.clone()),
+                Some(Kept::Changed(n)) => Some(*n),
+                Some(_) => None,
+                // A change while it's hashed has an entry to mark.
+                None => {
+                    hashes.insert(k.clone(), Kept::Changed(0));
+                    Some(0)
+                }
             }
         };
         let version = (k.clone(), stamp);
@@ -245,10 +248,13 @@ impl Files {
     }
 
     /// The files under `dir` (symlinks followed) with their digests, as
-    /// `InputTree::add_dir` sees them. One that can't be listed for a
-    /// lasting reason (see `lasting`) fails for the session, or when
-    /// watched, until a change under it: actions don't each walk it again.
-    /// Other failures are tried again.
+    /// `InputTree::add_dir` sees them. Kept until a change under it when the
+    /// watcher vouches for its files, but for their other names when the
+    /// walk sees those all in the tree (hard links, symbolic links within
+    /// it): a change through any is reported under it. One that can't be
+    /// listed for a lasting reason (see `lasting`) fails for the session,
+    /// or when watched, until a change under it: actions don't each walk it
+    /// again. Other failures are tried again.
     pub fn tree(&self, dir: &Path) -> Result<Arc<TreeInfo>, String> {
         let k = key(dir, self.case_insensitive);
         if let Some(t) = self.kept_tree(&k) {
@@ -277,6 +283,9 @@ impl Files {
         let token = if self.watcher.volatile_dir(k) { None } else { self.watcher.tree_token(dir) };
         let mut walk = Walk::default();
         let walked = std::fs::canonicalize(dir).map_err(|e| context("listing", dir, e)).and_then(|real| self.walk(dir, "", &real, &mut walk));
+        // Every name of a file with others is in the tree: a change through
+        // any is reported under it.
+        walk.unwatched |= walk.names.values().any(|(names, seen)| seen != names);
         let kept = walked.as_ref().map_or_else(lasting, |_| true);
         let info = walked.map(|()| Arc::new(walk.info)).map_err(|e| e.to_string());
         if kept {
@@ -301,8 +310,11 @@ impl Files {
             let name = e.file_name().to_string_lossy().into_owned();
             let child = if rel.is_empty() { name } else { format!("{rel}/{name}") };
             let path = e.path();
-            if e.file_type().is_ok_and(|t| t.is_symlink()) {
-                w.unwatched |= !std::fs::canonicalize(&path).is_ok_and(|t| t.starts_with(real));
+            // A link leading out of the tree (or where walks don't go): what
+            // it leads to may change unseen.
+            let link = e.file_type().is_ok_and(|t| t.is_symlink());
+            if link {
+                w.unwatched |= !std::fs::canonicalize(&path).is_ok_and(|t| t.strip_prefix(real).is_ok_and(|t| !t.iter().any(walk_skips)));
             }
             let meta = std::fs::metadata(&path).map_err(|e| context("stat", &path, e))?;
             if meta.is_dir() {
@@ -310,7 +322,15 @@ impl Files {
                 self.walk(&path, &child, real, w)?;
             } else {
                 let (info, vouched) = self.check(&path)?;
-                w.unwatched |= !vouched;
+                // Not alone, for its other names: the tree is, if the walk
+                // sees them all.
+                if !vouched {
+                    match self.watcher.walked_token(&path) {
+                        Some(_) if link => {}
+                        Some((_, names)) if names > 1 => w.names.entry(identity(&meta, &info)).or_insert((names, 0)).1 += 1,
+                        _ => w.unwatched = true,
+                    }
+                }
                 w.info.files.push((child, info));
             }
         }
@@ -321,7 +341,7 @@ impl Files {
     /// for there again: see `Listener::forget`).
     fn forget_under(&self, dir: &Path) {
         let k = key(dir, self.case_insensitive);
-        let n = remove_under(&mut self.hashes.lock().unwrap(), &k);
+        let n = self.hashes.lock().unwrap().remove_under(&k);
         self.watcher.sweep(n + 1);
     }
 }
@@ -331,9 +351,25 @@ impl Files {
 struct Walk {
     info: TreeInfo,
     /// A file the watcher doesn't vouch for (a link leading out of the
-    /// tree, a file with other names, a change seen during the walk): the
-    /// tree holds for the session only.
+    /// tree, a file with names outside it, a change seen during the walk):
+    /// the tree holds for the session only.
     unwatched: bool,
+    /// Files with other names (hard links: GCC's `gcc` and `<target>-gcc`,
+    /// Git's commands), by identity: how many names each has, and how many
+    /// the walk saw.
+    names: HashMap<(u64, u128), (u64, u64)>,
+}
+
+/// A file's identity: its device or volume, and its inode or file ID.
+#[cfg(unix)]
+fn identity(meta: &std::fs::Metadata, _info: &FileInfo) -> (u64, u128) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), u128::from(meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity(_meta: &std::fs::Metadata, info: &FileInfo) -> (u64, u128) {
+    (info.volume, info.id)
 }
 
 impl Listener for Files {
@@ -351,20 +387,20 @@ impl Listener for Files {
             }
             Change::Names => {}
             Change::Tree => {
-                swept += remove_under(&mut self.files.write().unwrap(), &k);
+                swept += self.files.write().unwrap().remove_under(&k);
             }
         }
         // A tree changes with anything under it.
         let hit = {
             let trees = self.trees.read().unwrap();
-            !trees.is_empty() && (k.ancestors().any(|a| trees.contains_key(a)) || has_under(&trees, &k))
+            !trees.is_empty() && (k.ancestors().any(|a| trees.contains_key(a)) || trees.has_under(&k))
         };
         if hit {
             let mut trees = self.trees.write().unwrap();
             for a in k.ancestors().skip(1) {
                 swept += usize::from(trees.remove(a).is_some());
             }
-            swept += remove_under(&mut trees, &k);
+            swept += trees.remove_under(&k);
         }
         self.watcher.sweep(swept);
     }
@@ -674,32 +710,43 @@ mod tests {
     }
 
     /// Lookups don't cost more with the build directories seen (CMake's
-    /// `try_compile` names hundreds a day): a lookup per ancestor. Those no
-    /// build named for a while are forgotten, with what was kept for their
-    /// files.
+    /// `try_compile` names hundreds a day): a lookup per ancestor, as with
+    /// one (in a checkout, which the test's directory may be in, a few
+    /// more). Those no build named for a while are forgotten, with what was
+    /// kept for their files.
     #[test]
     fn many_build_dirs() {
         let dir = TestDir::new("ninja_daemon_many");
         std::fs::create_dir_all(dir.join("src")).unwrap();
         let f = dir.join("src/x.h");
         std::fs::write(&f, "x").unwrap();
-        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
-        let files = Arc::new(Files::new(w.clone(), cfg!(windows)));
-        w.listen(files.clone());
         let scratch = |i: usize| dir.join(format!("build/CMakeFiles/CMakeScratch/TryCompile-{i:06x}"));
-        for i in 0..10_000 {
-            w.ignore(&scratch(i), true);
-        }
-        files.get(&f).unwrap();
-        let probes = || w.probes();
-        let before = probes();
-        for _ in 0..1_000 {
+        // What 1,000 lookups cost with `n` build directories, once the
+        // root the file is in (if any) is set up.
+        let lookups = |n: usize| {
+            let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+            let files = Arc::new(Files::new(w.clone(), cfg!(windows)));
+            w.listen(files.clone());
+            for i in 0..n {
+                w.ignore(&scratch(i), true);
+            }
             files.get(&f).unwrap();
-            w.token(&f);
-        }
-        // Two lookups each, of every ancestor at most.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while w.roots().iter().any(|(_, s)| *s == crate::watch::RootState::Starting) {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let before = Watcher::probes();
+            for _ in 0..1_000 {
+                files.get(&f).unwrap();
+                w.token(&f);
+            }
+            (Watcher::probes() - before, w, files)
+        };
+        let (one, ..) = lookups(1);
+        let (many, w, files) = lookups(10_000);
         let depth = f.ancestors().count() as u64;
-        assert!(probes() - before <= 1_000 * 2 * depth, "{} probes", probes() - before);
+        assert!(many <= one + 1_000 * depth, "{many} probes, {one} with one build directory");
         let k = |p: &Path| key(p, cfg!(windows));
         assert!(w.volatile_file(&k(&scratch(42).join("a.o"))));
         // An object built in one, then not named for a while.
@@ -715,6 +762,102 @@ mod tests {
         assert!(!w.volatile_file(&k(&scratch(42).join("a.o"))));
         assert_eq!(files.len().0, 1);
         assert!(!files.hashes.lock().unwrap().keys().any(|p| p.starts_with(k(&scratch(42)))));
+    }
+
+    /// A tree whose files with other names have them all in it (GCC's
+    /// `gcc` and `<target>-gcc`, hard links; LLVM's `clang++`, a symbolic
+    /// link to `clang`) is vouched for: its walk sees every name, and a
+    /// change through any is reported under it. Such trees were walked
+    /// again every build. One with a name outside isn't.
+    #[test]
+    fn linked_trees() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        let base = TestDir::new("ninja_daemon_linked_trees");
+        for d in ["tc/bin", "tc2/bin", "elsewhere"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let dir = strip_verbatim(std::fs::canonicalize(&*base).unwrap());
+        let (tc, tc2) = (dir.join("tc"), dir.join("tc2"));
+        let gcc = tc.join("bin/gcc");
+        std::fs::write(&gcc, "gcc").unwrap();
+        std::fs::hard_link(&gcc, tc.join("bin/x86_64-linux-gnu-gcc")).unwrap();
+        std::fs::write(tc.join("bin/clang"), "clang").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("clang", tc.join("bin/clang++")).unwrap();
+        // A privilege not every user has.
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_file("clang", tc.join("bin/clang++"));
+        std::fs::write(tc2.join("bin/cc"), "cc").unwrap();
+        std::fs::hard_link(tc2.join("bin/cc"), dir.join("elsewhere/cc")).unwrap();
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        w.set_cookie_dir(&dir.join("cookies"));
+        let files = Arc::new(Files::new(w.clone(), cfg!(windows)));
+        w.listen(files.clone());
+        let watched = |t: &Path| files.trees.read().unwrap().get(&key(t, cfg!(windows))).is_some_and(|e| e.session.load(Ordering::Relaxed) == WATCHED);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !watched(&tc) {
+            assert!(Instant::now() < deadline, "{:?}", w.roots());
+            w.sync();
+            files.new_session();
+            files.tree(&tc).unwrap();
+            files.tree(&tc2).unwrap();
+        }
+        assert!(!watched(&tc2));
+        // Changed through its other name, before the next build: walked
+        // again.
+        let before = files.tree(&tc).unwrap();
+        std::fs::write(tc.join("bin/x86_64-linux-gnu-gcc"), "gcc 2").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let after = loop {
+            files.new_session();
+            let t = files.tree(&tc).unwrap();
+            if !Arc::ptr_eq(&t, &before) {
+                break t;
+            }
+            assert!(Instant::now() < deadline, "the change wasn't seen");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(after.files.iter().find(|(f, _)| f == "bin/gcc").map(|(_, i)| i.size), Some(5));
+    }
+
+    /// A root gone (a checkout removed) takes what was kept for it along,
+    /// digests included: those of the files at its top, under no directory
+    /// known, stayed for the daemon's life.
+    #[test]
+    fn roots_gone_forgotten() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        let base = TestDir::new("ninja_daemon_gone_digests");
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        std::fs::create_dir_all(base.join("repo/src")).unwrap();
+        let dir = strip_verbatim(std::fs::canonicalize(&*base).unwrap());
+        let repo = dir.join("repo");
+        let (a, b) = (repo.join("a.h"), repo.join("src/b.h"));
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        let w = Watcher::new(cfg!(windows), Box::new(|_| {}));
+        w.set_cookie_dir(&dir.join("cookies"));
+        let files = Arc::new(Files::new(w.clone(), cfg!(windows)));
+        w.listen(files.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while w.token(&a).is_none() {
+            assert!(Instant::now() < deadline, "{:?}", w.roots());
+            files.get(&a).unwrap();
+            files.get(&b).unwrap();
+            w.sync();
+        }
+        test_dirs::remove_all(&repo).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !w.roots().is_empty() {
+            assert!(Instant::now() < deadline, "{:?}", w.roots());
+            w.sync();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let k = key(&repo, cfg!(windows));
+        assert!(!files.hashes.lock().unwrap().keys().any(|p| p.starts_with(&k)), "{:?}", files.hashes.lock().unwrap().keys().collect::<Vec<_>>());
     }
 
     #[test]

@@ -610,6 +610,9 @@ pub enum Want {
 pub struct Plan {
     pub want: HashMap<EdgeId, Want>,
     ready: BinaryHeap<(i64, Reverse<EdgeId>)>,
+    /// Ready edges whose kind of runner slots were all taken, by kind (see
+    /// `CommandRunner::has_free_slot`).
+    waiting: Vec<BinaryHeap<(i64, Reverse<EdgeId>)>>,
     targets: Vec<NodeId>,
     command_edges: usize,
     wanted_edges: usize,
@@ -624,7 +627,7 @@ impl Plan {
         self.command_edges
     }
     pub fn work_ready(&self) -> bool {
-        !self.ready.is_empty()
+        !self.ready.is_empty() || self.waiting.iter().any(|w| !w.is_empty())
     }
 }
 
@@ -904,8 +907,55 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn find_work(&mut self) -> Option<EdgeId> {
-        self.plan.ready.pop().map(|(_, Reverse(e))| e)
+    /// The next edge to start, by priority: of the ready ones, and of those
+    /// waiting for slots of a kind the runner has free now. A ready edge
+    /// whose kind of slots are all taken waits (see
+    /// `CommandRunner::has_free_slot`), and the next one is taken; with
+    /// `force` (nothing runs), the best waiting one is when no other is.
+    fn find_work(&mut self, runner: &dyn CommandRunner, force: bool) -> Option<EdgeId> {
+        if runner.slot_kinds() <= 1 {
+            return self.plan.ready.pop().map(|(_, Reverse(e))| e);
+        }
+        let best_waiting = |plan: &Plan, free: &dyn Fn(usize) -> bool| {
+            (0..plan.waiting.len()).filter(|&k| free(k)).filter_map(|k| plan.waiting[k].peek().map(|&top| (top, k))).max()
+        };
+        loop {
+            let waiting = best_waiting(&self.plan, &|k| runner.has_free_slot(k));
+            match (self.plan.ready.peek().copied(), waiting) {
+                (None, None) => {
+                    let (_, kind) = best_waiting(&self.plan, &|_| force)?;
+                    return self.plan.waiting[kind].pop().map(|(_, Reverse(e))| e);
+                }
+                (ready, Some((top, kind))) if ready.is_none_or(|r| top > r) => return self.plan.waiting[kind].pop().map(|(_, Reverse(e))| e),
+                _ => {
+                    let (weight, Reverse(e)) = self.plan.ready.pop().expect("a ready edge");
+                    if self.state.is_phony(e) {
+                        return Some(e);
+                    }
+                    let kind = runner.slots_of(&self.task_preview(e));
+                    if runner.has_free_slot(kind) {
+                        return Some(e);
+                    }
+                    if self.plan.waiting.len() <= kind {
+                        self.plan.waiting.resize_with(kind + 1, BinaryHeap::new);
+                    }
+                    self.plan.waiting[kind].push((weight, Reverse(e)));
+                }
+            }
+        }
+    }
+
+    /// What a runner tells the slots `edge` takes from (see
+    /// `CommandRunner::slots_of`): not its inputs.
+    fn task_preview(&self, edge: EdgeId) -> Task {
+        Task {
+            edge,
+            rule: self.state.rule_of(edge).name.clone(),
+            use_console: self.state.use_console(edge),
+            generator: self.state.edge_binding_bool(edge, "generator"),
+            bindings: self.task_bindings(edge).unwrap_or_default(),
+            ..Default::default()
+        }
     }
 
     fn edge_weight(&self, e: EdgeId) -> usize {
@@ -1354,14 +1404,43 @@ impl<'a> Builder<'a> {
     }
 
     /// Runs the build. `runner` executes commands. However it ends, the
-    /// file whose time outputs are recorded with (`.ninja_lock`) is
-    /// removed, as ninja's `Cleanup` does.
+    /// logs' records are written, and the file whose time outputs are
+    /// recorded with (`.ninja_lock`) is removed, as ninja's `Cleanup` does.
     pub async fn build(&mut self, runner: &mut dyn CommandRunner) -> Result<(), BuildError> {
         let result = self.run(runner).await;
+        // Into the files there now, whatever happened to them meanwhile.
+        self.recheck_logs();
+        let flushed = self.flush_logs();
         if self.disk.stat(&self.lock_file_path).unwrap_or(0) > 0 {
             let _ = self.disk.remove_file(&self.lock_file_path);
         }
-        result
+        result.and(flushed.map_err(BuildError::new))
+    }
+
+    /// Writes the logs' records of the commands finished since the last
+    /// call: once per turn of the loop, for every command it reaped (one
+    /// lock, one write each).
+    fn flush_logs(&mut self) -> Result<(), String> {
+        if let Some(log) = self.build_log.as_deref_mut() {
+            log.flush()?;
+        }
+        if let Some(log) = self.deps_log.as_deref_mut()
+            && let Some(warning) = log.flush()?
+        {
+            self.status.warning(&warning);
+        }
+        Ok(())
+    }
+
+    /// Makes the next flush check that the logs weren't replaced (see
+    /// `BuildLog::recheck`).
+    fn recheck_logs(&mut self) {
+        if let Some(log) = self.build_log.as_deref_mut() {
+            log.recheck();
+        }
+        if let Some(log) = self.deps_log.as_deref_mut() {
+            log.recheck();
+        }
     }
 
     async fn run(&mut self, runner: &mut dyn CommandRunner) -> Result<(), BuildError> {
@@ -1379,7 +1458,7 @@ impl<'a> Builder<'a> {
             if failures_allowed > 0 {
                 let mut capacity = runner.can_run_more();
                 while capacity > 0 {
-                    let Some(edge) = self.find_work() else { break };
+                    let Some(edge) = self.find_work(&*runner, pending_commands == 0) else { break };
                     if let Err(e) = self.start_edge(edge, runner) {
                         self.cleanup(runner).await;
                         self.status.build_finished();
@@ -1404,29 +1483,49 @@ impl<'a> Builder<'a> {
                 }
             }
 
-            // See if we can reap any finished commands.
+            // See if we can reap any finished commands: one, waited for,
+            // then those that finished meanwhile, whose records the logs
+            // then write at once, before more commands start (one of them
+            // may read them: a build in this directory). Not in a dry run,
+            // which writes none, and whose commands all finish at once:
+            // its status lines are ninja's, one command reaped per turn.
             if pending_commands > 0 {
-                let Some(result) = runner.wait_for_command().await else {
-                    self.cleanup(runner).await;
-                    self.status.build_finished();
-                    return Err(BuildError::new("internal error: runner lost a command"));
-                };
-                pending_commands -= 1;
-                if result.status == ExitStatus::Interrupted {
-                    self.cleanup(runner).await;
-                    self.status.build_finished();
-                    return Err(BuildError { message: "interrupted by user".into(), interrupted: true, exit_code: 130 });
-                }
-                let success = match self.finish_command(result) {
-                    Ok(success) => success,
-                    Err(e) => {
+                let mut next = runner.wait_for_command().await;
+                loop {
+                    let Some(result) = next else {
                         self.cleanup(runner).await;
                         self.status.build_finished();
-                        return Err(BuildError::new(e));
+                        return Err(BuildError::new("internal error: runner lost a command"));
+                    };
+                    pending_commands -= 1;
+                    if result.status == ExitStatus::Interrupted {
+                        self.cleanup(runner).await;
+                        self.status.build_finished();
+                        return Err(BuildError { message: "interrupted by user".into(), interrupted: true, exit_code: 130 });
                     }
-                };
-                if !success && failures_allowed > 0 {
-                    failures_allowed -= 1;
+                    let success = match self.finish_command(result) {
+                        Ok(success) => success,
+                        Err(e) => {
+                            self.cleanup(runner).await;
+                            self.status.build_finished();
+                            return Err(BuildError::new(e));
+                        }
+                    };
+                    if !success && failures_allowed > 0 {
+                        failures_allowed -= 1;
+                    }
+                    if pending_commands == 0 || self.config.dry_run {
+                        break;
+                    }
+                    match ready_now(runner.wait_for_command()) {
+                        Some(result) => next = result,
+                        None => break,
+                    }
+                }
+                if let Err(e) = self.flush_logs() {
+                    self.cleanup(runner).await;
+                    self.status.build_finished();
+                    return Err(BuildError::new(e));
                 }
                 // We made some progress; start the main loop over.
                 continue;
@@ -1687,6 +1786,12 @@ impl<'a> Builder<'a> {
         }
 
         if !self.config.dry_run {
+            // A generator may have replaced the logs (an older ninja-rs's
+            // `-t restat`, a recompaction without the lock): the records
+            // go to the new ones.
+            if self.state.edge_binding_bool(edge, "generator") {
+                self.recheck_logs();
+            }
             let command = self.state.evaluate_command(edge, true)?;
             let hash = hash_command(&command);
             let outputs = self.state.edge(edge).outputs.clone();
@@ -1784,6 +1889,16 @@ impl<'a> Builder<'a> {
                 let _ = self.disk.remove_file(&depfile);
             }
         }
+    }
+}
+
+/// `future`'s output if it is ready now, without waiting for it (see
+/// `CommandRunner::wait_for_command`).
+fn ready_now<T>(future: impl std::future::Future<Output = T>) -> Option<T> {
+    let mut future = std::pin::pin!(future);
+    match future.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
     }
 }
 

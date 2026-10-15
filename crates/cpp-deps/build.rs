@@ -6,6 +6,8 @@
 //! `CPP_DEPS_TEST_GLIB`) each set the cfg of the same name in lower case. Bazel builds don't run this: BUILD.bazel
 //! gives the cfgs, and the hermetic toolchain's compilers.
 
+#![allow(clippy::disallowed_macros)] // Cargo reads its directives on stdout.
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     for var in ["CPP_DEPS_TEST_CXX", "CPP_DEPS_TEST_CL", "CPP_DEPS_TEST_CLANG_CL", "CPP_DEPS_TEST_LIBCXX", "CPP_DEPS_TEST_BOOST", "CPP_DEPS_TEST_GLIB"] {

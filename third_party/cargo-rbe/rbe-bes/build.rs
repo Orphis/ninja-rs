@@ -2,6 +2,8 @@
 //! Bazel's Build Event Protocol (`build_event_stream`) from the vendored
 //! protos in `proto/`. protox compiles them, so no system protoc is needed.
 
+#![allow(clippy::disallowed_macros)] // Cargo reads its directives on stdout.
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let files = [
         "google/devtools/build/v1/publish_build_event.proto",

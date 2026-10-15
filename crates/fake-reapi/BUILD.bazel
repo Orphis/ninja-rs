@@ -9,12 +9,14 @@ rust_library(
     srcs = [
         "src/certs.rs",
         "src/lib.rs",
+        "src/misbehaving.rs",
     ],
     crate_name = "fake_reapi",
     deps = [
         "//third_party/cargo-rbe/rbe-bes",
         "@crates//:bazel-remote-apis",
         "@crates//:fastcdc",
+        "@crates//:h2",
         "@crates//:hex",
         "@crates//:prost",
         "@crates//:sha2",

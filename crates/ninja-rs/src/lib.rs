@@ -43,10 +43,19 @@ pub const RBE_BINDINGS: &[&str] = &["rbe_local", "rbe_mnemonic", "rbe_target", "
 /// The version of the RBE interface this executor implements.
 pub const RBE_VERSION: &str = "1";
 
-/// This executor's version (`--version`, build events, remote requests),
-/// with its commit: the daemon's (see `ninja_daemon::server::version`).
+/// This executor's version (`--version`, build events, remote requests, the
+/// daemon's): the package's, with the commit it was built from when the
+/// build knew it (`build.rs` asks git; Bazel stamps it with
+/// `--config=stamp`), as `0.1.0+1a2b3c4d5e6f`.
 pub fn version() -> &'static str {
-    ninja_daemon::server::version()
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        // An unstamped Bazel build leaves the placeholder.
+        match option_env!("NINJA_RS_COMMIT").filter(|c| !c.is_empty() && !c.starts_with('{')) {
+            Some(commit) => format!("{}+{commit}", env!("CARGO_PKG_VERSION")),
+            None => env!("CARGO_PKG_VERSION").to_string(),
+        }
+    })
 }
 
 pub const EXIT_SUCCESS: i32 = 0;
@@ -212,7 +221,7 @@ impl Service {
             None => Ok(()),
         };
         if let Err(e) = format {
-            eprintln!("ninja: fatal: {e}");
+            ninja_core::status::print_err(&format!("ninja: fatal: {e}\n"));
             return EXIT_FAILURE;
         }
         *self.events.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = bes.clone();
@@ -294,7 +303,7 @@ impl Service {
             if let Err(e) = parsed {
                 match e.strip_prefix(ninja_core::parser::FATAL) {
                     Some(fatal) => {
-                        eprintln!("ninja: fatal: {fatal}");
+                        ninja_core::status::print_err(&format!("ninja: fatal: {fatal}\n"));
                         if let Some(b) = &status.bes {
                             b.message(&format!("ninja: fatal: {fatal}\n"));
                         }
@@ -401,9 +410,16 @@ impl Service {
                 b.announce(&bes::patterns(&state, &opts.targets, &targets));
             }
             // Outputs of remote actions that weren't downloaded, from earlier
-            // builds (whatever the download mode).
-            let remote_outputs = (opts.remote.endpoint().is_some() && !opts.dry_run)
-                .then(|| Arc::new(RemoteOutputs::load(std::path::Path::new(&in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE)))));
+            // builds (whatever the download mode). A build sharing the logs
+            // (see `Access::Shared`) neither rewrites their file nor removes
+            // it: the build holding the lock appends to it.
+            let remote_outputs = (opts.remote.endpoint().is_some() && !opts.dry_run).then(|| {
+                let file = in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE);
+                Arc::new(match access {
+                    Access::Exclusive => RemoteOutputs::load_compacting(std::path::Path::new(&file)),
+                    Access::Shared => RemoteOutputs::load(std::path::Path::new(&file)),
+                })
+            });
             let requested = requested_paths(&state, &deps_log, &opts.targets);
             // The build event service's connection, made meanwhile, before
             // any command runs: a certificate refused ends the invocation.
@@ -430,7 +446,7 @@ impl Service {
             // locally, and records kept would outlive them.
             let remote = backend.as_ref().is_some_and(|b| b.transfers().is_some());
             let remote_outputs = remote_outputs.filter(|_| remote);
-            if !remote && !opts.dry_run {
+            if !remote && !opts.dry_run && access == Access::Exclusive {
                 let _ = std::fs::remove_file(in_build_dir(&build_dir, REMOTE_OUTPUTS_FILE));
             }
             if let (Some(b), Some(outputs)) = (&backend, &remote_outputs)
@@ -499,12 +515,16 @@ impl Service {
                     {
                         status.warning(&format!("saving {REMOTE_OUTPUTS_FILE}: {e}"));
                     }
+                    if self.finish_uploads(&backend, status).await {
+                        return EXIT_INTERRUPTED;
+                    }
                     // Start the build over with the new manifest.
                     continue;
                 }
                 Ok(false) => {}
                 Err((e, code)) => {
                     status.error(&format!("rebuilding '{}': {e}", opts.input_file));
+                    self.finish_uploads(&backend, status).await;
                     return code;
                 }
             }
@@ -535,10 +555,6 @@ impl Service {
                     &jobserver_settings,
                 )
                 .await;
-            // Local results still going to the remote cache.
-            if let Some(b) = &backend {
-                b.finish_uploads(!self.interrupt.is_set()).await;
-            }
             if let Some(outputs) = &remote_outputs
                 && let Err(e) = outputs.save()
             {
@@ -557,6 +573,9 @@ impl Service {
                     status.warning(&format!("saving {digests_file}: {e}"));
                 }
             }
+            // Local results still going to the remote cache, once the records
+            // and digests are saved.
+            let code = if self.finish_uploads(&backend, status).await && code == EXIT_SUCCESS { EXIT_INTERRUPTED } else { code };
             let (remote_n, hits) = status.printer.remote_counts();
             if remote_n > 0 && opts.verbosity != Verbosity::Quiet {
                 status.info(&format!("{remote_n} remote actions ({hits} remote cache hits)."));
@@ -575,13 +594,18 @@ impl Service {
                 && t.read + t.sent > 0
             {
                 let mib = |b: u64| format!("{:.1} MiB", b as f64 / (1 << 20) as f64);
-                status.info(&format!(
+                // On stderr, as the other `--remote_verbose` lines.
+                ninja_core::status::message(&format!(
                     "remote transfers: {} downloaded ({} on the wire), {} uploaded ({} on the wire).",
                     mib(t.read),
                     mib(t.wire_read),
                     mib(t.sent),
                     mib(t.wire_sent)
                 ));
+            }
+            // Said once for the client: blobs are uploaded whole since.
+            if let Some(why) = self.remote_client.as_ref().and_then(|(_, c)| c.splicing_refused()) {
+                status.warning(&format!("the remote service refused to splice blobs, which are uploaded whole: {why}"));
             }
             if let Some(e) = backend.as_ref().and_then(|b| b.daemon_error()) {
                 status.warning(&format!("the daemon failed ({e}): the build did its work itself"));
@@ -606,6 +630,30 @@ impl Service {
         }
         status.error(&format!("manifest '{}' still dirty after {CYCLE_LIMIT} tries", opts.input_file));
         EXIT_FAILURE
+    }
+
+    /// Waits for the local results the backend sends to the remote cache
+    /// (see `Backend::finish_uploads`), saying so when that takes a while.
+    /// An interrupt, before the wait or during it, gives them up: whether
+    /// one came during it.
+    async fn finish_uploads(&self, backend: &Option<Arc<ninja_remote::Backend>>, status: &mut dyn Status) -> bool {
+        let Some(b) = backend else { return false };
+        // The wait acts on interrupts: they don't end the invocation at once.
+        let _handling = self.interrupt.handle();
+        let before = self.interrupt.is_set();
+        let interrupt = &self.interrupt;
+        let stop = async move {
+            if !before {
+                interrupt.wait().await;
+            }
+        };
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let left = b.finish_uploads(stop, |n| status.info(&format!("waiting for {n} upload{} to the remote cache.", plural(n)))).await;
+        if left == 0 || before {
+            return false;
+        }
+        status.info(&format!("interrupted: {left} local result{} not stored in the remote cache.", plural(left)));
+        true
     }
 
     /// Takes the lock on the logs in `build_dir` for this invocation (see
@@ -680,7 +728,7 @@ impl Service {
             RBE_VERSION => {}
             "" => {
                 if opts.remote.verbose {
-                    status.info("remote execution disabled: the manifest does not set rbe_version");
+                    ninja_core::status::message("remote execution disabled: the manifest does not set rbe_version");
                 }
                 return Ok(None);
             }
@@ -712,9 +760,11 @@ impl Service {
                         Ok(client) => self.remote_client = Some((key.clone(), client)),
                         // No connection, or no answer: done without. A
                         // certificate refused, or the settings, aren't.
-                        Err(e) if rbe_client::fault::fault(e.as_ref()).unreachable() => self.unreachable(&key, endpoint, &format!("{e:#}"), opts, status)?,
+                        Err(e) if rbe_client::fault::fault(e.as_ref()).unreachable() => {
+                            self.unreachable(&key, endpoint, &rbe_client::fault::describe(e.as_ref()), opts, status)?
+                        }
                         Err(e) => {
-                            let e = format!("{e:#}");
+                            let e = rbe_client::fault::describe(e.as_ref());
                             return Err(format!("remote execution: {e}{}", options::tls_hint(&e, endpoint, &opts.tls, true)));
                         }
                     }
@@ -741,6 +791,7 @@ impl Service {
         }
         let build_dir = std::env::current_dir().map_err(|e| e.to_string())?;
         let volatile = volatile_dirs(state, &build_dir);
+        let written = written_dirs(state, &build_dir);
         let file_var = |name: &str| Some(state.lookup_variable(ROOT_SCOPE, name)).filter(|v| !v.is_empty());
         let daemon = if opts.remote.daemon {
             let begin = ninja_daemon::proto::Begin {
@@ -783,6 +834,7 @@ impl Service {
         let config = |remote_outputs: Option<Arc<RemoteOutputs>>| ninja_remote::BackendConfig {
             build_dir: build_dir.clone(),
             volatile: outermost(&volatile),
+            written: written.clone(),
             toolchains_file: file_var("rbe_toolchains"),
             targets: targets.clone(),
             exec_root: opts.remote.exec_root.clone().map(Into::into),
@@ -813,14 +865,14 @@ impl Service {
             // the retries): unreachable.
             Err(e) if with_remote && (rbe_client::fault::fault(e.as_ref()).unreachable() || rbe_client::fault::unavailable(e.as_ref())) => {
                 let endpoint = opts.remote.endpoint().cloned().unwrap_or_default();
-                self.unreachable(&key, &endpoint, &format!("{e:#}"), opts, status)?;
+                self.unreachable(&key, &endpoint, &rbe_client::fault::describe(e.as_ref()), opts, status)?;
                 if disk.is_none() {
                     return Ok(None);
                 }
                 ninja_remote::Backend::new(config(None), None, disk, self.store.clone()).await.map_err(|e| format!("remote execution: {e:#}"))?
             }
             Err(e) => {
-                let e = format!("{e:#}");
+                let e = rbe_client::fault::describe(e.as_ref());
                 let hint = opts.remote.endpoint().map(|ep| options::tls_hint(&e, ep, &opts.tls, true)).unwrap_or_default();
                 return Err(format!("remote execution: {e}{hint}"));
             }
@@ -836,7 +888,8 @@ impl Service {
     /// `--remote_strict`), a warning, and builds do without it; else the
     /// build's error.
     fn unreachable(&mut self, key: &str, endpoint: &str, error: &str, opts: &Options, status: &mut dyn Status) -> Result<(), String> {
-        let hint = options::tls_hint(error, endpoint, &opts.tls, true);
+        // Nothing answered: a connection closed isn't a certificate refused.
+        let hint = options::tls_hint(error, endpoint, &opts.tls, false) + &options::plaintext_hint(error, endpoint);
         if !opts.remote.local_fallback || opts.remote.strict {
             let local = if opts.remote.strict { "" } else { " (with --remote_local_fallback, the build would run locally)" };
             return Err(format!("the remote service {endpoint} is unreachable{local}: {error}{hint}"));
@@ -880,7 +933,7 @@ impl Service {
         let max = opts.remote.disk_cache_max_size;
         match cache.collect_garbage(max, max / 10 * 9) {
             Ok(Some((files, bytes))) if files > 0 && opts.remote.verbose => {
-                status.info(&format!("disk cache: evicted {files} entries ({} MiB).", bytes >> 20));
+                ninja_core::status::message(&format!("disk cache: evicted {files} entries ({} MiB).", bytes >> 20));
             }
             Ok(_) => {}
             Err(e) => status.warning(&format!("disk cache eviction: {e}")),
@@ -1223,7 +1276,12 @@ pub(crate) fn try_lock_logs(file: &str) -> std::io::Result<LogsAccess> {
         Ok(true) => Ok(LogsAccess::Locked(lock)),
         // Also on a file system without locks.
         Ok(false) | Err(_) if inherited(&lock) => Ok(LogsAccess::Inherited),
-        Ok(false) => Ok(LogsAccess::Busy(lock.holder())),
+        Ok(false) => match lock.holder() {
+            // The build running this one, whose commands lost
+            // `LOGS_LOCK_ENV` (a wrapper scrubbing the environment).
+            Some(holder) if nested::runs_this(holder.pid) => Ok(LogsAccess::Inherited),
+            holder => Ok(LogsAccess::Busy(holder)),
+        },
         Err(e) => Err(e),
     }
 }
@@ -1297,6 +1355,35 @@ fn volatile_dirs(state: &State, build_dir: &std::path::Path) -> Vec<std::path::P
     dirs
 }
 
+/// The directories build edges write to (their outputs'), in the build
+/// directory or not, those in it also by its real spelling: the
+/// conservative scanner looks there every time, and doesn't send them for
+/// computed includes (see `ninja_remote::scanner::WrittenDirs`).
+fn written_dirs(state: &State, build_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let real = std::fs::canonicalize(build_dir).map(ninja_daemon::watch::strip_verbatim).ok().filter(|r| r != build_dir);
+    let mut dirs: Vec<std::path::PathBuf> = real.iter().cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    for (i, e) in state.edges.iter().enumerate() {
+        if state.is_phony(ninja_core::graph::EdgeId(i as u32)) {
+            continue;
+        }
+        for &o in &e.outputs {
+            let path = ninja_remote::scanner::normalize(&build_dir.join(state.path(o)));
+            let Some(dir) = path.parent() else { continue };
+            if !seen.insert(dir.to_path_buf()) {
+                continue;
+            }
+            if let (Some(real), Ok(rel)) = (&real, dir.strip_prefix(build_dir))
+                && !rel.as_os_str().is_empty()
+            {
+                dirs.push(real.join(rel));
+            }
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    dirs
+}
+
 /// `dirs` without those under another (the scanners in the build take a
 /// directory for all under it).
 fn outermost(dirs: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
@@ -1349,7 +1436,10 @@ mod tests {
         // for the scanners in the build).
         let dirs = volatile_dirs(&state, &build);
         assert_eq!(dirs, vec![generated.clone(), generated.join("sub")]);
-        assert_eq!(outermost(&dirs), vec![generated]);
+        assert_eq!(outermost(&dirs), vec![generated.clone()]);
+        // For the conservative scanner: each directory edges write to, in
+        // the build directory too.
+        assert_eq!(written_dirs(&state, &build), vec![build.join("obj"), generated.clone(), generated.join("sub")]);
     }
 
     /// The build directory's real spelling, when it differs, is as paths

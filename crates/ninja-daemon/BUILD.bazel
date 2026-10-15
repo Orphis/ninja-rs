@@ -3,15 +3,10 @@ load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# The ninja-rs version lives here (`server::version`): the module's, with
-# the commit when stamped (`--stamp`, `STABLE_GIT_COMMIT` from the workspace
-# status command in .bazelrc). Cargo builds ask git instead (build.rs).
 rust_library(
     name = "ninja-daemon",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "ninja_daemon",
-    rustc_env_files = ["commit.env"],
-    stamp = -1,
     version = module_version(),
     deps = [
         "//crates/cpp-deps",

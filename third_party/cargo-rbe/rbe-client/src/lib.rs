@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,10 +32,13 @@ pub use bazel_remote_apis::google::protobuf as pb;
 
 pub mod chunking;
 pub mod fault;
+mod transport;
 pub mod tree;
 pub use chunking::{Chunking, FastCdc};
 pub use fault::header;
-use fault::{FIRST_CONTACT_RETRIES, Fault, NoAnswer, broken_connection, from_server, no_answer};
+use fault::{Declined, FIRST_CONTACT_RETRIES, Fault, NoAnswer, Unreachable, answered, broken_connection, no_answer};
+pub use transport::HttpErrors;
+use transport::{Connector, Link};
 pub use tree::{BlobSet, BlobSource, DigestCache, InputTree};
 
 /// gRPC messages are capped at 4 MiB by default; stay well below for batches.
@@ -85,10 +88,8 @@ pub struct Client {
     /// without moving. Executions aren't bounded: a broken one is followed
     /// again (`WaitExecution`).
     timeout: Duration,
-    /// Whether the server answered a call since connecting. Until it has,
-    /// a call it left unanswered isn't made again (see `retrying`). Shared
-    /// by clones.
-    answered: Arc<std::sync::atomic::AtomicBool>,
+    /// What the server said since connecting. Shared by clones.
+    said: Arc<Said>,
     /// Blobs being uploaded, by hash: a call needing one another call is
     /// uploading waits for it (`true` once there, `false` if that upload
     /// failed), instead of uploading it too. Shared by clones.
@@ -97,6 +98,65 @@ pub struct Client {
     reads: Arc<tokio::sync::Semaphore>,
     /// Permits for uploads (`MAX_UPLOADS`), shared by clones.
     uploads: Arc<tokio::sync::Semaphore>,
+    /// Permits for calls on the connection (`MAX_CALLS`), shared by clones.
+    calls: Arc<tokio::sync::Semaphore>,
+    /// The connections executions go through, shared by clones.
+    executions: Arc<Executions>,
+    /// What tells a connection that broke before the server answered
+    /// anything from no service at all (see `Link::unheard`); none for a
+    /// client made from a channel.
+    link: Option<Arc<Link>>,
+    /// How long connecting may take, and so the first call (see `within`);
+    /// until when, the server having answered nothing, a connection that
+    /// broke is made again (see `first_contact_retries`).
+    connect_timeout: Duration,
+    connect_deadline: Instant,
+    /// Why the server refused to splice blobs, once it did (see
+    /// `splicing_refused`): blobs are then uploaded whole. Shared by clones.
+    splices_refused: Arc<SplicesRefused>,
+}
+
+/// What the server said since connecting: whether it answered anything
+/// (until it has, a call it left unanswered isn't made again: see
+/// `retrying`), and whether that was more than that it can't serve now
+/// (`served`), or only that (`declined`; see `judged`).
+#[derive(Default)]
+struct Said {
+    answered: AtomicBool,
+    served: AtomicBool,
+    declined: AtomicBool,
+}
+
+/// See `Client::splices_refused`.
+#[derive(Default)]
+struct SplicesRefused {
+    why: Mutex<Option<String>>,
+    said: AtomicBool,
+}
+
+/// The connections executions go through (Execute and WaitExecution
+/// streams, open as long as their actions run), made as they're needed:
+/// one more for each `EXECUTIONS_PER_CONNECTION` running at once. On the
+/// connection other calls go through, they would take the streams the
+/// server allows it, and those calls wait for one while their
+/// `--remote_timeout` runs. A client made from a channel has none: its
+/// executions share that channel. The endpoint, whether it's TLS, and the
+/// connect timeout.
+struct Executions {
+    endpoint: Option<(Endpoint, bool, Duration)>,
+    channels: Mutex<Vec<(Channel, Arc<AtomicUsize>)>>,
+}
+
+/// The connection of one execution, counted as long as it runs.
+struct ExecutionChannel {
+    channel: Channel,
+    running: Arc<AtomicUsize>,
+}
+
+impl Drop for ExecutionChannel {
+    fn drop(&mut self) {
+        self.running.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// `--remote_retries` and `--remote_timeout` defaults, Bazel's.
@@ -119,6 +179,12 @@ pub fn transient(code: tonic::Code) -> bool {
 fn backoff(attempt: u32) -> Duration {
     let base = Duration::from_millis(100).saturating_mul(1 << attempt.min(16)).min(Duration::from_secs(5));
     base.mul_f64(0.9 + 0.2 * (ninja_os::random_u64() % 1000) as f64 / 1000.0)
+}
+
+/// How long to wait before following an operation again the `n + 1`th
+/// time: as long as `backoff` says, but `FOLLOW_UP_PAUSE` at most.
+fn follow_up_pause(n: u32) -> Duration {
+    backoff(n).min(FOLLOW_UP_PAUSE)
 }
 
 /// Reads until `buf` is full or the end: fewer bytes only at the end.
@@ -190,6 +256,9 @@ fn produce_writes(
     }
 }
 
+/// Blobs read, with their hashes.
+type HashedBlobs = Vec<(String, Vec<u8>)>;
+
 /// Blobs smaller than this travel uncompressed: too little to gain.
 const MIN_COMPRESSED: usize = 1024;
 
@@ -215,6 +284,21 @@ const MAX_UPLOADS: usize = 32;
 /// Reads (batches and streams) in flight at once, all calls together. This
 /// bounds calls, not bytes: callers bound what they hold in memory.
 const MAX_READS: usize = 32;
+
+/// Calls (unary ones, and streams but executions') in flight at once, all
+/// together: fewer than the streams servers allow on one HTTP/2 connection
+/// (100 for most). One more would wait in the transport's queue while its
+/// `--remote_timeout` runs; one waiting for a permit doesn't.
+const MAX_CALLS: usize = 90;
+
+/// Executions sharing one connection: fewer than the streams servers
+/// allow on one (see `Executions`).
+const EXECUTIONS_PER_CONNECTION: usize = 90;
+
+/// The longest pause before following an operation again (see `execute`):
+/// one whose streams the server ends after each update is seen done within
+/// this of its end.
+const FOLLOW_UP_PAUSE: Duration = Duration::from_secs(1);
 
 /// How often an HTTP/2 ping checks a connection that's quiet while calls
 /// are in flight (an execution can say nothing for minutes): no more often
@@ -265,7 +349,16 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Connects a gRPC channel (TLS for `grpcs://`, with an optional client
 /// identity). Shared by the REAPI client and other services (e.g. BES).
 pub async fn connect_channel(opts: &ConnectOptions) -> Result<Channel> {
-    connect_within(opts, CONNECT_TIMEOUT, FIRST_CONTACT_RETRIES).await
+    Ok(connect_within(opts, CONNECT_TIMEOUT, DEFAULT_RETRIES).await?.channel)
+}
+
+/// A channel connected, with what judges its failures (`Link`) and what
+/// makes more connections like it (executions').
+struct Connection {
+    channel: Channel,
+    endpoint: Endpoint,
+    link: Arc<Link>,
+    timeout: Duration,
 }
 
 /// The host of an endpoint without its scheme (`host:port/...`), as its
@@ -280,19 +373,24 @@ fn endpoint_host(rest: &str) -> &str {
 /// `connect_channel`, failing after `timeout`, a connection that broke
 /// once made (a server restarting) made again up to `retries` times (see
 /// `connect_attempts`).
-async fn connect_within(opts: &ConnectOptions, timeout: Duration, retries: u32) -> Result<Channel> {
-    let endpoint = endpoint(opts, timeout)?;
+async fn connect_within(opts: &ConnectOptions, timeout: Duration, retries: u32) -> Result<Connection> {
+    let (endpoint, tls) = endpoint(opts, timeout)?;
+    let link = Link::new(tls);
+    let connector = Connector::new(link.clone(), timeout);
     let what = || format!("connecting to {}", opts.endpoint);
-    match tokio::time::timeout(timeout, connect_attempts(retries, || endpoint.connect())).await {
-        Ok(connected) => connected.with_context(what),
-        Err(_) => Err(anyhow::Error::new(NoAnswer).context(format!("{}: no connection within {timeout:?}", what()))),
+    match tokio::time::timeout(timeout, connect_attempts(retries, &link, || endpoint.connect_with_connector(connector.clone()))).await {
+        Ok(Ok(channel)) => Ok(Connection { channel, endpoint, link, timeout }),
+        // The connect timeout covers the TLS handshake too: said as such.
+        Ok(Err(e)) if fault::fault(e.as_ref()) != Fault::NoAnswer => Err(e.context(what())),
+        _ => Err(anyhow::Error::new(NoAnswer).context(format!("{}: no connection within {timeout:?}", what()))),
     }
 }
 
 /// The endpoint `opts` names, with its TLS settings, connecting within
-/// `timeout`. What's wrong with them is said in words, not as a transport
-/// error: it isn't a fault of the connection's (see `fault`).
-fn endpoint(opts: &ConnectOptions, timeout: Duration) -> Result<Endpoint> {
+/// `timeout`, and whether it's TLS. What's wrong with them is said in
+/// words, not as a transport error: it isn't a fault of the connection's
+/// (see `fault`).
+fn endpoint(opts: &ConnectOptions, timeout: Duration) -> Result<(Endpoint, bool)> {
     let settings = |e: tonic::transport::Error| anyhow::anyhow!("{}", std::error::Error::source(&e).map_or(e.to_string(), |s| s.to_string()));
     let (scheme, rest) = opts.endpoint.split_once("://").unwrap_or(("grpcs", opts.endpoint.as_str()));
     let host = endpoint_host(rest).to_string();
@@ -306,12 +404,12 @@ fn endpoint(opts: &ConnectOptions, timeout: Duration) -> Result<Endpoint> {
     // isn't held back by them. Pings only while calls are in flight, as
     // Bazel's (`--grpc_keepalive_time`): servers close connections pinged
     // while idle.
+    // (TCP_NODELAY: see `Connector`.)
     let mut endpoint = Endpoint::from_shared(url)
         .map_err(settings)?
         .connect_timeout(timeout)
         .http2_keep_alive_interval(KEEP_ALIVE)
         .keep_alive_while_idle(false)
-        .tcp_nodelay(true)
         .http2_adaptive_window(true);
     if tls {
         let domain = opts.authority_override.clone().unwrap_or(host);
@@ -333,28 +431,38 @@ fn endpoint(opts: &ConnectOptions, timeout: Duration) -> Result<Endpoint> {
         }
         endpoint = endpoint.tls_config(cfg).map_err(settings)?;
     }
-    Ok(endpoint)
+    Ok((endpoint, tls))
 }
 
-/// Makes a connection with `connect`, again up to `retries` times when it
-/// broke once made (reset, closed: a server restarting, a load balancer's
-/// hiccup). Not when there was none (refused, no route to the host, a name
-/// that doesn't resolve), nor when nothing answered, nor when a certificate
-/// was refused: another try would cost as much again, or fail the same way.
-async fn connect_attempts<F, Fut>(retries: u32, mut connect: F) -> Result<Channel, tonic::transport::Error>
+/// Makes a connection with `connect`, again when it broke once made
+/// (reset, closed): up to `retries` times when that was before the other
+/// end said anything (a tunnel whose far end is down, a load balancer
+/// restarting; see `Link::unheard`), and the connection fails then as one
+/// to no service (`Unreachable`); once at most when after (a server
+/// restarting, or refusing the client's certificate without a word). Not
+/// when there was none (refused, no route to the host, a name that doesn't
+/// resolve), nor when nothing answered, nor when a certificate was
+/// refused: another try would cost as much again, or fail the same way.
+async fn connect_attempts<F, Fut>(retries: u32, link: &Link, mut connect: F) -> Result<Channel>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<Channel, tonic::transport::Error>>,
 {
     let mut attempt = 0;
     loop {
-        match connect().await {
-            Err(e) if attempt < retries && fault::fault(&e) == Fault::Broke => {
-                tokio::time::sleep(backoff(attempt)).await;
-                attempt += 1;
-            }
-            connected => return connected,
+        let e = match connect().await {
+            Ok(channel) => return Ok(channel),
+            Err(e) => e,
+        };
+        if fault::fault(&e) != Fault::Broke {
+            return Err(e.into());
         }
+        let unheard = link.unheard();
+        if attempt >= if unheard { retries } else { retries.min(FIRST_CONTACT_RETRIES) } {
+            return Err(if unheard { anyhow::Error::new(Unreachable(e.into())) } else { e.into() });
+        }
+        tokio::time::sleep(backoff(attempt)).await;
+        attempt += 1;
     }
 }
 
@@ -402,14 +510,29 @@ pub fn digest_str(d: &re::Digest) -> String {
 
 impl Client {
     pub async fn connect(opts: ConnectOptions) -> Result<Self> {
-        Self::connect_retrying(opts, FIRST_CONTACT_RETRIES).await
+        Self::connect_retrying(opts, DEFAULT_RETRIES).await
     }
 
     /// `connect`, a connection that broke once made made again `retries`
-    /// times at most (one): `--remote_retries=0` connects once.
+    /// times at most (see `connect_attempts`): `--remote_retries=0`
+    /// connects once.
     pub async fn connect_retrying(opts: ConnectOptions, retries: u32) -> Result<Self> {
-        let channel = connect_within(&opts, CONNECT_TIMEOUT, retries.min(FIRST_CONTACT_RETRIES)).await?;
-        Self::from_channel(channel, &opts.instance_name).with_headers(&opts.headers)
+        let start = Instant::now();
+        let c = connect_within(&opts, CONNECT_TIMEOUT, retries).await?;
+        Self::from_connection(c, start, &opts.instance_name).with_headers(&opts.headers)
+    }
+
+    /// A client of a connection made from `start`: its executions go
+    /// through connections of their own (see `Executions`).
+    fn from_connection(c: Connection, start: Instant, instance: &str) -> Self {
+        let tls = c.endpoint.uri().scheme_str() == Some("https");
+        Self {
+            executions: Arc::new(Executions { endpoint: Some((c.endpoint, tls, c.timeout)), channels: Default::default() }),
+            link: Some(c.link),
+            connect_timeout: c.timeout,
+            connect_deadline: start + c.timeout,
+            ..Self::from_channel(c.channel, instance)
+        }
     }
 
     /// Sends these extra headers with every call.
@@ -433,10 +556,16 @@ impl Client {
             headers: Arc::new(Vec::new()),
             retries: DEFAULT_RETRIES,
             timeout: DEFAULT_TIMEOUT,
-            answered: Default::default(),
+            said: Default::default(),
             inflight: Default::default(),
             reads: Arc::new(tokio::sync::Semaphore::new(MAX_READS)),
             uploads: Arc::new(tokio::sync::Semaphore::new(MAX_UPLOADS)),
+            calls: Arc::new(tokio::sync::Semaphore::new(MAX_CALLS)),
+            executions: Arc::new(Executions { endpoint: None, channels: Default::default() }),
+            link: None,
+            connect_timeout: CONNECT_TIMEOUT,
+            connect_deadline: Instant::now() + CONNECT_TIMEOUT,
+            splices_refused: Default::default(),
         }
     }
 
@@ -465,10 +594,10 @@ impl Client {
                 }
                 Err(e) => e,
             };
-            if status_of(&e).is_some_and(from_server) {
-                self.answer();
+            if let Some(s) = status_of(&e) {
+                self.heard(s);
             }
-            let Some(wait) = self.retry_after(&e, attempt) else { return Err(e) };
+            let Some(wait) = self.retry_after(&e, attempt) else { return Err(self.judged(e)) };
             tokio::time::sleep(wait).await;
             attempt += 1;
         }
@@ -477,41 +606,116 @@ impl Client {
     /// How long to wait before attempt `attempt + 1` of a call that failed
     /// with `e`, if it's worth one: a transient failure, up to `retries`
     /// times. Until the server answered anything, only a connection that
-    /// broke once made (reset, closed) is, once (the call reconnects): a
-    /// server leaving calls unanswered (one accepting connections and
-    /// saying nothing, as a hung one does) would cost `--remote_timeout`
-    /// each time, one refusing connections as much again. A certificate
-    /// refused never is: connecting again would be refused the same way.
+    /// broke once made (reset, closed) is (the call reconnects; see
+    /// `first_contact_retries`): a server leaving calls unanswered (one
+    /// accepting connections and saying nothing, as a hung one does) would
+    /// cost a timeout each time, one refusing connections as much again. A
+    /// certificate refused never is: connecting again would be refused the
+    /// same way.
     fn retry_after(&self, e: &anyhow::Error, attempt: u32) -> Option<Duration> {
         let status = status_of(e)?;
+        let wait = backoff(attempt);
         let budget = if fault::certificate(status).is_some() {
             0
-        } else if self.answered.load(Ordering::Relaxed) {
+        } else if self.said.answered.load(Ordering::Relaxed) {
             self.retries
         } else if broken_connection(status) {
-            self.retries.min(FIRST_CONTACT_RETRIES)
+            self.first_contact_retries(wait)
         } else {
             0
         };
-        (attempt < budget && transient(status.code())).then(|| backoff(attempt))
+        (attempt < budget && transient(status.code())).then_some(wait)
+    }
+
+    /// How many times a call is made again, the server having answered
+    /// nothing yet, when its connection broke (`wait` before the next
+    /// time): as many as any (`retries`) when it broke before the other end
+    /// said anything (a load balancer restarting; see `Link::unheard`),
+    /// until the connect timeout is over; else once at most (a server
+    /// restarting, or refusing the client's certificate without a word).
+    fn first_contact_retries(&self, wait: Duration) -> u32 {
+        match &self.link {
+            Some(link) if link.unheard() => {
+                if Instant::now() + wait < self.connect_deadline {
+                    self.retries
+                } else {
+                    0
+                }
+            }
+            _ => self.retries.min(FIRST_CONTACT_RETRIES),
+        }
+    }
+
+    /// `e`, which ends a call whose connection broke, the server having
+    /// served nothing yet: a service saying it can't serve now (`Declined`)
+    /// when that's all it said (a server draining closes its connections
+    /// too); else one to no service at all (`Unreachable`) when it never
+    /// answered anything and the connection broke before the other end said
+    /// anything (see `Link::unheard`).
+    fn judged(&self, e: anyhow::Error) -> anyhow::Error {
+        let said = &self.said;
+        if said.served.load(Ordering::Relaxed) || fault::fault(e.as_ref()) != Fault::Broke {
+            return e;
+        }
+        if said.declined.load(Ordering::Relaxed) {
+            return anyhow::Error::new(Declined(e));
+        }
+        if !said.answered.load(Ordering::Relaxed) && self.link.as_ref().is_some_and(|l| l.unheard()) {
+            return anyhow::Error::new(Unreachable(e));
+        }
+        e
     }
 
     /// The server answered something: a call, a stream's message or its
     /// own status.
     fn answer(&self) {
-        self.answered.store(true, Ordering::Relaxed);
+        self.said.answered.store(true, Ordering::Relaxed);
+        self.said.served.store(true, Ordering::Relaxed);
     }
 
-    /// `call`, failing with DEADLINE_EXCEEDED after `--remote_timeout`.
+    /// A call failed with `s`: whether the server answered it (see
+    /// `fault::answered`), and only that it can't serve now.
+    fn heard(&self, s: &tonic::Status) {
+        if answered(s) {
+            self.said.answered.store(true, Ordering::Relaxed);
+            let now = if fault::unavailable(s) { &self.said.declined } else { &self.said.served };
+            now.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// `call`, once there's a call permit (see `MAX_CALLS`), failing with
+    /// DEADLINE_EXCEEDED after `--remote_timeout` from then (see `within`).
     async fn timed<T>(&self, call: impl std::future::Future<Output = Result<T, tonic::Status>>) -> Result<T, tonic::Status> {
-        match tokio::time::timeout(self.timeout, call).await {
+        let _call = self.call_permit().await?;
+        self.within(call).await
+    }
+
+    /// A permit for a call on the connection (`MAX_CALLS`), held as long as
+    /// the call is (a stream, until it ended).
+    async fn call_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, tonic::Status> {
+        self.calls.acquire().await.map_err(|_| tonic::Status::cancelled("calls stopped"))
+    }
+
+    /// `call` (or a step of one, holding a call permit), failing with
+    /// DEADLINE_EXCEEDED after `--remote_timeout`, or until the server
+    /// answered anything after the connect timeout if shorter: a server
+    /// accepting connections and saying nothing costs as long over
+    /// plaintext as its TLS handshake would.
+    async fn within<T>(&self, call: impl std::future::Future<Output = Result<T, tonic::Status>>) -> Result<T, tonic::Status> {
+        let first = !self.said.answered.load(Ordering::Relaxed) && self.connect_timeout < self.timeout;
+        let limit = if first { self.connect_timeout } else { self.timeout };
+        match tokio::time::timeout(limit, call).await {
             Ok(r) => {
-                if r.as_ref().err().is_none_or(from_server) {
-                    self.answer();
+                match &r {
+                    Ok(_) => self.answer(),
+                    Err(s) => self.heard(s),
                 }
                 r
             }
-            Err(_) => Err(no_answer(format!("no answer within {:?} (--remote_timeout)", self.timeout))),
+            Err(_) => {
+                let why = if first { "nothing answered since connecting" } else { "--remote_timeout" };
+                Err(no_answer(format!("no answer within {limit:?} ({why})")))
+            }
         }
     }
 
@@ -560,6 +764,58 @@ impl Client {
         &self.channel
     }
 
+    /// The channel as gRPC clients take it: a proxy's HTTP errors read as
+    /// their statuses (see `HttpErrors`).
+    fn grpc(&self) -> HttpErrors<Channel> {
+        HttpErrors(self.channel.clone())
+    }
+
+    /// The connection for an execution: of those executions go through, the
+    /// one fewest run on, or a new one when each has
+    /// `EXECUTIONS_PER_CONNECTION` (connecting with the first call on it).
+    fn execution_channel(&self) -> ExecutionChannel {
+        let Some((endpoint, tls, timeout)) = &self.executions.endpoint else {
+            return ExecutionChannel { channel: self.channel.clone(), running: Arc::new(AtomicUsize::new(1)) };
+        };
+        let mut channels = self.executions.channels.lock().unwrap();
+        let fewest = channels.iter().min_by_key(|(_, running)| running.load(Ordering::Relaxed)).filter(|(_, running)| running.load(Ordering::Relaxed) < EXECUTIONS_PER_CONNECTION);
+        let (channel, running) = match fewest {
+            Some(c) => c.clone(),
+            None => {
+                let made = (endpoint.connect_with_connector_lazy(Connector::new(Link::new(*tls), *timeout)), Arc::new(AtomicUsize::new(0)));
+                channels.push(made.clone());
+                made
+            }
+        };
+        running.fetch_add(1, Ordering::Relaxed);
+        ExecutionChannel { channel, running }
+    }
+
+    /// Why the server refused to splice blobs, the first time this is
+    /// asked after it did: since then, blobs are uploaded whole.
+    pub fn splicing_refused(&self) -> Option<String> {
+        let why = self.splices_refused.why.lock().unwrap().clone()?;
+        (!self.splices_refused.said.swap(true, Ordering::Relaxed)).then_some(why)
+    }
+
+    /// Whether blobs are spliced together on the server (the chunks it
+    /// lacks uploaded, not the blobs whole): when it can, and didn't refuse.
+    fn splicing(&self, d: &re::Digest) -> Option<FastCdc> {
+        if self.splices_refused.why.lock().unwrap().is_some() {
+            return None;
+        }
+        self.chunking.splice_chunker(d)
+    }
+
+    /// Notes a splice that failed with `e`: a refusal that would be the
+    /// same for any blob (not one a chunk missing, nor a transient failure,
+    /// which the retries got) turns splicing off, saying why.
+    fn splice_failed(&self, e: &anyhow::Error) {
+        if status_of(e).is_some_and(|s| answered(s) && !transient(s.code()) && s.code() != tonic::Code::NotFound) {
+            self.splices_refused.why.lock().unwrap().get_or_insert_with(|| fault::describe(e.as_ref()));
+        }
+    }
+
     /// Sends `metadata` (tool details, invocation ids) with every call.
     pub fn with_request_metadata(mut self, metadata: re::RequestMetadata) -> Self {
         self.metadata = Some(Arc::new(metadata));
@@ -601,7 +857,7 @@ impl Client {
         let caps = this
             .retrying(|| async {
                 let request = this.req(re::GetCapabilitiesRequest { instance_name: this.instance.clone() });
-                Ok(this.timed(CapabilitiesClient::new(this.channel.clone()).get_capabilities(request)).await?.into_inner())
+                Ok(this.timed(CapabilitiesClient::new(this.grpc()).get_capabilities(request)).await?.into_inner())
             })
             .await?;
         if let Some(cache) = &caps.cache_capabilities
@@ -623,8 +879,8 @@ impl Client {
         &self.chunking
     }
 
-    fn cas(&self) -> ContentAddressableStorageClient<Channel> {
-        ContentAddressableStorageClient::new(self.channel.clone())
+    fn cas(&self) -> ContentAddressableStorageClient<HttpErrors<Channel>> {
+        ContentAddressableStorageClient::new(self.grpc())
     }
 
     pub async fn find_missing(&self, digests: Vec<re::Digest>) -> Result<Vec<re::Digest>> {
@@ -698,7 +954,7 @@ impl Client {
                 continue;
             }
             let (_, src) = &blobs.0[&d.hash];
-            match self.chunking.splice_chunker(d) {
+            match self.splicing(d) {
                 Some(cdc) => splices.push((d.clone(), cdc, src.clone())),
                 None => up.add(d, src).await?,
             }
@@ -712,10 +968,18 @@ impl Client {
             while splicing.len() < SPLICES
                 && let Some((d, chunks)) = spliced.next()
             {
+                // Refused meanwhile: whole, without asking again.
+                if self.splices_refused.why.lock().unwrap().is_some() {
+                    up.add(&d, &blobs.0[&d.hash].1).await?;
+                    continue;
+                }
                 let client = self.clone();
                 splicing.spawn(async move {
-                    let done = client.splice_blob(&d, &chunks).await.is_ok();
-                    (d, done)
+                    let spliced = client.splice_blob(&d, &chunks).await;
+                    if let Err(e) = &spliced {
+                        client.splice_failed(e);
+                    }
+                    (d, spliced.is_ok())
                 });
             }
             let Some(r) = splicing.join_next().await else { break };
@@ -778,24 +1042,23 @@ impl Client {
                 if !lacking.remove(&c.hash) {
                     continue;
                 }
-                let data = match src {
-                    BlobSource::File(p) => {
-                        let (p, c, offset) = (p.clone(), c.clone(), *offset);
-                        tokio::task::spawn_blocking(move || read_chunk(&p, &c, offset)).await??
-                    }
-                    BlobSource::Bytes(b) => b[*offset as usize..][..c.size_bytes as usize].to_vec(),
-                    BlobSource::Remote(_) => src.load()?,
-                };
                 if !streamed {
-                    up.add_bytes(c, data).await?;
+                    up.add_bytes(c, chunk_data(src, c, *offset).await?).await?;
                     continue;
                 }
                 if streams.len() >= CHUNK_STREAMS {
                     streams.join_next().await.expect("uploads in flight")??;
                 }
+                // The permit before the chunk is read: chunks waiting for one
+                // aren't held in memory.
+                let upload = self.uploads.clone().acquire_owned().await.context("uploads stopped")?;
+                let data = chunk_data(src, c, *offset).await?;
                 up.sent += data.len() as u64;
                 let (client, c) = (self.clone(), c.clone());
-                streams.spawn(async move { client.bytestream_write(&c, &BlobSource::Bytes(data)).await });
+                streams.spawn(async move {
+                    let _upload = upload;
+                    client.write_blob(&c, &BlobSource::Bytes(data)).await
+                });
             }
         }
         while let Some(r) = streams.join_next().await {
@@ -813,6 +1076,7 @@ impl Client {
             return Ok(None);
         }
         self.retrying(|| async {
+            let _call = self.call_permit().await?;
             match tokio::time::timeout(self.timeout, self.split_blob_once(d)).await {
                 Ok(r) => r,
                 Err(_) => Err(no_answer(format!("splitting {}: no answer within {:?}", digest_str(d), self.timeout)).into()),
@@ -883,6 +1147,7 @@ impl Client {
     /// (`RegisterChunkMapping`, or `SpliceBlob` before RE API v2.13).
     pub async fn splice_blob(&self, d: &re::Digest, chunks: &[re::Digest]) -> Result<()> {
         self.retrying(|| async {
+            let _call = self.call_permit().await?;
             match tokio::time::timeout(self.timeout, self.splice_blob_once(d, chunks)).await {
                 Ok(r) => r,
                 Err(_) => Err(no_answer(format!("splicing {}: no answer within {:?}", digest_str(d), self.timeout)).into()),
@@ -951,12 +1216,6 @@ impl Client {
         .await
     }
 
-    /// Uploads a blob through ByteStream, once there's an upload permit.
-    async fn bytestream_write(&self, d: &re::Digest, src: &BlobSource) -> Result<()> {
-        let _upload = self.uploads.acquire().await.context("uploads stopped")?;
-        self.write_blob(d, src).await
-    }
-
     /// Uploads a blob through ByteStream, read from `src` as it is sent,
     /// with an upload permit. A write that broke resumes where the server
     /// says it got to (`QueryWriteStatus`, as Bazel's), when uncompressed (a
@@ -973,8 +1232,8 @@ impl Client {
                 Ok(()) => break,
                 Err(e) => e,
             };
-            if status_of(&e).is_some_and(from_server) {
-                self.answer();
+            if let Some(s) = status_of(&e) {
+                self.heard(s);
             }
             let Some(wait) = self.retry_after(&e, attempt) else { return Err(e) };
             let (complete, committed) = self.write_status(&resource).await;
@@ -995,7 +1254,7 @@ impl Client {
     /// holds of it (none when it can't tell).
     async fn write_status(&self, resource: &str) -> (bool, i64) {
         let request = self.req(QueryWriteStatusRequest { resource_name: resource.to_string() });
-        match self.timed(ByteStreamClient::new(self.channel.clone()).query_write_status(request)).await {
+        match self.timed(ByteStreamClient::new(self.grpc()).query_write_status(request)).await {
             Ok(r) => (r.get_ref().complete, r.get_ref().committed_size),
             Err(_) => (false, 0),
         }
@@ -1003,6 +1262,7 @@ impl Client {
 
     /// One attempt of `write_blob`, from `offset`.
     async fn bytestream_write_once(&self, d: &re::Digest, src: &BlobSource, resource: &str, compress: bool, offset: u64) -> Result<()> {
+        let _call = self.call_permit().await?;
         let reader: Box<dyn Read + Send> = match src {
             BlobSource::Bytes(b) => Box::new(std::io::Cursor::new(b.get(offset as usize..).unwrap_or_default().to_vec())),
             BlobSource::File(p) => {
@@ -1032,7 +1292,7 @@ impl Client {
                 r
             })
         };
-        let mut bytestream = ByteStreamClient::new(self.channel.clone());
+        let mut bytestream = ByteStreamClient::new(self.grpc());
         let call = bytestream.write(self.req(requests));
         let result: Result<()> = tokio::select! {
             r = call => r.map(|_| ()).map_err(anyhow::Error::from),
@@ -1059,7 +1319,7 @@ impl Client {
         let mut batches: Vec<Vec<re::Digest>> = Vec::new();
         let mut cur: Vec<re::Digest> = Vec::new();
         let mut cur_bytes = 0i64;
-        let mut tasks: tokio::task::JoinSet<Result<Vec<(String, Vec<u8>)>>> = tokio::task::JoinSet::new();
+        let mut tasks: tokio::task::JoinSet<Result<HashedBlobs>> = tokio::task::JoinSet::new();
         for d in digests {
             if !seen.insert(d.hash.clone()) {
                 continue;
@@ -1126,7 +1386,7 @@ impl Client {
         Ok(data)
     }
 
-    async fn batch_read(&self, digests: Vec<re::Digest>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn batch_read(&self, digests: Vec<re::Digest>) -> Result<HashedBlobs> {
         let _read = self.reads.acquire().await.context("reads stopped")?;
         let requested: HashSet<(String, i64)> = digests.iter().map(|d| (d.hash.clone(), d.size_bytes)).collect();
         let resp = self
@@ -1228,9 +1488,10 @@ impl Client {
     /// within `--remote_timeout`, counting its bytes in `got`. Stops early
     /// when the writer has.
     async fn read_stream_to(&self, resource: &str, offset: u64, tx: &tokio::sync::mpsc::Sender<Vec<u8>>, got: &mut u64) -> Result<()> {
+        let _call = self.call_permit().await?;
         let request = self.req(ReadRequest { resource_name: resource.to_string(), read_offset: offset as i64, read_limit: 0 });
-        let mut stream = self.timed(ByteStreamClient::new(self.channel.clone()).read(request)).await?.into_inner();
-        while let Some(chunk) = self.timed(stream.message()).await? {
+        let mut stream = self.within(ByteStreamClient::new(self.grpc()).read(request)).await?.into_inner();
+        while let Some(chunk) = self.within(stream.message()).await? {
             *got += chunk.data.len() as u64;
             self.transfers.wire_read.fetch_add(chunk.data.len() as u64, Ordering::Relaxed);
             if tx.send(chunk.data).await.is_err() {
@@ -1272,9 +1533,10 @@ impl Client {
     /// One attempt of `read_stream`, appending to `data`, up to `want`
     /// bytes in all.
     async fn read_stream_once(&self, resource: &str, offset: i64, limit: i64, want: u64, data: &mut Vec<u8>) -> Result<()> {
+        let _call = self.call_permit().await?;
         let request = self.req(ReadRequest { resource_name: resource.to_string(), read_offset: offset, read_limit: limit });
-        let mut stream = self.timed(ByteStreamClient::new(self.channel.clone()).read(request)).await?.into_inner();
-        while let Some(chunk) = self.timed(stream.message()).await? {
+        let mut stream = self.within(ByteStreamClient::new(self.grpc()).read(request)).await?.into_inner();
+        while let Some(chunk) = self.within(stream.message()).await? {
             if (data.len() + chunk.data.len()) as u64 > want {
                 bail!("more than the {want} bytes expected");
             }
@@ -1309,7 +1571,7 @@ impl Client {
                 inline_output_files: vec![],
                 digest_function: re::digest_function::Value::Sha256 as i32,
             });
-            match self.timed(ActionCacheClient::new(self.channel.clone()).get_action_result(request)).await {
+            match self.timed(ActionCacheClient::new(self.grpc()).get_action_result(request)).await {
                 Ok(r) => Ok(Some(r.into_inner())),
                 Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
                 Err(s) => Err(s.into()),
@@ -1336,7 +1598,7 @@ impl Client {
                 results_cache_policy: None,
                 digest_function: re::digest_function::Value::Sha256 as i32,
             });
-            self.timed(ActionCacheClient::new(self.channel.clone()).update_action_result(request)).await?;
+            self.timed(ActionCacheClient::new(self.grpc()).update_action_result(request)).await?;
             Ok(())
         })
         .await
@@ -1370,8 +1632,9 @@ impl Client {
         // updates or not: one whose streams the server ends after each
         // update isn't followed ten times a second.
         let mut pauses = 0;
+        let connection = self.execution_channel();
         loop {
-            let executions_client = ExecutionClient::new(self.channel.clone());
+            let executions_client = ExecutionClient::new(HttpErrors(connection.channel.clone()));
             let mut moved = false;
             let outcome = match &operation {
                 None => self.follow(executions_client.clone().execute(self.req(request.clone())).await, &mut operation, &mut moved).await,
@@ -1396,9 +1659,7 @@ impl Client {
                 }
                 Err(Ended::Stream(s)) => s,
             };
-            if from_server(&status) {
-                self.answer();
-            }
+            self.heard(&status);
             // Followed again, the operation is gone (or can't be followed):
             // executed again.
             let lost = operation.is_some() && matches!(status.code(), tonic::Code::NotFound | tonic::Code::Unimplemented);
@@ -1415,7 +1676,7 @@ impl Client {
             if *budget >= self.retries || !(lost || transient(status.code())) || fault::certificate(&status).is_some() {
                 return Err(anyhow::Error::from(status).context(format!("executing {}", digest_str(action))));
             }
-            tokio::time::sleep(backoff(if following { pauses } else { *budget })).await;
+            tokio::time::sleep(if following { follow_up_pause(pauses) } else { backoff(*budget) }).await;
             *budget += 1;
             pauses = if following { pauses + 1 } else { 0 };
         }
@@ -1482,6 +1743,18 @@ fn chunk_offsets(cdc: FastCdc, src: &BlobSource) -> Result<Vec<(re::Digest, u64)
         BlobSource::Remote(_) => return src.load().map(|_| Vec::new()),
     };
     cdc.stream(reader).map(|c| c.map(|c| (digest_of(&c.data), c.offset)).context("chunking a blob")).collect()
+}
+
+/// The chunk `c` of a blob to splice, at `offset` of `src`.
+async fn chunk_data(src: &BlobSource, c: &re::Digest, offset: u64) -> Result<Vec<u8>> {
+    Ok(match src {
+        BlobSource::File(p) => {
+            let (p, c) = (p.clone(), c.clone());
+            tokio::task::spawn_blocking(move || read_chunk(&p, &c, offset)).await??
+        }
+        BlobSource::Bytes(b) => b[offset as usize..][..c.size_bytes as usize].to_vec(),
+        BlobSource::Remote(_) => src.load()?,
+    })
 }
 
 /// The chunk `c` of the file `path` to splice, at `offset`: the file must
@@ -1900,7 +2173,7 @@ mod tests {
         let (port, accepted) = tcp_server(false);
         let opts = options(&format!("grpcs://127.0.0.1:{port}"));
         let connected = tokio::time::timeout(Duration::from_secs(30), connect_within(&opts, Duration::from_millis(500), 1)).await;
-        let err = connected.expect("the TLS handshake wasn't bounded").unwrap_err();
+        let err = connected.expect("the TLS handshake wasn't bounded").err().expect("connected to a silent server");
         // (On a busy machine, the TCP connection may not have been made in
         // time either.)
         assert!(fault::fault(err.as_ref()).unreachable(), "{err:#}");
@@ -1920,22 +2193,482 @@ mod tests {
         // Refused (as Windows says only after 2 s): there was no connection.
         let attempts = AtomicU64::new(0);
         let refused = Endpoint::from_static("http://127.0.0.1:1");
-        let r = connect_attempts(5, || {
+        let r = connect_attempts(5, &Link::new(false), || {
             attempts.fetch_add(1, Ordering::SeqCst);
             refused.connect()
         })
         .await;
-        assert_eq!(fault::fault(&r.unwrap_err()), Fault::NoConnection);
+        assert_eq!(fault::fault(r.unwrap_err().as_ref()), Fault::NoConnection);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        // Closed once made, in the TLS handshake (a server restarting):
-        // made again, once; with --remote_retries=0, not.
+        // Closed before the TLS handshake (a tunnel whose far end is down):
+        // made again --remote_retries times, and then no service at all;
+        // with --remote_retries=0, not again.
         let (port, accepted) = tcp_server(true);
         let ep = format!("grpcs://127.0.0.1:{port}");
-        let err = Client::connect_retrying(options(&ep), 5).await.err().expect("connected to a server closing connections");
-        assert_eq!(fault::fault(err.as_ref()), Fault::Broke, "{err:#}");
-        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        let err = Client::connect_retrying(options(&ep), 3).await.err().expect("connected to a server closing connections");
+        assert_eq!(fault::fault(err.as_ref()), Fault::NoConnection, "{err:#}");
+        assert!(err.chain().any(|c| c.is::<Unreachable>()), "{err:#}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 4);
         assert!(Client::connect_retrying(options(&ep), 0).await.is_err());
-        assert_eq!(accepted.load(Ordering::SeqCst), 3);
+        assert_eq!(accepted.load(Ordering::SeqCst), 5);
+    }
+
+    /// What a build decides of a service it connects to, as ninja-rs does
+    /// (`--remote_retries` 2): its capabilities, or whether to do without
+    /// it (no service, or one saying it can't serve now), or to fail.
+    async fn first_contact(endpoint: &str) -> Result<(), bool> {
+        let r = async {
+            let mut c = Client::connect_retrying(options(endpoint), 2).await?.with_retries(2, Duration::from_secs(10));
+            c.capabilities().await
+        }
+        .await;
+        r.map(|_| ()).map_err(|e| fault::fault(e.as_ref()).unreachable() || fault::unavailable(e.as_ref()))
+    }
+
+    /// A server closing each connection it accepts at once, reset (`rst`)
+    /// or not, saying nothing (the far end of a tunnel down, a load
+    /// balancer restarting): its address, and the connections it took.
+    async fn closing_server(rst: bool) -> (std::net::SocketAddr, Arc<AtomicU64>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counted = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((c, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if rst {
+                    #[allow(deprecated)]
+                    let _ = c.set_linger(Some(Duration::ZERO));
+                }
+                drop(c);
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// A connection that broke before the other end said anything, over
+    /// plaintext or TLS, reset or closed, at connect or at the first call
+    /// (as the platform has it), is made again, and then no service at
+    /// all: the same on every platform.
+    #[tokio::test]
+    async fn connections_broken_before_anything_answered_are_no_service() {
+        for rst in [false, true] {
+            for scheme in ["grpc", "grpcs"] {
+                let (addr, accepted) = closing_server(rst).await;
+                assert_eq!(first_contact(&format!("{scheme}://{addr}")).await, Err(true), "{scheme}, rst {rst}");
+                assert!(accepted.load(Ordering::SeqCst) >= 3, "{scheme}, rst {rst}: {} connections", accepted.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    /// A TCP proxy to `upstream` resetting the first `bad` connections it
+    /// takes (a load balancer restarting): its endpoint.
+    async fn restarting_proxy(upstream: std::net::SocketAddr, bad: u64) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut taken = 0;
+            while let Ok((mut c, _)) = listener.accept().await {
+                taken += 1;
+                if taken <= bad {
+                    #[allow(deprecated)]
+                    let _ = c.set_linger(Some(Duration::ZERO));
+                    continue;
+                }
+                tokio::spawn(async move {
+                    if let Ok(mut s) = tokio::net::TcpStream::connect(upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut c, &mut s).await;
+                    }
+                });
+            }
+        });
+        format!("grpc://{addr}")
+    }
+
+    /// A load balancer restarting (resetting the first four connections) is
+    /// waited for, --remote_retries (5) times: connecting, and calling.
+    #[tokio::test]
+    async fn restarting_load_balancers_are_waited_for() {
+        let cas = TestCas::default();
+        let upstream = cas.serve().await.trim_start_matches("grpc://").parse().unwrap();
+        let endpoint = restarting_proxy(upstream, 4).await;
+        let mut c = Client::connect_retrying(options(&endpoint), 5).await.unwrap().with_retries(5, Duration::from_secs(10));
+        c.capabilities().await.unwrap();
+    }
+
+    /// How an HTTP/2 server answers each request (see `h2_server`).
+    #[derive(Clone, Copy, Debug)]
+    enum H2 {
+        /// With this HTTP status and an HTML page (a proxy without a
+        /// healthy backend).
+        Page(u16),
+        /// Resetting its stream (REFUSED_STREAM, ENHANCE_YOUR_CALM...).
+        Reset(h2::Reason),
+        /// Closing the connection at once (GOAWAY: a server draining).
+        GoAway,
+    }
+
+    /// An HTTP/2 server answering as `how`: its endpoint, and the requests
+    /// it got.
+    async fn h2_server(how: H2) -> (String, Arc<AtomicU64>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicU64::new(0));
+        let counted = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((c, _)) = listener.accept().await {
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(c).await else { return };
+                    if let H2::GoAway = how {
+                        conn.abrupt_shutdown(h2::Reason::NO_ERROR);
+                    }
+                    while let Some(Ok((_, mut respond))) = conn.accept().await {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        match how {
+                            H2::Page(status) => {
+                                let page = tonic::codegen::http::Response::builder().status(status).header("content-type", "text/html").body(()).unwrap();
+                                if let Ok(mut body) = respond.send_response(page, false) {
+                                    let _ = body.send_data(tonic::codegen::Bytes::from_static(b"<html>no healthy upstream</html>"), true);
+                                }
+                            }
+                            H2::Reset(reason) => respond.send_reset(reason),
+                            H2::GoAway => respond.send_reset(h2::Reason::REFUSED_STREAM),
+                        }
+                    }
+                });
+            }
+        });
+        (format!("grpc://{addr}"), requests)
+    }
+
+    /// What HTTP/2 says the server answered (a stream refused, slow down,
+    /// GOAWAY), or a proxy's HTTP error page, is an answer: made again as
+    /// any, and then the server saying it can't serve now, as UNAVAILABLE.
+    #[tokio::test]
+    async fn http_answers_short_of_grpc_are_answers() {
+        for how in [H2::Reset(h2::Reason::REFUSED_STREAM), H2::Reset(h2::Reason::ENHANCE_YOUR_CALM), H2::Page(503), H2::Page(502), H2::Page(429)] {
+            let (endpoint, requests) = h2_server(how).await;
+            let mut c = Client::connect(options(&endpoint)).await.unwrap().with_retries(2, Duration::from_secs(10));
+            let err = c.capabilities().await.unwrap_err();
+            assert!(fault::unavailable(err.as_ref()) && fault::fault(err.as_ref()) == Fault::None, "{how:?}: {err:#}");
+            assert_eq!(requests.load(Ordering::SeqCst), 3, "{how:?}");
+        }
+        // A page saying what isn't there: as gRPC has it, not made again.
+        let (endpoint, requests) = h2_server(H2::Page(404)).await;
+        let mut c = Client::connect(options(&endpoint)).await.unwrap().with_retries(2, Duration::from_secs(10));
+        let err = c.capabilities().await.unwrap_err();
+        assert_eq!(status_of(&err).map(|s| s.code()), Some(tonic::Code::Unimplemented), "{err:#}");
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(fault::describe(err.as_ref()).contains("HTTP 404 Not Found, not gRPC"), "{err:#}");
+        // A server closing the connection at once (GOAWAY): an answer, or
+        // (as Windows may see it) a connection broken before any: done
+        // without either way.
+        let (endpoint, _) = h2_server(H2::GoAway).await;
+        assert_eq!(first_contact(&endpoint).await, Err(true));
+    }
+
+    /// Until the server answered anything, a call it leaves unanswered
+    /// fails after the connect timeout, not --remote_timeout: a silent
+    /// plaintext server costs as long as a silent TLS one.
+    #[tokio::test]
+    async fn first_calls_are_bounded_by_the_connect_timeout() {
+        let (port, _) = tcp_server(false);
+        let start = Instant::now();
+        let connection = connect_within(&options(&format!("grpc://127.0.0.1:{port}")), Duration::from_millis(500), 0).await.unwrap();
+        let mut c = Client::from_connection(connection, start, "").with_retries(0, Duration::from_secs(600));
+        let err = tokio::time::timeout(Duration::from_secs(60), c.capabilities()).await.expect("the first call waited for --remote_timeout").unwrap_err();
+        assert!(format!("{err:#}").contains("no answer within 500ms (nothing answered since connecting)"), "{err:#}");
+        assert_eq!(fault::fault(err.as_ref()), Fault::NoAnswer);
+    }
+
+    /// An Execution service holding every execution until it's released,
+    /// and a CAS answering at once: the executions running.
+    #[derive(Clone, Default)]
+    struct Held {
+        running: Arc<AtomicU64>,
+        released: Arc<tokio::sync::Notify>,
+        open: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Held {
+        async fn hold(&self) {
+            let released = self.released.notified();
+            if !self.open.load(Ordering::SeqCst) {
+                released.await;
+            }
+        }
+
+        fn release(&self) {
+            self.open.store(true, Ordering::SeqCst);
+            self.released.notify_waiters();
+        }
+    }
+
+    #[tonic::async_trait]
+    impl re::execution_server::Execution for Held {
+        type ExecuteStream = Operations;
+        async fn execute(&self, _: tonic::Request<re::ExecuteRequest>) -> Result<tonic::Response<Operations>, tonic::Status> {
+            use bazel_remote_apis::google::longrunning::Operation;
+            let held = self.clone();
+            held.running.fetch_add(1, Ordering::SeqCst);
+            let named = tokio_stream::iter(vec![Ok(Operation { name: "operations/held".into(), ..Default::default() })]);
+            let done = tokio_stream::StreamExt::then(tokio_stream::iter([()]), move |_| {
+                let held = held.clone();
+                async move {
+                    held.hold().await;
+                    let response = re::ExecuteResponse { result: Some(re::ActionResult::default()), ..Default::default() };
+                    let any = pb::Any { type_url: "type.googleapis.com/build.bazel.remote.execution.v2.ExecuteResponse".into(), value: response.encode_to_vec() };
+                    Ok(Operation { name: "operations/held".into(), done: true, result: Some(operation::Result::Response(any)), ..Default::default() })
+                }
+            });
+            Ok(tonic::Response::new(Box::pin(tokio_stream::StreamExt::chain(named, done))))
+        }
+        type WaitExecutionStream = Operations;
+        async fn wait_execution(&self, _: tonic::Request<re::WaitExecutionRequest>) -> Result<tonic::Response<Operations>, tonic::Status> {
+            Err(tonic::Status::unimplemented(""))
+        }
+    }
+
+    /// Waits until `n` says `want`.
+    async fn until(n: &AtomicU64, want: u64) {
+        let reached = async {
+            while n.load(Ordering::SeqCst) < want {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), reached).await.unwrap_or_else(|_| panic!("{} of {want}", n.load(Ordering::SeqCst)));
+    }
+
+    /// A hundred executions running on a server allowing a hundred streams
+    /// on a connection: other calls don't wait behind them (they would on
+    /// the one connection, while their --remote_timeout runs).
+    #[tokio::test]
+    async fn calls_dont_wait_behind_executions() {
+        let held = Held::default();
+        let cas = TestCas::default();
+        let endpoint = serve(
+            tonic::transport::Server::builder()
+                .max_concurrent_streams(100)
+                .add_service(re::execution_server::ExecutionServer::new(held.clone()))
+                .add_service(re::content_addressable_storage_server::ContentAddressableStorageServer::new(cas)),
+        )
+        .await;
+        let c = Client::connect(options(&endpoint)).await.unwrap().with_retries(0, Duration::from_secs(2));
+        c.find_missing(vec![digest_of(b"x")]).await.unwrap();
+        let mut executions = tokio::task::JoinSet::new();
+        for i in 0..100u32 {
+            let c = c.clone();
+            executions.spawn(async move { c.execute(&digest_of(&i.to_le_bytes()), false).await });
+        }
+        until(&held.running, 100).await;
+        let found = c.find_missing(vec![digest_of(b"x")]).await;
+        held.release();
+        found.unwrap();
+        while let Some(r) = executions.join_next().await {
+            r.unwrap().unwrap();
+        }
+    }
+
+    /// An action cache holding every lookup until it's released: the most
+    /// it held at once.
+    #[derive(Clone, Default)]
+    struct HeldCache {
+        held: Held,
+        most: Arc<AtomicU64>,
+    }
+
+    #[tonic::async_trait]
+    impl re::action_cache_server::ActionCache for HeldCache {
+        async fn get_action_result(&self, _: tonic::Request<re::GetActionResultRequest>) -> Result<tonic::Response<re::ActionResult>, tonic::Status> {
+            let now = self.held.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            self.held.hold().await;
+            self.held.running.fetch_sub(1, Ordering::SeqCst);
+            Err(tonic::Status::not_found("not cached"))
+        }
+        async fn update_action_result(&self, _: tonic::Request<re::UpdateActionResultRequest>) -> Result<tonic::Response<re::ActionResult>, tonic::Status> {
+            Err(tonic::Status::unimplemented(""))
+        }
+    }
+
+    /// Calls on the connection are bounded, below the streams servers
+    /// allow on one: those waiting for a permit don't wait under their
+    /// --remote_timeout.
+    #[tokio::test]
+    async fn calls_on_the_connection_are_bounded() {
+        let cache = HeldCache::default();
+        let endpoint = serve(tonic::transport::Server::builder().add_service(re::action_cache_server::ActionCacheServer::new(cache.clone()))).await;
+        let c = Client::connect(options(&endpoint)).await.unwrap().with_retries(0, Duration::from_secs(60));
+        let mut lookups = tokio::task::JoinSet::new();
+        for i in 0..MAX_CALLS as u32 + 30 {
+            let c = c.clone();
+            lookups.spawn(async move { c.get_action_result(&digest_of(&i.to_le_bytes())).await });
+        }
+        until(&cache.held.running, MAX_CALLS as u64).await;
+        // Any more would have come by now.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cache.held.release();
+        while let Some(r) = lookups.join_next().await {
+            assert_eq!(r.unwrap().unwrap(), None);
+        }
+        assert_eq!(cache.most.load(Ordering::SeqCst), MAX_CALLS as u64);
+    }
+
+    /// Reads are bounded across calls (`MAX_READS`).
+    #[tokio::test]
+    async fn reads_are_bounded_across_calls() {
+        let cas = TestCas::default();
+        *cas.0.read_hold.lock().unwrap() = Duration::from_millis(100);
+        let mut c = cas.client(0, Duration::from_secs(30)).await;
+        // Blobs of 100 KiB go through ByteStream.
+        c.max_batch_bytes = 64 << 10;
+        let mut calls = tokio::task::JoinSet::new();
+        for call in 0..4u8 {
+            let digests: Vec<re::Digest> = (0..16u8).map(|i| cas.put(vec![call * 16 + i; 100 << 10])).collect();
+            let c = c.clone();
+            calls.spawn(async move { c.read_blobs(&digests).await.unwrap().len() });
+        }
+        while let Some(r) = calls.join_next().await {
+            assert_eq!(r.unwrap(), 16);
+        }
+        let most = cas.0.most_reading.load(Ordering::SeqCst);
+        assert!(most <= MAX_READS as u64 && most > 1, "{most} reads at once");
+    }
+
+    /// A TCP proxy to `upstream` for its first connection, and to a server
+    /// saying nothing for every later one (`later`, counted): a server
+    /// whose TLS handshakes hang once the connection is made again.
+    async fn hanging_after_first(upstream: std::net::SocketAddr) -> (String, Arc<tokio::sync::Notify>, Arc<AtomicU64>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (cut, later) = (Arc::new(tokio::sync::Notify::new()), Arc::new(AtomicU64::new(0)));
+        let (cutting, counted) = (cut.clone(), later.clone());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut first = true;
+            while let Ok((mut c, _)) = listener.accept().await {
+                if !std::mem::take(&mut first) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    held.push(c);
+                    continue;
+                }
+                let cutting = cutting.clone();
+                tokio::spawn(async move {
+                    let Ok(mut s) = tokio::net::TcpStream::connect(upstream).await else { return };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut c, &mut s) => {}
+                        _ = cutting.notified() => {}
+                    }
+                });
+            }
+        });
+        (format!("grpcs://localhost:{}", addr.port()), cut, later)
+    }
+
+    /// A connection made again whose TLS handshake hangs fails after the
+    /// connect timeout, not after --remote_timeout (nor never).
+    #[tokio::test]
+    async fn tls_handshakes_made_again_are_bounded() {
+        let (tls, _) = tls_server(false).await;
+        let upstream: std::net::SocketAddr = tls.replace("grpcs://localhost", "127.0.0.1").parse().unwrap();
+        let (endpoint, cut, later) = hanging_after_first(upstream).await;
+        let opts = ConnectOptions { ca_pem: Some(CA.to_vec()), ..options(&endpoint) };
+        let start = Instant::now();
+        let connection = connect_within(&opts, Duration::from_millis(500), 0).await.unwrap();
+        let mut c = Client::from_connection(connection, start, "").with_retries(0, Duration::from_secs(600));
+        c.capabilities().await.unwrap();
+        cut.notify_waiters();
+        // Until the connection made again hangs: the first calls may see
+        // the one cut first.
+        let err = loop {
+            let r = tokio::time::timeout(Duration::from_secs(60), c.capabilities()).await.expect("a TLS handshake made again wasn't bounded");
+            if let Err(e) = r
+                && later.load(Ordering::SeqCst) > 0
+            {
+                break e;
+            }
+        };
+        // (The connect timeout covers it, as the TLS handshake's does.)
+        assert_eq!(fault::fault(err.as_ref()), Fault::NoAnswer, "{err:#}");
+        assert!(!format!("{err:#}").contains("--remote_timeout"), "{err:#}");
+    }
+
+    /// The pauses before following an operation again grow, to a second.
+    #[test]
+    fn follow_up_pauses_are_a_second_at_most() {
+        assert!(follow_up_pause(0) < Duration::from_millis(200));
+        assert!((0..20).all(|n| follow_up_pause(n) <= FOLLOW_UP_PAUSE));
+        assert_eq!(follow_up_pause(10), FOLLOW_UP_PAUSE);
+    }
+
+    /// A server refusing to splice blobs (for good, not for a chunk
+    /// missing) has blobs uploaded whole from then on, and is said to once.
+    #[tokio::test]
+    async fn refused_splices_turn_splicing_off() {
+        let cas = TestCas::default();
+        cas.0.splice.store(true, Ordering::SeqCst);
+        cas.0.refuse_splices.store(true, Ordering::SeqCst);
+        let c = cas.client(0, Duration::from_secs(10)).await;
+        let set = |seed: u8| {
+            let mut set = BlobSet::default();
+            for i in 0..3u8 {
+                let mut b = noise(1 << 20);
+                b[0] = seed + i;
+                set.insert(digest_of(&b), BlobSource::Bytes(b));
+            }
+            set
+        };
+        let first = set(0);
+        assert_eq!(c.upload_blobs(&first).await.unwrap().0, 3);
+        assert!(first.0.values().all(|(d, _)| cas.has(d)));
+        let refused = cas.0.splice_calls.load(Ordering::SeqCst);
+        assert!(refused >= 1);
+        let why = c.splicing_refused().expect("splicing refused");
+        assert!(why.contains("INVALID_ARGUMENT"), "{why}");
+        assert_eq!(c.splicing_refused(), None);
+        // Uploaded whole at once: no chunks, no splice.
+        let second = set(10);
+        let before = cas.0.find_missing_calls.load(Ordering::SeqCst);
+        assert_eq!(c.upload_blobs(&second).await.unwrap().0, 3);
+        assert!(second.0.values().all(|(d, _)| cas.has(d)));
+        assert_eq!(cas.0.splice_calls.load(Ordering::SeqCst), refused);
+        assert_eq!(cas.0.find_missing_calls.load(Ordering::SeqCst) - before, 1);
+    }
+
+    /// Chunks streamed (with zstd for ByteStream only) are read once there
+    /// is an upload permit for them: those waiting for one aren't held in
+    /// memory.
+    #[tokio::test]
+    async fn streamed_chunks_are_read_with_a_permit() {
+        let dir = test_dirs::TestDir::new("rbe-streamed-chunks");
+        let cas = TestCas::default();
+        cas.0.splice.store(true, Ordering::SeqCst);
+        cas.0.zstd.store(true, Ordering::SeqCst);
+        let c = cas.client(0, Duration::from_secs(30)).await;
+        assert_eq!(c.compressing(), (true, false));
+        let path = dir.join("blob");
+        let data = noise(2 << 20);
+        std::fs::write(&path, &data).unwrap();
+        let mut set = BlobSet::default();
+        set.insert(digest_of(&data), BlobSource::File(path.clone()));
+        // Every upload permit is taken (other calls' uploads).
+        let held = c.uploads.clone().acquire_many_owned(MAX_UPLOADS as u32).await.unwrap();
+        let before = cas.0.find_missing_calls.load(Ordering::SeqCst);
+        let upload = tokio::spawn({
+            let c = c.clone();
+            async move { c.upload_blobs(&set).await }
+        });
+        // The blob, then its chunks, were looked up: its chunks are next.
+        until(&cas.0.find_missing_calls, before + 2).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Changed meanwhile: a chunk read from now on isn't the blob's.
+        std::fs::write(&path, noise(2 << 20).iter().map(|b| !b).collect::<Vec<u8>>()).unwrap();
+        drop(held);
+        let err = upload.await.unwrap().unwrap_err();
+        assert!(format!("{err:#}").contains("changed since it was hashed"), "{err:#}");
+        // No chunk had been read before: none was sent.
+        assert_eq!(cas.0.writes.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -2071,7 +2804,15 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let update = Operation { name: "operations/long".into(), ..Default::default() };
             let broke = Err(tonic::Status::unavailable("a proxy reset the stream"));
-            if self.breaks.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+            // One break fewer, if any is left (`fetch_update` is deprecated
+            // from Rust 1.99, `try_update` doesn't exist before).
+            let mut left = self.breaks.load(Ordering::SeqCst);
+            while left > 0
+                && let Err(now) = self.breaks.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                left = now;
+            }
+            if left > 0 {
                 let sent = if follow_up && !self.updates { vec![broke] } else { vec![Ok(update), broke] };
                 return Box::pin(tokio_stream::iter(sent));
             }
@@ -2203,6 +2944,9 @@ mod tests {
         streamed: Arc<AtomicU64>,
         /// Reads hold their first message this long.
         read_hold: Mutex<Duration>,
+        /// Reads being served, and the most at once.
+        reading: AtomicU64,
+        most_reading: AtomicU64,
         /// The next writes break after a message, so many times, keeping
         /// what they got under their name; their offsets.
         write_breaks: Mutex<u32>,
@@ -2212,6 +2956,8 @@ mod tests {
         write_pace: Mutex<Duration>,
         writing: AtomicU64,
         most_writing: AtomicU64,
+        /// Writes received.
+        writes: AtomicU64,
         /// zstd advertised (and served for reads).
         zstd: std::sync::atomic::AtomicBool,
         /// GetActionResult leaves this many calls unanswered first.
@@ -2226,6 +2972,9 @@ mod tests {
         splice: std::sync::atomic::AtomicBool,
         splices: AtomicU64,
         find_missing_calls: AtomicU64,
+        /// Splices are refused (INVALID_ARGUMENT); the calls.
+        refuse_splices: std::sync::atomic::AtomicBool,
+        splice_calls: AtomicU64,
     }
 
     type Responses<T> = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<T, tonic::Status>> + Send>>;
@@ -2343,6 +3092,10 @@ mod tests {
             Ok(tonic::Response::new(re::SplitBlobResponse { chunk_digests, chunking_function: 0 }))
         }
         async fn splice_blob(&self, r: tonic::Request<re::SpliceBlobRequest>) -> Result<tonic::Response<re::SpliceBlobResponse>, tonic::Status> {
+            self.0.splice_calls.fetch_add(1, Ordering::SeqCst);
+            if self.0.refuse_splices.load(Ordering::SeqCst) {
+                return Err(tonic::Status::invalid_argument("splices aren't served here"));
+            }
             let r = r.into_inner();
             let mut data = Vec::new();
             for c in &r.chunk_digests {
@@ -2372,6 +3125,16 @@ mod tests {
     impl bs::byte_stream_server::ByteStream for TestCas {
         type ReadStream = Responses<bs::ReadResponse>;
         async fn read(&self, r: tonic::Request<bs::ReadRequest>) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+            /// A read being served, until its stream is dropped.
+            struct Reading(Arc<CasState>);
+            impl Drop for Reading {
+                fn drop(&mut self) {
+                    self.0.reading.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            let now = self.0.reading.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0.most_reading.fetch_max(now, Ordering::SeqCst);
+            let reading = Reading(self.0.clone());
             let r = r.into_inner();
             self.0.read_offsets.lock().unwrap().push(r.read_offset);
             if let Some(n) = *self.0.endless.lock().unwrap() {
@@ -2396,11 +3159,14 @@ mod tests {
                 }
             }
             let hold = *self.0.read_hold.lock().unwrap();
-            let held = tokio_stream::StreamExt::then(tokio_stream::iter(sent.into_iter().enumerate()), move |(i, m)| async move {
-                if i == 0 {
-                    tokio::time::sleep(hold).await;
+            let held = tokio_stream::StreamExt::then(tokio_stream::iter(sent.into_iter().enumerate()), move |(i, m)| {
+                let _reading = &reading;
+                async move {
+                    if i == 0 {
+                        tokio::time::sleep(hold).await;
+                    }
+                    m
                 }
-                m
             });
             Ok(tonic::Response::new(Box::pin(held)))
         }
@@ -2412,6 +3178,7 @@ mod tests {
                     self.0.writing.fetch_sub(1, Ordering::SeqCst);
                 }
             }
+            self.0.writes.fetch_add(1, Ordering::SeqCst);
             let now = self.0.writing.fetch_add(1, Ordering::SeqCst) + 1;
             self.0.most_writing.fetch_max(now, Ordering::SeqCst);
             let _writing = Writing(&self.0);
@@ -2624,7 +3391,7 @@ mod tests {
         let d = digest_of(&data);
         // Each attempt gets a message further: more breaks than retries.
         *cas.0.write_breaks.lock().unwrap() = 3;
-        c.bytestream_write(&d, &BlobSource::Bytes(data)).await.unwrap();
+        c.write_blob(&d, &BlobSource::Bytes(data)).await.unwrap();
         assert!(cas.has(&d));
         assert_eq!(*cas.0.write_offsets.lock().unwrap(), [0, 1 << 20, 2 << 20, 3 << 20]);
     }
@@ -2662,7 +3429,7 @@ mod tests {
         // A write is the server's first answer: a call it leaves
         // unanswered next (longer than this --remote_timeout) is made again.
         let data = b"blob".to_vec();
-        c.bytestream_write(&digest_of(&data), &BlobSource::Bytes(data)).await.unwrap();
+        c.write_blob(&digest_of(&data), &BlobSource::Bytes(data)).await.unwrap();
         *cas.0.unanswered.lock().unwrap() = 1;
         let c = c.with_retries(2, Duration::from_secs(1));
         assert_eq!(c.get_action_result(&digest_of(b"action")).await.unwrap(), None);

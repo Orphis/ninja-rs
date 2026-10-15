@@ -3,3 +3,13 @@
 disallowed-methods = [
     { path = "std::env::temp_dir", reason = "tests use test_dirs::TestDir (Bazel's TEST_TMPDIR, removed when done); allow it where a build's own temporary files are meant" },
 ]
+
+# std's printing macros panic when the output can't be written (a pipe its
+# reader closed, a terminal gone): a build would end without its cleanup
+# (logs, lock, build events). Tests, build scripts and examples allow them.
+disallowed-macros = [
+    { path = "std::print", reason = "panics on a closed pipe or a terminal gone: ninja_core::status::print_out, or status::message during a build" },
+    { path = "std::println", reason = "panics on a closed pipe or a terminal gone: ninja_core::status::print_out, or status::message during a build" },
+    { path = "std::eprint", reason = "panics on a closed pipe or a terminal gone: ninja_core::status::print_err, or status::message during a build" },
+    { path = "std::eprintln", reason = "panics on a closed pipe or a terminal gone: ninja_core::status::print_err, or status::message during a build" },
+]

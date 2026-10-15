@@ -4,6 +4,8 @@
 //! `capabilities <grpc[s]://host:port> [--instance NAME]
 //!   [--tls_client_certificate FILE --tls_client_key FILE] [--tls_certificate FILE]`
 
+#![allow(clippy::disallowed_macros)] // It prints what it found.
+
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let endpoint = args.next().ok_or_else(|| anyhow::anyhow!("usage: capabilities <endpoint> [flags]"))?;

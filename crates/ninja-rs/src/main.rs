@@ -63,7 +63,7 @@ fn main() {
             print_out(&format!("ninja: Entering directory `{dir}'\n"));
         }
         if let Err(e) = std::env::set_current_dir(dir) {
-            print_err(&format!("ninja: fatal: chdir to '{dir}' - {e}\n"));
+            print_err(&format!("ninja: fatal: chdir to '{dir}' - {}\n", strerror(&e)));
             std::process::exit(1);
         }
     }
@@ -137,6 +137,16 @@ fn main() {
     // open by background processes).
     drop(secret_flags);
     std::process::exit(code);
+}
+
+/// The system's message for `e`, as `strerror` gives it to ninja: without
+/// Rust's ` (os error N)`.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(code) => text.strip_suffix(&format!(" (os error {code})")).map_or_else(|| text.clone(), str::to_string),
+        None => text,
+    }
 }
 
 /// Prints an answer of the command line.

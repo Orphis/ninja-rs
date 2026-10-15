@@ -57,6 +57,8 @@ known! {
     PRAGMA_OPERATOR = "_Pragma",
     MS_PRAGMA_OPERATOR = "__pragma",
     INCLUDE_ALIAS = "include_alias",
+    GCC = "GCC",
+    DEPENDENCY = "dependency",
     HAS_EMBED = "__has_embed",
     DATE = "__DATE__",
     TIME = "__TIME__",

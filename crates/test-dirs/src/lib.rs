@@ -3,6 +3,8 @@
 //! removed when the test is done with them. A test that panicked leaves its
 //! directory, to look into.
 
+#![allow(clippy::disallowed_macros)] // Tests say what they leave.
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -11,7 +13,14 @@ use std::time::Duration;
 /// Where tests' directories go.
 #[allow(clippy::disallowed_methods)] // The one place tests ask for it.
 pub fn base() -> PathBuf {
-    std::env::var_os("TEST_TMPDIR").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    std::env::var_os("TEST_TMPDIR").filter(|d| !d.is_empty()).map(|d| native(d.as_ref())).unwrap_or_else(std::env::temp_dir)
+}
+
+/// `dir` as the system spells it. Bazel's `TEST_TMPDIR` has slashes on
+/// Windows, unlike its temporary directory: the tests see the same paths
+/// as with Cargo (which tools and messages spell with backslashes).
+fn native(dir: &Path) -> PathBuf {
+    if cfg!(windows) { std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf()) } else { dir.to_path_buf() }
 }
 
 /// A test's directory, removed when dropped (unless the thread panics).
@@ -101,5 +110,14 @@ mod tests {
         let kept = TestDir::new("test-dirs").keep();
         assert!(kept.is_dir());
         remove_all(&kept).unwrap();
+    }
+
+    #[test]
+    fn native_spelling() {
+        if cfg!(windows) {
+            assert_eq!(native(Path::new("C:/a/_tmp/b")).as_os_str(), r"C:\a\_tmp\b");
+        } else {
+            assert_eq!(native(Path::new("/a/_tmp/b")).as_os_str(), "/a/_tmp/b");
+        }
     }
 }

@@ -31,7 +31,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
-use rbe_client::fault::{FIRST_CONTACT_RETRIES, broken_connection, certificate, from_server, no_answer};
+use rbe_client::HttpErrors;
+use rbe_client::fault::{FIRST_CONTACT_RETRIES, answered, broken_connection, certificate, describe, no_answer, status_words};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -152,7 +153,8 @@ impl BesUploader {
                 let headers = config.headers.iter().map(|(k, v)| rbe_client::header(k, v)).collect::<Result<Headers>>()?;
                 let channel = connect.await?;
                 trace(format_args!("connected"));
-                Upload { client: PublishBuildEventClient::new(channel), config, headers, answered: AtomicBool::new(false), acked }.run(&mut rx).await
+                let client = PublishBuildEventClient::new(HttpErrors(channel));
+                Upload { client, config, headers, answered: AtomicBool::new(false), acked }.run(&mut rx).await
             }
         });
         Self { tx, task, acked }
@@ -267,13 +269,13 @@ pub fn pack(event: &bep::BuildEvent) -> Event {
 /// fails remote calls).
 type Headers = Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>;
 
-/// Notes that the backend answered, when `status` is its own (see
-/// `rbe_client::fault::from_server`). Until the backend answered
-/// something, failures aren't retried (but for a connection that broke):
-/// it is gone, or isn't a BES.
-fn note_answer(answered: &AtomicBool, status: &tonic::Status) {
-    if from_server(status) {
-        answered.store(true, Ordering::Relaxed);
+/// Notes that the backend answered, when `status` is its answer (see
+/// `rbe_client::fault::answered`). Until the backend answered something,
+/// failures aren't retried (but for a connection that broke): it is gone,
+/// or isn't a BES.
+fn note_answer(heard: &AtomicBool, status: &tonic::Status) {
+    if answered(status) {
+        heard.store(true, Ordering::Relaxed);
     }
 }
 
@@ -292,7 +294,7 @@ fn retryable(s: &tonic::Status) -> bool {
 
 /// The background task: the backend's client, and what its calls share.
 struct Upload {
-    client: PublishBuildEventClient<Channel>,
+    client: PublishBuildEventClient<HttpErrors<Channel>>,
     config: BesConfig,
     headers: Headers,
     /// Whether the backend answered anything yet (see `note_answer`).
@@ -359,7 +361,7 @@ impl Upload {
                 Err(_) => no_answer(format!("no answer within {:?}", self.lifecycle_timeout())),
             };
             if attempt >= self.budget(&e, retries) || !retryable(&e) {
-                bail!("{what}: {e}");
+                bail!("{what}: {}", describe(&e));
             }
             attempt += 1;
             tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + backoff)).await;
@@ -526,17 +528,19 @@ impl Upload {
             // one before would have the proxy close it too, again and again
             // through a long build step saying nothing.
             if pending.is_empty() {
-                trace(format_args!("stream closed while idle: {err}"));
+                trace(format_args!("stream closed while idle: {}", describe(&err)));
                 let next = rx.recv().await.unwrap_or_else(abandoned);
                 accept(next, config, &mut pending, &mut next_seq, &mut outcome, &mut summary);
                 continue;
             }
             failures += 1;
-            trace(format_args!("stream failed ({} pending): {err}", pending.len()));
+            trace(format_args!("stream failed ({} pending): {}", pending.len(), describe(&err)));
             if failures > self.budget(&err, config.max_retries) || !retryable(&err) {
                 let answered = answered.load(Ordering::Relaxed);
                 let never = if answered { "" } else { " (the backend never answered)" };
-                return Err(Failed { message: format!("BES upload failed after {failures} attempts{never}: {err}"), status: err, answered }.into());
+                // Its causes are the status's (see `Failed`).
+                let message = format!("BES upload failed after {failures} attempts{never}: {}", status_words(&err));
+                return Err(Failed { message, status: err, answered }.into());
             }
             summary.reconnects += 1;
             tokio::time::sleep(backoff).await;
@@ -578,12 +582,14 @@ impl std::error::Error for Failed {
 /// Whether `trace` prints: `BesConfig::trace` of the last uploader started.
 static TRACE: AtomicBool = AtomicBool::new(false);
 
-/// Traces the upload on stderr, with `BesConfig::trace`.
+/// Traces the upload on stderr, with `BesConfig::trace` (lost if stderr
+/// can't be written, rather than a panic).
 fn trace(what: std::fmt::Arguments<'_>) {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
     if TRACE.load(Ordering::Relaxed) {
-        eprintln!("[bes {:>8.3}s] {what}", start.elapsed().as_secs_f64());
+        let line = format!("[bes {:>8.3}s] {what}\n", start.elapsed().as_secs_f64());
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
     }
 }
 

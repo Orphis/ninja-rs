@@ -66,11 +66,12 @@ pub trait Status {
 }
 
 /// Messages from work the build loop doesn't see (the remote backend,
-/// include scanners), with one prefix: while a status printer is there,
-/// it prints them on their own lines at its next update, never over its
-/// status line; else they go to standard error at once.
+/// include scanners, build events), with ninja's prefix (tools and IDEs
+/// read its `ninja: warning:` lines): while a status printer is there, it
+/// prints them on standard error on their own lines at its next update,
+/// never over its status line; else they go there at once.
 pub fn message(msg: &str) {
-    queue(&MESSAGES, format!("ninja-rs: {msg}\n"));
+    queue(&MESSAGES, format!("ninja: {msg}\n"));
 }
 
 /// `message`'s lines: the status printers there are, and the lines
@@ -137,6 +138,8 @@ pub struct LinePrinter {
     line_buffer: String,
     line_type_elide: bool,
     output_buffer: Vec<u8>,
+    /// What goes to stderr while the console is locked, after the output.
+    error_buffer: String,
 }
 
 impl Default for LinePrinter {
@@ -175,34 +178,11 @@ mod terminal {
 /// The console on stdout, as ninja's `LinePrinter` asks about it.
 #[cfg(windows)]
 mod terminal {
-    use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
 
-    #[repr(C)]
-    #[derive(Default)]
-    struct Coord {
-        x: i16,
-        y: i16,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct ScreenBufferInfo {
-        size: Coord,
-        cursor_position: Coord,
-        attributes: u16,
-        window: [i16; 4],
-        maximum_window_size: Coord,
-    }
-
-    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetConsoleScreenBufferInfo(console: *mut c_void, info: *mut ScreenBufferInfo) -> i32;
-        fn GetConsoleMode(console: *mut c_void, mode: *mut u32) -> i32;
-        fn SetConsoleMode(console: *mut c_void, mode: u32) -> i32;
-    }
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetConsoleScreenBufferInfo, SetConsoleMode,
+    };
 
     pub fn is_terminal() -> bool {
         width().is_some()
@@ -210,10 +190,10 @@ mod terminal {
 
     /// The width of its screen buffer, as ninja takes it.
     pub fn width() -> Option<usize> {
-        let mut info = ScreenBufferInfo::default();
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
         // SAFETY: plain system call, filling `info`.
         let ok = unsafe { GetConsoleScreenBufferInfo(std::io::stdout().as_raw_handle(), &mut info) } != 0;
-        (ok && info.size.x > 0).then_some(info.size.x as usize)
+        (ok && info.dwSize.X > 0).then_some(info.dwSize.X as usize)
     }
 
     /// Turns on escape sequences, as ninja does (and leaves them on). False
@@ -254,6 +234,7 @@ impl LinePrinter {
             line_buffer: String::new(),
             line_type_elide: false,
             output_buffer: Vec::new(),
+            error_buffer: String::new(),
         }
     }
 
@@ -344,6 +325,18 @@ impl LinePrinter {
         }
     }
 
+    /// Prints `text` (whole lines) on stderr, past the status line; while
+    /// the console is locked (a `console` pool command has the terminal),
+    /// once it's unlocked, as the output.
+    pub fn print_error_on_new_line(&mut self, text: &str) {
+        if self.console_locked {
+            self.error_buffer.push_str(text);
+            return;
+        }
+        self.print_on_new_line(b"");
+        print_err(text);
+    }
+
     pub fn set_console_locked(&mut self, locked: bool) {
         if locked == self.console_locked {
             return;
@@ -355,6 +348,10 @@ impl LinePrinter {
         if !locked {
             let buf = std::mem::take(&mut self.output_buffer);
             self.print_on_new_line(&buf);
+            let errors = std::mem::take(&mut self.error_buffer);
+            if !errors.is_empty() {
+                print_err(&errors);
+            }
             if !self.line_buffer.is_empty() {
                 let l = std::mem::take(&mut self.line_buffer);
                 let elide = self.line_type_elide;
@@ -433,6 +430,15 @@ fn elide_middle(s: &str, width: usize) -> String {
     }
     out.extend(&chars[i..]);
     out
+}
+
+/// A failed command's first line, as ninja (1.13) prints it: its exit code,
+/// then each output followed by a space (which tools reading it expect);
+/// the label red on a terminal taking colors.
+pub fn failed_line(code: i32, outputs: &[String], color: bool) -> String {
+    let label = format!("FAILED: [code={code}] ");
+    let outputs: String = outputs.iter().map(|o| format!("{o} ")).collect();
+    if color { format!("\x1b[31m{label}\x1b[0m{outputs}\n") } else { format!("{label}{outputs}\n") }
 }
 
 /// Removes ANSI escape sequences (for non-terminal output).
@@ -608,8 +614,14 @@ fn clock(secs: i64, with_hours: bool) -> String {
 }
 
 impl Drop for StatusPrinter {
+    /// The messages left go to stderr, as at once without a printer; a
+    /// terminal gone loses them (a panic here, while unwinding, aborted).
     fn drop(&mut self) {
-        eprint!("{}", take_messages(&MESSAGES, -1));
+        self.printer.set_console_locked(false);
+        let lines = take_messages(&MESSAGES, -1);
+        if !lines.is_empty() {
+            self.printer.print_error_on_new_line(&lines);
+        }
     }
 }
 
@@ -647,22 +659,20 @@ impl StatusPrinter {
         }
     }
 
-    /// Prints `message`'s lines waiting, past the status line.
+    /// Prints `message`'s lines waiting, past the status line (see
+    /// `LinePrinter::print_error_on_new_line`).
     fn print_messages(&mut self) {
         let lines = take_messages(&MESSAGES, 0);
         if !lines.is_empty() {
-            self.printer.print_on_new_line(b"");
-            eprint!("{lines}");
+            self.printer.print_error_on_new_line(&lines);
             self.printed_since_failure = true;
         }
     }
 
     /// Prints a failed command's `FAILED:` block: outputs, command line, and
     /// its output.
-    fn print_failure(&mut self, code: i32, outputs: &str, command: &str, output: &[u8]) {
-        let failed = if self.printer.supports_color() { "\x1b[31mFAILED: \x1b[0m" } else { "FAILED: " };
-        let code_str = if code != 1 { format!("[code={code}] ") } else { String::new() };
-        self.printer.print_on_new_line(format!("{failed}{code_str}{outputs}\n").as_bytes());
+    fn print_failure(&mut self, code: i32, outputs: &[String], command: &str, output: &[u8]) {
+        self.printer.print_on_new_line(failed_line(code, outputs, self.printer.supports_color()).as_bytes());
         self.printer.print_on_new_line(format!("{command}\n").as_bytes());
         if output.is_empty() {
             return;
@@ -949,9 +959,8 @@ impl Status for StatusPrinter {
         }
         self.running_edges = self.running_edges.saturating_sub(1);
         if let Some(code) = exit_code {
-            let outputs = info.outputs.join(" ");
-            self.print_failure(code, &outputs, &info.command, output);
-            self.failures.push(outputs);
+            self.print_failure(code, &info.outputs, &info.command, output);
+            self.failures.push(info.outputs.join(" "));
             self.printed_since_failure = false;
         } else if !output.is_empty() {
             let out = if self.printer.supports_color() { output.to_vec() } else { strip_ansi_escape_codes(output) };
@@ -978,20 +987,17 @@ impl Status for StatusPrinter {
     }
     fn info(&mut self, msg: &str) {
         self.print_messages();
-        self.printer.print_on_new_line(b"");
-        print_out(&format!("ninja: {msg}\n"));
+        self.printer.print_on_new_line(format!("ninja: {msg}\n").as_bytes());
         self.printed_since_failure = true;
     }
     fn warning(&mut self, msg: &str) {
         self.print_messages();
-        self.printer.print_on_new_line(b"");
-        print_err(&format!("ninja: warning: {msg}\n"));
+        self.printer.print_error_on_new_line(&format!("ninja: warning: {msg}\n"));
         self.printed_since_failure = true;
     }
     fn error(&mut self, msg: &str) {
         self.print_messages();
-        self.printer.print_on_new_line(b"");
-        print_err(&format!("ninja: error: {msg}\n"));
+        self.printer.print_error_on_new_line(&format!("ninja: error: {msg}\n"));
         self.printed_since_failure = true;
     }
     /// With many jobs, a failure scrolls away behind the output of the
@@ -1289,22 +1295,42 @@ mod tests {
         assert_eq!(term(None, true), cfg!(windows));
     }
 
+    /// While a `console` pool command has the terminal, what goes to stderr
+    /// waits too, and follows its output.
+    #[test]
+    fn errors_wait_for_the_console() {
+        let mut p = LinePrinter::new();
+        p.set_console_locked(true);
+        p.print_error_on_new_line("ninja: warning: later\n");
+        assert_eq!(p.error_buffer, "ninja: warning: later\n");
+        p.set_console_locked(false);
+        assert!(p.error_buffer.is_empty());
+    }
+
+    /// As ninja 1.13: the code always, each output followed by a space.
+    #[test]
+    fn failed_lines() {
+        let outputs = ["a.o".to_string(), "a.d".to_string()];
+        assert_eq!(failed_line(1, &outputs, false), "FAILED: [code=1] a.o a.d \n");
+        assert_eq!(failed_line(130, &outputs[..1], true), "\x1b[31mFAILED: [code=130] \x1b[0ma.o \n");
+    }
+
     /// Messages from outside the build loop wait for the status printer
     /// while there is one (printed past its status line), and are printed
     /// at once without one.
     #[test]
     fn messages_wait_for_the_printer() {
         let messages: Messages = std::sync::Mutex::new((0, Vec::new()));
-        queue(&messages, "ninja-rs: before\n".into());
+        queue(&messages, "ninja: before\n".into());
         assert!(messages.lock().unwrap().1.is_empty());
         take_messages(&messages, 1);
-        queue(&messages, "ninja-rs: warning: one\n".into());
-        queue(&messages, "ninja-rs: two\n".into());
-        assert_eq!(take_messages(&messages, 0), "ninja-rs: warning: one\nninja-rs: two\n");
+        queue(&messages, "ninja: warning: one\n".into());
+        queue(&messages, "ninja: two\n".into());
+        assert_eq!(take_messages(&messages, 0), "ninja: warning: one\nninja: two\n");
         assert_eq!(take_messages(&messages, 0), "");
-        queue(&messages, "ninja-rs: last\n".into());
-        assert_eq!(take_messages(&messages, -1), "ninja-rs: last\n");
-        queue(&messages, "ninja-rs: after\n".into());
+        queue(&messages, "ninja: last\n".into());
+        assert_eq!(take_messages(&messages, -1), "ninja: last\n");
+        queue(&messages, "ninja: after\n".into());
         assert_eq!(*messages.lock().unwrap(), (0, Vec::new()));
     }
 }

@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::SystemTime;
+
+use ninja_os::FileStamp;
 
 use cpp_deps::lex::{DirKind, Kind, P, Token};
 /// Lexical normalization (removes `.` and `..` components).
@@ -62,6 +63,8 @@ pub struct CompileInfo {
     pub sysroot: Option<PathBuf>,
     /// Response files referenced with `@file`.
     pub rsp_files: Vec<PathBuf>,
+    /// The macros the command line defines or undefines (`-D`, `-U`).
+    pub defines: Vec<String>,
     /// Other files named in arguments (e.g. `-fprofile-use=`,
     /// `-fmodule-file=`, see `cpp_deps::driver::read_paths`), sent as
     /// inputs.
@@ -73,8 +76,14 @@ pub struct CompileInfo {
     pub embed_dirs: Vec<PathBuf>,
     /// MSVC's lookup (cl, clang-cl, and Clang for the MSVC ABI): `#include
     /// "..."` searches every includer's directory. From the flags; the
-    /// compiler's predefined macros decide (see `Scanner::msvc_lookup`).
+    /// compiler's predefined macros may add it (see `Scanner::msvc_lookup`).
     pub msvc_lookup: bool,
+    /// The forced includes as given, where `forced_includes` are placed
+    /// from (see `place_forced_includes`).
+    forced: Vec<String>,
+    cwd: PathBuf,
+    /// The compiler is cl.exe (not clang-cl, whose `/FI` is `-include`).
+    cl_exe: bool,
 }
 
 /// Whether a target triple is the MSVC ABI's (Clang's default environment
@@ -150,7 +159,7 @@ pub fn expand_response_files(argv: &[String], cwd: &Path, windows: bool) -> (Vec
 /// Response files may be UTF-16 (MSVC) or UTF-8 (with or without BOM).
 pub fn decode_rsp(content: &[u8]) -> String {
     if content.len() >= 2 && content[0] == 0xff && content[1] == 0xfe {
-        let u: Vec<u16> = content[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u: Vec<u16> = content[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         return String::from_utf16_lossy(&u);
     }
     let c = content.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(content);
@@ -295,6 +304,10 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
         }
         if let Some(v) = opt(&["-iwithprefix"], &mut i) {
             info.after_dirs.extend(v.map(|v| abs(&format!("{prefix}{v}"), cwd)));
+            continue;
+        }
+        if let Some(v) = opt(&["-D", "-U"], &mut i).or_else(|| if msvc { opt(&["/D", "/U"], &mut i) } else { None }) {
+            info.defines.extend(v.map(|v| v.split(['=', '(', '#']).next().unwrap_or_default().to_string()));
             continue;
         }
         // (Files flags name are `read_paths`'.)
@@ -455,32 +468,42 @@ pub fn parse_compile(argv: &[String], cwd: &Path) -> CompileInfo {
             Some(t) => msvc_target(t),
             None => cfg!(windows) && clang,
         });
-    // A forced include is found in the working directory (but by cl.exe,
-    // which searches it as an `#include "..."` in the source), else as an
-    // `#include "..."` in the source (MSVC's lookup next to it first): every
-    // place it may be.
-    for name in forced {
-        let p = abs(&name, cwd);
-        if Path::new(&name).is_absolute() || (!cl_exe && p.is_file()) {
-            info.forced_includes.push(p);
-            continue;
-        }
-        let source_dirs = info.sources.iter().filter_map(|s| s.parent()).filter(|_| info.msvc_lookup);
-        // cl.exe's built-in directories are INCLUDE's.
-        let include = if cl_exe { std::env::var_os("INCLUDE").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default() } else { Vec::new() };
-        let dirs: Vec<PathBuf> = source_dirs
-            .map(Path::to_path_buf)
-            .chain(info.quote_dirs.iter().chain(&info.user_dirs).chain(&info.system_dirs).chain(&info.after_dirs).cloned())
-            .chain(include)
-            .collect();
-        let found: Vec<PathBuf> = dirs.iter().map(|d| normalize(&d.join(&name))).filter(|p| p.is_file()).collect();
-        // None: where the build may make it.
-        info.forced_includes.extend(if found.is_empty() && !cl_exe { vec![p] } else { found });
-    }
+    (info.forced, info.cwd, info.cl_exe) = (forced, cwd.to_path_buf(), cl_exe);
+    info.place_forced_includes(info.msvc_lookup);
     let (files, dirs) = cpp_deps::driver::read_paths(argv, cwd);
     info.extra_files.extend(files);
     info.extra_dirs.extend(dirs);
     info
+}
+
+impl CompileInfo {
+    /// Finds the forced includes, with MSVC's lookup or not (the flags'
+    /// when parsed; the compiler may say otherwise: see
+    /// `Scanner::msvc_lookup`). One is found in the working directory (but
+    /// by cl.exe, which searches it as an `#include "..."` in the source),
+    /// else as an `#include "..."` in the source (MSVC's lookup next to it
+    /// first): every place it may be.
+    pub fn place_forced_includes(&mut self, msvc_lookup: bool) {
+        self.forced_includes.clear();
+        for name in &self.forced {
+            let p = abs(name, &self.cwd);
+            if Path::new(name).is_absolute() || (!self.cl_exe && p.is_file()) {
+                self.forced_includes.push(p);
+                continue;
+            }
+            let source_dirs = self.sources.iter().filter_map(|s| s.parent()).filter(|_| msvc_lookup);
+            // cl.exe's built-in directories are INCLUDE's.
+            let include = if self.cl_exe { std::env::var_os("INCLUDE").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default() } else { Vec::new() };
+            let dirs: Vec<PathBuf> = source_dirs
+                .map(Path::to_path_buf)
+                .chain(self.quote_dirs.iter().chain(&self.user_dirs).chain(&self.system_dirs).chain(&self.after_dirs).cloned())
+                .chain(include)
+                .collect();
+            let found: Vec<PathBuf> = dirs.iter().map(|d| normalize(&d.join(name))).filter(|p| p.is_file()).collect();
+            // None: where the build may make it.
+            self.forced_includes.extend(if found.is_empty() && !self.cl_exe { vec![p] } else { found });
+        }
+    }
 }
 
 fn source_if_any(a: &str, cwd: &Path) -> Option<PathBuf> {
@@ -511,6 +534,43 @@ pub struct Directives {
     pub header_macros: Vec<String>,
     /// `#define A B`: macros defined as another macro.
     pub macro_aliases: Vec<(String, String)>,
+    /// The directories each computed include (as `computed`) spells out
+    /// (see `path_prefixes`).
+    pub computed_paths: Vec<Vec<String>>,
+    /// The macros defined, with the directories their bodies spell out.
+    pub defines: Vec<(String, Vec<String>)>,
+}
+
+/// The directories tokens spell out, which a header name made of them is
+/// under: names joined by slashes, without spaces, up to the last slash
+/// (`BOOST_PP_STRINGIZE(boost/mpl/list/AUX778076_LIST_HEADER)` names a
+/// header under `boost/mpl/list/`), unless a macro changes those names (see
+/// `ScanResult::narrow`).
+fn path_prefixes(toks: &[Token]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        // Not a part of a longer path (after `/`, `.`, `..`).
+        let starts = toks[i].kind == Kind::Ident && (i == 0 || toks[i - 1].is(P::LParen) || toks[i - 1].is(P::Comma) || toks[i - 1].is(P::Lt));
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let (mut j, mut path, mut prefix) = (i, String::new(), None);
+        while toks.get(j).is_some_and(|t| t.kind == Kind::Ident && (j == i || !t.space)) {
+            path.push_str(toks[j].sym.as_str());
+            j += 1;
+            if !toks.get(j).is_some_and(|t| t.is(P::Slash) && !t.space) {
+                break;
+            }
+            path.push('/');
+            j += 1;
+            prefix = Some(path.clone());
+        }
+        out.extend(prefix);
+        i = j.max(i + 1);
+    }
+    out
 }
 
 fn header_like(name: &str) -> bool {
@@ -585,9 +645,15 @@ pub fn parse_directives(content: &[u8]) -> Directives {
             DirKind::Include | DirKind::IncludeNext | DirKind::Import | DirKind::Embed => match &dir.toks[..] {
                 [t, ..] if matches!(t.kind, Kind::HeaderName | Kind::Str) => d.includes.extend(header_names(&dir.toks[..1]).into_iter().map(|(inc, _)| inc)),
                 // `#include MACRO`: a computed include.
-                [t] if t.kind == Kind::Ident => d.computed.push(t.sym.as_str().to_string()),
+                [t] if t.kind == Kind::Ident => {
+                    d.computed.push(t.sym.as_str().to_string());
+                    d.computed_paths.push(Vec::new());
+                }
                 [] => {}
-                _ => d.computed.push(String::new()),
+                toks => {
+                    d.computed.push(String::new());
+                    d.computed_paths.push(path_prefixes(toks));
+                }
             },
             DirKind::If | DirKind::Elif | DirKind::Ifdef | DirKind::Ifndef | DirKind::Elifdef | DirKind::Elifndef => {
                 d.includes.extend(has_include_operands(&dir.toks));
@@ -607,6 +673,7 @@ pub fn parse_directives(content: &[u8]) -> Directives {
                     d.header_macros.push(name.to_string());
                 }
                 d.define_candidates.extend(candidates);
+                d.defines.push((name.to_string(), path_prefixes(&m.body)));
             }
             _ => {}
         }
@@ -637,7 +704,11 @@ impl SearchPath {
     }
 }
 
-type FileKey = (PathBuf, u64, Option<SystemTime>);
+/// A file's version (see `FileStamp`).
+type FileKey = (PathBuf, FileStamp);
+
+/// A file's directives, for its version.
+type Parsed = (FileStamp, Arc<Directives>);
 
 #[derive(Clone, Debug, Default)]
 pub struct Resolved {
@@ -648,18 +719,19 @@ pub struct Resolved {
     pub linked: Option<PathBuf>,
 }
 
-/// A compiler's built-in directories, and whether it searches includers'
-/// directories (when it said: see `Scanner::msvc_lookup`).
-type Builtin = (Arc<Vec<PathBuf>>, Option<bool>);
+/// A compiler's built-in directories, whether it searches includers'
+/// directories (when it said: see `Scanner::msvc_lookup`), and the macros
+/// it predefines (when it said).
+type Builtin = (Arc<Vec<PathBuf>>, Option<bool>, Arc<HashSet<String>>);
 
 /// Scanner caches, shared across actions (and builds, in a daemon).
 #[derive(Default)]
 pub struct ScanCache {
-    directives: Mutex<HashMap<PathBuf, (u64, Option<SystemTime>, Arc<Directives>)>>,
+    directives: Mutex<HashMap<PathBuf, Parsed>>,
     resolutions: Mutex<HashMap<(FileKey, u64), Arc<Resolved>>>,
     listings: RwLock<HashMap<PathBuf, Option<Arc<HashSet<String>>>>>,
     /// MSVC's lookups (see `Scanner::msvc_candidates`): by directory, the file
-    /// each name is there (outside the build directory).
+    /// each name is there (outside the directories the build writes to).
     msvc: RwLock<HashMap<PathBuf, HashMap<String, Option<PathBuf>>>>,
     /// The compilers' built-in directories, and whether they search
     /// includers' directories (see `Builtin`).
@@ -675,6 +747,8 @@ pub struct ScanStats {
     pub files_parsed: usize,
     pub resolution_hits: usize,
     pub resolution_misses: usize,
+    /// Names MSVC's lookup looked for in a directory (not cached).
+    pub msvc_lookups: usize,
 }
 
 impl ScanCache {
@@ -683,13 +757,15 @@ impl ScanCache {
     /// compile's: where the scan stopped being exact, which header wasn't
     /// found), which is then worth telling.
     pub fn fell_back(&self, why: &str) -> bool {
+        // What it is, without the details after it ("what: details").
+        let what = |w: &str| w.split(": ").next().unwrap_or_default().to_string();
         let reason = match why.strip_prefix("not exact (").and_then(|w| w.strip_suffix(')')) {
             Some(w) if w.ends_with(" not found") => "not exact (an #include not found)".to_string(),
             // ("file:line: what", or "file: what"; a drive's colon has no
             // space after it.)
-            Some(w) => format!("not exact ({})", w.split_once(": ").map_or(w, |(_, what)| what)),
+            Some(w) => format!("not exact ({})", what(w.split_once(": ").map_or(w, |(_, w)| w))),
             None if why.starts_with("more than one input") => "more than one input".to_string(),
-            None => why.to_string(),
+            None => what(why),
         };
         let mut fallbacks = self.fallbacks.lock().unwrap();
         let n = fallbacks.entry(reason).or_default();
@@ -714,19 +790,67 @@ pub struct ScanResult {
     /// name: see `crate::store::dir_files`).
     pub dirs: BTreeSet<PathBuf>,
     pub warnings: Vec<String>,
-    /// Why the compile can't run remotely, if so: a computed include in
-    /// the build directory (whose files the build is writing), or a `..`
-    /// after a symbolic link (which the compiler resolves elsewhere than a
-    /// remote worker).
+    /// Why the compile can't run remotely, if so: a computed include in a
+    /// directory the build writes to (objects, logs, headers not generated
+    /// yet), or a `..` after a symbolic link (which the compiler resolves
+    /// elsewhere than a remote worker).
     pub local: Option<String>,
+    /// For each computed include the scan can't name: the directory of its
+    /// file, and those its tokens or its macro's definitions spell out (see
+    /// `path_prefixes`; none when one isn't a plain name, the scanned files
+    /// defining it as a macro). Directories narrower than `dirs`, when
+    /// those have too many files (see `Scanner::narrowed_dirs`).
+    pub narrow: Vec<(PathBuf, Vec<String>)>,
+    /// The names those directories are spelled with: none must be a macro
+    /// (the command line's, the compiler's).
+    pub narrow_names: BTreeSet<String>,
+}
+
+/// The directories build edges write to (their outputs', the build
+/// directory's own), where files may appear or change during the build:
+/// looked at every time, never sent for computed includes. Not the rest of
+/// the build directory: sources fetched at configure time (CMake's
+/// FetchContent and CPM put them in `_deps`) are sources.
+#[derive(Debug, Default)]
+pub struct WrittenDirs {
+    /// As keys (see `key`).
+    dirs: HashSet<PathBuf>,
+    /// Those and every directory above them.
+    above: HashSet<PathBuf>,
+    case_insensitive: bool,
+}
+
+impl WrittenDirs {
+    pub fn new(dirs: impl IntoIterator<Item = PathBuf>, case_insensitive: bool) -> Self {
+        let mut w = WrittenDirs { case_insensitive, ..Default::default() };
+        for d in dirs {
+            let key = w.key(&d);
+            w.above.extend(key.ancestors().map(Path::to_path_buf));
+            w.dirs.insert(key);
+        }
+        w
+    }
+
+    fn key(&self, p: &Path) -> PathBuf {
+        if self.case_insensitive { PathBuf::from(p.to_string_lossy().to_lowercase()) } else { p.to_path_buf() }
+    }
+
+    /// Whether the build writes to `dir`.
+    pub fn contains(&self, dir: &Path) -> bool {
+        !self.dirs.is_empty() && self.dirs.contains(&self.key(dir))
+    }
+
+    /// Whether the build writes to `dir`, or under it.
+    pub fn holds(&self, dir: &Path) -> bool {
+        !self.above.is_empty() && self.above.contains(&self.key(dir))
+    }
 }
 
 pub struct Scanner<'a> {
     pub cache: &'a ScanCache,
     pub windows: bool,
-    /// Directories whose contents may change during the build (the build
-    /// directory): never cached.
-    pub volatile_roots: Vec<PathBuf>,
+    /// Where the build writes: never cached.
+    pub written: &'a WrittenDirs,
 }
 
 /// MSVC's lookup, in a scan: the quoted names of the files reached, each
@@ -759,23 +883,14 @@ impl MsvcLookup {
 }
 
 fn file_key(p: &Path) -> Option<FileKey> {
-    let m = std::fs::metadata(p).ok()?;
-    if !m.is_file() {
-        return None;
-    }
-    Some((p.to_path_buf(), m.len(), m.modified().ok()))
+    let (m, stamp) = ninja_os::stat(p).ok()?;
+    m.is_file().then(|| (p.to_path_buf(), stamp))
 }
 
 impl Scanner<'_> {
+    /// Whether the file `p` is where the build writes (its directory is).
     fn is_volatile(&self, p: &Path) -> bool {
-        if self.windows {
-            // Names are case-insensitive.
-            let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
-            let p = lower(p);
-            self.volatile_roots.iter().any(|r| p.starts_with(lower(r)))
-        } else {
-            self.volatile_roots.iter().any(|r| p.starts_with(r))
-        }
+        p.parent().is_some_and(|d| self.written.contains(d))
     }
 
     fn name_key(&self, s: &str) -> String {
@@ -794,7 +909,7 @@ impl Scanner<'_> {
     }
 
     /// Whether `p` is an existing file, using cached directory listings
-    /// outside the build directory.
+    /// outside the directories the build writes to.
     pub fn is_file(&self, p: &Path) -> bool {
         if self.is_volatile(p) {
             return p.is_file();
@@ -807,15 +922,14 @@ impl Scanner<'_> {
     }
 
     fn directives(&self, p: &Path, key: &FileKey) -> Arc<Directives> {
-        if let Some((len, t, d)) = self.cache.directives.lock().unwrap().get(p)
-            && *len == key.1
-            && *t == key.2
+        if let Some((stamp, d)) = self.cache.directives.lock().unwrap().get(p)
+            && *stamp == key.1
         {
             return d.clone();
         }
         let d = Arc::new(std::fs::read(p).map(|c| parse_directives(&c)).unwrap_or_default());
         self.cache.stats.lock().unwrap().files_parsed += 1;
-        self.cache.directives.lock().unwrap().insert(p.to_path_buf(), (key.1, key.2, d.clone()));
+        self.cache.directives.lock().unwrap().insert(p.to_path_buf(), (key.1, d.clone()));
         d
     }
 
@@ -856,8 +970,8 @@ impl Scanner<'_> {
         let mut found = Vec::new();
         let mut look = |dir: &Path, names: &[String]| {
             // The file a name is in a directory, looked up once (outside the
-            // build directory): a plain name in the directory's listing,
-            // others as paths.
+            // directories the build writes to): a plain name in the
+            // directory's listing, others as paths.
             let find = |n: &String, listing: &Option<Arc<HashSet<String>>>| {
                 let p = normalize(&dir.join(n));
                 let exists = match listing {
@@ -866,25 +980,28 @@ impl Scanner<'_> {
                 };
                 exists.then_some(p)
             };
-            if self.is_volatile(dir) {
-                found.extend(names.iter().filter_map(|n| find(n, &None)));
-                return;
-            }
+            // (Under a directory the build writes to, a name's own.)
+            let holds = self.written.holds(dir);
             let mut unknown = Vec::new();
-            if let Some(known) = self.cache.msvc.read().unwrap().get(dir) {
+            {
+                let known = self.cache.msvc.read().unwrap();
+                let known = known.get(dir);
                 for n in names {
-                    match known.get(n) {
+                    if holds && self.is_volatile(&normalize(&dir.join(n))) {
+                        found.extend(find(n, &None));
+                        continue;
+                    }
+                    match known.and_then(|k| k.get(n)) {
                         Some(f) => found.extend(f.iter().cloned()),
                         None => unknown.push(n),
                     }
                 }
-            } else {
-                unknown.extend(names);
             }
             if unknown.is_empty() {
                 return;
             }
             let listing = self.listing(dir);
+            self.cache.stats.lock().unwrap().msvc_lookups += unknown.len();
             let looked: Vec<(String, Option<PathBuf>)> = unknown.into_iter().map(|n| (n.clone(), find(n, &listing))).collect();
             found.extend(looked.iter().filter_map(|(_, f)| f.clone()));
             self.cache.msvc.write().unwrap().entry(dir.to_path_buf()).or_default().extend(looked);
@@ -934,10 +1051,11 @@ impl Scanner<'_> {
         let mut linked = None;
         let mut queue: VecDeque<PathBuf> = roots.iter().cloned().collect();
         // Computed includes, and the macros the scanned files define.
-        let mut computed: Vec<(PathBuf, Vec<String>)> = Vec::new();
+        let mut computed: Vec<(PathBuf, Arc<Directives>)> = Vec::new();
+        let mut reached: Vec<Arc<Directives>> = Vec::new();
         let mut header_macros: HashSet<String> = HashSet::new();
         let mut aliases: Vec<(String, String)> = Vec::new();
-        let volatile_search = sp.quote.iter().chain(&sp.angled).any(|d| self.is_volatile(d));
+        let volatile_search = sp.quote.iter().chain(&sp.angled).any(|d| self.written.holds(d));
         // MSVC's lookup: the quoted names, and the directories of the files
         // reached, each tried with every other (see `msvc_candidates`).
         let mut msvc = MsvcLookup::default();
@@ -951,14 +1069,15 @@ impl Scanner<'_> {
                     linked.clone_from(&r.linked);
                 }
                 if !r.directives.computed.is_empty() {
-                    computed.push((f.clone(), r.directives.computed.clone()));
+                    computed.push((f.clone(), r.directives.clone()));
                 }
+                reached.push(r.directives.clone());
                 header_macros.extend(r.directives.header_macros.iter().cloned());
                 aliases.extend(r.directives.macro_aliases.iter().cloned());
                 let from_dir = f.parent().unwrap_or(Path::new(""));
                 // What the build may have made since, or make later, there.
                 let mut found = r.files.clone();
-                if volatile_search || self.is_volatile(from_dir) {
+                if volatile_search || self.written.holds(from_dir) {
                     for inc in r.directives.includes.iter().chain(&r.directives.define_candidates) {
                         self.candidates(inc, from_dir, sp, true, &mut found, &mut linked);
                     }
@@ -990,49 +1109,154 @@ impl Scanner<'_> {
         }
         // A computed include whose macro names a header is covered: the
         // header was followed as a candidate. Otherwise its directory's
-        // files go (not its subdirectories'); not those of the build
-        // directory, which the build is writing (objects, logs): the
-        // compile runs locally then.
-        let mut local = linked.map(|l| format!("`..` after the symbolic link {}, which the compiler resolves elsewhere than a remote worker", l.display()));
-        for (f, macros) in computed {
-            if macros.iter().all(|m| header_macros.contains(m)) {
-                continue;
-            }
+        // files go, its subdirectories' too (see `store::dir_files`); not
+        // those of a directory the build writes to (objects, logs, headers
+        // not generated yet): the compile runs locally then.
+        let mut local = linked.map(|l| format!("`..` after a symbolic link, which the compiler resolves elsewhere than a remote worker: {}", l.display()));
+        let (mut narrow, mut narrow_names) = (Vec::new(), BTreeSet::new());
+        // The directories the scanned files' macros spell out, by macro.
+        let mut defines: Option<HashMap<&str, Vec<&Vec<String>>>> = None;
+        for (f, d) in &computed {
             let Some(parent) = f.parent() else { continue };
-            if self.is_volatile(parent) {
-                local.get_or_insert_with(|| format!("computed #include in {}, in the build directory", f.display()));
-            } else if dirs.insert(parent.to_path_buf()) {
-                warnings.push(format!("computed #include in {}: sending the files of {}", f.display(), parent.display()));
+            for (m, paths) in d.computed.iter().zip(&d.computed_paths) {
+                if !m.is_empty() && header_macros.contains(m) {
+                    continue;
+                }
+                if self.written.contains(parent) {
+                    local.get_or_insert_with(|| format!("computed #include in a directory the build writes to: {}", f.display()));
+                    continue;
+                }
+                if dirs.insert(parent.to_path_buf()) {
+                    warnings.push(format!("computed #include in {}: sending the files under {}", f.display(), parent.display()));
+                }
+                let defines = defines.get_or_insert_with(|| {
+                    let mut by_name: HashMap<&str, Vec<&Vec<String>>> = HashMap::new();
+                    for (name, paths) in reached.iter().flat_map(|d| &d.defines) {
+                        by_name.entry(name.as_str()).or_default().push(paths);
+                    }
+                    by_name
+                });
+                // Its tokens', or every definition's of its macro.
+                let mut paths: Vec<String> = paths.clone();
+                if paths.is_empty()
+                    && let Some(defs) = defines.get(m.as_str())
+                    && defs.iter().all(|p| !p.is_empty())
+                {
+                    paths = defs.iter().flat_map(|p| p.iter().cloned()).collect();
+                }
+                let names: BTreeSet<String> = paths.iter().flat_map(|p| p.split('/')).filter(|n| !n.is_empty()).map(str::to_string).collect();
+                if names.iter().any(|n| defines.contains_key(n.as_str())) {
+                    paths.clear();
+                } else {
+                    narrow_names.extend(names);
+                }
+                narrow.push((parent.to_path_buf(), paths));
             }
         }
-        ScanResult { files, dirs, warnings, local }
+        ScanResult { files, dirs, warnings, local, narrow, narrow_names }
     }
 
-    /// Whether the compiler searches includers' directories (MSVC's lookup),
-    /// as its predefined macros say (`_MSC_VER` and `__clang__`: Clang for
-    /// the MSVC ABI, which its driver's name, configuration files or cc1's
-    /// flags may choose) when `builtin_dirs` could ask it; else from the
-    /// flags.
+    /// The files to send for the computed includes the scan can't name
+    /// (`r.dirs`): those under their directories (see `store::dir_files`,
+    /// which `written` is for); too many, those `narrowed_dirs` says, and
+    /// what those under the directories their paths name include (the
+    /// header one names, a part of a sequence, includes others elsewhere:
+    /// with their own computed includes, narrowed the same), unless one of
+    /// those names is a macro (`is_macro`: the command line's, the
+    /// compiler's). Err (the compile runs locally) with the reason.
+    pub fn computed_files(
+        &self,
+        r: &ScanResult,
+        sp: &SearchPath,
+        written: &dyn Fn(&Path) -> bool,
+        is_macro: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<PathBuf>, String> {
+        let e = match crate::store::dir_files(&r.dirs, written) {
+            Ok(files) => return Ok(files),
+            Err(e) => e,
+        };
+        if r.narrow_names.iter().any(|n| is_macro(n)) {
+            return Err(e);
+        }
+        let mut narrowed = self.narrowed_dirs(r, sp);
+        // Until what they include adds no directory.
+        loop {
+            let mut files = crate::store::files_under(narrowed.clone(), written).map_err(|_| e.clone())?;
+            let named = |f: &Path| narrowed.iter().any(|(n, depth)| *depth > 0 && f.starts_with(n));
+            let more = self.scan(&files.iter().filter(|f| named(f)).cloned().collect::<Vec<_>>(), sp);
+            if more.local.is_some() || more.narrow_names.iter().any(|n| is_macro(n)) {
+                return Err(e);
+            }
+            let mut grew = false;
+            for (d, depth) in self.narrowed_dirs(&more, sp) {
+                let covered = narrowed.iter().any(|(n, n_depth)| (d == *n && *n_depth >= depth) || (*n_depth > 0 && d.starts_with(n)));
+                if !covered {
+                    narrowed.insert(d, depth);
+                    grew = true;
+                }
+            }
+            if !grew {
+                files.extend(more.files);
+                return Ok(files);
+            }
+        }
+    }
+
+    /// The directories to send for computed includes the scan can't name
+    /// when those under `r.dirs` are too many, and how deep under each to
+    /// go (see `store::files_under`): those their paths name (see
+    /// `ScanResult::narrow`), wherever an `#include "..."` from their file
+    /// may find them (the file's directory, MSVC's lookup's, the search
+    /// path), all under them; else the files of their file's directory
+    /// only (`BOOST_PP_ITERATE()`'s, whose headers are named elsewhere).
+    pub fn narrowed_dirs(&self, r: &ScanResult, sp: &SearchPath) -> BTreeMap<PathBuf, usize> {
+        let includers: BTreeSet<&Path> = if sp.msvc { r.files.iter().filter_map(|f| f.parent()).collect() } else { BTreeSet::new() };
+        let mut out = BTreeMap::new();
+        for (dir, paths) in &r.narrow {
+            let bases = || std::iter::once(dir.as_path()).chain(includers.iter().copied()).chain(sp.quote.iter().chain(&sp.angled).map(PathBuf::as_path));
+            let found: Vec<Vec<PathBuf>> = paths.iter().map(|p| bases().map(|b| normalize(&b.join(p))).filter(|d| d.is_dir()).collect()).collect();
+            if found.is_empty() || found.iter().any(Vec::is_empty) {
+                out.entry(dir.clone()).or_insert(0);
+            } else {
+                out.extend(found.into_iter().flatten().map(|d| (d, crate::store::DIR_DEPTH_MAX)));
+            }
+        }
+        out
+    }
+
+    /// Whether the compiler searches includers' directories (MSVC's lookup):
+    /// when the flags say so (cl's, clang-cl's; Clang's MSVC compatibility,
+    /// which its search follows whatever the target), or its predefined
+    /// macros (`_MSC_VER` and `__clang__`: Clang for the MSVC ABI, which its
+    /// driver's name or configuration files may choose) when `builtin_dirs`
+    /// could ask it. Either way: searching more directories only sends more
+    /// files.
     pub fn msvc_lookup(&self, compiler: &Path, info: &CompileInfo) -> bool {
-        let answer = self.cache.builtin.lock().unwrap().get(&builtin_key(compiler, info)).and_then(|(_, msvc)| *msvc);
-        info.style == Some(Style::Msvc) || answer.unwrap_or(info.msvc_lookup)
+        let answer = self.cache.builtin.lock().unwrap().get(&builtin_key(compiler, info)).and_then(|(_, msvc, _)| *msvc);
+        info.style == Some(Style::Msvc) || info.msvc_lookup || answer == Some(true)
     }
 
     /// The compiler's built-in include directories, from `-v` output
     /// (cached per compiler, relevant flags and language).
     pub fn builtin_dirs(&self, compiler: &Path, info: &CompileInfo) -> Result<Arc<Vec<PathBuf>>, String> {
         let key = builtin_key(compiler, info);
-        if let Some((d, _)) = self.cache.builtin.lock().unwrap().get(&key) {
+        if let Some((d, _, _)) = self.cache.builtin.lock().unwrap().get(&key) {
             return Ok(d.clone());
         }
         // (Asked with `-nostdinc` too, for `msvc_lookup`.)
-        let (dirs, msvc) = match discover_builtin_dirs(compiler, info, info.lang.unwrap_or(Lang::Cxx)) {
-            Err(_) if info.no_builtin_includes => (Vec::new(), None),
+        let (dirs, msvc, predefined) = match discover_builtin_dirs(compiler, info, info.lang.unwrap_or(Lang::Cxx)) {
+            Err(_) if info.no_builtin_includes => (Vec::new(), None, HashSet::new()),
             found => found?,
         };
         let dirs = Arc::new(if info.no_builtin_includes { Vec::new() } else { dirs });
-        self.cache.builtin.lock().unwrap().insert(key, (dirs.clone(), msvc));
+        self.cache.builtin.lock().unwrap().insert(key, (dirs.clone(), msvc, Arc::new(predefined)));
         Ok(dirs)
+    }
+
+    /// Whether `name` is a macro the command line or the compiler (as
+    /// `builtin_dirs` asked it) defines.
+    pub fn predefined(&self, compiler: &Path, info: &CompileInfo, name: &str) -> bool {
+        info.defines.iter().any(|d| d == name) || self.cache.builtin.lock().unwrap().get(&builtin_key(compiler, info)).is_some_and(|(_, _, p)| p.contains(name))
     }
 }
 
@@ -1042,19 +1266,24 @@ fn builtin_key(compiler: &Path, info: &CompileInfo) -> String {
     format!("{}|{:?}|{:?}|{}", compiler.display(), info.style, info.lang.unwrap_or(Lang::Cxx), info.builtin_flags.join("\u{1}"))
 }
 
+/// The include search list a compiler prints, whether it searches
+/// includers' directories (MSVC's lookup), and the macros it predefines.
+type Discovered = (Vec<PathBuf>, Option<bool>, HashSet<String>);
+
 /// Runs `<compiler> -E -v` on an empty input and parses the include search
-/// list it prints; for GCC-style drivers, with `-dM`: whether the compiler
-/// is Clang for the MSVC ABI (`_MSC_VER` and `__clang__`), which searches
-/// includers' directories. Killed when it takes too long.
-pub fn discover_builtin_dirs(compiler: &Path, info: &CompileInfo, lang: Lang) -> Result<(Vec<PathBuf>, Option<bool>), String> {
+/// list it prints; for GCC-style drivers, with `-dM`: the macros it
+/// predefines, and whether the compiler is Clang for the MSVC ABI
+/// (`_MSC_VER` and `__clang__`), which searches includers' directories.
+/// Killed when it takes too long.
+pub fn discover_builtin_dirs(compiler: &Path, info: &CompileInfo, lang: Lang) -> Result<Discovered, String> {
     discover_builtin_dirs_for(compiler, info, lang, cpp_deps::probe::TIMEOUT)
 }
 
-fn discover_builtin_dirs_for(compiler: &Path, info: &CompileInfo, lang: Lang, timeout: std::time::Duration) -> Result<(Vec<PathBuf>, Option<bool>), String> {
+fn discover_builtin_dirs_for(compiler: &Path, info: &CompileInfo, lang: Lang, timeout: std::time::Duration) -> Result<Discovered, String> {
     let base = compiler.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if base == "cl" {
         // MSVC's cl.exe has no -v; it uses the INCLUDE environment variable.
-        return Ok((std::env::var_os("INCLUDE").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default(), None));
+        return Ok((std::env::var_os("INCLUDE").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default(), None, HashSet::new()));
     }
     let mut cmd = std::process::Command::new(compiler);
     cmd.args(&info.builtin_flags);
@@ -1081,10 +1310,10 @@ fn discover_builtin_dirs_for(compiler: &Path, info: &CompileInfo, lang: Lang, ti
         return Err(format!("could not find the include search list in `{} -v` output (exit {:?})", compiler.display(), out.status.code()));
     }
     let macros = String::from_utf8_lossy(&out.stdout);
-    let defined = |m: &str| {
-        macros.lines().any(|l| l.strip_prefix("#define ").and_then(|d| d.strip_prefix(m)).is_some_and(|rest| rest.is_empty() || rest.starts_with(' ')))
-    };
-    Ok((dirs, gcc.then(|| defined("_MSC_VER") && defined("__clang__"))))
+    let predefined: HashSet<String> =
+        macros.lines().filter_map(|l| l.strip_prefix("#define ")).filter_map(|d| d.split([' ', '(']).next()).map(str::to_string).collect();
+    let msvc = gcc.then(|| predefined.contains("_MSC_VER") && predefined.contains("__clang__"));
+    Ok((dirs, msvc, predefined))
 }
 
 pub fn parse_search_list(text: &str) -> Vec<PathBuf> {
@@ -1199,7 +1428,7 @@ mod tests {
         // A comment mentioning #include, as glibc's limits.h has.
         std::fs::write(dir.join("other.h"), "/*\n   #include's protect themselves\n*/\n").unwrap();
         let cache = ScanCache::default();
-        let scanner = Scanner { cache: &cache, windows: false, volatile_roots: vec![] };
+        let scanner = Scanner { cache: &cache, windows: false, written: &WrittenDirs::default() };
         let sp = SearchPath { quote: vec![], angled: vec![dir.join("inc")], msvc: false };
         let r = scanner.scan(&[dir.join("main.c")], &sp);
         let rel: Vec<String> = r.files.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect();
@@ -1259,6 +1488,7 @@ mod tests {
         assert_eq!(info.sources.len(), 1);
         assert!(info.builtin_flags.contains(&"--target=x86_64-linux-gnu".to_string()));
         assert!(info.builtin_flags.contains(&"--sysroot".to_string()));
+        assert_eq!(info.defines, ["X"]);
     }
 
     #[test]
@@ -1285,7 +1515,7 @@ mod tests {
         std::fs::write(dir.join("inc/sub/b.h"), "#include \"../a.h\"\n").unwrap();
         std::fs::write(dir.join("comp/c.h"), "#include COMPUTED\n").unwrap();
         let cache = ScanCache::default();
-        let scanner = Scanner { cache: &cache, windows: false, volatile_roots: vec![] };
+        let scanner = Scanner { cache: &cache, windows: false, written: &WrittenDirs::default() };
         let sp = SearchPath { quote: vec![dir.to_path_buf()], angled: vec![dir.join("inc"), dir.join("sys")], msvc: false };
         let r = scanner.scan(&[dir.join("src/main.c")], &sp);
         let rel: Vec<String> = r.files.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect();
@@ -1331,7 +1561,7 @@ mod tests {
         let scanned = |argv: &[&str]| {
             let info = parse_compile(&s(argv), &dir);
             let cache = ScanCache::default();
-            let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![] };
+            let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &WrittenDirs::default() };
             let mut roots = info.sources.clone();
             roots.extend(info.forced_includes.iter().cloned());
             (info.msvc_lookup, rel(&dir, &scanner.scan(&roots, &search_path(&info, &[])).files))
@@ -1367,9 +1597,9 @@ mod tests {
         // build/config.h, generated during the build, shadows inc/config.h.
         let dir = tree("volatile", &[("src/main.c", "#include \"config.h\"\n"), ("inc/config.h", "")]);
         let cache = ScanCache::default();
-        // Volatile roots are compared as Windows compares names.
-        let root = dir.join(if cfg!(windows) { "BUILD" } else { "build" });
-        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![root] };
+        // Directories are compared as Windows compares names.
+        let written = WrittenDirs::new([dir.join(if cfg!(windows) { "BUILD" } else { "build" })], cfg!(windows));
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &written };
         let sp = SearchPath { quote: vec![], angled: vec![dir.join("build"), dir.join("inc")], msvc: false };
         assert_eq!(rel(&dir, &scanner.scan(&[dir.join("src/main.c")], &sp).files), vec!["inc/config.h", "src/main.c"]);
         std::fs::create_dir_all(dir.join("build")).unwrap();
@@ -1413,10 +1643,18 @@ mod tests {
         assert!(cache.fell_back("unsupported flag -fmodules"));
         assert!(cache.fell_back("unsupported flag -I-"));
         assert!(!cache.fell_back("unsupported flag -fmodules"));
+        // Without the files reasons name after them.
+        let once =
+            |a: &str, b: &str| format!("not exact ({a}: the same as a file with #pragma once (whether it's read again depends on the file system): {b})");
+        assert!(cache.fell_back(&once("/s/a/x.h", "/s/b/x.h")));
+        assert!(!cache.fell_back(&once("/s/c/y.h", "/s/d/y.h")));
+        assert!(cache.fell_back("`..` after a symbolic link: /s/lnk"));
+        assert!(!cache.fell_back("`..` after a symbolic link: /s/other"));
         assert_eq!(
             cache.fallback_summary().unwrap(),
-            "7 compiles were scanned conservatively (2: not exact (__COUNTER__ in a condition or #include); \
-             2: not exact (an #include not found); 1: unsupported flag -I-; 2: unsupported flag -fmodules)"
+            "11 compiles were scanned conservatively (2: `..` after a symbolic link; 2: not exact (__COUNTER__ in a condition or #include); \
+             2: not exact (an #include not found); 2: not exact (the same as a file with #pragma once (whether it's read again depends on the \
+             file system)); 1: unsupported flag -I-; 2: unsupported flag -fmodules)"
         );
     }
 
@@ -1441,15 +1679,17 @@ mod tests {
         }
     }
 
-    /// Whether the compiler searches includers' directories is the
-    /// compiler's to say (Clang for the MSVC ABI: a driver named after its
-    /// target, a configuration file, cc1's flags), not the flags'.
+    /// Whether the compiler searches includers' directories: the compiler
+    /// may say so where the flags don't (Clang for the MSVC ABI: a driver
+    /// named after its target, a configuration file); the flags where it
+    /// doesn't (Clang's MSVC compatibility, whatever the target, which
+    /// `_MSC_VER` doesn't show). And forced includes are placed as it says.
     #[test]
     fn msvc_lookup_from_the_compiler() {
         let dir = test_dirs::TestDir::new("ninja_rs_scan_msvc_compiler");
         std::fs::write(dir.join("a.cc"), "").unwrap();
         let cache = ScanCache::default();
-        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![] };
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &WrittenDirs::default() };
         let lookup = |compiler: &Path, flags: &[&str]| {
             let argv: Vec<String> = [compiler.to_string_lossy().into_owned()].into_iter().chain(s(flags)).chain(s(&["-c", "a.cc"])).collect();
             let info = parse_compile(&argv, &dir);
@@ -1459,9 +1699,23 @@ mod tests {
         let msvc = fake_compiler(&dir, "x86_64-pc-windows-msvc-clang++", &["__clang__", "_MSC_VER"]);
         assert!(lookup(&msvc, &[]));
         let gnu = fake_compiler(&dir, "clang++", &["__clang__"]);
-        assert!(!lookup(&gnu, &["--target=x86_64-pc-windows-msvc"]));
+        assert!(!lookup(&gnu, &["--target=x86_64-linux-gnu"]));
+        assert!(lookup(&gnu, &["--target=x86_64-linux-gnu", "-fms-compatibility"]));
+        assert!(lookup(&gnu, &["--target=x86_64-linux-gnu", "-Xclang", "-fms-compatibility"]));
         let gcc = fake_compiler(&dir, "g++", &["__GNUC__"]);
         assert!(!lookup(&gcc, &[]));
+        // pre.h next to the source, found there first (not in inc/).
+        for f in ["src/a.cc", "src/pre.h", "inc/pre.h"] {
+            std::fs::create_dir_all(dir.join(f).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(f), "").unwrap();
+        }
+        let flags = ["--target=x86_64-linux-gnu", "-include", "pre.h", "-Iinc", "-c", "src/a.cc"];
+        let argv: Vec<String> = [msvc.to_string_lossy().into_owned()].into_iter().chain(s(&flags)).collect();
+        let mut info = parse_compile(&argv, &dir);
+        scanner.builtin_dirs(&msvc, &info).unwrap();
+        assert!(!info.msvc_lookup);
+        info.place_forced_includes(scanner.msvc_lookup(&msvc, &info));
+        assert_eq!(rel(&dir, &info.forced_includes.iter().cloned().collect()), ["inc/pre.h", "src/pre.h"]);
     }
 
     /// cl.exe searches a relative `/FI` as an `#include "..."` in the source,
@@ -1499,36 +1753,115 @@ mod tests {
         assert_eq!((i.system_dirs, i.after_dirs, i.user_dirs), (vec![a("cxx")], vec![a("pre/after")], vec![a("pre/before")]));
     }
 
-    /// A computed include the scan can't name sends its directory's files,
-    /// not its subdirectories' (a source root holding the build directory),
-    /// and, in the build directory, makes the compile run locally.
+    /// A computed include the scan can't name sends the files under its
+    /// directory (Boost.MPL's reach subdirectories), but those of the
+    /// directories the build writes to (a source root holding the build
+    /// directory), another build directory's, a repository's own; in a
+    /// directory the build writes to, the compile runs locally. Not the
+    /// whole build directory: sources fetched there at configure time are
+    /// sent.
     #[test]
     fn computed_include_directories() {
         let dir = tree(
             "computed_dirs",
             &[
-                ("main.cpp", "#define STR(x) #x\n#define HDR(x) STR(x.h)\n#include HDR(gen)\n"),
-                ("gen.h", ""),
+                ("main.cpp", "#define STR(x) #x\n#define HDR(x) STR(sub/x.h)\n#include HDR(gen)\n"),
+                ("sub/gen.h", ""),
+                ("sub/deeper/more.h", ""),
+                // Generated in the source tree.
+                ("gen/out.h", ""),
+                (".git/config", "GIT"),
                 ("build/.ninja_log", "LOG"),
                 ("build/app.exe", "EXE"),
                 ("build/gen/main.cpp", "#include HDR(gen)\n"),
+                ("build/_deps/lib-src/include/lib.h", "#include LIB_HEADER(x)\n"),
+                ("build/_deps/lib-src/include/lib/x.h", ""),
+                ("build/_deps/lib-build/lib.a", "A"),
+                ("build-release/CMakeCache.txt", "CACHE"),
+                ("build-release/obj.o", "O"),
             ],
         );
         let cache = ScanCache::default();
-        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![dir.join("build")] };
+        let written_dirs = ["build", "build/gen", "build/_deps/lib-build", "gen"].map(|d| dir.join(d));
+        let written = WrittenDirs::new(written_dirs, cfg!(windows));
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &written };
+        let sent = |r: &ScanResult| rel(&dir, &crate::store::dir_files(&r.dirs, &|d| written.contains(d)).unwrap().into_iter().collect());
         let sp = SearchPath::default();
         let r = scanner.scan(&[dir.join("main.cpp")], &sp);
         assert!(r.local.is_none());
-        assert_eq!(rel(&dir, &crate::store::dir_files(&r.dirs).unwrap().into_iter().collect()), ["gen.h", "main.cpp"]);
+        assert_eq!(sent(&r), ["main.cpp", "sub/deeper/more.h", "sub/gen.h"]);
         let r = scanner.scan(&[dir.join("build/gen/main.cpp")], &sp);
-        assert!(r.local.is_some_and(|why| why.contains("build directory")));
+        assert!(r.local.is_some_and(|why| why.contains("the build writes to")));
+        // Fetched at configure time (CMake's FetchContent).
+        let r = scanner.scan(&[dir.join("build/_deps/lib-src/include/lib.h")], &sp);
+        assert!(r.local.is_none());
+        assert_eq!(sent(&r), ["build/_deps/lib-src/include/lib/x.h", "build/_deps/lib-src/include/lib.h"]);
         // Too many to send: run locally.
         let big = dir.join("big");
-        std::fs::create_dir_all(&big).unwrap();
         for i in 0..=crate::store::DIR_FILES_MAX {
-            std::fs::write(big.join(format!("{i}.h")), "").unwrap();
+            let sub = big.join(format!("{}", i % 3));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(format!("{i}.h")), "").unwrap();
         }
-        assert!(crate::store::dir_files(&BTreeSet::from([big])).is_err());
+        assert!(crate::store::dir_files(&BTreeSet::from([big]), &|_| false).is_err());
+    }
+
+    /// Too many files under the directories of computed includes: those
+    /// under the directories their paths name (Boost.MPL's
+    /// `BOOST_PP_STRINGIZE(boost/mpl/list/AUX778076_LIST_HEADER)`), in the
+    /// include or its macro's definition, unless a name of theirs is a
+    /// macro.
+    #[test]
+    fn computed_include_paths() {
+        let dir = tree(
+            "computed_paths",
+            &[
+                ("main.cpp", "#include <lib/big.h>\n#include <lib/aux_/inc.h>\n"),
+                ("inc/lib/big.h", "#define STR(x) #x\n#define XSTR(x) STR(x)\n#include XSTR(lib/list/HEADER)\n"),
+                ("inc/lib/list/list10.h", "#include <lib/config/typeof.h>\n"),
+                ("inc/lib/config/typeof.h", "#include XSTR(lib/extra/HEADER)\n"),
+                ("inc/lib/extra/x.h", ""),
+                ("inc/lib/list/aux_/pre.h", ""),
+                ("inc/lib/aux_/inc.h", "#define INC_STRING XSTR(lib/aux_/pre/HEADER)\n#include INC_STRING\n"),
+                ("inc/lib/aux_/pre/plain/a.h", ""),
+                ("other.cpp", "#define list vector\n#include <lib/big.h>\n"),
+            ],
+        );
+        for i in 0..=crate::store::DIR_FILES_MAX {
+            let sub = dir.join("inc/lib/more");
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join(format!("{i}.h")), "").unwrap();
+        }
+        let cache = ScanCache::default();
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &WrittenDirs::default() };
+        let sp = SearchPath { quote: vec![], angled: vec![dir.join("inc")], msvc: false };
+        let r = scanner.scan(&[dir.join("main.cpp")], &sp);
+        assert!(crate::store::dir_files(&r.dirs, &|_| false).is_err());
+        assert_eq!(r.narrow_names.iter().collect::<Vec<_>>(), ["aux_", "lib", "list", "pre"]);
+        let narrowed = |r: &ScanResult| {
+            scanner
+                .narrowed_dirs(r, &sp)
+                .into_iter()
+                .map(|(d, depth)| (d.strip_prefix(&*dir).unwrap().to_string_lossy().replace('\\', "/"), depth))
+                .collect::<Vec<_>>()
+        };
+        let deep = crate::store::DIR_DEPTH_MAX;
+        assert_eq!(narrowed(&r), [("inc/lib/aux_/pre".to_string(), deep), ("inc/lib/list".to_string(), deep)]);
+        assert_eq!(
+            rel(&dir, &crate::store::files_under(scanner.narrowed_dirs(&r, &sp), &|_| false).unwrap().into_iter().collect()),
+            ["inc/lib/aux_/pre/plain/a.h", "inc/lib/list/aux_/pre.h", "inc/lib/list/list10.h"]
+        );
+        // And what those include, elsewhere: not with them.
+        let computed = |r: &ScanResult, macros: &[&str]| scanner.computed_files(r, &sp, &|_| false, &|n| macros.contains(&n));
+        let sent = rel(&dir, &computed(&r, &[]).unwrap().into_iter().collect());
+        for f in ["inc/lib/config/typeof.h", "inc/lib/list/list10.h", "inc/lib/extra/x.h"] {
+            assert!(sent.contains(&f.to_string()), "{f}: {sent:?}");
+        }
+        assert!(computed(&r, &["list"]).is_err());
+        // `list` a macro: the directory's own files.
+        let r = scanner.scan(&[dir.join("other.cpp")], &sp);
+        assert_eq!(narrowed(&r), [("inc/lib".to_string(), 0)]);
+        assert_eq!(rel(&dir, &crate::store::files_under(scanner.narrowed_dirs(&r, &sp), &|_| false).unwrap().into_iter().collect()), ["inc/lib/big.h"]);
     }
 
     /// MSVC's lookup across rounds: a name seen early is found in a
@@ -1552,18 +1885,20 @@ mod tests {
             ],
         );
         let cache = ScanCache::default();
-        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![] };
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &WrittenDirs::default() };
         let sp = SearchPath { quote: vec![], angled: vec![dir.join("inc")], msvc: true };
         let files = rel(&dir, &scanner.scan(&[dir.join("src/main.cc")], &sp).files);
         assert_eq!(files, ["inc/l1/a.h", "inc/l1/y.h", "src/b.h", "src/deep/c.h", "src/deep/zz.h", "src/main.cc"]);
-        // Looked up once: a scan again finds what was found.
-        std::fs::remove_file(dir.join("inc/l1/y.h")).unwrap();
-        let again = rel(&dir, &scanner.scan(&[dir.join("src/main.cc")], &sp).files);
-        assert_eq!(again, files);
+        // Looked up once: a scan again looks nothing up.
+        let looked = cache.stats.lock().unwrap().msvc_lookups;
+        assert!(looked > 0);
+        assert_eq!(rel(&dir, &scanner.scan(&[dir.join("src/main.cc")], &sp).files), files);
+        assert_eq!(cache.stats.lock().unwrap().msvc_lookups, looked);
     }
 
     /// A `..` after a symbolic link: the compiler reads elsewhere than a
-    /// remote worker would: local.
+    /// remote worker would: local. Not on Windows, which applies `..`
+    /// before following links (a junction here), as remote workers do.
     #[test]
     fn dotdot_after_links() {
         let dir = tree("dotdot", &[("main.c", "#include \"lnk/a.h\"\n"), ("real/sub/a.h", "#include \"../b.h\"\n"), ("b.h", ""), ("real/b.h", "")]);
@@ -1581,9 +1916,40 @@ mod tests {
                 .success()
         );
         let cache = ScanCache::default();
-        let scanner = Scanner { cache: &cache, windows: cfg!(windows), volatile_roots: vec![] };
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &WrittenDirs::default() };
         let r = scanner.scan(&[dir.join("main.c")], &SearchPath::default());
-        assert!(r.local.is_some_and(|why| why.contains("symbolic link")));
+        if cfg!(windows) {
+            assert!(r.local.is_none(), "{:?}", r.local);
+            assert_eq!(rel(&dir, &r.files), ["b.h", "lnk/a.h", "main.c"]);
+        } else {
+            assert!(r.local.is_some_and(|why| why.contains("symbolic link")));
+        }
+    }
+
+    /// A file rewritten with its size and modification time kept (an
+    /// archive extracted over it) is read again: its stamp tells.
+    #[test]
+    fn rewritten_files() {
+        let dir = tree("rewritten", &[("main.c", "#include \"a.h\"\n"), ("a.h", ""), ("b.h", "")]);
+        let cache = ScanCache::default();
+        let scanner = Scanner { cache: &cache, windows: cfg!(windows), written: &WrittenDirs::default() };
+        let main = dir.join("main.c");
+        let stamp = |p: &Path| ninja_os::stat(p).unwrap().1;
+        let before = stamp(&main);
+        assert_eq!(rel(&dir, &scanner.scan(std::slice::from_ref(&main), &SearchPath::default()).files), ["a.h", "main.c"]);
+        // Once the file system's clock ticked: a new change time.
+        loop {
+            std::fs::write(dir.join("tick"), "").unwrap();
+            if stamp(&dir.join("tick")).change > before.change {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::fs::write(&main, "#include \"b.h\"\n").unwrap();
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(before.mtime_ns);
+        std::fs::File::options().write(true).open(&main).unwrap().set_modified(mtime).unwrap();
+        assert_eq!((stamp(&main).len, stamp(&main).mtime_ns), (before.len, before.mtime_ns));
+        assert_eq!(rel(&dir, &scanner.scan(std::slice::from_ref(&main), &SearchPath::default()).files), ["b.h", "main.c"]);
     }
 
     /// The compiler's run for its built-in directories is given up on when

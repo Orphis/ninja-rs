@@ -5,6 +5,10 @@ load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
+# The ninja-rs version lives here (`ninja_rs::version`): the module's, with
+# the commit when stamped (`--config=stamp`, `STABLE_GIT_COMMIT` from the
+# workspace status command in .bazelrc). Cargo builds ask git instead
+# (build.rs).
 rust_library(
     name = "ninja_rs_lib",
     srcs = glob(
@@ -13,6 +17,8 @@ rust_library(
     ),
     crate_name = "ninja_rs",
     crate_root = "src/lib.rs",
+    rustc_env_files = ["commit.env"],
+    stamp = -1,
     version = module_version(),
     deps = [
         "//crates/ninja-core",
@@ -32,10 +38,12 @@ rust_library(
     }),
 )
 
-# Embeds the Windows long path manifest (see build.rs).
+# Embeds the Windows long path manifest (see build.rs); the commit comes
+# from stamping, not from git.
 cargo_build_script(
     name = "build_script",
     srcs = ["build.rs"],
+    build_script_env = {"NINJA_RS_BAZEL": "1"},
 )
 
 rust_binary(
@@ -117,6 +125,7 @@ rust_test(
     deps = [
         ":ninja_rs_lib",
         "//crates/ninja-core",
+        "//crates/ninja-remote",
         "//crates/test-dirs",
     ] + select({
         "@platforms//os:windows": ["@crates//:windows-sys"],

@@ -23,13 +23,20 @@ use crate::hash::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::graph::TimeStamp;
 
 pub const BUILD_LOG_FILE: &str = ".ninja_rs_log";
 /// The lock file of a build directory's logs (see [`LogLock`]).
 pub const LOCK_FILE: &str = ".ninja_rs_lock";
+
+/// How often a writer checks that the log it appends to wasn't replaced (by
+/// a process rewriting it without the lock, which ninja-rs doesn't do): the
+/// records it appends to the old one meanwhile are lost. Not at every
+/// write, which would double their cost; but after a generator ran (see
+/// `BuildLog::recheck`) and at the end of a build.
+pub(crate) const REPLACED_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How a process may write a build directory's logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -280,6 +287,14 @@ pub struct BuildLog {
     truncate_to: Option<u64>,
     /// The file's length when loaded (`None`: there was none).
     loaded_len: Option<u64>,
+    /// The records `flush` writes next.
+    pending: String,
+    /// The outputs recorded since the log was opened: a file replacing the
+    /// one their records went to gets them again.
+    recorded: Vec<String>,
+    /// When `ensure_open` last checked that the file wasn't replaced (None:
+    /// at the next flush).
+    checked: Option<Instant>,
 }
 
 impl BuildLog {
@@ -371,38 +386,76 @@ impl BuildLog {
     }
 
     /// The file to append to: the one at the log's path, opened again once
-    /// another process replaced it (recompacted it without the lock).
+    /// another process replaced it (recompacted it without the lock), as
+    /// checked once per `REPLACED_CHECK_INTERVAL`, or at the next flush
+    /// after `recheck`. The new file gets every record made since the log
+    /// was opened (those written to the old one meanwhile were lost).
     fn ensure_open(&mut self) -> Result<&mut File, String> {
-        if self.file.as_ref().is_some_and(|f| ninja_os::replaced(f, Path::new(&self.path))) {
-            self.file = None;
+        if self.checked.is_none_or(|t| t.elapsed() >= REPLACED_CHECK_INTERVAL)
+            && let Some(f) = &self.file
+        {
+            self.checked = Some(Instant::now());
+            if ninja_os::replaced(f, Path::new(&self.path)) {
+                self.file = None;
+                self.pending = self.recorded.iter().filter_map(|o| self.entries.get(o)).map(format_entry).collect();
+            }
         }
         if self.file.is_none() {
             self.cut_torn_line()?;
             self.file = Some(open_log(&self.path).map_err(|e| format!("opening build log: {e}"))?);
+            self.checked = Some(Instant::now());
         }
         Ok(self.file.as_mut().expect("opened"))
     }
 
+    /// Makes the next `flush` check first that the file wasn't replaced
+    /// (a generator ran, which may have rewritten the logs; the build
+    /// ends).
+    pub fn recheck(&mut self) {
+        self.checked = None;
+    }
+
+    /// Records `entry`, which `flush` writes.
     pub fn record(&mut self, entry: LogEntry) -> Result<(), String> {
         if !self.path.is_empty() {
-            self.append(&format_entry(&entry))?;
+            self.pending.push_str(&format_entry(&entry));
+            self.recorded.push(entry.output.clone());
         }
         self.entries.insert(entry.output.clone(), entry);
         Ok(())
     }
 
-    fn append(&mut self, lines: &str) -> Result<(), String> {
-        let f = self.ensure_open()?;
+    /// Writes the records made since the last flush, in one write: the
+    /// build loop flushes once per turn, for the commands it reaped. After
+    /// `recheck`, with nothing to write too: records written to a file
+    /// replaced since go to the new one.
+    pub fn flush(&mut self) -> Result<(), String> {
+        let recheck = self.checked.is_none() && self.file.is_some();
+        if self.pending.is_empty() && !recheck {
+            return Ok(());
+        }
+        self.ensure_open()?;
+        let lines = std::mem::take(&mut self.pending);
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let f = self.file.as_mut().expect("opened");
         f.write_all(lines.as_bytes()).map_err(|e| format!("Error writing to build log: {e}"))
     }
 
+    /// Writes the records left (see `flush`, whose errors are lost: the
+    /// build flushes before) and closes the file.
     pub fn close(&mut self) {
+        self.recheck();
+        let _ = self.flush();
         self.file = None;
     }
 
     /// Rewrites the log keeping only live entries.
     pub fn recompact(&mut self, path: &str, is_live: &dyn Fn(&str) -> bool) -> Result<(), String> {
         self.close();
+        // In the new file, or dead.
+        self.recorded.clear();
         self.entries.retain(|k, _| is_live(k));
         let mut out = String::from(SIGNATURE);
         let mut keys: Vec<&String> = self.entries.keys().collect();
@@ -439,12 +492,19 @@ impl BuildLog {
         }
         self.open_for_write(path, &|_| true, access)?;
         changed.sort();
-        let lines: String = changed.iter().map(|k| format_entry(&self.entries[k])).collect();
-        if !lines.is_empty() {
-            self.append(&lines)?;
-        }
+        self.pending = changed.iter().map(|k| format_entry(&self.entries[k])).collect();
+        self.flush()?;
         self.close();
         Ok(())
+    }
+}
+
+impl Drop for BuildLog {
+    /// Writes the records left: a build flushes its own, but for a panic.
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            self.close();
+        }
     }
 }
 
@@ -584,16 +644,53 @@ mod tests {
         let mut log = BuildLog::new();
         log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
         log.record(entry("a", 1)).unwrap();
+        log.flush().unwrap();
         let other = dir.join("other");
-        std::fs::write(&other, format!("{SIGNATURE}{}", format_entry(&entry("x", 5)))).unwrap();
-        std::fs::rename(&other, &p).unwrap();
+        let replace = |e: LogEntry| {
+            std::fs::write(&other, format!("{SIGNATURE}{}", format_entry(&e))).unwrap();
+            std::fs::rename(&other, &p).unwrap();
+        };
+        // A generator ran.
+        replace(entry("x", 5));
+        log.recheck();
         log.record(entry("b", 2)).unwrap();
+        log.flush().unwrap();
+        let read = || {
+            let mut log = BuildLog::new();
+            log.load(&p).unwrap();
+            log
+        };
+        // The new file has every record of this log's.
+        let new = read();
+        assert_eq!(
+            (new.lookup_by_output("x"), new.lookup_by_output("a"), new.lookup_by_output("b")),
+            (Some(&entry("x", 5)), Some(&entry("a", 1)), Some(&entry("b", 2)))
+        );
+        // Before the end: closing checks, with nothing left to write too.
+        replace(entry("y", 6));
         log.close();
+        let last = read();
+        assert_eq!(
+            (last.lookup_by_output("y"), last.lookup_by_output("a"), last.lookup_by_output("b")),
+            (Some(&entry("y", 6)), Some(&entry("a", 1)), Some(&entry("b", 2)))
+        );
+    }
+
+    /// Records wait for `flush`, which writes them all at once.
+    #[test]
+    fn records_are_written_at_each_flush() {
+        let (_dir, p) = tmp("buildlog-flush");
         let mut log = BuildLog::new();
-        log.load(&p).unwrap();
-        assert_eq!(log.lookup_by_output("x"), Some(&entry("x", 5)));
-        assert_eq!(log.lookup_by_output("b"), Some(&entry("b", 2)));
-        assert!(log.lookup_by_output("a").is_none());
+        log.open_for_write(&p, &|_| true, Access::Exclusive).unwrap();
+        log.record(entry("a", 1)).unwrap();
+        log.flush().unwrap();
+        let before = std::fs::read(&p).unwrap();
+        log.record(entry("b", 2)).unwrap();
+        log.record(entry("c", 3)).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        log.flush().unwrap();
+        let after = std::fs::read(&p).unwrap();
+        assert_eq!(String::from_utf8_lossy(&after[before.len()..]), format_entry(&entry("b", 2)) + &format_entry(&entry("c", 3)));
     }
 
     /// `-t restat`: an exclusive writer rewrites the log, a shared one

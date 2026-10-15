@@ -339,6 +339,8 @@ pub trait CommandRunner: Send {
     /// Starts a task without blocking.
     fn start_command(&mut self, task: Task) -> Result<(), String>;
     /// Waits for the next task to finish. `None` if nothing is running.
+    /// The engine also polls it once for a task finished already, and
+    /// drops it if none is: a result must not be lost then.
     fn wait_for_command(&mut self) -> WaitFuture<'_>;
     fn active_edges(&self) -> Vec<EdgeId>;
     /// Stops everything running. Completes once the commands started have
@@ -347,6 +349,24 @@ pub trait CommandRunner: Send {
     /// Whether it reads `Task::inputs` (a remote backend does): the engine
     /// doesn't gather them otherwise.
     fn wants_inputs(&self) -> bool {
+        true
+    }
+    /// How many kinds of slots it has (local ones, remote ones...): tasks
+    /// of a kind run at most so many at once. One by default.
+    fn slot_kinds(&self) -> usize {
+        1
+    }
+    /// Which kind of slots `task` would take, below `slot_kinds`, from its
+    /// edge's bindings (its inputs aren't gathered yet), for
+    /// `has_free_slot`.
+    fn slots_of(&self, _task: &Task) -> usize {
+        0
+    }
+    /// Whether a task taking slots of `kind` may start now. One whose slots
+    /// are all taken waits in the plan, other kinds starting meanwhile,
+    /// rather than in the runner, where it would count as started (and its
+    /// wait in its times) and take room tasks of other kinds could use.
+    fn has_free_slot(&self, _kind: usize) -> bool {
         true
     }
 }

@@ -4,7 +4,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -25,14 +25,41 @@ fn short_hash(parts: &[&[u8]]) -> String {
     hex::encode(&h.finalize()[..8])
 }
 
+/// The identity of the file at `path` (links followed): its device or
+/// volume, and its inode or file ID, however the path spells it.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> io::Result<(u64, u128)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok((meta.dev(), u128::from(meta.ino())))
+}
+
+#[cfg(windows)]
+fn file_identity(path: &Path) -> io::Result<(u64, u128)> {
+    ninja_os::identity(&ninja_os::windows::open_attributes(path)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(path: &Path) -> io::Result<(u64, u128)> {
+    let real = std::fs::canonicalize(path)?;
+    Ok((0, u128::from_str_radix(&short_hash(&[real.to_string_lossy().as_bytes()]), 16).unwrap_or_default()))
+}
+
+/// How long builds don't start a daemon again after one failed to start
+/// (one that dies at once would, every build, after waiting for it).
+pub const START_FAILED_FOR: Duration = Duration::from_secs(5 * 60);
+
 impl Location {
     /// The daemon of the ninja-rs binary `exe`, for this user: a rebuilt
-    /// binary gets its own (the old one exits when idle). The directory is
-    /// `NINJA_RS_DAEMON_DIR` when set.
+    /// binary gets its own (the old one exits when idle). The binary is
+    /// told by its identity, not its path: through another spelling (case,
+    /// slashes, a junction, a `subst` drive, a link) it's the same daemon.
+    /// The directory is `NINJA_RS_DAEMON_DIR` when set.
     pub fn for_exe(exe: &Path) -> io::Result<Location> {
         let meta = std::fs::metadata(exe)?;
         let mtime = meta.modified()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let id = short_hash(&[exe.to_string_lossy().as_bytes(), &meta.len().to_le_bytes(), &mtime.to_le_bytes()]);
+        let (volume, file) = file_identity(exe)?;
+        let id = short_hash(&[&volume.to_le_bytes(), &file.to_le_bytes(), &meta.len().to_le_bytes(), &mtime.to_le_bytes()]);
         Ok(Location { dir: default_dir()?, id })
     }
 
@@ -47,6 +74,37 @@ impl Location {
 
     pub fn log_file(&self) -> PathBuf {
         self.dir.join(format!("{}.log", self.id))
+    }
+
+    /// The log before the one being written (see `server::logger`).
+    pub fn old_log_file(&self) -> PathBuf {
+        self.dir.join(format!("{}.log.1", self.id))
+    }
+
+    /// Says why its daemon couldn't start, and since when (see
+    /// `start_failed`).
+    fn failed_file(&self) -> PathBuf {
+        self.dir.join(format!("{}.failed", self.id))
+    }
+
+    /// Why its daemon failed to start, if it did less than `within` ago.
+    pub fn start_failed(&self, within: Duration) -> Option<String> {
+        let path = self.failed_file();
+        let when = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+        let ago = SystemTime::now().duration_since(when).unwrap_or_default();
+        if ago >= within {
+            return None;
+        }
+        let why = std::fs::read_to_string(&path).ok()?;
+        Some(format!("{why} ({}s ago)", ago.as_secs()))
+    }
+
+    /// Notes that its daemon failed to start, and why (`None`: it started).
+    pub fn note_start(&self, failed: Option<&str>) {
+        let _ = match failed {
+            Some(why) => std::fs::write(self.failed_file(), why),
+            None => std::fs::remove_file(self.failed_file()),
+        };
     }
 
     /// Where the watcher's cookies go for roots without a repository
@@ -78,15 +136,23 @@ impl Location {
     }
 
     /// Removes the files of other daemons in its directory (of other
-    /// ninja-rs binaries: copies, locks, logs, cookies) unless they run.
+    /// ninja-rs binaries: copies, locks, logs, cookies, failures) unless
+    /// they run; and copies left half made (`{id}.{pid}.tmp`, a build that
+    /// stopped while copying) a while ago.
     pub fn remove_others(&self) -> io::Result<()> {
+        const TMP_KEPT: Duration = Duration::from_secs(10 * 60);
         for e in std::fs::read_dir(&self.dir)?.flatten() {
             let path = e.path();
-            let (Some(id), Some(kind)) = (path.file_stem().and_then(|s| s.to_str()), path.extension().and_then(|s| s.to_str())) else { continue };
-            if id == self.id || !matches!(kind, "exe" | "lock" | "log" | "cookies") {
+            // `{id}.{kind}`: ids have no dots.
+            let Some((id, kind)) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.split_once('.')) else { continue };
+            let tmp = kind.ends_with(".tmp");
+            if !tmp && (id == self.id || !matches!(kind, "exe" | "lock" | "log" | "log.1" | "cookies" | "failed")) {
                 continue;
             }
-            if (Location { dir: self.dir.clone(), id: id.to_string() }).running() {
+            if tmp && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() < TMP_KEPT) {
+                continue;
+            }
+            if !tmp && (Location { dir: self.dir.clone(), id: id.to_string() }).running() {
                 continue;
             }
             let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
@@ -173,7 +239,9 @@ fn default_dir() -> io::Result<PathBuf> {
         }
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
-        Ok(std::env::temp_dir().join(format!("ninja-rs-{uid}")))
+        #[allow(clippy::disallowed_methods)] // The daemon's own directory, not a test's.
+        let base = std::env::temp_dir();
+        Ok(base.join(format!("ninja-rs-{uid}")))
     }
 }
 
@@ -267,10 +335,11 @@ mod platform {
 
     /// Starts `exe` in the background, out of the terminal's process group
     /// (so that Ctrl-C in the build doesn't stop it), without the variables
-    /// `env_remove`, nor any file of the build's: descriptors it inherited
-    /// without close-on-exec (a jobserver's, a pipe its caller reads) would
-    /// stay open as long as the daemon runs.
-    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path, env_remove: &[&str]) -> io::Result<()> {
+    /// `env_remove` and with those of `env_set`, nor any file of the
+    /// build's: descriptors it inherited without close-on-exec (a
+    /// jobserver's, a pipe its caller reads) would stay open as long as the
+    /// daemon runs.
+    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path, env_remove: &[&str], env_set: &[(&str, &std::ffi::OsStr)]) -> io::Result<Child> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
         let mut c = Command::new(exe);
@@ -278,6 +347,7 @@ mod platform {
         for v in env_remove {
             c.env_remove(v);
         }
+        c.envs(env_set.iter().copied());
         // SAFETY: the closure only makes system calls, which are
         // async-signal-safe.
         unsafe {
@@ -286,7 +356,19 @@ mod platform {
                 Ok(())
             })
         };
-        c.spawn().map(|_| ())
+        c.spawn().map(Child)
+    }
+
+    /// A process `spawn_detached` started.
+    pub struct Child(std::process::Child);
+
+    impl Child {
+        /// None while it runs; Ok once it exited successfully, else how it
+        /// ended.
+        pub fn exited(&mut self) -> Option<Result<(), String>> {
+            let status = self.0.try_wait().ok()??;
+            Some(if status.success() { Ok(()) } else { Err(status.to_string()) })
+        }
     }
 
     /// Marks the descriptors from `first` on close-on-exec (std's own,
@@ -604,11 +686,12 @@ mod platform {
 
     /// Starts `exe` in the background, detached from the console (so that
     /// Ctrl-C in the build doesn't stop it), out of the build's job object
-    /// when it allows that, without the variables `env_remove`. It inherits
-    /// no handle: std's spawn passes on every inheritable one, the pipes the
-    /// build's output goes to included, which their reader (an IDE, `| tee`)
-    /// would then wait on until the daemon exits, hours later.
-    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path, env_remove: &[&str]) -> io::Result<()> {
+    /// when it allows that, without the variables `env_remove` and with
+    /// those of `env_set`. It inherits no handle: std's spawn passes on
+    /// every inheritable one, the pipes the build's output goes to
+    /// included, which their reader (an IDE, `| tee`) would then wait on
+    /// until the daemon exits, hours later.
+    pub fn spawn_detached(exe: &Path, args: &[&str], cwd: &Path, env_remove: &[&str], env_set: &[(&str, &std::ffi::OsStr)]) -> io::Result<Child> {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
@@ -622,7 +705,10 @@ mod platform {
         }
         line.push(0);
         // Sorted by name, ignoring case, as Windows wants it.
-        let mut vars: Vec<_> = std::env::vars_os().filter(|(k, _)| !env_remove.iter().any(|r| k.eq_ignore_ascii_case(r))).collect();
+        let mut vars: Vec<_> = std::env::vars_os()
+            .filter(|(k, _)| !env_remove.iter().chain(env_set.iter().map(|(k, _)| k)).any(|r| k.eq_ignore_ascii_case(r)))
+            .chain(env_set.iter().map(|(k, v)| (k.into(), v.into())))
+            .collect();
         vars.sort_by_cached_key(|(k, _)| k.to_string_lossy().to_uppercase());
         let mut env = Vec::new();
         for (k, v) in vars {
@@ -655,14 +741,35 @@ mod platform {
             if ok == 0 {
                 return Err(io::Error::last_os_error());
             }
-            // SAFETY: handles the call returned, not used again.
+            // SAFETY: handles the call returned: the thread's not used
+            // again, the process' owned from now on.
             unsafe {
                 CloseHandle(info.hThread);
-                CloseHandle(info.hProcess);
+                Ok(Child(OwnedHandle::from_raw_handle(info.hProcess)))
             }
-            Ok(())
         };
         spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP))
+    }
+
+    /// A process `spawn_detached` started.
+    pub struct Child(OwnedHandle);
+
+    impl Child {
+        /// None while it runs; Ok once it exited successfully, else how it
+        /// ended.
+        pub fn exited(&mut self) -> Option<Result<(), String>> {
+            use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+            use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+            let mut code = 0u32;
+            // SAFETY: a process handle this owns, and a valid out-parameter.
+            let ended =
+                unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_OBJECT_0 && GetExitCodeProcess(self.0.as_raw_handle(), &mut code) != 0 };
+            ended.then(|| match code {
+                0 => Ok(()),
+                c if c > 0xffff => Err(format!("exit code {c:#x}")),
+                c => Err(format!("exit code {c}")),
+            })
+        }
     }
 
     /// Appends `arg` to a command line, as `CommandLineToArgvW` (and the C
@@ -697,7 +804,7 @@ mod platform {
     }
 }
 
-pub use platform::{Listener, Stream, TimedStream, connect, connect_timed, spawn_detached};
+pub use platform::{Child, Listener, Stream, TimedStream, connect, connect_timed, spawn_detached};
 
 #[cfg(test)]
 mod tests {
@@ -740,7 +847,8 @@ mod tests {
     }
 
     /// The files of other daemons go, unless they run (they used to go
-    /// all, those of running ones included).
+    /// all, those of running ones included); so do copies left half made a
+    /// while ago (they never went, 20 MB each), not those being made.
     #[test]
     fn others_removed() {
         let base = test_dirs::TestDir::new("ninja_daemon_others");
@@ -748,19 +856,60 @@ mod tests {
         let (me, running, gone) = (at("me"), at("running"), at("gone"));
         me.create_dir().unwrap();
         for loc in [&me, &running, &gone] {
-            for f in [loc.lock_file(), loc.log_file(), loc.dir.join(format!("{}.exe", loc.id))] {
+            for f in [loc.lock_file(), loc.log_file(), loc.old_log_file(), loc.dir.join(format!("{}.exe", loc.id))] {
                 std::fs::write(f, "").unwrap();
             }
             std::fs::create_dir(loc.cookie_dir()).unwrap();
+            loc.note_start(Some("it failed"));
         }
+        let (old, new) = (me.dir.join("gone.1234.tmp"), me.dir.join("gone.5678.tmp"));
+        for f in [&old, &new] {
+            std::fs::write(f, "a copy").unwrap();
+        }
+        let long_ago = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(long_ago).unwrap();
         let lock = std::fs::File::options().write(true).open(running.lock_file()).unwrap();
         lock.try_lock().unwrap();
         assert!(running.running() && !gone.running());
         me.remove_others().unwrap();
         let mut left: Vec<String> = std::fs::read_dir(&me.dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        let expected = ["me.cookies", "me.exe", "me.lock", "me.log", "running.cookies", "running.exe", "running.lock", "running.log"];
+        let mine = ["me.cookies", "me.exe", "me.failed", "me.lock", "me.log", "me.log.1"];
+        let running = ["running.cookies", "running.exe", "running.failed", "running.lock", "running.log", "running.log.1"];
+        let expected: Vec<&str> = std::iter::once("gone.5678.tmp").chain(mine).chain(running).collect();
         assert_eq!(left, expected);
+    }
+
+    /// A binary has one daemon, however its path is spelled (`.`, case,
+    /// slashes, a link to its directory): each spelling used to get its
+    /// own, which `-t daemon status` and `stop` didn't see. Another binary
+    /// (a copy) has another.
+    #[test]
+    fn one_daemon_per_binary() {
+        let base = test_dirs::TestDir::new("ninja_daemon_spellings");
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        let exe = base.join("bin").join("ninja-rs");
+        std::fs::write(&exe, "the binary").unwrap();
+        let id = |p: &Path| Location::for_exe(p).unwrap().id;
+        let mut spellings = vec![base.join("bin").join(".").join("ninja-rs")];
+        let linked = base.join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("bin"), &linked).unwrap();
+        #[cfg(windows)]
+        {
+            let backslashes = |p: &Path| p.to_string_lossy().replace('/', "\\");
+            let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J", &backslashes(&linked), &backslashes(&base.join("bin"))]).output().unwrap();
+            assert!(made.status.success(), "{made:?}");
+            spellings.push(PathBuf::from(exe.to_string_lossy().to_uppercase().replace('\\', "/")));
+        }
+        spellings.push(linked.join("ninja-rs"));
+        for p in &spellings {
+            assert_eq!(id(p), id(&exe), "{}", p.display());
+        }
+        let copy = base.join("copy");
+        std::fs::copy(&exe, &copy).unwrap();
+        std::fs::File::options().write(true).open(&copy).unwrap().set_modified(std::fs::metadata(&exe).unwrap().modified().unwrap()).unwrap();
+        assert_ne!(id(&copy), id(&exe));
     }
 
     /// Lets everyone change `dir`.
@@ -810,7 +959,7 @@ mod tests {
         };
         let pid_file = dir.join("pid");
         let script = format!("echo $$ > '{}'.tmp && mv '{0}'.tmp '{0}' && exec sleep 600", pid_file.display());
-        spawn_detached(Path::new("/bin/sh"), &["-c", &script], &dir, &[]).unwrap();
+        spawn_detached(Path::new("/bin/sh"), &["-c", &script], &dir, &[], &[]).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let pid: i32 = loop {
             if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|p| p.trim().parse().ok()) {

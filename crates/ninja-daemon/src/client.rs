@@ -9,13 +9,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::ipc::{self, Location, TimedStream};
+use crate::ipc::{self, Child, Location, START_FAILED_FOR, TimedStream};
 use crate::proto::{self, Begin, FileInfo, PROTOCOL, Request, Response, ScanOutput, Status, TreeInfo};
 
 /// How long the daemon may take to answer: listing a large toolchain the
 /// first time, or a scan probing a compiler, takes seconds. A daemon stuck
 /// longer is given up on (the build does the work itself).
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a daemon just started may take to answer.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Client {
     location: Location,
@@ -59,24 +62,47 @@ impl Client {
         }
     }
 
-    /// Connects, starting the daemon with `start` when none answers. One
-    /// that answers in another protocol is given up on at once: another
-    /// daemon can't start there while it runs.
-    pub fn connect_or_start(location: &Location, start: impl FnOnce() -> io::Result<()>) -> io::Result<Client> {
+    /// Connects, starting the daemon with `start` (which gives the process
+    /// it started, if any) when none answers. One that answers in another
+    /// protocol is given up on at once: another daemon can't start there
+    /// while it runs. One that exits as it starts (not finding another
+    /// running) is given up on at once, and isn't started again for a
+    /// while (`START_FAILED_FOR`): builds don't each wait for it.
+    pub fn connect_or_start(location: &Location, start: impl FnOnce() -> io::Result<Option<Child>>) -> io::Result<Client> {
         let mismatch = |e: &io::Error| e.kind() == io::ErrorKind::Unsupported;
         match Client::connect(location) {
             Ok(c) => return Ok(c),
             Err(e) if mismatch(&e) => return Err(e),
             Err(_) => {}
         }
-        start()?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let log = location.log_file();
+        if let Some(why) = location.start_failed(START_FAILED_FOR) {
+            return Err(io::Error::other(format!("it failed to start: {why}; see {} (`ninja-rs -t daemon start` tries again)", log.display())));
+        }
+        let mut child = start()?;
+        let failed = |e: io::Error, why: String| {
+            location.note_start(Some(&why));
+            io::Error::new(e.kind(), format!("{why}; see {}", log.display()))
+        };
+        let deadline = Instant::now() + START_TIMEOUT;
         loop {
             match Client::connect(location) {
-                Ok(c) => return Ok(c),
+                Ok(c) => {
+                    location.note_start(None);
+                    return Ok(c);
+                }
                 Err(e) if mismatch(&e) => return Err(e),
-                Err(e) if Instant::now() >= deadline => return Err(io::Error::new(e.kind(), format!("the daemon didn't start: {e}"))),
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => {
+                    // One finding another running exits successfully: that
+                    // one answers soon.
+                    if let Some(Err(how)) = child.as_mut().and_then(Child::exited) {
+                        return Err(failed(e, format!("the daemon exited as it started ({how})")));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(failed(e, format!("the daemon didn't answer in {START_TIMEOUT:?}")));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
         }
     }
@@ -219,7 +245,7 @@ mod tests {
         let loc = location(&base, "forgot");
         let served = loc.clone();
         std::thread::spawn(move || crate::server::serve(&served, Duration::from_secs(3600), None));
-        let client = Client::connect_or_start(&loc, || Ok(())).unwrap();
+        let client = Client::connect_or_start(&loc, || Ok(None)).unwrap();
         client.begin(Begin { build_dir: base.join("long"), ..Default::default() }).unwrap();
         let other = Client::connect(&loc).unwrap();
         for i in 0..=64 {
@@ -255,6 +281,38 @@ mod tests {
         fake_daemon(&loc, |_| Response::Hello { protocol: PROTOCOL + 1, pid: 1, version: "next".into() });
         let e = Client::connect_or_start(&loc, || panic!("started another daemon")).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+    }
+
+    /// A daemon that exits as it starts (it can't listen, it crashes) is
+    /// given up on at once (builds used to wait 10 s for it), and not
+    /// started again for a while, but when asked to.
+    #[test]
+    fn failed_starts() {
+        let base = TestDir::new("ninja_daemon_client_failed");
+        let loc = location(&base, "failed");
+        let shell = |code: i32| {
+            #[cfg(unix)]
+            let c = ipc::spawn_detached(Path::new("/bin/sh"), &["-c", &format!("exit {code}")], &base, &[], &[]);
+            // Bazel's tests don't get `ComSpec`; `SystemRoot` they do.
+            #[cfg(windows)]
+            let cmd = std::env::var_os("ComSpec")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join(r"System32\cmd.exe"));
+            #[cfg(windows)]
+            let c = ipc::spawn_detached(&cmd, &["/c", &format!("exit {code}")], &base, &[], &[]);
+            c.map(Some)
+        };
+        let e = Client::connect_or_start(&loc, || shell(3)).unwrap_err();
+        assert!(e.to_string().contains("exited as it started") && e.to_string().contains("3"), "{e}");
+        let e = Client::connect_or_start(&loc, || panic!("started again")).unwrap_err();
+        assert!(e.to_string().contains("failed to start: the daemon exited as it started"), "{e}");
+        // Asked to start it: the failure is forgotten, and a daemon that
+        // answers is used.
+        loc.note_start(None);
+        let served = loc.clone();
+        std::thread::spawn(move || crate::server::serve(&served, Duration::from_secs(3600), None));
+        Client::connect_or_start(&loc, || Ok(None)).unwrap();
+        assert_eq!(loc.start_failed(START_FAILED_FOR), None);
     }
 
     /// A daemon that doesn't answer is given up on.

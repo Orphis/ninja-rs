@@ -10,6 +10,8 @@
 //! one (as a daemon would see). Times are wall clock with N threads taking
 //! compiles from a queue, as a build would.
 
+#![allow(clippy::disallowed_macros)] // It prints what it found.
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -30,10 +32,16 @@ type Inputs = Result<Vec<PathBuf>, String>;
 fn conservative(cache: &ScanCache, c: &Compile) -> Inputs {
     let windows = cfg!(windows);
     let (expanded, _) = scanner::expand_response_files(&c.argv, &c.cwd, windows);
-    let info = scanner::parse_compile(&expanded, &c.cwd);
-    let s = Scanner { cache, windows, volatile_roots: vec![c.cwd.clone()] };
+    let mut info = scanner::parse_compile(&expanded, &c.cwd);
+    // (The build directory stands for the directories the build writes to.)
+    let written = scanner::WrittenDirs::new([c.cwd.clone()], windows);
+    let s = Scanner { cache, windows, written: &written };
     let builtin = s.builtin_dirs(Path::new(&c.argv[0]), &info)?;
     let mut sp = scanner::search_path(&info, &builtin);
+    sp.msvc = s.msvc_lookup(Path::new(&c.argv[0]), &info);
+    if sp.msvc != info.msvc_lookup {
+        info.place_forced_includes(sp.msvc);
+    }
     if info.style == Some(Style::Msvc)
         && let Some(inc) = std::env::var_os("INCLUDE")
     {
@@ -42,12 +50,11 @@ fn conservative(cache: &ScanCache, c: &Compile) -> Inputs {
     let mut roots = info.sources.clone();
     roots.extend(info.forced_includes.iter().cloned());
     let r = s.scan(&roots, &sp);
-    let mut files: Vec<PathBuf> = r.files.into_iter().collect();
-    for d in &r.dirs {
-        let mut list = Vec::new();
-        ninja_remote::store::walk_files(d, "", &mut list);
-        files.extend(list.iter().map(|f| d.join(f)));
+    if let Some(why) = r.local {
+        return Err(why);
     }
+    let mut files: Vec<PathBuf> = r.files.iter().cloned().collect();
+    files.extend(s.computed_files(&r, &sp, &|d| written.contains(d), &|n| s.predefined(Path::new(&c.argv[0]), &info, n))?);
     files.extend(info.extra_files);
     Ok(files)
 }

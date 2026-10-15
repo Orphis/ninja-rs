@@ -17,10 +17,14 @@
 //!                      which removes those unused for a month itself
 //! ```
 //!
-//! A directory without `VERSION` that isn't empty is another tool's (Bazel's
-//! `--disk_cache`, which a shared `.bazelrc` names, has the same `ac/` and
-//! `cas/`): it is used as it is, without writing `VERSION` there, and its
-//! garbage is left to its owner.
+//! A directory without `VERSION` (removed by a cleaner of old files) is
+//! ours again when it has the `size` only this cache writes (after every
+//! build that wrote to it): `VERSION` is written back. Without it, one with
+//! Bazel's layout (`ac/`, `cas/`, and `tmp/`, `gc/`, but what this cache
+//! adds using it) is Bazel's `--disk_cache`, which a shared `.bazelrc`
+//! names: it is used as it is, without writing `VERSION` there, its
+//! garbage left to its owner, and the build says so once. Any other
+//! directory that isn't empty (a mistyped path) isn't used.
 //!
 //! Content-defined chunking: a blob larger than [`CHUNK_MAX`] is stored as
 //! its FastCDC 2020 chunks (REAPI's `FAST_CDC_2020` with its recommended
@@ -86,6 +90,54 @@ pub(crate) fn unique_name() -> String {
     format!("{}-{}-{:016x}", std::process::id(), N.fetch_add(1, Ordering::Relaxed), ninja_os::random_u64())
 }
 
+/// What a directory without `VERSION` holds (see the module's
+/// documentation).
+#[derive(Debug, PartialEq, Eq)]
+enum Layout {
+    /// Nothing: a new cache.
+    Empty,
+    /// This cache's, its `VERSION` gone.
+    Ours,
+    /// Bazel's.
+    Bazel,
+    /// Something else.
+    Other,
+}
+
+/// The top-level entries of this cache's layout: Bazel's (`ac`, `cas`,
+/// `tmp`, and its collector's `gc`), and those this cache adds, even to a
+/// Bazel cache it uses.
+const LAYOUT: &[&str] = &["VERSION", "ac", "cas", "chunked", "tmp", "gc", "size", "cpp-deps"];
+
+fn layout(root: &Path) -> Layout {
+    let Ok(entries) = std::fs::read_dir(root) else { return Layout::Empty };
+    let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    if names.is_empty() {
+        Layout::Empty
+    } else if !names.iter().all(|n| LAYOUT.contains(&n.as_str())) || !names.iter().any(|n| n == "ac" || n == "cas") {
+        Layout::Other
+    } else if names.iter().any(|n| n == "size") {
+        Layout::Ours
+    } else {
+        Layout::Bazel
+    }
+}
+
+/// Says once per process that the cache in `root` is Bazel's.
+fn note_bazel_cache(root: &Path) {
+    static NOTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut noted = NOTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if noted.iter().any(|r| r == root) {
+        return;
+    }
+    noted.push(root.to_path_buf());
+    ninja_core::status::message(&format!(
+        "note: the disk cache {} is Bazel's (no VERSION): used as it is, its old entries left to Bazel to remove. \
+         (If it's ninja-rs's, writing {VERSION} to its VERSION file makes it so.)",
+        root.display()
+    ));
+}
+
 /// How old a file in `tmp/` must be for garbage collection to remove it:
 /// one left by a writer that died.
 const STALE_TMP: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -118,11 +170,19 @@ impl DiskCache {
             Ok(v) => {
                 return Err(std::io::Error::other(format!("{} has format version {}, this ninja-rs uses {VERSION}", root.display(), v.trim())));
             }
-            Err(_) if std::fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_some()) => foreign = true,
-            Err(_) => {
-                std::fs::create_dir_all(root)?;
-                std::fs::write(&version, format!("{VERSION}\n"))?;
-            }
+            Err(_) => match layout(root) {
+                Layout::Empty | Layout::Ours => {
+                    std::fs::create_dir_all(root)?;
+                    std::fs::write(&version, format!("{VERSION}\n"))?;
+                }
+                Layout::Bazel => {
+                    foreign = true;
+                    note_bazel_cache(root);
+                }
+                Layout::Other => {
+                    return Err(std::io::Error::other(format!("{} isn't empty, and isn't a disk cache", root.display())));
+                }
+            },
         }
         let dirs: &[&str] = if foreign { &["cas", "chunked", "ac", "tmp"] } else { &["cas", "chunked", "ac", "tmp", "gc"] };
         for d in dirs {
@@ -342,7 +402,8 @@ impl DiskCache {
         }
         if !is_chunked(d) {
             let data = std::fs::read(path)?;
-            anyhow::ensure!(data.len() as i64 == d.size_bytes, "{} changed while being stored", path.display());
+            let changed = data.len() as i64 != d.size_bytes || (check && rbe_client::verify(d, &data).is_err());
+            anyhow::ensure!(!changed, "{} changed while being stored", path.display());
             self.write_atomic(&self.blob_path(&d.hash).ok_or_else(|| malformed(&d.hash))?, &data)?;
             return Ok(());
         }
@@ -856,9 +917,10 @@ mod tests {
         assert!(!stale.exists());
     }
 
-    /// Another tool's cache (Bazel's, named by a shared `.bazelrc`): used
-    /// as it is, without a `VERSION` of ours, and its entries never
-    /// collected. An empty directory becomes ours.
+    /// Bazel's cache (named by a shared `.bazelrc`): used as it is, without
+    /// a `VERSION` of ours, and its entries never collected. An empty
+    /// directory becomes ours; ours without its `VERSION` (removed by a
+    /// cleaner) is ours again, collected; another directory isn't one.
     #[test]
     fn another_tools_cache() {
         let dir = test_dirs::TestDir::new("ninja-rs-disk-cache-bazel");
@@ -878,6 +940,26 @@ mod tests {
         assert!(!DiskCache::open(&empty).unwrap().is_foreign());
         assert!(empty.join("VERSION").exists());
         assert!(!DiskCache::open(&empty.join("new")).unwrap().is_foreign());
+
+        let (c, dir) = cache("version-removed");
+        let old = (0..3u8).map(|i| vec![i; 1000]).collect::<Vec<_>>();
+        for data in &old {
+            c.put_bytes(&rbe_client::digest_of(data), data).unwrap();
+        }
+        c.collect_garbage(u64::MAX, u64::MAX).unwrap();
+        std::fs::remove_file(dir.join("VERSION")).unwrap();
+        let c = DiskCache::open(&dir).unwrap();
+        assert!(!c.is_foreign() && dir.join("VERSION").exists());
+        assert_eq!(c.collect_garbage(1, 0).unwrap().map(|(files, _)| files), Some(3));
+
+        let elsewhere = test_dirs::TestDir::new("ninja-rs-disk-cache-mistyped");
+        std::fs::write(elsewhere.join("main.c"), "int main() {}").unwrap();
+        assert!(DiskCache::open(&elsewhere).is_err());
+        assert!(!elsewhere.join("VERSION").exists() && !elsewhere.join("cas").exists());
+        // Bazel's has `ac/` or `cas/`.
+        std::fs::create_dir(elsewhere.join("tmp")).unwrap();
+        std::fs::remove_file(elsewhere.join("main.c")).unwrap();
+        assert!(DiskCache::open(&elsewhere).is_err());
     }
 
     #[test]

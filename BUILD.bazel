@@ -2,6 +2,7 @@ exports_files([
     "Cargo.toml",
     "Cargo.lock",
     "MODULE.bazel",
+    "clippy.toml",
 ])
 
 alias(

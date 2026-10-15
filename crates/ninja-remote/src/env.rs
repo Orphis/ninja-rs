@@ -138,10 +138,11 @@ const CLANG: &[(&str, Value)] = &[
 /// ...or into files the action doesn't return.
 const CLANG_REFUSED: &[&str] = &["CC_PRINT_OPTIONS_FILE", "CC_PRINT_HEADERS_FILE", "CC_LOG_DIAGNOSTICS_FILE", "CC_PRINT_PROC_STAT_FILE"];
 
-/// MSVC linkers: library directories, options added to every command line
-/// (unless lld-link ignores the environment). No linker reads `LIBPATH`
-/// (cl's `/clr` does).
-const MSVC_LINK: &[(&str, Value)] = &[("LIB", Value::MsvcPaths), ("LINK", Value::Options), ("_LINK_", Value::Options)];
+/// MSVC linkers: library directories, and options added to every command
+/// line (unless lld-link ignores the environment). No linker reads
+/// `LIBPATH` (cl's `/clr` does).
+const MSVC_LIB: &[(&str, Value)] = &[("LIB", Value::MsvcPaths)];
+const LINK_OPTIONS: &[(&str, Value)] = &[("LINK", Value::Options), ("_LINK_", Value::Options)];
 
 /// GNU-style links: library directories, where the driver finds its
 /// programs, Apple SDKs and timestamps, and the run-time library path the
@@ -157,9 +158,9 @@ const GNU_LINK: &[(&str, Value)] = &[
     ("LD_RUN_PATH", Value::Plain),
 ];
 
-/// Archivers: Apple's timestamps; lib.exe's library directories.
+/// Archivers: Apple's timestamps. (lib.exe's library directories are
+/// `MSVC_LIB`, see `lib_searches_env`.)
 const AR: &[(&str, Value)] = &[("ZERO_AR_DATE", Value::Plain)];
-const LIB: &[(&str, Value)] = &[("LIB", Value::MsvcPaths)];
 
 /// Whether a cl-style command line has an option (`/name` or `-name`),
 /// alone or with a value joined (`/vctoolsdirC:\vc`): `names` are
@@ -192,12 +193,45 @@ fn linker_args(args: &[String], cl: bool) -> Vec<&str> {
     out
 }
 
+/// Whether lib.exe or llvm-lib, given `args`, looks for an input in `LIB`'s
+/// directories: when it isn't found from the working directory, nor in a
+/// `/LIBPATH:` directory (`present` tells, for a path relative to the
+/// working directory or absolute).
+fn lib_searches_env(args: &[String], present: &dyn Fn(&Path) -> bool) -> bool {
+    let libpaths: Vec<&str> = args
+        .iter()
+        .filter_map(|a| a.strip_prefix(['/', '-'])?.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("libpath"))
+        .map(|(_, dir)| dir.trim_matches('"'))
+        .collect();
+    // An absolute POSIX path is an input, not an option.
+    let mut inputs = args.iter().filter(|a| !(a.starts_with('-') || (a.starts_with('/') && !present(Path::new(a.as_str())))));
+    inputs.any(|i| !present(Path::new(i)) && !libpaths.iter().any(|d| present(&Path::new(d).join(i))))
+}
+
 impl Tool {
     /// The tool `exe` running `argv` (response files expanded, with the
     /// options `CL` or `LINK` add): compiling (`style`, the scanner's),
     /// linking, archiving. `windows`: on a Windows host, where Clang
-    /// targets MSVC unless told otherwise.
+    /// targets MSVC unless told otherwise. As `of_step`, for a command line
+    /// without response files whose files are found from this process's
+    /// directory.
     pub fn of(exe: &Path, argv: &[String], style: Option<crate::scanner::Style>, windows: bool) -> Tool {
+        Self::of_step(exe, argv, argv, style, windows, &|p| p.is_file())
+    }
+
+    /// The tool of a step: `exe` running `argv` (as for `of`), whose
+    /// command line is `written` (response files unexpanded), and for
+    /// which `present` tells which files are there (absolute, or relative
+    /// to its working directory).
+    pub fn of_step(
+        exe: &Path,
+        written: &[String],
+        argv: &[String],
+        style: Option<crate::scanner::Style>,
+        windows: bool,
+        present: &dyn Fn(&Path) -> bool,
+    ) -> Tool {
         let name = exe.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         let clang = name.contains("clang");
         let cl = style == Some(crate::scanner::Style::Msvc);
@@ -270,11 +304,24 @@ impl Tool {
             }
             Kind::MsvcLink { clang, driver } => {
                 let linker = if driver { linker_args(args, true) } else { args.iter().map(String::as_str).collect() };
-                if !(clang && link_option(&linker, "lldignoreenv")) {
-                    tool.add(MSVC_LINK);
+                // lld-link's `/lldignoreenv`: it then reads neither `LIB` nor
+                // where Visual Studio is (nor `LIB` under `/winsysroot`).
+                // Nor `LINK` and `_LINK_`, which it adds before reading
+                // response files: when its own command line has it, not a
+                // response file (a driver passes it on the linker's).
+                let ignores = clang && link_option(&linker, "lldignoreenv");
+                let written_args: Vec<&str> = written.get(1..).unwrap_or_default().iter().map(String::as_str).collect();
+                let ignores_options = if driver { ignores } else { clang && link_option(&written_args, "lldignoreenv") };
+                let sysroot = clang && !driver && link_option(&linker, "winsysroot");
+                if !ignores && !sysroot {
+                    tool.add(MSVC_LIB);
+                }
+                if !ignores_options {
+                    tool.add(LINK_OPTIONS);
                 }
                 // The driver's own (and its toolchain's, which it reads
-                // instead of the environment's once named).
+                // instead of the environment's once named; lld-link alone
+                // doesn't look for it under `/lldignoreenv` either).
                 let named = if driver {
                     cl_option(args, &["vctoolsdir", "winsysroot"])
                 } else {
@@ -284,7 +331,7 @@ impl Tool {
                     tool.add(CL_OPTIONS);
                 }
                 if clang {
-                    if !named {
+                    if !named && (driver || !ignores) {
                         tool.add(VS_LOCATIONS);
                     }
                     if driver {
@@ -299,7 +346,8 @@ impl Tool {
                     // Linking for MSVC: the driver runs an MSVC linker.
                     if targets_msvc(argv, windows) {
                         if !link_option(&linker_args(args, false), "lldignoreenv") {
-                            tool.add(MSVC_LINK);
+                            tool.add(MSVC_LIB);
+                            tool.add(LINK_OPTIONS);
                         }
                         if !gnu_toolchain(&["-Xmicrosoft-visualc-tools-root", "-Xmicrosoft-windows-sys-root"]) {
                             tool.add(VS_LOCATIONS);
@@ -309,7 +357,11 @@ impl Tool {
                 }
             }
             Kind::Ar => tool.add(AR),
-            Kind::Lib => tool.add(LIB),
+            Kind::Lib => {
+                if lib_searches_env(args, present) {
+                    tool.add(MSVC_LIB);
+                }
+            }
             Kind::Other => {}
         }
         tool
@@ -655,6 +707,58 @@ mod tests {
         // names the SDK, which no variable gives anyway.
         let tool = Tool::of(Path::new("C:/llvm/bin/clang-cl.exe"), &argv("clang-cl /c /winsdkdirC:/tc/sdk a.cpp"), Some(Style::Msvc), true);
         assert_eq!(names(&action_env(&[tool], &mut m, &in_prompt, &[]).0), ["EXTERNAL_INCLUDE", "INCLUDE", "VCINSTALLDIR", "VCToolsInstallDir"]);
+    }
+
+    /// lld-link's `/lldignoreenv` in a response file: it then ignores `LIB`
+    /// and where Visual Studio is, but still reads `LINK` and `_LINK_`,
+    /// which it adds before reading response files. On its command line:
+    /// none of them. A driver passes it on its linker's command line.
+    #[test]
+    fn lld_link_ignoring_the_environment() {
+        let root = ExecRoot::common(&["C:/Users/x/proj/build".into()], true);
+        let mut m = PathMapper::new(root, r"C:\Users\x\proj\build", true).unwrap();
+        let prompt: BTreeMap<&str, &str> =
+            [("LIB", r"C:\VS\lib"), ("LINK", "/DEBUG"), ("_LINK_", "/OPT:REF"), ("VCToolsInstallDir", r"C:\VS\")].into_iter().collect();
+        let vars = |n: &str| prompt.get(n).map(OsString::from);
+        let lld = Path::new("C:/llvm/bin/lld-link.exe");
+        let names_of = |m: &mut PathMapper, written: &str, read: &str, style| {
+            let tool = Tool::of_step(lld, &argv(written), &argv(read), style, true, &|_| true);
+            names(&action_env(&[tool], m, &vars, &[]).0).iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(names_of(&mut m, "lld-link @link.rsp", "lld-link /lldignoreenv a.obj", None), ["LINK", "_LINK_"]);
+        let tool = Tool::of_step(lld, &argv("lld-link @link.rsp"), &argv("lld-link /lldignoreenv a.obj"), None, true, &|_| true);
+        assert_eq!(env_options(&tool, &vars), (vec!["/DEBUG".to_string()], vec!["/OPT:REF".to_string()]));
+        // `/winsysroot` names Visual Studio, and leaves `LIB` out too.
+        assert_eq!(names_of(&mut m, "lld-link /winsysroot:C:/tc a.obj", "lld-link /winsysroot:C:/tc a.obj", None), ["LINK", "_LINK_"]);
+        assert!(names_of(&mut m, "lld-link /lldignoreenv @link.rsp", "lld-link /lldignoreenv a.obj", None).is_empty());
+        assert_eq!(names_of(&mut m, "lld-link a.obj", "lld-link a.obj", None), ["LIB", "LINK", "VCToolsInstallDir", "_LINK_"]);
+        // A driver: its linker gets it on its command line; the driver
+        // looks for Visual Studio itself.
+        let line = "clang-cl @link.rsp";
+        let tool =
+            Tool::of_step(Path::new("C:/llvm/bin/clang-cl.exe"), &argv(line), &argv("clang-cl a.obj /link /lldignoreenv"), Some(Style::Msvc), true, &|_| true);
+        assert_eq!(names(&action_env(&[tool], &mut m, &vars, &[]).0), ["VCToolsInstallDir"]);
+    }
+
+    /// lib.exe and llvm-lib read `LIB` to find an input that isn't found
+    /// from the working directory or a `/LIBPATH:`, else not: an archive's
+    /// key is the same in a developer prompt.
+    #[test]
+    fn librarian_lib() {
+        let root = ExecRoot::common(&["C:/Users/x/proj/build".into()], true);
+        let mut m = PathMapper::new(root, r"C:\Users\x\proj\build", true).unwrap();
+        let vars = |n: &str| (n == "LIB").then(|| OsString::from(r"C:\VS\lib"));
+        let here = ["a.obj", "objs/b.obj", "C:/Users/x/proj/c.obj"];
+        let present = |p: &Path| here.iter().any(|h| Path::new(h) == p);
+        let env_of = |m: &mut PathMapper, exe: &str, cmd: &str| {
+            let tool = Tool::of_step(Path::new(exe), &argv(cmd), &argv(cmd), None, true, &present);
+            names(&action_env(&[tool], m, &vars, &[]).0).iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        };
+        for (exe, name) in [("C:/llvm/bin/llvm-lib.exe", "llvm-lib"), ("C:/VS/bin/lib.exe", "lib")] {
+            assert!(env_of(&mut m, exe, &format!("{name} /nologo /out:x.lib a.obj C:/Users/x/proj/c.obj")).is_empty(), "{name}");
+            assert!(env_of(&mut m, exe, &format!("{name} /out:x.lib /LIBPATH:objs b.obj")).is_empty(), "{name}");
+            assert_eq!(env_of(&mut m, exe, &format!("{name} /out:x.lib a.obj kernel32.lib")), ["LIB"], "{name}");
+        }
     }
 
     /// The options `CL` and `LINK` add, for the tools that read them.

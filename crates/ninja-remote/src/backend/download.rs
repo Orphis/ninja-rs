@@ -88,6 +88,52 @@ pub(super) fn fs_now(dir: &Path) -> std::time::SystemTime {
     made.unwrap_or_else(|_| std::time::SystemTime::now())
 }
 
+/// How far behind its clock the file system's times may lag, at most: it
+/// stamps files with a clock that ticks every few milliseconds (Windows,
+/// every 15.6).
+const FS_TICK: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The clocks of the file systems a build writes outputs to, as offsets
+/// from the host's, each probed once (see `fs_now`) for a directory: a probe
+/// costs a file made and removed (and events to the daemon watching it),
+/// and outputs left as they were, or recorded, need the time each.
+#[derive(Default)]
+pub(super) struct FsClock {
+    /// Nanoseconds the file system's clock is ahead of the host's, by
+    /// directory.
+    offsets: std::sync::Mutex<HashMap<PathBuf, i128>>,
+    /// How many probes were made.
+    probes: std::sync::atomic::AtomicUsize,
+}
+
+impl FsClock {
+    /// The time of the file system holding `dir`, now: never ahead of it
+    /// (an input changed right after would look older than an output given
+    /// this time), and behind it by a tick at most.
+    pub(super) fn now(&self, dir: &Path) -> std::time::SystemTime {
+        let ns = |t: std::time::SystemTime| match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as i128,
+            Err(e) => -(e.duration().as_nanos() as i128),
+        };
+        let known = self.offsets.lock().unwrap().get(dir).copied();
+        let offset = match known {
+            Some(offset) => offset,
+            None => {
+                self.probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The host's time after the probe: however long it took,
+                // the offset errs on the side of the past.
+                let probed = ns(fs_now(dir));
+                let offset = probed - ns(std::time::SystemTime::now());
+                self.offsets.lock().unwrap().insert(dir.to_path_buf(), offset);
+                offset
+            }
+        };
+        let at = ns(std::time::SystemTime::now()) + offset - FS_TICK.as_nanos() as i128;
+        let since = std::time::Duration::from_nanos(at.unsigned_abs() as u64);
+        if at >= 0 { std::time::UNIX_EPOCH + since } else { std::time::UNIX_EPOCH - since }
+    }
+}
+
 impl Inner {
     /// Whether a blob is fetched as it arrives rather than read whole: a
     /// large one, or one the disk cache stores as chunks.
@@ -239,6 +285,23 @@ impl Fetched {
         filled
     }
 
+    /// Whether a blob was fetched (an empty one needs none).
+    pub(super) fn has(&self, d: &re::Digest) -> bool {
+        d.size_bytes == 0 || self.files.contains_key(&d.hash)
+    }
+
+    /// Takes the blobs another fetch got (but those it has: removed with
+    /// `other`).
+    pub(super) fn merge(&mut self, mut other: Fetched) {
+        other.files.retain(|hash, file| match self.files.entry(hash.clone()) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(file.clone());
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(_) => true,
+        });
+    }
+
     /// A blob's contents, for the outputs read here (depfiles).
     pub(super) fn read(&self, d: &re::Digest) -> Result<Vec<u8>> {
         if d.size_bytes == 0 {
@@ -314,12 +377,38 @@ async fn fetch_into_file(
 }
 
 /// A file removed when dropped, unless kept.
-struct TempFile(Option<PathBuf>);
+pub(super) struct TempFile(Option<PathBuf>);
 
 impl TempFile {
     fn keep(mut self) -> PathBuf {
         self.0.take().expect("kept once")
     }
+
+    pub(super) fn path(&self) -> &Path {
+        self.0.as_deref().expect("not kept")
+    }
+}
+
+/// A copy of `path` next to it, which nothing else writes, and the digest
+/// of its contents, hashed as they're copied: what's read from the copy is
+/// what was read from `path`, whatever happens to it afterwards (a step
+/// rewriting it in place: signing, stripping).
+pub(super) fn snapshot(path: &Path) -> Result<(TempFile, re::Digest)> {
+    use std::io::{Read as _, Write as _};
+    let copy = TempFile(Some(temp_next_to(path)?));
+    let mut out = std::fs::File::options().write(true).create_new(true).open(copy.path())?;
+    let mut src = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let (mut hasher, mut size, mut buf) = (Sha256::new(), 0u64, vec![0u8; 1 << 16]);
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+        size += n as u64;
+    }
+    Ok((copy, re::Digest { hash: hex::encode(hasher.finalize()), size_bytes: size as i64 }))
 }
 
 impl Drop for TempFile {
@@ -489,6 +578,26 @@ mod tests {
         }
         sweep_temp_files(&dir, STALE_TEMP);
         assert!(!old.exists() && fresh.exists() && dir.join("a.o").exists());
+    }
+
+    /// The file system's clock, probed once for a directory: never ahead of
+    /// the times of files made after.
+    #[test]
+    fn file_system_clock() {
+        let dir = test_dirs::TestDir::new("ninja-rs-fs-clock");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        let clock = FsClock::default();
+        for i in 0..3 {
+            for d in [dir.to_path_buf(), dir.join("sub")] {
+                let t = clock.now(&d);
+                let made = d.join(format!("after-{i}"));
+                std::fs::write(&made, "").unwrap();
+                assert!(t <= std::fs::metadata(&made).unwrap().modified().unwrap());
+            }
+        }
+        assert_eq!(clock.probes.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // The probes go.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4);
     }
 
     /// The file system's clock is a new file's time there: an output left

@@ -29,7 +29,7 @@ use crate::store::Store;
 use crate::targets::Targets;
 use crate::toolchains::Toolchains;
 use capture::Capture;
-use download::{DOWNLOAD_BUDGET_KIB, Fetched, disk_store, fs_now, write_output};
+use download::{DOWNLOAD_BUDGET_KIB, Fetched, FsClock, disk_store, write_output};
 
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
@@ -37,6 +37,9 @@ pub struct BackendConfig {
     pub build_dir: PathBuf,
     /// Other directories the build writes to (see `Shared::volatile`).
     pub volatile: Vec<PathBuf>,
+    /// The directories build edges write to, inside the build directory or
+    /// not (see `Shared::written`).
+    pub written: Vec<PathBuf>,
     /// `rbe_toolchains`, relative to the build directory.
     pub toolchains_file: Option<String>,
     /// The `rbe_targets` file's contents: labels and configurations for the
@@ -117,6 +120,11 @@ struct Inner {
     /// Local results going to the remote cache (see `Capture`), which the
     /// build waits for at its end (`Backend::finish_uploads`).
     uploads: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    /// Bytes of outputs those uploads hold in memory, in KiB (see
+    /// `capture::UPLOAD_BUDGET_KIB`).
+    upload_budget: Arc<tokio::sync::Semaphore>,
+    /// The clocks of the file systems outputs are written to.
+    fs_clock: FsClock,
 }
 
 /// Remote-only outputs being downloaded, by path (see `Inner::materializing`).
@@ -128,12 +136,41 @@ type ClaimMap = std::sync::Mutex<std::collections::HashMap<String, tokio::sync::
 struct Fallbacks {
     /// Actions the policy sent remotely.
     started: std::sync::atomic::AtomicUsize,
-    /// Actions that couldn't be sent (`prepare` refused them).
-    unsent: std::sync::Mutex<(usize, Option<String>)>,
+    /// Actions that couldn't be sent (`prepare` refused them), by what the
+    /// reason is (see `Fallbacks::unsent`): how many, and the first reason.
+    unsent: std::sync::Mutex<std::collections::BTreeMap<String, (usize, String)>>,
     /// Actions run locally after a remote failure.
     failed: std::sync::Mutex<(usize, Option<String>)>,
     /// Why remote failures no longer fall back, once a limit is crossed.
     stopped: std::sync::Mutex<Option<String>>,
+}
+
+/// How long the build waits for its uploads (see `Backend::finish_uploads`)
+/// before it says so.
+const UPLOADS_NOTICED: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl Fallbacks {
+    /// Counts an action `prepare` refused, by what the reason is: its
+    /// first line, without the details after it ("what: details", which
+    /// name its files).
+    fn unsent(&self, reason: &str) {
+        let line = first_line(reason);
+        let what = line.split(": ").next().unwrap_or_default().to_string();
+        self.unsent.lock().unwrap().entry(what).or_insert_with(|| (0, line)).0 += 1;
+    }
+
+    /// How many actions couldn't be sent, and why: each reason's count and
+    /// first one, the most frequent first.
+    fn unsent_summary(&self) -> (usize, String) {
+        let mut reasons: Vec<(usize, String)> = self.unsent.lock().unwrap().values().cloned().collect();
+        reasons.sort_by_key(|r| std::cmp::Reverse(r.0));
+        let total = reasons.iter().map(|(n, _)| n).sum();
+        let mut shown: Vec<String> = reasons.iter().take(4).map(|(n, first)| format!("{n}: {first}")).collect();
+        if reasons.len() > 4 {
+            shown.push(format!("{} more reasons", reasons.len() - 4));
+        }
+        (total, shown.join("; "))
+    }
 }
 
 /// `--remote_max_fallback_ratio` applies from this many remote actions on,
@@ -204,6 +241,7 @@ impl Backend {
             daemon_error: Default::default(),
             profile_dir: disk.as_ref().map(|d| d.profile_dir()),
             volatile: std::iter::once(config.build_dir.clone()).chain(config.volatile.iter().cloned()).collect(),
+            written: crate::scanner::WrittenDirs::new(std::iter::once(config.build_dir.clone()).chain(config.written.iter().cloned()), windows),
             action_env: config.action_env.clone(),
         };
         shared.store.new_build();
@@ -231,18 +269,41 @@ impl Backend {
                 download_budget: Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_BUDGET_KIB)),
                 swept: Default::default(),
                 uploads: Default::default(),
+                upload_budget: Arc::new(tokio::sync::Semaphore::new(capture::UPLOAD_BUDGET_KIB)),
+                fs_clock: FsClock::default(),
             }),
         })
     }
 
-    /// Waits for the local results going to the remote cache (`wait`), or
-    /// gives them up (an interrupted build).
-    pub async fn finish_uploads(&self, wait: bool) {
+    /// Waits for the local results going to the remote cache, until `stop`
+    /// completes (an interrupt): those left are given up, and their number
+    /// returned. `waiting` is told how many there are once the wait is
+    /// noticeable.
+    pub async fn finish_uploads(&self, stop: impl std::future::Future<Output = ()>, waiting: impl FnOnce(usize)) -> usize {
         let mut uploads = std::mem::take(&mut *self.inner.uploads.lock().unwrap());
-        if wait {
-            while uploads.join_next().await.is_some() {}
-        } else {
-            uploads.shutdown().await;
+        let mut waiting = Some(waiting);
+        let mut stop = std::pin::pin!(stop);
+        let noticed = tokio::time::sleep(UPLOADS_NOTICED);
+        let mut noticed = std::pin::pin!(noticed);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut stop => {
+                    let left = uploads.len();
+                    uploads.shutdown().await;
+                    return left;
+                }
+                done = uploads.join_next() => {
+                    if done.is_none() {
+                        return 0;
+                    }
+                }
+                () = &mut noticed, if waiting.is_some() => {
+                    if let Some(tell) = waiting.take() {
+                        tell(uploads.len());
+                    }
+                }
+            }
         }
     }
 
@@ -265,7 +326,7 @@ impl Backend {
     /// the end of the build, and whether some did after remote failures.
     pub fn fallback_summary(&self) -> Option<(String, bool)> {
         let f = &self.inner.fallbacks;
-        let (unsent, unsent_reason) = f.unsent.lock().unwrap().clone();
+        let (unsent, unsent_reasons) = f.unsent_summary();
         let (failed, failed_reason) = f.failed.lock().unwrap().clone();
         // Compiles the chosen include scanner left to the conservative one.
         let scans = self.inner.shared.store.scan.fallback_summary().map(|s| format!("{s}."));
@@ -274,7 +335,7 @@ impl Backend {
         }
         let mut parts = Vec::new();
         if unsent > 0 {
-            parts.push(format!("{unsent} couldn't be sent (first: {})", unsent_reason.unwrap_or_default()));
+            parts.push(format!("{unsent} couldn't be sent ({unsent_reasons})"));
         }
         if failed > 0 {
             parts.push(format!("{failed} after remote failures (first: {})", failed_reason.unwrap_or_default()));
@@ -397,17 +458,22 @@ fn is_not_found(e: &anyhow::Error) -> bool {
 }
 
 /// The command a local run of the action uses (see `LocalCommand`): the
-/// remote action's. None for a command with steps on the host, which runs
-/// as the build file has it.
+/// remote action's (with the host's paths for other volumes, see
+/// `LocalForm`). None for a command with steps on the host, which runs as
+/// the build file has it.
 fn local_command(p: &Prepared, task: &Task, build_dir: &Path, windows: bool) -> Option<LocalCommand> {
     if !p.local_before.is_empty() || !p.local_after.is_empty() {
         return None;
     }
-    let (argv, files) = local_rsp_files(p, task, build_dir, windows);
+    let (arguments, rsp_files, env) = match &p.local {
+        Some(l) => (&l.arguments, &l.rsp_files, l.env.clone()),
+        None => (&p.command.arguments, &p.rsp_files, p.command.environment_variables.iter().map(|e| (e.name.clone(), e.value.clone())).collect()),
+    };
+    let (argv, files) = local_rsp_files(arguments, rsp_files, task, build_dir, windows);
     Some(LocalCommand {
         argv,
         dir: PathBuf::from(&p.mapper.build_dir),
-        env: p.command.environment_variables.iter().map(|e| (e.name.clone(), e.value.clone())).collect(),
+        env,
         files,
         map_back: Some(Arc::new(LocalMapBack { mapper: p.mapper.clone(), tree_index: p.tree_index.clone(), build_dir: build_dir.to_path_buf() })),
     })
@@ -445,33 +511,36 @@ fn sweep_rsp_copies(dir: &Path, age: std::time::Duration) {
 /// references to it (in the command, in other response files) point
 /// there: the original is never modified, and a concurrent command never
 /// reads it half written.
-fn local_rsp_files(p: &Prepared, task: &Task, build_dir: &Path, windows: bool) -> (Vec<String>, Vec<(PathBuf, Vec<u8>)>) {
+fn local_rsp_files(
+    arguments: &[String],
+    rsp_files: &[(PathBuf, Vec<u8>)],
+    task: &Task,
+    build_dir: &Path,
+    windows: bool,
+) -> (Vec<String>, Vec<(PathBuf, Vec<u8>)>) {
     let key = |path: &Path| {
         let s = crate::scanner::normalize(path).to_string_lossy().replace('\\', "/");
         if windows { s.to_ascii_lowercase() } else { s }
     };
     let own = task.rspfile.as_ref().map(|(r, _)| key(&build_dir.join(r)));
     let private_dir = build_dir.join(RSP_COPIES);
-    let copies: HashMap<String, PathBuf> = p
-        .rsp_files
+    let copies: HashMap<String, PathBuf> = rsp_files
         .iter()
         .filter(|(path, _)| Some(key(path)) != own)
         .map(|(path, bytes)| (key(path), private_dir.join(format!("{}.rsp", &rbe_client::digest_of(bytes).hash[..32]))))
         .collect();
     if copies.is_empty() {
-        return (p.command.arguments.clone(), p.rsp_files.clone());
+        return (arguments.to_vec(), rsp_files.to_vec());
     }
-    let work_dir = PathBuf::from(&p.mapper.build_dir);
     let redirect = |args: &[String]| -> Vec<String> {
         args.iter()
-            .map(|a| match a.strip_prefix('@').and_then(|f| copies.get(&key(&work_dir.join(f)))) {
+            .map(|a| match a.strip_prefix('@').and_then(|f| copies.get(&key(&build_dir.join(f)))) {
                 Some(copy) => format!("@{}", copy.display()),
                 None => a.clone(),
             })
             .collect()
     };
-    let files = p
-        .rsp_files
+    let files = rsp_files
         .iter()
         .map(|(path, bytes)| {
             let text = String::from_utf8_lossy(bytes);
@@ -479,7 +548,7 @@ fn local_rsp_files(p: &Prepared, task: &Task, build_dir: &Path, windows: bool) -
             (copies.get(&key(path)).cloned().unwrap_or_else(|| path.clone()), content)
         })
         .collect();
-    (redirect(&p.command.arguments), files)
+    (redirect(arguments), files)
 }
 
 /// Maps a local run of the remote command back, as a download does.
@@ -669,12 +738,9 @@ impl Inner {
             Err(Failure::Lost) => RemoteOutcome::Lost,
             Err(Failure::Prepare(reason)) => {
                 if self.config.strict {
-                    return failed(format!("ninja-rs: the action can't run remotely (--remote_strict): {reason}\n"));
+                    return failed(format!("ninja: the action can't run remotely (--remote_strict): {reason}\n"));
                 }
-                let mut unsent = self.fallbacks.unsent.lock().unwrap();
-                unsent.0 += 1;
-                unsent.1.get_or_insert_with(|| first_line(&reason));
-                drop(unsent);
+                self.fallbacks.unsent(&reason);
                 RemoteOutcome::Fallback(reason, None)
             }
             Err(Failure::RunLocally(prepared)) => {
@@ -682,16 +748,16 @@ impl Inner {
                 RemoteOutcome::RunLocally(Box::new(Capture { inner: self, prepared, task }), command)
             }
             Err(Failure::Infra(e)) => {
-                let reason = format!("remote execution failed: {e:#}");
+                let reason = format!("remote execution failed: {}", rbe_client::fault::describe(e.as_ref()));
                 // A certificate refused (the server's, or this client's)
                 // fails every remote action alike, and must be seen to:
                 // not hidden behind local runs.
                 if !self.config.local_fallback || self.config.strict || certificate_refused(&e) {
-                    return failed(format!("ninja-rs: {reason}\n"));
+                    return failed(format!("ninja: {reason}\n"));
                 }
                 match self.allow_fallback(&reason) {
                     Ok(()) => RemoteOutcome::Fallback(reason, command),
-                    Err(why) => failed(format!("ninja-rs: {reason}\nninja-rs: not running it locally: {why}\n")),
+                    Err(why) => failed(format!("ninja: {reason}\nninja: not running it locally: {why}\n")),
                 }
             }
         }
@@ -825,15 +891,11 @@ impl Inner {
             return Err(Failure::RunLocally(Box::new(prepared)));
         }
 
-        // Local steps (e.g. deleting an archive before re-creating it). They
-        // write on the host: a command with some isn't raced.
-        if !prepared.local_before.is_empty() || !prepared.local_after.is_empty() {
-            claim(race).await?;
-        }
+        // The result, and its outputs fetched, before steps on the host run
+        // (see below): should that fail, nothing ran there, and the local
+        // run that follows runs them once.
         let mut output = Vec::new();
-        if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
-            return Ok(failed);
-        }
+        let steps_first = !prepared.local_before.is_empty();
         let (mut result, mut hit) = match cached {
             Some(r) => (r, true),
             None => match self.execute_remotely(&client, task, &prepared, stale, &mut output).await? {
@@ -842,7 +904,7 @@ impl Inner {
             },
         };
         let mut retried = false;
-        let staged = loop {
+        let mut staged = loop {
             // An execution's result must be usable too: nothing is written
             // from one that isn't (the action runs locally instead).
             check_result(&prepared, &result).map_err(|e| Failure::Infra(anyhow::anyhow!("unusable result for {}: {e}", digest.hash)))?;
@@ -854,7 +916,7 @@ impl Inner {
                     lost.remove(&d.hash);
                 }
             }
-            match self.fetch_outputs(Some(&client), task, &prepared, &result, false).await {
+            match self.fetch_outputs(Some(&client), task, &prepared, &result, steps_first).await {
                 // A hit whose outputs the CAS no longer has (evicted since it
                 // was stored, or checked) is a miss: the action runs again,
                 // while a raced local run goes on.
@@ -875,8 +937,16 @@ impl Inner {
             }
         };
         // Racing: its outputs are claimed once fetched, before anything is
-        // written on the host.
-        claim(race).await?;
+        // written on the host. (A command with steps there isn't raced.)
+        if race.is_some() {
+            claim(race).await?;
+            self.fetch_changed(Some(&client), &mut staged, task, &prepared).await.map_err(Failure::Infra)?;
+        }
+        // Steps on the host before the remote one (deleting an archive
+        // before it's made again).
+        if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
+            return Ok(failed);
+        }
         let keep = self.disk.is_some() && result.exit_code == 0;
         output.extend(blocking(|| self.write_staged(staged, task, &prepared, &result, keep)).map_err(Failure::Infra)?);
         let kind = if hit { ExecKind::RemoteCacheHit } else { ExecKind::Remote };
@@ -894,14 +964,13 @@ impl Inner {
                 },
                 None => String::new(),
             };
-            let mut msg =
-                format!("ninja-rs: {} {} ({} inputs{target})\n", if hit { "remote cache hit" } else { "executed remotely" }, digest.hash, prepared.input_files)
-                    .into_bytes();
+            // On standard error with the other --remote_verbose lines, not
+            // in the command's output.
+            let what = if hit { "remote cache hit" } else { "executed remotely" };
+            message(&format!("{what} {} ({} inputs{target}): {}", digest.hash, prepared.input_files, task.outputs.join(" ")));
             for w in &prepared.warnings {
-                msg.extend_from_slice(format!("ninja-rs: warning: {w}\n").as_bytes());
+                message(&format!("warning: {w}"));
             }
-            msg.extend_from_slice(&output);
-            output = msg;
         }
         let status = if result.exit_code == 0 { ExitStatus::Success } else { ExitStatus::Failure(result.exit_code) };
         // The outputs are in the CAS now: build events can point there.
@@ -927,7 +996,7 @@ impl Inner {
         // (thin archives' members read from the remote CAS). The blobs are
         // fetched first: a miss then has run nothing on the host.
         let client = if remote { self.client.as_ref().map(|c| c.for_action(meta, &digest.hash)) } else { None };
-        let staged = match self.fetch_outputs(client.as_ref(), task, prepared, &result, !prepared.local_before.is_empty()).await {
+        let mut staged = match self.fetch_outputs(client.as_ref(), task, prepared, &result, !prepared.local_before.is_empty()).await {
             Ok(staged) => staged,
             Err(e) if e.is::<DiskMiss>() => {
                 if self.config.verbose {
@@ -940,7 +1009,10 @@ impl Inner {
             }
             Err(e) => return Err(Failure::Infra(e)),
         };
-        claim(race).await?;
+        if race.is_some() {
+            claim(race).await?;
+            self.fetch_changed(client.as_ref(), &mut staged, task, prepared).await.map_err(Failure::Infra)?;
+        }
         let mut output = Vec::new();
         if let Some(failed) = self.run_local_steps(task, &prepared.local_before, &mut output).await {
             return Ok(Some(failed));
@@ -951,9 +1023,7 @@ impl Inner {
             return Ok(Some(failed));
         }
         if self.config.verbose {
-            let mut msg = format!("ninja-rs: disk cache hit {}\n", digest.hash).into_bytes();
-            msg.extend_from_slice(&output);
-            output = msg;
+            message(&format!("disk cache hit {}: {}", digest.hash, task.outputs.join(" ")));
         }
         // Outputs in the remote CAS: build events can point there.
         let cas_outputs = if remote { cas_outputs(task, prepared, &result) } else { Vec::new() };
@@ -1178,6 +1248,29 @@ impl Inner {
         Ok(staged)
     }
 
+    /// Racing, once the outputs are claimed: fetches those whose blobs
+    /// `fetch_outputs` left out, their files having the result's contents
+    /// then, that a local run changed meanwhile (wrote again in place, and
+    /// was stopped halfway).
+    async fn fetch_changed(&self, client: Option<&Client>, staged: &mut Staged, task: &Task, p: &Prepared) -> Result<()> {
+        let needed: Vec<(re::Digest, PathBuf)> = blocking(|| {
+            staged
+                .files
+                .iter()
+                .filter(|(local, f)| {
+                    let d = f.digest.clone().unwrap_or_default();
+                    f.contents.is_empty() && !staged.fetched.has(&d) && !self.stays_remote(staged, task, p, f) && !same_content(local, &d, &self.shared.store)
+                })
+                .map(|(local, f)| (f.digest.clone().unwrap_or_default(), local.clone()))
+                .collect()
+        });
+        if !needed.is_empty() {
+            let more = self.fetch_blobs(client, &needed).await?;
+            staged.fetched.merge(more);
+        }
+        Ok(())
+    }
+
     /// Whether this build may leave an output of a result remote (minimal
     /// downloads; see `must_download`).
     fn may_stay_remote(&self, staged: &Staged, task: &Task, p: &Prepared, f: &re::OutputFile) -> bool {
@@ -1255,8 +1348,7 @@ impl Inner {
         let depfile_local = p.depfile.as_ref().map(|(_, l)| l.clone());
         // The file system's time, for outputs left as they were and records
         // (its clock, not the host's: a network file system's may differ).
-        let mut fs_time: Option<std::time::SystemTime> = None;
-        let mut now = |dir: &Path| *fs_time.get_or_insert_with(|| fs_now(dir));
+        let now = |dir: &Path| self.fs_clock.now(dir);
         // The records this result replaces, side outputs it lacks included.
         let previous: HashMap<&str, Entry> = match &self.config.remote_outputs {
             Some(outputs) => {
@@ -1560,7 +1652,7 @@ fn cas_outputs(task: &Task, prepared: &Prepared, result: &re::ActionResult) -> V
 /// The result of a task whose inputs were lost from the remote CAS: the
 /// engine rebuilds them and runs the task again.
 fn lost_inputs_result(task: &Task, lost: Vec<String>, mut output: Vec<u8>) -> TaskResult {
-    output.extend_from_slice(format!("ninja-rs: gone from the remote cache: {}\n", lost.join(", ")).as_bytes());
+    output.extend_from_slice(format!("ninja: gone from the remote cache: {}\n", lost.join(", ")).as_bytes());
     TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Remote, cas_outputs: Vec::new(), lost_inputs: lost }
 }
 
@@ -1619,6 +1711,21 @@ fn escape_make(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Actions that couldn't be sent are counted by reason, whatever files
+    /// its details name.
+    #[test]
+    fn unsent_by_reason() {
+        let f = Fallbacks::default();
+        f.unsent("computed #include in a directory the build writes to: /b/gen/a.c");
+        f.unsent("computed #include in a directory the build writes to: /b/gen/b.c\nmore");
+        f.unsent("cannot find program 'tool'");
+        assert_eq!(f.unsent_summary(), (3, "2: computed #include in a directory the build writes to: /b/gen/a.c; 1: cannot find program 'tool'".to_string()));
+        for i in 0..4 {
+            f.unsent(&format!("reason {i}"));
+        }
+        assert!(f.unsent_summary().1.ends_with("; 2 more reasons"), "{}", f.unsent_summary().1);
+    }
 
     #[test]
     fn fallback_limits() {

@@ -10,11 +10,12 @@ publish = false
 bazel-remote-apis = { workspace = true }
 fastcdc = { workspace = true }
 zstd = { workspace = true }
+h2 = { workspace = true }
 hex = { workspace = true }
 prost = { workspace = true }
 rbe-bes = { path = "../../third_party/cargo-rbe/rbe-bes" }
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["net", "signal"] }
+tokio = { workspace = true, features = ["net", "signal", "io-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["router", "server"] }
 

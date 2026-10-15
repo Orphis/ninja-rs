@@ -1,5 +1,14 @@
-//! Embeds a Windows application manifest declaring long path support in the
-//! ninja-rs binary.
+//! Gives the ninja-rs version (`ninja_rs::version`) the commit the sources
+//! are at, and embeds a Windows application manifest declaring long path
+//! support in the ninja-rs binary.
+//!
+//! The commit, `NINJA_RS_COMMIT`, is git's when the workspace is a git
+//! checkout of its own (not sources copied into another repository), with
+//! `.dirty` after it when tracked files differ from it. It is this crate's,
+//! the one at the top, rather than one the others depend on: when this runs
+//! again (a commit, a checkout, a change to git's index), only this crate is
+//! built again. Bazel builds don't ask git: they're stamped instead
+//! (`--config=stamp`, `commit.env`).
 //!
 //! Even with long paths enabled system-wide, Windows only lifts the 260
 //! character `MAX_PATH` limit for processes whose manifest declares
@@ -12,7 +21,10 @@
 //! make, which every Windows linker takes (link.exe and lld-link for MSVC
 //! targets, the MinGW ones and LLVM's gnullvm for GNU targets).
 
-use std::path::PathBuf;
+#![allow(clippy::disallowed_macros)] // Cargo reads its directives on stdout.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
@@ -93,6 +105,52 @@ fn coff_object(machine: u16, addr32nb: u16) -> Vec<u8> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    commit();
+    manifest();
+}
+
+/// Sets `NINJA_RS_COMMIT`, in a git checkout of the workspace.
+fn commit() {
+    // Bazel stamps it instead (its build of this script sets this).
+    if std::env::var_os("NINJA_RS_BAZEL").is_some() {
+        return;
+    }
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let Some(root) = manifest.parent().and_then(Path::parent) else { return };
+    // What git says in the workspace root, empty or not.
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git").arg("--no-optional-locks").args(args).current_dir(root).output().ok().filter(|o| o.status.success())?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    // The top of a checkout holding this crate: not one the sources were
+    // copied into.
+    let ours =
+        git(&["rev-parse", "--show-cdup"]).is_some_and(|up| up.is_empty()) && git(&["ls-files", "--error-unmatch", "crates/ninja-rs/build.rs"]).is_some();
+    let Some(commit) = git(&["rev-parse", "--short=12", "HEAD"]).filter(|c| ours && !c.is_empty()) else { return };
+    let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).is_none_or(|s| !s.is_empty());
+    // Run again after a commit, a checkout or a change to the index: HEAD,
+    // the branch's ref (or the packed ones), the index. A file that doesn't
+    // exist would run it always.
+    let mut watched = vec!["HEAD".to_string(), "index".to_string()];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]).filter(|b| !b.is_empty()) {
+        watched.extend([branch, "packed-refs".to_string()]);
+    }
+    let mut paths: Vec<PathBuf> = watched.iter().filter_map(|name| git(&["rev-parse", "--git-path", name])).map(|p| root.join(p)).collect();
+    // And after the first edit of a clean tree, which makes it dirty: the
+    // tracked files and directories (rather than every edit, which would
+    // build this crate again each time).
+    if !dirty {
+        paths.extend(git(&["ls-tree", "--name-only", "HEAD"]).unwrap_or_default().lines().map(|name| root.join(name)));
+    }
+    for path in paths.iter().filter(|p| p.exists()) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    let dirty = if dirty { ".dirty" } else { "" };
+    println!("cargo:rustc-env=NINJA_RS_COMMIT={commit}{dirty}");
+}
+
+/// Links the long path manifest into Windows binaries.
+fn manifest() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if target_os != "windows" {

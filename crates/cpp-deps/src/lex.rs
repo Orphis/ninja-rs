@@ -10,7 +10,7 @@
 //! result is cached per file version and shared by every compile that
 //! includes the file.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::intern::{self, Sym};
 use crate::macros::{self, Macro};
@@ -149,6 +149,59 @@ pub struct FileDirectives {
     /// A line of text is an assembler's `.include` or `.incbin` (in `.S`
     /// files), which reads a file the preprocessor doesn't see.
     pub asm_include: bool,
+    /// A hash of the file's bytes, which tells files with the same
+    /// contents (with their sizes) without reading them again (see
+    /// `#pragma once` in `scan`).
+    pub hash: u64,
+    /// The names text may call (see `name_hash`), sorted: text isn't
+    /// expanded, but a call of a macro whose pragma its arguments make is
+    /// seen (see `Context::arg_pragma`).
+    pub calls: Box<[u64]>,
+    /// The tokens of the text, when a scan looks at such a call: read
+    /// again then (rarely), once (None: the file changed since).
+    pub text: OnceLock<Option<Box<[Token]>>>,
+}
+
+/// A name's hash (see `FileDirectives::calls`).
+pub(crate) fn name_hash(name: &[u8]) -> u64 {
+    // FNV-1a.
+    name.iter().fold(0xcbf2_9ce4_8422_2325, |h, &c| (h ^ u64::from(c)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// Adds the hashes of the names a line of text may call to `out`: those
+/// followed by `(`, or ending the line (the call may go on on the next).
+/// (Names in its comments and strings too.)
+fn calls(text: &[u8], out: &mut Vec<u64>) {
+    let mut i = 0;
+    while i < text.len() {
+        if !is_ident_start(text[i]) || (i > 0 && is_ident_char(text[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < text.len() && is_ident_char(text[i]) {
+            i += 1;
+        }
+        let mut j = i;
+        loop {
+            match text.get(j) {
+                Some(b' ' | b'\t' | b'\r' | b'\n' | b'\\') => j += 1,
+                Some(b'(') | None => {
+                    out.push(name_hash(&text[start..i]));
+                    break;
+                }
+                Some(_) => break,
+            }
+        }
+    }
+}
+
+/// A hash of a file's bytes (see `FileDirectives::hash`).
+pub(crate) fn content_hash(content: &[u8]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::hash::DefaultHasher::new();
+    h.write(content);
+    h.finish()
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -610,8 +663,9 @@ fn directive_kind(name: &[u8]) -> DirKind {
 
 /// Lexes a file's directives.
 pub fn lex(content: &[u8]) -> FileDirectives {
+    let hash = content_hash(content);
     if content.starts_with(&[0xff, 0xfe]) || content.starts_with(&[0xfe, 0xff]) {
-        return FileDirectives { utf16: true, ..Default::default() };
+        return FileDirectives { utf16: true, hash, ..Default::default() };
     }
     // A UTF-8 byte order mark (as editors on Windows write) is not text:
     // left in, it would hide a directive on the first line.
@@ -634,6 +688,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
     let mut text_first = false;
     let mut text_last = false;
     let mut asm_include = false;
+    let mut called = Vec::new();
     loop {
         lx.skip_space();
         let Some(c) = lx.peek() else { break };
@@ -653,6 +708,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
             asm_include |= [&b".include"[..], b".incbin"]
                 .iter()
                 .any(|d| text.strip_prefix(*d).is_some_and(|rest| rest.first().is_some_and(|c| c.is_ascii_whitespace() || *c == b'"')));
+            calls(text, &mut called);
             if may_run_pragma(text) {
                 let line = lx.line_at(start);
                 let toks = tokens(text);
@@ -664,8 +720,8 @@ pub fn lex(content: &[u8]) -> FileDirectives {
                 }));
                 // `_Pragma(OPERAND)` with an operand macros make: what it
                 // does depends on the macros defined there.
-                let (pragmas, operands) = macros::pragmas(&toks, false, &[]);
-                dirs.extend(operands.into_iter().map(|operand| {
+                let found = macros::pragmas(&toks, false, &[]);
+                dirs.extend(found.operands.into_iter().map(|operand| {
                     let mut toks = vec![
                         Token { kind: Kind::Ident, sym: intern::PRAGMA_OPERATOR, space: false },
                         Token { kind: Kind::Punct(P::LParen), sym: intern::intern("("), space: false },
@@ -676,9 +732,15 @@ pub fn lex(content: &[u8]) -> FileDirectives {
                 }));
                 // A pragma from a macro (`DO_PRAGMA(push_macro("M"))`,
                 // `__pragma(once)`): text isn't expanded, so it's marked.
-                if pragmas != macros::Pragmas::None {
+                if found.pragmas != macros::Pragmas::None {
                     let marker = Token { kind: Kind::Ident, sym: intern::PRAGMA_OPERATOR, space: false };
                     dirs.push(Directive { kind: DirKind::Pragma, toks: Box::new([marker]), line, mac: None });
+                } else if !found.callees.is_empty() {
+                    // Pragmas' words given to these (`DO_PRAGMA(once)`, not
+                    // `if (once)`): one if a macro (see `CALLEES`).
+                    let marker = Token { kind: Kind::Unknown, sym: CALLEES, space: false };
+                    let callees = found.callees.iter().map(|&c| Token { kind: Kind::Ident, sym: c, space: true });
+                    dirs.push(Directive { kind: DirKind::Pragma, toks: std::iter::once(marker).chain(callees).collect(), line, mac: None });
                 }
             }
             continue;
@@ -705,8 +767,15 @@ pub fn lex(content: &[u8]) -> FileDirectives {
         dirs.push(Directive { kind, toks: toks.into_boxed_slice(), line, mac });
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
-    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs, asm_include }
+    called.sort_unstable();
+    called.dedup();
+    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs, asm_include, hash, calls: called.into_boxed_slice(), text: OnceLock::new() }
 }
+
+/// The first token of a `#pragma` the lexer makes for text that gives a
+/// pragma's words to the macros its other tokens name (see
+/// `macros::Found::callees`): no text lexes as it.
+pub(crate) const CALLEES: Sym = intern::EMPTY;
 
 /// Whether a line of text may run a pragma that changes macros or
 /// inclusion, `_Pragma("...")` or through a macro (see `macros::pragmas`):
@@ -769,6 +838,29 @@ pub(crate) fn include_guard(dirs: &[Directive]) -> Option<Sym> {
         }
     }
     None
+}
+
+/// The tokens of a file's text: its lines that aren't directives (which
+/// `lex` skips; see `FileDirectives::text`).
+pub(crate) fn text_tokens(content: &[u8]) -> Vec<Token> {
+    let content = content.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(content);
+    let mut lx = Lexer { b: content, pos: 0, line: 0, line_pos: 0 };
+    let mut out = Vec::new();
+    loop {
+        lx.skip_space();
+        let Some(c) = lx.peek() else { break };
+        if c == b'\n' {
+            lx.bump();
+            continue;
+        }
+        let directive = c == b'#' || (c == b'%' && lx.peek2() == Some(b':'));
+        let start = lx.pos;
+        lx.skip_text_line();
+        if !directive {
+            out.extend(tokens(&lx.text(start)));
+        }
+    }
+    out
 }
 
 /// Lexes a line of tokens (for `##` pasting and command-line macros).
@@ -872,8 +964,24 @@ mod tests {
         let pragmas: Vec<Vec<&str>> = fd.dirs.iter().map(|d| spell(&d.toks)).collect();
         // An operand macros make: kept for the scan, which knows them.
         let operand = vec!["_Pragma", "(", "STR", "(", "once", ")", ")"];
-        assert_eq!(pragmas, vec![vec!["push_macro", "(", "\"M\"", ")"], vec!["_Pragma"], vec!["_Pragma"], vec!["_Pragma"], operand]);
+        // Words given to a macro: a pragma if it's one (not `if (once)`).
+        assert_eq!(pragmas, vec![vec!["push_macro", "(", "\"M\"", ")"], vec!["_Pragma"], vec!["_Pragma"], vec!["", "PRAGMA"], operand]);
         assert!(fd.dirs.iter().all(|d| d.kind == DirKind::Pragma));
+        let fd = lex(b"if (once) f();\nP2(x, once)\nP3(\"once\", y)\n(once)\n");
+        let pragmas: Vec<Vec<&str>> = fd.dirs.iter().map(|d| spell(&d.toks)).collect();
+        assert_eq!(pragmas, vec![vec!["", "if"], vec!["", "P2"], vec!["", "P3"], vec!["_Pragma"]]);
+    }
+
+    /// The names text may call, and its tokens.
+    #[test]
+    fn text_calls() {
+        let text = b"#define F(x) G(x)\nint a = F(1) + H (2);\nCALL\n  (3);\nvoid f(int x);\n";
+        let fd = lex(text);
+        let mut names: Vec<u64> = ["F", "H", "CALL", "f"].iter().map(|n| name_hash(n.as_bytes())).collect();
+        names.sort_unstable();
+        assert_eq!(&*fd.calls, &names[..]);
+        let toks: Vec<&str> = text_tokens(text).iter().map(|t| t.sym.as_str()).collect();
+        assert_eq!(toks.join(" "), "int a = F ( 1 ) + H ( 2 ) ; CALL ( 3 ) ; void f ( int x ) ;");
     }
 
     #[test]

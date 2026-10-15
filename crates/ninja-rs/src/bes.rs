@@ -291,7 +291,7 @@ impl Bes {
         let relay_out = flags.relay.as_ref().and_then(|r| match crate::nested::connect(r, &build_dir) {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("ninja: warning: this build's events won't reach the invocation running it: {e}");
+                print_err(&format!("ninja: warning: this build's events won't reach the invocation running it: {e}\n"));
                 None
             }
         });
@@ -314,7 +314,7 @@ impl Bes {
             let connecting = async move {
                 let channel = rbe_client::connect_channel(&connect).await;
                 let fatal = channel.as_ref().err().filter(|e| fault::certificate(e.as_ref()).is_some() || fault::fault(e.as_ref()) == Fault::None).map(|e| {
-                    let e = format!("{e:#}");
+                    let e = fault::describe(e.as_ref());
                     format!("build events: {e}{}", crate::options::tls_hint(&e, &backend, &tls, true))
                 });
                 made.send_replace(Some(fatal));
@@ -326,12 +326,12 @@ impl Bes {
         let file = flags.binary_file.as_ref().and_then(|p| match std::fs::File::create(p) {
             Ok(f) => Some(std::io::BufWriter::new(f)),
             Err(e) => {
-                eprintln!("ninja: warning: can't write build events to {p}: {e}");
+                print_err(&format!("ninja: warning: can't write build events to {p}: {e}\n"));
                 None
             }
         });
         if let (Some(url), true) = (&flags.results_url, uploader.is_some()) {
-            eprintln!("ninja: streaming build results to: {url}{}", ids.invocation_id);
+            print_err(&format!("ninja: streaming build results to: {url}{}\n", ids.invocation_id));
         }
         let relay_in = relay.as_ref().map(|r| r.address.clone());
         let (hashing, jobs) = tokio::sync::mpsc::unbounded_channel();
@@ -554,14 +554,15 @@ impl Bes {
     }
 
     /// Writes events to the file and the uploader. Callers hold `inner`, so
-    /// that events go out in the stream's order.
+    /// that events go out in the stream's order. Their failures, during the
+    /// build, are said past the status line.
     fn send(&self, events: Vec<bep::BuildEvent>) {
         {
             let mut relay = self.relay_out.lock().unwrap();
             if let Some(stream) = relay.as_mut() {
                 for e in &events {
                     if let Err(err) = crate::nested::write_frame(stream, &e.encode_to_vec()) {
-                        print_err(&format!("ninja: warning: sending build events to the invocation running this one failed: {err}\n"));
+                        ninja_core::status::message(&format!("warning: sending build events to the invocation running this one failed: {err}"));
                         *relay = None;
                         break;
                     }
@@ -575,7 +576,7 @@ impl Bes {
             if let Some(f) = file.as_mut()
                 && let Err(err) = f.write_all(&e.encode_length_delimited_to_vec())
             {
-                print_err(&format!("ninja: warning: writing build events failed: {err}\n"));
+                ninja_core::status::message(&format!("warning: writing build events failed: {err}"));
                 *file = None;
             }
             if let Some(u) = uploader.as_ref() {
@@ -960,8 +961,8 @@ impl Bes {
 
         let mut console = format!("{progress}{}\n", if info.description.is_empty() { &info.command } else { &info.description });
         if let Some(code) = exit_code {
-            let code = if code != 1 { format!("[code={code}] ") } else { String::new() };
-            console.push_str(&format!("FAILED: {code}{}\n{}\n", info.outputs.join(" "), info.command));
+            console.push_str(&ninja_core::status::failed_line(code, &info.outputs, false));
+            console.push_str(&format!("{}\n", info.command));
         }
         let output = String::from_utf8_lossy(output).into_owned();
         console.push_str(&output);
@@ -1147,7 +1148,7 @@ impl Bes {
                     // The stream's failure says whether the backend answered;
                     // any other failure came before it could.
                     let first_contact = e.downcast_ref::<rbe_bes::uploader::Failed>().is_none_or(|f| !f.answered());
-                    let e = format!("{e:#}");
+                    let e = fault::describe(e.as_ref());
                     let hint = self.flags.backend.as_deref().map(|b| crate::options::tls_hint(&e, b, &self.tls, first_contact)).unwrap_or_default();
                     let level = if refused { "error" } else { "warning" };
                     print_err(&format!("ninja: {level}: build event upload failed: {e}{hint}\n"));

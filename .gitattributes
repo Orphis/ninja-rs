@@ -1,3 +1,8 @@
+# Text files have LF line endings in every checkout, Windows' too: a
+# checkout that Windows and WSL share is clean in both.
+* text=auto eol=lf
+# Read by cmd: CRLF.
+*.cmd text eol=crlf
 # Patches must apply byte-for-byte to LF sources: never convert line endings.
 *.patch -text
 crates/ninja-remote/testdata/** binary
@@ -5,4 +10,5 @@ crates/ninja-remote/testdata/** binary
 .githooks/* text eol=lf
 # Read by sh and by rustc_env_files on every platform: no carriage returns.
 *.sh text eol=lf
-crates/ninja-daemon/commit.env text eol=lf
+tools/workspace_status text eol=lf
+crates/ninja-rs/commit.env text eol=lf

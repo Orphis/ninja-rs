@@ -6,8 +6,8 @@
 //! - [`action`] turns a ninja task into a REAPI action.
 //! - [`cmdline`] splits command lines into the commands they run.
 //! - [`scanner`] finds the headers a C/C++ compile reads.
-//! - [`link`] finds what a link reads, and [`archive`] the members of thin
-//!   archives.
+//! - [`link`] finds what a link reads (with [`directives`], the libraries
+//!   objects ask for), and [`archive`] the members of thin archives.
 //! - [`paths`] maps local paths into the remote input root and back.
 //! - [`env`] chooses the environment variables an action gets.
 //! - [`toolchains`] reads the `rbe_toolchains` file.
@@ -20,6 +20,7 @@ pub mod archive;
 pub mod backend;
 pub mod cmdline;
 pub mod compile_outputs;
+pub mod directives;
 pub mod disk_cache;
 pub mod env;
 pub mod link;

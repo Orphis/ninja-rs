@@ -10,9 +10,18 @@ common --experimental_platform_in_output_dir
 # Rust link; rustc surfaces linker stderr as warnings.
 build --@rules_rust//rust/settings:extra_rustc_flag=-Alinker_messages
 
-# The commit, which builds with --stamp put in the ninja-rs version.
-build:linux --workspace_status_command=tools/workspace_status.sh
-build:windows --workspace_status_command=tools/workspace_status.cmd
+# Stamped builds put the commit in the ninja-rs version: tools/workspace_status
+# gives it (on Windows, cmd runs workspace_status.cmd for that name). Other
+# builds don't run git.
+build:stamp --stamp
+build:stamp --workspace_status_command=tools/workspace_status
+
+# Clippy on every Rust target, as `cargo clippy --all-targets` with the
+# workspace's clippy.toml: `bazelisk build --config=clippy //...`. Warnings
+# are errors.
+build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:clippy --output_groups=+clippy_checks
+build:clippy --@rules_rust//rust/settings:clippy.toml=//:clippy.toml
 
 # --- Windows host -----------------------------------------------------------
 # The MSVC ABI (x86_64-pc-windows-msvc) for both the target and the exec

@@ -58,6 +58,10 @@ pub struct GivenOption {
     /// Typed on the command line, not from a `.ninjars` file or the
     /// invocation running this one.
     pub explicit: bool,
+    /// Left out for an option it conflicts with (see `validate`): the
+    /// invocations this one runs don't get it, so that they take the
+    /// options in effect here, without the conflict.
+    pub left_out: bool,
 }
 
 /// `.ninjars` files and their configs (see `rc`). Which files are read is
@@ -319,6 +323,11 @@ impl TlsFlags {
                     }
                     !certs.is_empty()
                 }
+                // An encrypted key (PKCS#8, or OpenSSL's PKCS#1 with a
+                // `Proc-Type` header) rustls doesn't read.
+                None if pem_labels(&data).any(|l| l == "ENCRYPTED PRIVATE KEY") || data.windows(22).any(|w| w == b"Proc-Type: 4,ENCRYPTED") => {
+                    return Err(format!("--{flag}={p}: the private key is encrypted, which isn't supported (`openssl pkey -in {p} -out key.pem` decrypts it)"));
+                }
                 // The sections rustls reads: PKCS#8, PKCS#1 and SEC1 keys.
                 None => pem_labels(&data).any(|l| ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"].contains(&l)),
             };
@@ -386,6 +395,11 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
             "certificateexpired" => client_refused(" as expired, or not valid yet (is the clock right?)"),
             "unknownca" => client_refused(", whose issuer it doesn't trust"),
             "certificaterevoked" => client_refused(" as revoked"),
+            // Also what a server sharing no TLS version or cipher suite with
+            // the client says.
+            "handshakefailure" => format!(
+                "the server refused the TLS handshake: it shares no TLS version or cipher suite with the client, or refused its certificate (sent {cert})"
+            ),
             _ => client_refused(""),
         }
     } else if e.contains("keymismatch") {
@@ -414,7 +428,9 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
     } else if e.contains("invalid peer certificate") {
         "the server's certificate was refused".to_string()
     } else if first_contact
-        && ["broken pipe", "connection closed", "connection reset", "unexpected eof", "forcibly closed", "connection was aborted"].iter().any(|c| e.contains(c))
+        && ["broken pipe", "connection closed", "connection reset", "unexpected eof", "forcibly closed", "connection was aborted", "connection aborted"]
+            .iter()
+            .any(|c| e.contains(c))
     {
         format!(
             "the server closed the connection before answering anything, as when it refuses the client's certificate (sent {cert}), or doesn't speak TLS (grpc:// connects without)"
@@ -423,6 +439,18 @@ pub fn tls_hint(error: &str, endpoint: &str, tls: &TlsFlags, first_contact: bool
         return String::new();
     };
     format!("\n  {hint}")
+}
+
+/// Explains a connection to a plaintext endpoint (`grpc://`) that broke
+/// before anything answered (`rbe_client::fault::Unreachable`), which a
+/// TLS server does too (Windows resets it before the client reads the
+/// server's alert): empty for other errors.
+pub fn plaintext_hint(error: &str, endpoint: &str) -> String {
+    let plaintext = endpoint.starts_with("grpc://") || endpoint.starts_with("http://");
+    if !plaintext || !error.contains("the connection broke before anything answered") {
+        return String::new();
+    }
+    "\n  a server that speaks TLS closes plaintext connections so too: grpcs:// connects with TLS".to_string()
 }
 
 /// Build event reporting, with Bazel's flag names.
@@ -835,7 +863,9 @@ pub fn parse_invocation(args: &[String], explicit: &[bool]) -> Result<ParseOutco
 /// Options that must agree with each other. One typed on the command line
 /// wins over one it conflicts with from a settings file or the invocation
 /// running this one, with a warning (Bazel takes either); two typed ones
-/// are an error.
+/// are an error. The option left out isn't passed on (see
+/// `GivenOption::left_out`): the invocations this one runs take the
+/// options in effect, and neither fail on the conflict nor warn again.
 fn validate(o: &mut Options) -> Result<(), String> {
     if o.tls.client_certificate.is_some() != o.tls.client_key.is_some() {
         return Err("--tls_client_certificate and --tls_client_key go together".into());
@@ -849,6 +879,7 @@ fn validate(o: &mut Options) -> Result<(), String> {
             _ => return Err("--remote_racing runs actions locally, which --remote_strict forbids".into()),
         };
         *bool_option(o, dropped).expect("a boolean option") = false;
+        leave_out(o, dropped);
         o.warnings.push(format!("--{dropped}, from a settings file or the invocation running this one, is left out: --{kept}, given here, {why}"));
     }
     if let (Some(e), Some(c)) = (&o.remote.executor, &o.remote.cache)
@@ -856,8 +887,19 @@ fn validate(o: &mut Options) -> Result<(), String> {
     {
         let warning = format!("--remote_cache={c} is left out: the cache of the executor (--remote_executor={e}) is used");
         o.warnings.push(warning);
+        leave_out(o, "remote_cache");
     }
     Ok(())
+}
+
+/// Marks every occurrence of the option `name` (`--name`, `--noname`,
+/// `--name=...`) left out.
+fn leave_out(o: &mut Options, name: &str) {
+    for g in &mut o.given {
+        if g.name == name || g.name.strip_prefix("no") == Some(name) {
+            g.left_out = true;
+        }
+    }
 }
 
 /// Parses the arguments, without checking that the options agree.
@@ -905,7 +947,14 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                     (Some(_), Some(_)) => return Err(format!("option '--{name}' doesn't take a value")),
                     (Some(v), None) => parse_bool(name, v)?,
                 };
-                o.given.push(GivenOption { combined_form: a.clone(), name: name.to_string(), value: inline.unwrap_or_default(), index: first, explicit: true });
+                o.given.push(GivenOption {
+                    combined_form: a.clone(),
+                    name: name.to_string(),
+                    value: inline.unwrap_or_default(),
+                    index: first,
+                    explicit: true,
+                    left_out: false,
+                });
                 continue;
             }
             match name {
@@ -1020,7 +1069,7 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                 None if i > first + 1 => args[i - 1].clone(),
                 None => String::new(),
             };
-            o.given.push(GivenOption { combined_form: args[first..i].join(" "), name: name.to_string(), value, index: first, explicit: true });
+            o.given.push(GivenOption { combined_form: args[first..i].join(" "), name: name.to_string(), value, index: first, explicit: true, left_out: false });
             continue;
         }
         if a.len() > 1 && a.starts_with('-') {
@@ -1055,6 +1104,7 @@ fn parse_unchecked(args: &[String]) -> Result<ParseOutcome, String> {
                     value: arg.clone().unwrap_or_default(),
                     index: first,
                     explicit: true,
+                    left_out: false,
                 });
                 match c {
                     'd' => match arg.as_deref().unwrap() {
@@ -1349,6 +1399,10 @@ mod tests {
             ("received fatal alert: UnknownCA", "refused the client's certificate, whose issuer it doesn't trust: sent the client certificate /c.pem"),
             ("received fatal alert: CertificateRevoked", "refused the client's certificate as revoked"),
             ("received fatal alert: BadCertificate", "refused the client's certificate: sent"),
+            (
+                "received fatal alert: HandshakeFailure",
+                "shares no TLS version or cipher suite with the client, or refused its certificate (sent the client certificate /c.pem)",
+            ),
             ("keys may not be consistent: KeyMismatch", "the client certificate /c.pem and its key (--tls_client_key) don't match"),
         ] {
             let h = hint(&format!("transport error: {error}"), "grpcs://h:1", true);
@@ -1361,15 +1415,22 @@ mod tests {
         assert_eq!(hint(&format!("connecting to {named}: transport error: connection refused"), named, true), "");
         // Which endpoints use the certificates at all.
         assert!(uses_tls("grpcs://h:1") && uses_tls("https://h:1") && uses_tls("h:1") && !uses_tls("grpc://h:1") && !uses_tls("http://h:1"));
-        // Windows' words for a connection reset, or aborted.
+        // Windows' words for a connection reset, or aborted, and hyper's.
         for e in [
             "An existing connection was forcibly closed by the remote host. (os error 10054)",
             "An established connection was aborted by the software in your host machine. (os error 10053)",
+            "connection error: connection aborted",
         ] {
             assert!(hint(&format!("transport error: {e}"), "grpcs://h:1", true).contains("closed the connection before answering"), "{e}");
         }
         assert_eq!(hint("transport error: broken pipe", "grpc://h:1", true), "");
         assert_eq!(hint("not found", "grpcs://h:1", true), "");
+        // A plaintext connection broken before anything answered may be to
+        // a TLS server.
+        let broke = "GetCapabilities: the connection broke before anything answered: UNKNOWN: transport error: connection aborted";
+        assert!(plaintext_hint(broke, "grpc://h:1").contains("grpcs:// connects with TLS"));
+        assert_eq!(plaintext_hint(broke, "grpcs://h:1"), "");
+        assert_eq!(plaintext_hint("connecting to grpc://h:1: transport error: tcp connect error: refused", "grpc://h:1"), "");
     }
 
     #[test]
@@ -1398,6 +1459,16 @@ mod tests {
         assert!(err.contains("--tls_client_certificate=") && err.contains("no PEM certificate"), "{err}");
         let err = TlsFlags { client_certificate: tls.client_certificate.clone(), client_key: der, ..Default::default() }.load().unwrap_err();
         assert!(err.contains("--tls_client_key=") && err.contains("no PEM private key"), "{err}");
+        // An encrypted key, PKCS#8 or OpenSSL's PKCS#1: said so, not as DER.
+        for (name, encrypted) in [
+            ("p8.pem", "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIF\n-----END ENCRYPTED PRIVATE KEY-----\n"),
+            ("p1.pem", "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\nMIIE\n-----END RSA PRIVATE KEY-----\n"),
+        ] {
+            let err = TlsFlags { client_certificate: tls.client_certificate.clone(), client_key: file(name, encrypted.as_bytes()), ..Default::default() }
+                .load()
+                .unwrap_err();
+            assert!(err.contains("--tls_client_key=") && err.contains("the private key is encrypted") && !err.contains("-inform der"), "{err}");
+        }
         // PEM that isn't a certificate.
         let err = TlsFlags { certificate: file("garbled.pem", b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"), ..Default::default() }
             .load()

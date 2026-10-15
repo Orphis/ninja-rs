@@ -124,7 +124,7 @@ fn parent_from(json: &str) -> Option<Parent> {
     if let Some(f) = &p.secret_flags {
         match std::fs::read_to_string(f).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str::<Vec<String>>(&t).map_err(|e| e.to_string())) {
             Ok(flags) => p.flags.extend(flags),
-            Err(e) => eprintln!("ninja: warning: the options of the invocation running this one: {}: {e}", f.display()),
+            Err(e) => ninja_core::status::print_err(&format!("ninja: warning: the options of the invocation running this one: {}: {e}\n", f.display())),
         }
     }
     Some(p)
@@ -204,6 +204,126 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Whether process `pid` runs this one: its parent, or the parent's, and so
+/// on. A generator's `-t restat` whose environment lost `LOGS_LOCK_ENV` (a
+/// wrapper scrubbing it) recognizes the build running it, which holds the
+/// lock, by the pid its lock file names, rather than wait for it forever.
+/// False where processes' parents can't be asked for.
+pub(crate) fn runs_this(pid: u32) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        // On Unix, a process whose parent exits gets another (init, a
+        // subreaper): ids in the chain are those of running processes.
+        let mut current = std::process::id();
+        // A bound, should ids ever make a cycle.
+        for _ in 0..256 {
+            match parent_of(current) {
+                Some(parent) if parent == pid => return true,
+                Some(parent) if parent > 1 && parent != current => current = parent,
+                _ => return false,
+            }
+        }
+        false
+    }
+    #[cfg(windows)]
+    {
+        windows_ancestry::runs_this(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// The parent of process `pid`, as `/proc` says.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (name) state ppid ...`: the name may hold spaces and parentheses.
+    stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The parent of process `pid`, as `proc_pidinfo` says.
+#[cfg(target_os = "macos")]
+fn parent_of(pid: u32) -> Option<u32> {
+    // SAFETY: fills `info`, of the size given, nothing else.
+    unsafe {
+        let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let filled = libc::proc_pidinfo(libc::c_int::try_from(pid).ok()?, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size);
+        (filled == size).then_some(info.pbi_ppid)
+    }
+}
+
+/// `runs_this` on Windows, where a process keeps the id of its parent,
+/// which another process may have taken since the parent exited: that
+/// one, created after, isn't the parent.
+#[cfg(windows)]
+mod windows_ancestry {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::Foundation::{FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
+    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    pub fn runs_this(pid: u32) -> bool {
+        let parents = parents();
+        let mut current = std::process::id();
+        let Some(mut created) = creation_time(current) else { return false };
+        for _ in 0..256 {
+            let Some(&parent) = parents.get(&current) else { return false };
+            let Some(parent_created) = creation_time(parent).filter(|&c| c <= created) else { return false };
+            if parent == pid {
+                return true;
+            }
+            (current, created) = (parent, parent_created);
+        }
+        false
+    }
+
+    /// Each running process's parent id.
+    fn parents() -> std::collections::HashMap<u32, u32> {
+        let mut parents = std::collections::HashMap::new();
+        // SAFETY: plain system calls; the snapshot handle is owned (closed)
+        // below, and the entry's size is set as they want it.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return parents;
+            }
+            let _owned = OwnedHandle::from_raw_handle(snapshot);
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+            while more {
+                parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+                more = Process32NextW(snapshot, &mut entry) != 0;
+            }
+        }
+        parents
+    }
+
+    /// When process `pid` was created (100 ns since 1601), if it can be
+    /// asked.
+    fn creation_time(pid: u32) -> Option<u64> {
+        // SAFETY: plain system calls; the handle is owned (closed) below.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let h = OwnedHandle::from_raw_handle(h);
+            let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+            let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+            if GetProcessTimes(std::os::windows::io::AsRawHandle::as_raw_handle(&h), &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+                return None;
+            }
+            Some(u64::from(creation.dwHighDateTime) << 32 | u64::from(creation.dwLowDateTime))
+        }
+    }
+}
+
 /// Options not passed on: per invocation (ids, build events, logs written
 /// once), about the terminal, or about `.ninjars` files (whose options
 /// are passed on instead).
@@ -229,7 +349,9 @@ fn inherited(name: &str) -> bool {
         ))
 }
 
-/// The long options given, as nested invocations take them: paths
+/// The long options given, as nested invocations take them: those in
+/// effect (not those left out for one they conflict with, which nested
+/// invocations, taking them all as given by settings, would fail on), paths
 /// absolute, since they run elsewhere.
 fn exported_flags(opts: &Options) -> Vec<String> {
     let absolute = |name: &str| -> Option<String> {
@@ -244,7 +366,7 @@ fn exported_flags(opts: &Options) -> Vec<String> {
     };
     opts.given
         .iter()
-        .filter(|g| g.combined_form.starts_with("--") && inherited(&g.name))
+        .filter(|g| g.combined_form.starts_with("--") && !g.left_out && inherited(&g.name))
         .map(|g| match absolute(&g.name) {
             Some(v) => format!("--{}={v}", g.name),
             None if g.value.is_empty() && !g.combined_form.contains('=') => format!("--{}", g.name),
@@ -284,7 +406,7 @@ pub fn export(opts: &mut Options) -> (Option<Relay>, Option<SecretFlags>) {
         match Relay::bind() {
             Ok(r) => Some(r),
             Err(e) => {
-                eprintln!("ninja: warning: nested builds' events won't be reported: {e}");
+                ninja_core::status::print_err(&format!("ninja: warning: nested builds' events won't be reported: {e}\n"));
                 None
             }
         }
@@ -299,7 +421,7 @@ pub fn export(opts: &mut Options) -> (Option<Relay>, Option<SecretFlags>) {
         match write_secret_flags(&secret) {
             Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("ninja: warning: nested builds won't get --remote_header: {e}");
+                ninja_core::status::print_err(&format!("ninja: warning: nested builds won't get --remote_header: {e}\n"));
                 None
             }
         }
@@ -501,6 +623,42 @@ mod tests {
         assert_eq!(child.bes.invocation_id.as_deref(), Some("abc"));
         assert_eq!(child.bes.relay, parent.relay);
         assert!(child.remote.execution_log_append);
+    }
+
+    /// An option typed here won over one of a settings file: nested
+    /// invocations get the one in effect only. Given both, as settings,
+    /// they failed on the conflict (CMake's `-t restat`, every nested
+    /// build), or warned again.
+    #[test]
+    fn options_left_out_arent_passed_on() {
+        use crate::options::parse_invocation;
+        let parse = |args: &[&str], explicit: &[bool]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            match parse_invocation(&args, explicit) {
+                Ok(ParseOutcome::Run(o)) => o,
+                Ok(ParseOutcome::Exit(..)) => panic!("exit"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        // `.ninjars`: --remote_strict, --remote_cache; typed: --remote_racing,
+        // --remote_executor.
+        let outer = parse(
+            &["--remote_strict", "--remote_cache=grpc://c:1", "--noremote_strict", "--remote_strict", "--remote_racing", "--remote_executor=grpc://e:1"],
+            &[false, false, false, false, true, true],
+        );
+        assert_eq!(outer.warnings.len(), 2, "{:?}", outer.warnings);
+        let flags = exported_flags(&outer);
+        assert_eq!(flags, ["--remote_racing", "--remote_executor=grpc://e:1"]);
+        // A nested invocation takes them as settings: the same options in
+        // effect, nothing to warn about.
+        let refs: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let nested = parse(&refs, &[false, false]);
+        assert!(nested.remote.racing && !nested.remote.strict && nested.remote.cache.is_none());
+        assert_eq!(nested.remote.executor.as_deref(), Some("grpc://e:1"));
+        assert!(nested.warnings.is_empty(), "{:?}", nested.warnings);
+        // The other way round.
+        let outer = parse(&["--remote_racing", "--remote_strict"], &[false, true]);
+        assert_eq!(exported_flags(&outer), ["--remote_strict"]);
     }
 
     #[test]

@@ -93,14 +93,16 @@ extern "C" fn note_sender(signal: libc::c_int, info: *mut libc::siginfo_t, _: *m
 }
 
 /// Installs `note_sender` for `signal`, unless it has a handler already
-/// (tokio's: replacing it would lose the signal).
+/// (tokio's: replacing it would lose the signal). Also when it is ignored
+/// (a background job of a shell without job control inherits SIGINT so):
+/// tokio's handler replaces that anyway, as ninja's does.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn note_senders_of(signal: i32) {
     // SAFETY: plain sigaction calls with initialized structures; the
     // handler only stores to an atomic.
     unsafe {
         let mut current: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(signal, std::ptr::null(), &mut current) != 0 || current.sa_sigaction != libc::SIG_DFL {
+        if libc::sigaction(signal, std::ptr::null(), &mut current) != 0 || ![libc::SIG_DFL, libc::SIG_IGN].contains(&current.sa_sigaction) {
             return;
         }
         let mut action: libc::sigaction = std::mem::zeroed();
@@ -890,7 +892,6 @@ fn reaps_orphans() -> bool {
 mod job {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
-    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_LIMIT_INFORMATION,
@@ -902,14 +903,6 @@ mod job {
     /// A command joins its job before it runs, and Ctrl-C reaches ninja-rs
     /// only, as in ninja.
     pub const CREATION_FLAGS: u32 = CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP;
-
-    // std keeps the handle of a new process's thread to itself: a process
-    // spawned suspended is resumed whole, with this ntdll export (long
-    // stable, if undocumented; PsSuspend and debuggers use it).
-    #[link(name = "ntdll")]
-    unsafe extern "system" {
-        fn NtResumeProcess(process: HANDLE) -> i32;
-    }
 
     /// Sends Ctrl-Break to the process group `group`, as ninja does to stop
     /// a command. False without a console to send it through.
@@ -927,10 +920,7 @@ mod job {
         pub fn start(process: RawHandle) -> std::io::Result<Option<Job>> {
             let job = Self::with_process(process);
             // SAFETY: a valid process handle, with all access rights.
-            let status = unsafe { NtResumeProcess(process) };
-            if status < 0 {
-                return Err(std::io::Error::other(format!("resuming the process: NTSTATUS {status:#x}")));
-            }
+            unsafe { ninja_os::process::resume(process) }?;
             Ok(job)
         }
 

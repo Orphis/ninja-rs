@@ -5,6 +5,8 @@
 //! Commands are this test binary itself: under the name `fake-job` it
 //! records how many jobs run at once and the `MAKEFLAGS` it got.
 
+#![allow(clippy::disallowed_macros)] // Tests, and the fake tools they run, print.
+
 mod harness;
 
 use std::path::{Path, PathBuf};
@@ -46,7 +48,7 @@ fn ninja(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Run {
     for (k, v) in env {
         c.env(k, v);
     }
-    let out = c.output().unwrap();
+    let out = harness::output(&mut c).unwrap();
     let text = |b: &[u8]| String::from_utf8_lossy(b).replace("\r\n", "\n");
     Run { code: out.status.code().unwrap_or(-1), stdout: text(&out.stdout), stderr: text(&out.stderr) }
 }
@@ -259,7 +261,7 @@ fn start_ninja(dir: &Path, name: &str, args: &[&str]) -> std::process::Child {
     // Files, not pipes: nothing blocks on them while the test waits.
     let out = std::fs::File::create(dir.join(format!("{name}.txt"))).unwrap();
     c.stdout(out.try_clone().unwrap()).stderr(out);
-    c.spawn().unwrap()
+    harness::spawn(&mut c).unwrap()
 }
 
 /// Waits for `child` to exit, killing it after `harness::PATIENCE`.
@@ -350,14 +352,49 @@ fn test_cross_nested_builds() -> Result<(), String> {
     check(!out.contains("waiting for"), &format!("a nested build waited: {out}"))
 }
 
-/// `fake-gen IN OUT NINJA`: regenerates OUT from IN, then runs what CMake
-/// runs at the end of a configure: `NINJA -t recompact`, `NINJA -t restat
-/// OUT`.
+/// An option typed on the command line wins over the one of a settings
+/// file it conflicts with (`--remote_racing` over `--remote_strict`,
+/// `--remote_executor` over `--remote_cache`), with a warning, said once:
+/// the invocations the build's commands run (CMake's `-t restat` at a
+/// regeneration, a nested build) take the options in effect. They got
+/// both, as settings, and failed on the conflict, or warned again.
+fn test_nested_after_an_override() -> Result<(), String> {
+    let dir = test_dir("nested_override");
+    let (cl, ninja_rs) = (tool(&dir, "fake-cl"), ninja_command());
+    std::fs::write(dir.join(".ninjars"), "build --remote_strict --remote_cache=grpc://127.0.0.1:1\n").unwrap();
+    std::fs::write(dir.join("inner.ninja"), format!("rule gen\n  command = {cl} gen $out\nbuild inner: gen\n")).unwrap();
+    let manifest = format!(
+        "rule gen\n  command = {cl} gen $out\nrule restat\n  command = {ninja_rs} -t restat out\nrule nest\n  command = {ninja_rs} -f inner.ninja inner\n\
+         build out: gen\nbuild restat: restat | out\nbuild nested: nest | restat\n"
+    );
+    std::fs::write(dir.join("build.ninja"), manifest).unwrap();
+    let args = ["--noignore_all_rc_files", "--nosystem_rc", "--nohome_rc", "--remote_racing", "--remote_executor=grpc://127.0.0.1:2", "nested"];
+    let r = ninja(&dir, &args, &[]);
+    let text = format!("{}{}", r.stdout, r.stderr);
+    check(r.code == 0 && dir.join("inner").exists(), &format!("exit {}:\n{text}", r.code))?;
+    for warning in ["--remote_strict, from a settings file", "--remote_cache=grpc://127.0.0.1:1 is left out"] {
+        check(text.matches(warning).count() == 1, &format!("'{warning}' not said once:\n{text}"))?;
+    }
+    Ok(())
+}
+
+/// `fake-gen IN OUT NINJA [scrub]`: regenerates OUT from IN, then runs what
+/// CMake runs at the end of a configure: `NINJA -t recompact`, `NINJA -t
+/// restat OUT`; with `scrub`, without the variable naming the logs' locks
+/// the build holds (a wrapper scrubbing the environment).
 fn fake_gen(args: &[String]) -> i32 {
-    let [input, out, ninja] = args else { return 2 };
+    let (input, out, ninja, scrub) = match args {
+        [input, out, ninja] => (input, out, ninja, false),
+        [input, out, ninja, scrub] if scrub == "scrub" => (input, out, ninja, true),
+        _ => return 2,
+    };
     std::fs::copy(input, out).unwrap();
     for tool in [vec!["-t", "recompact"], vec!["-t", "restat", out]] {
-        match Command::new(ninja).args(tool).status() {
+        let mut c = Command::new(ninja);
+        if scrub {
+            c.env_remove(ninja_rs::nested::LOGS_LOCK_ENV);
+        }
+        match c.args(tool).status() {
             Ok(s) if s.success() => {}
             Ok(s) => return s.code().unwrap_or(1),
             Err(_) => return 1,
@@ -395,6 +432,60 @@ fn test_generator_under_the_lock() -> Result<(), String> {
     check(r.code == 0 && r.stdout.contains("no work to do"), &format!("the next build: {}{}", r.stdout, r.stderr))
 }
 
+/// The same, the generator's tools started without the variable naming the
+/// locks the build holds (a wrapper scrubbing the environment): they know
+/// the build by its pid in the lock file, an ancestor of theirs. They
+/// waited for it, as it waited for them, forever.
+fn test_generator_without_the_lock_variable() -> Result<(), String> {
+    let dir = test_dir("generator_scrubbed");
+    let (generator, cl) = (tool(&dir, "fake-gen"), tool(&dir, "fake-cl"));
+    let manifest = format!(
+        "rule gen\n  command = {generator} build.ninja.in build.ninja {} scrub\n  generator = 1\nbuild build.ninja: gen build.ninja.in\n\
+         rule touch\n  command = {cl} gen $out\nbuild out: touch\n",
+        ninja_command()
+    );
+    std::fs::write(dir.join("build.ninja.in"), &manifest).unwrap();
+    std::fs::write(dir.join("build.ninja"), &manifest).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(60);
+    std::fs::File::options().write(true).open(dir.join("build.ninja")).unwrap().set_modified(old).unwrap();
+    std::fs::write(dir.join(".ninja_rs_log"), build_log([("gone.o".to_string(), 1)])).unwrap();
+    let mut child = start_ninja(&dir, "out", &[]);
+    let status = wait_exit(&mut child, "the build regenerating its manifest")?;
+    let out = std::fs::read_to_string(dir.join("out.txt")).unwrap_or_default();
+    check(status.success() && dir.join("out").exists(), &format!("{status}: {out}"))?;
+    check(!out.contains("waiting for"), &format!("the generator's tools waited: {out}"))?;
+    check(logged(&dir)?.lookup_by_output("gone.o").is_some(), "the log was recompacted under the build")
+}
+
+/// `-t restat` run by another process than the build holding the lock
+/// waits for it, saying so on stderr: CMake discards its stdout.
+fn test_restat_waits_on_stderr() -> Result<(), String> {
+    let dir = test_dir("restat_waits");
+    let wait = tool(&dir, "fake-wait");
+    std::fs::write(dir.join("build.ninja"), format!("rule wait\n  command = {wait} $out\nbuild held: wait\n")).unwrap();
+    std::fs::write(dir.join(".ninja_rs_log"), build_log([("held".to_string(), 1)])).unwrap();
+    let mut holder = start_ninja(&dir, "holder", &[]);
+    let result = (|| {
+        harness::wait_for("the build's command", || dir.join("held.started").exists())?;
+        let mut restat = command(&dir);
+        restat.args(["-t", "restat", "held"]).stdout(std::fs::File::create(dir.join("restat.out")).unwrap());
+        let mut restat = restat.stderr(std::fs::File::create(dir.join("restat.err")).unwrap()).spawn().map_err(|e| e.to_string())?;
+        let said = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default();
+        let waiting = || said("restat.err").contains("waiting for") || said("restat.out").contains("waiting for");
+        let waited = harness::wait_for("-t restat waiting", || waiting() || restat.try_wait().is_ok_and(|s| s.is_some()));
+        std::fs::write(dir.join("release"), "").unwrap();
+        let status = wait_exit(&mut restat, "-t restat")?;
+        waited?;
+        let (out, err) = (said("restat.out"), said("restat.err"));
+        check(status.success() && out.is_empty(), &format!("-t restat: {status}: stdout: {out}"))?;
+        check(err.contains(&format!("ninja: waiting for the build running in this directory (pid {}, started ", holder.id())), &format!("stderr: {err}"))
+    })();
+    std::fs::write(dir.join("release"), "").unwrap();
+    let status = wait_exit(&mut holder, "the build")?;
+    result?;
+    check(status.success(), &format!("the build: {status}"))
+}
+
 /// `fake-wait OUT`: says it runs (`OUT.started`), waits for a `release`
 /// file, then writes OUT.
 fn fake_wait(args: &[String]) -> i32 {
@@ -405,6 +496,21 @@ fn fake_wait(args: &[String]) -> i32 {
     }
     std::fs::write(out, "").unwrap();
     0
+}
+
+/// Interrupts `child` as the terminal does: SIGINT, or Ctrl-Break (sent by
+/// its `console-host`).
+fn sigint(child: &mut std::process::Child) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        // SAFETY: plain system call.
+        check(unsafe { libc::kill(child.id() as i32, libc::SIGINT) } == 0, "kill failed")
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        writeln!(child.stdin.take().expect("stdin"), "break").map_err(|e| format!("console-host: {e}"))
+    }
 }
 
 /// A build waiting for the one running in its directory says which one
@@ -438,20 +544,9 @@ fn test_interrupt_while_waiting_for_the_lock() -> Result<(), String> {
         let said = || std::fs::read_to_string(dir.join("waiter.txt")).unwrap_or_default().replace("\r\n", "\n");
         let waiting = format!("waiting for the build running in this directory (pid {}, started ", holder.id());
         let waited = harness::wait_for("the second build waiting", || said().contains(&waiting) || waiter.try_wait().is_ok_and(|s| s.is_some()));
-        let interrupted =
-            waited.and_then(|()| check(said().contains(&waiting), &format!("no waiting message naming the first build:\n{}", said()))).and_then(|()| {
-                #[cfg(unix)]
-                // SAFETY: plain system call.
-                unsafe {
-                    libc::kill(waiter.id() as i32, libc::SIGINT)
-                };
-                #[cfg(windows)]
-                {
-                    use std::io::Write;
-                    writeln!(waiter.stdin.take().expect("stdin"), "break").map_err(|e| format!("console-host: {e}"))?;
-                }
-                Ok(())
-            });
+        let interrupted = waited
+            .and_then(|()| check(said().contains(&waiting), &format!("no waiting message naming the first build:\n{}", said())))
+            .and_then(|()| sigint(&mut waiter));
         let status = wait_exit(&mut waiter, "the waiting build exiting");
         interrupted?;
         let status = status?;
@@ -479,8 +574,9 @@ fn test_clean_keeps_other_remote_records() -> Result<(), String> {
     std::fs::write(dir.join(".ninja_remote"), format!("# ninja-rs remote outputs v2\n{}{}", record("a"), record("b"))).unwrap();
     let r = ninja(&dir, &["-t", "clean", "a"], &[]);
     check(r.code == 0, &format!("-t clean a: {}{}", r.stdout, r.stderr))?;
-    let records = std::fs::read_to_string(dir.join(".ninja_remote")).unwrap_or_default();
-    check(records.contains(&record("b")) && !records.contains(&record("a")), &format!("the records left:\n{records}"))
+    let records = ninja_remote::remote_outputs::RemoteOutputs::load(&dir.join(".ninja_remote"));
+    let text = std::fs::read_to_string(dir.join(".ninja_remote")).unwrap_or_default();
+    check(records.get("b").is_some() && records.get("a").is_none(), &format!("the records left:\n{text}"))
 }
 
 /// Two manifests share one build directory's logs (CMake's Ninja
@@ -505,14 +601,23 @@ fn test_recompaction_keeps_other_manifests_records() -> Result<(), String> {
 }
 
 /// As ninja: a failed build exits with the code of the last command that
-/// failed (1.13); an unknown option prints the usage and exits with 1; a
-/// build file needing a newer ninja is fatal.
+/// failed (1.13), which its `FAILED:` line gives, whatever it is, with each
+/// output followed by a space; an unknown option prints the usage and exits
+/// with 1; a build file needing a newer ninja is fatal; so is a directory
+/// `-C` can't enter, with the system's message alone.
 fn test_exit_codes() -> Result<(), String> {
     let dir = test_dir("exit_codes");
-    let fail = if cfg!(windows) { "cmd /c exit 3" } else { "exit 3" };
-    std::fs::write(dir.join("build.ninja"), format!("rule fail\n  command = {fail}\nbuild out: fail\n")).unwrap();
-    let r = ninja(&dir, &[], &[]);
-    check(r.code == 3 && r.stdout.contains("FAILED: [code=3] out"), &format!("a failed command: exit {}: {}{}", r.code, r.stdout, r.stderr))?;
+    for code in [3, 1] {
+        let fail = if cfg!(windows) { format!("cmd /c exit {code}") } else { format!("exit {code}") };
+        std::fs::write(dir.join("build.ninja"), format!("rule fail\n  command = {fail}\nbuild out: fail\n")).unwrap();
+        let r = ninja(&dir, &[], &[]);
+        let line = format!("FAILED: [code={code}] out \n");
+        check(r.code == code && r.stdout.contains(&line), &format!("a failed command: exit {}: {}{}", r.code, r.stdout, r.stderr))?;
+    }
+    let r = ninja(&dir, &["-C", "nowhere"], &[]);
+    check(r.code == 1 && r.stderr.starts_with("ninja: fatal: chdir to 'nowhere' - ") && !r.stderr.contains("os error"), &format!("-C nowhere: {}", r.stderr))?;
+    #[cfg(unix)]
+    check_eq(&r.stderr, "ninja: fatal: chdir to 'nowhere' - No such file or directory\n", "-C nowhere")?;
     let r = ninja(&dir, &["--bogus"], &[]);
     check(r.code == 1 && r.stderr.starts_with("ninja: unrecognized option '--bogus'\nusage:"), &format!("--bogus: exit {}: {}", r.code, r.stderr))?;
     let r = ninja(&dir, &["-j", "x"], &[]);
@@ -560,6 +665,37 @@ fn test_write_errors() -> Result<(), String> {
     std::fs::write(build.join("build.ninja"), format!("rule fail\n  command = {fail}\nbuild out: fail\n")).unwrap();
     let (status, stderr) = closed(&build, &[])?;
     check(status.code() == Some(3) && !stderr.contains("panicked"), &format!("a build: {status}: {stderr}"))
+}
+
+/// A build whose stderr can't be written (a pipe its reader closed, a
+/// terminal gone) while its remote backend says things there (here why
+/// actions ran locally, with `--remote_verbose`, and a disk cache): it
+/// goes on without them, and ends as builds do, its logs saved. The status
+/// printer's `eprint!` panicked (and aborted, unwinding), leaving the
+/// lock file and no logs.
+fn test_messages_to_a_closed_stderr() -> Result<(), String> {
+    let dir = test_dir("closed_stderr");
+    let cl = tool(&dir, "fake-cl");
+    let mut manifest = format!("rbe_version = 1\nrule cc\n  command = {cl} gen $out\n");
+    let outputs: Vec<String> = (0..20).map(|i| format!("o{i}.o")).collect();
+    for o in &outputs {
+        manifest += &format!("build {o}: cc\n  rbe_mnemonic = CppCompile\n");
+    }
+    std::fs::write(dir.join("build.ninja"), manifest).unwrap();
+    let mut c = command(&dir);
+    c.args(["--disk_cache=cache", "--remote_verbose", "-j2"])
+        .stdout(std::fs::File::create(dir.join("stdout.txt")).unwrap())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().map_err(|e| e.to_string())?;
+    // Closed before anything is read.
+    drop(child.stderr.take());
+    let status = wait_exit(&mut child, "the build")?;
+    let stdout = std::fs::read_to_string(dir.join("stdout.txt")).unwrap_or_default();
+    check(status.success(), &format!("{status}:\n{stdout}"))?;
+    let log = logged(&dir)?;
+    let missing: Vec<&String> = outputs.iter().filter(|o| log.lookup_by_output(o).is_none()).collect();
+    check(missing.is_empty(), &format!("not in the build log: {missing:?}"))?;
+    check(!dir.join(".ninja_lock").exists(), "the build left .ninja_lock")
 }
 
 /// `--version` and `-t list` are answered from the command line alone, as
@@ -744,35 +880,43 @@ fn test_exec_forwards_signals() -> Result<(), String> {
 
 /// `-t exec` passes on SIGINT when a process sent it to ninja-rs alone
 /// (kill(2)), even in the terminal's foreground: the terminal's own reaches
-/// the command too (and isn't passed on), a process's doesn't.
+/// the command too (and isn't passed on), a process's doesn't. Also when
+/// ninja-rs started with SIGINT ignored (a background job of a shell
+/// without job control): who sent it wasn't noted then.
 #[cfg(target_os = "linux")]
 fn test_exec_forwards_sigint_from_processes() -> Result<(), String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
-    let dir = test_dir("exec_sigint");
-    let (_master, terminal) = pty(80)?;
-    let script = "trap 'echo > got-int; exit 7' INT; echo > ready; while :; do sleep 0.1; done";
-    let mut c = command(&dir);
-    c.args(["-t", "exec", "sh", "-c", script]).stdin(std::process::Stdio::null());
-    let tty = terminal.as_raw_fd();
-    // In the foreground of a terminal of its own, as its command.
-    // SAFETY: async-signal-safe calls only, between fork and exec.
-    unsafe {
-        c.pre_exec(move || {
-            if libc::setsid() < 0 || libc::ioctl(tty, libc::TIOCSCTTY, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    for ignored in [false, true] {
+        let dir = test_dir(if ignored { "exec_sigint_ignored" } else { "exec_sigint" });
+        let (_master, terminal) = pty(80)?;
+        let script = "trap 'echo > got-int; exit 7' INT; echo > ready; while :; do sleep 0.1; done";
+        let mut c = command(&dir);
+        c.args(["-t", "exec", "sh", "-c", script]).stdin(std::process::Stdio::null());
+        let tty = terminal.as_raw_fd();
+        // In the foreground of a terminal of its own, as its command.
+        // SAFETY: async-signal-safe calls only, between fork and exec.
+        unsafe {
+            c.pre_exec(move || {
+                if libc::setsid() < 0 || libc::ioctl(tty, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if ignored {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                }
+                Ok(())
+            });
+        }
+        let mut child = c.spawn().map_err(|e| e.to_string())?;
+        harness::wait_for("the command running", || dir.join("ready").exists() || child.try_wait().is_ok_and(|s| s.is_some()))?;
+        // SAFETY: plain system call.
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+        match wait_at_most(&mut child, harness::PATIENCE) {
+            Some(s) => check(s.code() == Some(7) && dir.join("got-int").exists(), &format!("SIGINT ignored at start: {ignored}: exited with {s}"))?,
+            None => return Err(format!("SIGINT ignored at start: {ignored}: the command didn't get SIGINT")),
+        }
     }
-    let mut child = c.spawn().map_err(|e| e.to_string())?;
-    harness::wait_for("the command running", || dir.join("ready").exists() || child.try_wait().is_ok_and(|s| s.is_some()))?;
-    // SAFETY: plain system call.
-    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    match wait_at_most(&mut child, harness::PATIENCE) {
-        Some(s) => check(s.code() == Some(7) && dir.join("got-int").exists(), &format!("exited with {s}")),
-        None => Err("the command didn't get SIGINT".into()),
-    }
+    Ok(())
 }
 
 /// `fake-job OUT`: runs for a while, then writes how many jobs were running
@@ -1087,31 +1231,11 @@ fn test_terminal_status() -> Result<(), String> {
 /// console's width, and what its screen shows.
 #[cfg(windows)]
 fn console_screen(args: &[String]) -> i32 {
-    use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    #[derive(Default)]
-    struct Coord {
-        x: i16,
-        y: i16,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct Info {
-        size: Coord,
-        cursor: Coord,
-        attributes: u16,
-        window: [i16; 4],
-        maximum_window_size: Coord,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetConsoleMode(console: *mut c_void, mode: *mut u32) -> i32;
-        fn SetConsoleMode(console: *mut c_void, mode: u32) -> i32;
-        fn GetConsoleScreenBufferInfo(console: *mut c_void, info: *mut Info) -> i32;
-        fn ReadConsoleOutputCharacterW(console: *mut c_void, chars: *mut u16, len: u32, at: Coord, read: *mut u32) -> i32;
-    }
-    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x4;
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetConsoleScreenBufferInfo, ReadConsoleOutputCharacterW,
+        SetConsoleMode,
+    };
     let console = match std::fs::File::options().read(true).write(true).open("CONOUT$") {
         Ok(c) => c,
         Err(e) => {
@@ -1128,18 +1252,18 @@ fn console_screen(args: &[String]) -> i32 {
     }
     let (Ok(stdout), Ok(stderr)) = (console.try_clone(), console.try_clone()) else { return 1 };
     let code = Command::new(&args[0]).args(&args[1..]).stdout(stdout).stderr(stderr).status().map_or(1, |s| s.code().unwrap_or(1));
-    let mut info = Info::default();
+    let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
     // SAFETY: as above.
     unsafe {
         GetConsoleMode(handle, &mut mode);
         GetConsoleScreenBufferInfo(handle, &mut info);
     }
-    println!("escapes {} width {}", mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0, info.size.x);
-    for y in 0..=info.cursor.y {
-        let mut row = vec![0u16; info.size.x.max(0) as usize];
+    println!("escapes {} width {}", mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0, info.dwSize.X);
+    for y in 0..=info.dwCursorPosition.Y {
+        let mut row = vec![0u16; info.dwSize.X.max(0) as usize];
         let mut read = 0;
         // SAFETY: reads a row at most, into `row`.
-        unsafe { ReadConsoleOutputCharacterW(handle, row.as_mut_ptr(), row.len() as u32, Coord { x: 0, y }, &mut read) };
+        unsafe { ReadConsoleOutputCharacterW(handle, row.as_mut_ptr(), row.len() as u32, COORD { X: 0, Y: y }, &mut read) };
         println!("{}", String::from_utf16_lossy(&row[..read as usize]).trim_end());
     }
     code
@@ -1164,7 +1288,7 @@ fn test_console_status() -> Result<(), String> {
     let screen = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
     let width = screen.lines().next().and_then(|l| l.strip_prefix("escapes true width ")?.parse::<usize>().ok());
     let width = width.ok_or_else(|| format!("escape sequences not turned on:\n{screen}"))?;
-    check(!screen.contains('\x1b') && screen.contains("\nFAILED: a\ncmd /c exit 1\n"), &format!("escape sequences shown:\n{screen}"))?;
+    check(!screen.contains('\x1b') && screen.contains("\nFAILED: [code=1] a\ncmd /c exit 1\n"), &format!("escape sequences shown:\n{screen}"))?;
     // Filling the last column leaves the cursor there, and erasing the rest
     // of the line erases it (with ninja too).
     let status = screen.lines().find(|l| l.starts_with("[1/1] x")).unwrap_or_default();
@@ -1262,6 +1386,41 @@ fn fake_sleep(args: &[String]) -> i32 {
     std::fs::write(format!("{out}.marker"), "late").unwrap();
     std::fs::write(out, "done").unwrap();
     0
+}
+
+/// The harness: a test still running at the end of `TEST_TIMEOUT` fails,
+/// and what it started through the harness (`fake-sleep`, for longer than
+/// the tests wait) doesn't outlive the tests' binary.
+fn test_watchdog_kills_what_tests_start() -> Result<(), String> {
+    // This test again, in the binary that times out.
+    if let Some(out) = std::env::var_os("HARNESS_TIMES_OUT") {
+        let sleep = Path::new(&out).with_file_name(if cfg!(windows) { "fake-sleep.exe" } else { "fake-sleep" });
+        harness::spawn(Command::new(sleep).arg(&out)).map_err(|e| e.to_string())?;
+        std::thread::sleep(2 * harness::PATIENCE);
+        return Err("not stopped".into());
+    }
+    let dir = test_dir("watchdog");
+    harness::link_self(&dir.join(if cfg!(windows) { "fake-sleep.exe" } else { "fake-sleep" }));
+    std::fs::create_dir_all(dir.join("tmp")).unwrap();
+    let out = dir.join("sleep");
+    let mut c = Command::new(std::env::current_exe().unwrap());
+    // Its own directories in this test's; a deadline 5 s after it starts.
+    c.args(["--exact", "watchdog_kills_what_tests_start"]).env("HARNESS_TIMES_OUT", &out).env("TEST_TMPDIR", dir.join("tmp")).env("TEST_TIMEOUT", "10");
+    for name in ["XML_OUTPUT_FILE", "TESTBRIDGE_TEST_ONLY", "TEST_TOTAL_SHARDS", "TEST_SHARD_INDEX", "TEST_SHARD_STATUS_FILE"] {
+        c.env_remove(name);
+    }
+    // A file, not a pipe, which fake-sleep would hold open.
+    let said = std::fs::File::create(dir.join("said.txt")).unwrap();
+    c.stdout(said.try_clone().unwrap()).stderr(said);
+    let code = harness::status(&mut c).map_err(|e| e.to_string())?.code();
+    let said = std::fs::read_to_string(dir.join("said.txt")).unwrap_or_default();
+    check(code == Some(1) && said.contains("watchdog_kills_what_tests_start ... FAILED: still running"), &format!("not failed in time: {said}"))?;
+    let Ok(pid) = std::fs::read_to_string(dir.join("sleep.pid")) else {
+        harness::not_tested("fake-sleep didn't start before the deadline");
+        return Ok(());
+    };
+    let pid: u32 = pid.trim().parse().map_err(|e| format!("sleep.pid: {e}"))?;
+    harness::wait_for("fake-sleep killed", || !harness::alive(pid))
 }
 
 /// Starts (with `launch`, given the test's directory) a build of two
@@ -1455,16 +1614,21 @@ fn main() -> ExitCode {
         ("jobserver_pool_from_manifest", test_jobserver_pool_from_manifest),
         ("jobserver_client", test_jobserver_client),
         ("ninjars", test_ninjars),
+        ("watchdog_kills_what_tests_start", test_watchdog_kills_what_tests_start),
         ("build_event_digests", test_build_event_digests),
         ("concurrent_builds", test_concurrent_builds),
         ("nested_build_appends_only", test_nested_build_appends_only),
         ("cross_nested_builds", test_cross_nested_builds),
+        ("nested_after_an_override", test_nested_after_an_override),
         ("generator_under_the_lock", test_generator_under_the_lock),
+        ("generator_without_the_lock_variable", test_generator_without_the_lock_variable),
+        ("restat_waits_on_stderr", test_restat_waits_on_stderr),
         ("interrupt_while_waiting_for_the_lock", test_interrupt_while_waiting_for_the_lock),
         ("clean_keeps_other_remote_records", test_clean_keeps_other_remote_records),
         ("recompaction_keeps_other_manifests_records", test_recompaction_keeps_other_manifests_records),
         ("exit_codes", test_exit_codes),
         ("write_errors", test_write_errors),
+        ("messages_to_a_closed_stderr", test_messages_to_a_closed_stderr),
         ("answers_without_settings", test_answers_without_settings),
         ("targets_depth", test_targets_depth),
         ("command_exiting_130", test_command_exiting_130),

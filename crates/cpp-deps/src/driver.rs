@@ -20,7 +20,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -128,6 +128,9 @@ impl Environment {
         }
     }
 }
+
+/// GCC's and Clang's variables listing directories to search.
+const INCLUDE_PATH_VARS: &[&str] = &["CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH", "OBJCPLUS_INCLUDE_PATH"];
 
 /// Variables that change what compilers predefine or search.
 const PROFILE_VARS: &[&str] = &[
@@ -671,6 +674,7 @@ const PROBED_PREFIXES: &[&str] = &[
 const PROBED_PATH_WITH_ARG: &[&str] = &[
     "--sysroot",
     "-isysroot",
+    "-stdlib++-isystem",
     "-resource-dir",
     "-gcc-toolchain",
     "--gcc-toolchain",
@@ -694,6 +698,7 @@ const PROBED_PATH_PREFIXES: &[&str] = &[
     "-fplugin=",
     "-specs=",
     "--specs=",
+    "-stdlib++-isystem",
     "-isysroot",
     "-B",
     "/winsysroot",
@@ -707,8 +712,8 @@ const PROBED_PATH_PREFIXES: &[&str] = &[
 /// A probed flag (`flag` with a separate value `v`, or joined when `v` is
 /// None) with the file or directory it names relative to `cwd` made
 /// absolute: the profile is then the same in every working directory
-/// (CMake's `try_compile` makes one per check). A configuration file named
-/// without a directory is searched for, not relative.
+/// (CMake's `try_compile` makes one per check). A file named without a
+/// directory is searched for, not relative (see `searched_name`).
 fn absolute_arg(flag: &str, v: Option<&str>, cwd: &Path) -> String {
     let absolute = |p: &str| absolute_path(p, cwd);
     let config = |p: &str| if p.contains(['/', '\\']) { absolute(p) } else { p.to_string() };
@@ -721,13 +726,22 @@ fn absolute_arg(flag: &str, v: Option<&str>, cwd: &Path) -> String {
                 return format!("--config={}", config(c));
             }
             match PROBED_PATH_PREFIXES.iter().find(|p| flag.starts_with(*p)) {
-                // (`-B` may be a prefix of programs' names.)
-                Some(&"-B") if !flag.contains(['/', '\\']) => flag.to_string(),
+                Some(_) if searched_name(flag).is_some() => flag.to_string(),
                 Some(p) => format!("{p}{}", absolute(&flag[p.len()..])),
                 None => flag.to_string(),
             }
         }
     }
+}
+
+/// The name a joined flag's value is when the compiler searches for it
+/// (it has no directory): `-B`'s, a prefix of programs' names; GCC's spec
+/// files (along `-B` and its own directories: newlib's `nano.specs`) and
+/// plugins (in its plugin directory); Clang's plugins (along the library
+/// path).
+fn searched_name(flag: &str) -> Option<&str> {
+    let v = ["-B", "-specs=", "--specs=", "-fplugin="].iter().find_map(|p| flag.strip_prefix(p))?;
+    (!v.contains(['/', '\\'])).then_some(v)
 }
 
 /// `p`, relative to `cwd`, made absolute.
@@ -1084,7 +1098,7 @@ fn parse_gcc(argv: &[String], cwd: &Path) -> Result<Invocation, String> {
     inv.ms_compat = ms_compat.or(ms_ext.filter(|e| !e));
     inv.relative_paths = relative.get() || inv.forced.iter().chain(&inv.imacros).any(|f| matches!(f, Forced::Gcc { .. }));
     if let Some(link) = linked.take() {
-        return Err(format!("`..` after the symbolic link {}", link.display()));
+        return Err(format!("`..` after a symbolic link: {}", link.display()));
     }
     finish(inv, lang, cxx)
 }
@@ -1396,7 +1410,7 @@ fn parse_cl(argv: &[String], cwd: &Path, env: &Environment) -> Result<Invocation
     inv.user_dirs.extend(wp_dirs.iter().map(|d| Dir::Path(abs(d))));
     inv.relative_paths = relative.get() || inv.forced.iter().any(|f| !matches!(f, Forced::Path(_)));
     if let Some(link) = linked.take() {
-        return Err(format!("`..` after the symbolic link {}", link.display()));
+        return Err(format!("`..` after a symbolic link: {}", link.display()));
     }
     let inv = finish(inv, lang, false)?;
     // C11 and later use the conforming preprocessor by default.
@@ -1514,14 +1528,19 @@ pub struct Profile {
     /// Held while the compiler answers queries, so that concurrent scans
     /// don't ask the same ones.
     asking: Mutex<()>,
-    /// Asking the compiler failed or took too long: not again (its scans
-    /// stay inexact rather than wait each time).
-    gave_up: AtomicBool,
+    /// The session asking the compiler failed or took too long in: not
+    /// again in that one (its scans stay inexact rather than wait each
+    /// time); 0 if none. A later one asks again (the machine was busy or
+    /// suspended, say).
+    gave_up: AtomicU64,
+    /// Where the compiler was probed, when its answer depends on it: a
+    /// directory it searches named relative (see `Driver::profile`).
+    cwd: Option<PathBuf>,
     /// When the compiler was probed, in seconds since the Unix epoch.
     probed: u64,
 }
 
-const PROFILE_SIGNATURE: &str = "cpp-deps profile 3";
+const PROFILE_SIGNATURE: &str = "cpp-deps profile 4";
 
 /// Profiles unused for this long are removed when another is saved (at
 /// most once a day: see `CLEANED`).
@@ -1573,7 +1592,8 @@ impl Profile {
             implicit,
             answers: Mutex::default(),
             asking: Mutex::default(),
-            gave_up: AtomicBool::new(false),
+            gave_up: AtomicU64::new(0),
+            cwd: None,
             probed: unix_secs(SystemTime::now()),
         }
     }
@@ -1614,6 +1634,9 @@ impl Profile {
         }
         for f in &self.implicit {
             out.push_str(&format!("implicit\t{}\n", f.display()));
+        }
+        if let Some(cwd) = &self.cwd {
+            out.push_str(&format!("cwd\t{}\n", cwd.display()));
         }
         let mut answers: Vec<_> = self.answers.lock().unwrap().iter().map(|(q, v)| (q.clone(), *v)).collect();
         answers.sort();
@@ -1659,6 +1682,7 @@ impl Profile {
         }
         let (mut probed, mut dialect, mut trigraphs, mut operators, mut dirs, mut implicit, mut answers) =
             (None, None, None, Vec::new(), Vec::new(), Vec::new(), HashMap::new());
+        let mut cwd = None;
         for line in lines {
             let f: Vec<&str> = line.split('\t').collect();
             match f.as_slice() {
@@ -1669,6 +1693,7 @@ impl Profile {
                 ["dir", p] => dirs.push(Dir::Path(PathBuf::from(p))),
                 ["framework", p] => dirs.push(Dir::Framework(PathBuf::from(p))),
                 ["implicit", p] => implicit.push(PathBuf::from(p)),
+                ["cwd", p] => cwd = Some(PathBuf::from(p)),
                 ["answer", op, arg, v] => {
                     let v = if *v == "-" { None } else { Some(v.parse().ok()?) };
                     answers.insert((op.to_string(), arg.to_string()), v);
@@ -1682,6 +1707,7 @@ impl Profile {
         }
         let mut profile = Profile::new(predefines.to_string(), operators, dialect?, trigraphs?, dirs, implicit);
         profile.probed = probed;
+        profile.cwd = cwd;
         *profile.answers.lock().unwrap() = answers;
         // Used: kept by the clean-up of `save`.
         if let Ok(f) = std::fs::File::options().append(true).open(&file) {
@@ -1912,8 +1938,16 @@ impl Driver {
         let meta = std::fs::metadata(&inv.compiler).ok();
         let mtime = meta.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
         let vars: Vec<String> = PROFILE_VARS.iter().filter_map(|v| env.var(v).map(|val| format!("{v}={val}"))).collect();
-        let relative_include =
-            inv.style == Style::Msvc && env.var("INCLUDE").is_some_and(|v| v.split(';').any(|d| !d.is_empty() && Path::new(d).is_relative()));
+        // Directories searched relative to it: cl's in `INCLUDE`; GCC's and
+        // Clang's in `CPATH` and the like (an empty entry is it). And files
+        // GCC searches for, else takes in it (`-specs=`).
+        let relative_include = match inv.style {
+            Style::Msvc => env.var("INCLUDE").is_some_and(|v| v.split(';').any(|d| !d.is_empty() && Path::new(d).is_relative())),
+            _ => {
+                INCLUDE_PATH_VARS.iter().filter_map(|v| env.var(v)).any(|v| std::env::split_paths(&v).any(|d| d.as_os_str().is_empty() || d.is_relative()))
+                    || inv.probe_args.iter().any(|a| searched_name(a).is_some() && !a.starts_with("-B"))
+            }
+        };
         format!(
             "{}\u{1}{}\u{1}{mtime}\u{1}{:?}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{:016x}\u{1}{configs:016x}",
             inv.compiler.display(),
@@ -1937,7 +1971,27 @@ impl Driver {
     /// The profile of a compiler for an invocation's flags: probed once,
     /// or loaded from the profile directory.
     pub fn profile(&self, inv: &Invocation, cwd: &Path, env: &Environment) -> Result<Arc<Profile>, String> {
+        self.profile_and_key(inv, cwd, env).map(|(p, _)| p)
+    }
+
+    /// `profile`, and its key.
+    fn profile_and_key(&self, inv: &Invocation, cwd: &Path, env: &Environment) -> Result<(Arc<Profile>, String), String> {
         let key = self.profile_key(inv, cwd, env);
+        let profile = self.profile_with_key(inv, cwd, env, key.clone())?;
+        // The compiler named a directory relative to where it was probed
+        // (from a flag or a variable the key doesn't see as such): one
+        // profile per working directory then.
+        match &profile.cwd {
+            Some(probed) if probed != cwd => {
+                let key = format!("{key}\u{1}{}", cwd.display());
+                Ok((self.profile_with_key(inv, cwd, env, key.clone())?, key))
+            }
+            _ => Ok((profile, key)),
+        }
+    }
+
+    /// `profile`, with `key`.
+    fn profile_with_key(&self, inv: &Invocation, cwd: &Path, env: &Environment, key: String) -> Result<Arc<Profile>, String> {
         let session = self.cache.session();
         let stale = |s: u64, loaded: &Result<Arc<Profile>, String>| match loaded {
             Ok(p) => unix_secs(SystemTime::now()).saturating_sub(p.probed) > PROFILE_LIFETIME.as_secs(),
@@ -1949,6 +2003,7 @@ impl Driver {
             }
             let compiler = env.compiler(inv, cwd);
             let p = probe::probe(&compiler)?;
+            let mut relative = false;
             let builtin_dirs = match inv.style {
                 Style::Msvc if inv.no_include_env => Vec::new(),
                 Style::Msvc => {
@@ -1957,11 +2012,13 @@ impl Driver {
                 _ => probe::builtin_dirs(&compiler)?
                     .into_iter()
                     .map(|(d, framework)| {
+                        relative |= Path::new(&d).is_relative();
                         let d = scan::normalize(&cwd.join(d));
                         if framework { Dir::Framework(d) } else { Dir::Path(d) }
                     })
                     .collect(),
             };
+            relative |= p.implicit.iter().any(|f| Path::new(f).is_relative());
             let mut predefines = p.predefines;
             if inv.style == Style::Msvc {
                 // The probe used the conforming preprocessor.
@@ -1969,7 +2026,8 @@ impl Driver {
                 predefines.push_str(&format!("#define _MSVC_TRADITIONAL {traditional}\n"));
             }
             let implicit = p.implicit.iter().map(|f| scan::normalize(&cwd.join(f))).collect();
-            let profile = Profile::new(predefines, p.operators, p.dialect, p.trigraphs, builtin_dirs, implicit);
+            let mut profile = Profile::new(predefines, p.operators, p.dialect, p.trigraphs, builtin_dirs, implicit);
+            profile.cwd = relative.then(|| cwd.to_path_buf());
             if let Some(d) = &env.profile_dir {
                 let _ = profile.save(d, &key);
             }
@@ -2004,7 +2062,7 @@ impl Driver {
     pub fn scan_in(&self, argv: &[String], cwd: &Path, env: &Environment) -> Result<Output, String> {
         self.prune();
         let inv = parse_in(argv, cwd, env)?;
-        let profile = self.profile(&inv, cwd, env)?;
+        let (profile, key) = self.profile_and_key(&inv, cwd, env)?;
         if profile.family == Family::Clang && inv.ms_compat.is_some_and(|c| c != profile.ms_compat) {
             return Err("MSVC compatibility flags the predefined macros don't show".into());
         }
@@ -2069,13 +2127,13 @@ impl Driver {
             if unknown.is_empty() {
                 continue;
             }
-            if asked == 4 || profile.gave_up.load(Ordering::Relaxed) {
+            if asked == 4 || profile.gave_up.load(Ordering::Relaxed) == self.cache.session() {
                 return Ok(out);
             }
             asked += 1;
             let values = probe::answer(&env.compiler(&inv, cwd), &unknown).inspect_err(|_| {
                 // Asked again, it would fail (or hang) again.
-                profile.gave_up.store(true, Ordering::Relaxed);
+                profile.gave_up.store(self.cache.session(), Ordering::Relaxed);
             })?;
             let mut answers = profile.answers.lock().unwrap();
             for (q, v) in unknown.into_iter().zip(values) {
@@ -2083,13 +2141,14 @@ impl Driver {
             }
             drop(answers);
             if let Some(d) = &env.profile_dir {
-                let _ = profile.save(d, &self.profile_key(&inv, cwd, env));
+                let _ = profile.save(d, &key);
             }
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_macros)] // Tests say what they didn't test.
 mod tests {
     use super::*;
 
@@ -2360,8 +2419,7 @@ mod tests {
 
     #[test]
     fn profiles_round_trip() {
-        let dir = test_dirs::base().join(format!("cpp_deps_profiles_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("cpp_deps_profiles");
         let p = Profile::new(
             "#define __GNUC__ 13\n#define __cplusplus 201703L\n".into(),
             vec!["__has_include".into(), "__has_builtin".into()],
@@ -2390,7 +2448,6 @@ mod tests {
         old.probed -= PROFILE_LIFETIME.as_secs() + 60;
         old.save(&dir, "k\u{1}1").unwrap();
         assert!(Profile::load(&dir, "k\u{1}1").is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2407,9 +2464,7 @@ mod tests {
 
     #[test]
     fn profiles_cleaned_daily() {
-        let dir = test_dirs::base().join(format!("cpp_deps_profiles_cleaned_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("cpp_deps_profiles_cleaned");
         let p = Profile::new("#define __GNUC__ 13\n".into(), vec![], crate::expr::Dialect::default(), false, vec![], vec![]);
         let age = |f: &Path, days: u64| {
             let t = SystemTime::now() - Duration::from_secs(days * 24 * 3600);
@@ -2442,7 +2497,6 @@ mod tests {
         age(&dir.join(CLEANED), 2);
         p.save(&dir, "k").unwrap();
         assert!(used.exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3177,6 +3231,61 @@ mod tests {
         assert!(driver.scan_in(&argv, &dir, &env).is_err());
         let out = driver.scan_in(&argv, &dir, &env).unwrap();
         assert_eq!(out.unknown, vec![("__has_builtin".to_string(), "__builtin_x".to_string())]);
+        // Until the next session (the daemon's next build): the machine may
+        // have been busy, or suspended.
+        driver.cache.new_session();
+        assert!(driver.scan_in(&argv, &dir, &env).is_err());
+    }
+
+    /// Files the compiler searches for (named without a directory) are kept
+    /// as named: GCC's spec files and plugins; others made absolute.
+    #[test]
+    fn searched_names_kept() {
+        let cwd = Path::new(if cfg!(windows) { "C:/b" } else { "/b" });
+        let abs = |p: &str| scan::normalize(&cwd.join(p)).to_string_lossy().into_owned();
+        assert_eq!(absolute_arg("-specs=nano.specs", None, cwd), "-specs=nano.specs");
+        assert_eq!(absolute_arg("--specs=nano.specs", None, cwd), "--specs=nano.specs");
+        assert_eq!(absolute_arg("-fplugin=foo.so", None, cwd), "-fplugin=foo.so");
+        assert_eq!(absolute_arg("-Bprefix-", None, cwd), "-Bprefix-");
+        assert_eq!(absolute_arg("-specs=cfg/my.specs", None, cwd), format!("-specs={}", abs("cfg/my.specs")));
+        assert_eq!(absolute_arg("-fplugin=./foo.so", None, cwd), format!("-fplugin={}", abs("foo.so")));
+        assert_eq!(absolute_arg("-stdlib++-isystem", Some("cxx"), cwd), abs("cxx"));
+        assert_eq!(absolute_arg("-stdlib++-isystemcxx", None, cwd), format!("-stdlib++-isystem{}", abs("cxx")));
+    }
+
+    /// Directories the compiler searches relative to the working directory
+    /// make a profile its own: `CPATH` and the like with relative or empty
+    /// entries, spec files GCC may find there, a search list the compiler
+    /// said relative.
+    #[test]
+    fn profiles_of_relative_dirs() {
+        let root = test_dirs::TestDir::new("cpp_deps_profile_relative");
+        let (a, b) = (root.join("a"), root.join("b"));
+        let compiler = if cfg!(windows) { "C:/no/such/clang++.exe" } else { "/no/such/clang++" };
+        let driver = Driver::new(Cache::new(vec![], false));
+        let env = |vars: &[(&str, &str)]| Environment {
+            vars: Some(Arc::new(vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())),
+            profile_dir: Some(root.join("profiles")),
+        };
+        let key = |cwd: &Path, vars: &[(&str, &str)], flags: &[&str]| {
+            let argv: Vec<String> = std::iter::once(compiler).chain(flags.iter().copied()).chain(["-c", "x.cc"]).map(String::from).collect();
+            driver.profile_key(&parse_in(&argv, cwd, &env(vars)).unwrap(), cwd, &env(vars))
+        };
+        let (sep, absolute) = if cfg!(windows) { (";", "C:/inc") } else { (":", "/inc") };
+        assert_eq!(key(&a, &[("CPATH", absolute)], &[]), key(&b, &[("CPATH", absolute)], &[]));
+        for v in ["cxx".to_string(), format!("{sep}{absolute}"), String::new()] {
+            assert_ne!(key(&a, &[("CPLUS_INCLUDE_PATH", &v)], &[]), key(&b, &[("CPLUS_INCLUDE_PATH", &v)], &[]), "{v:?}");
+        }
+        assert_ne!(key(&a, &[], &["-specs=my.specs"]), key(&b, &[], &["-specs=my.specs"]));
+        // Probed where it said a directory relative: probed again elsewhere
+        // (here it can't be).
+        let argv = s(&[compiler, "-c", "x.cc"]);
+        let inv = |cwd: &Path| parse_in(&argv, cwd, &env(&[])).unwrap();
+        let mut p = Profile::new("#define __clang__ 1\n".into(), vec![], crate::expr::Dialect::default(), false, vec![Dir::Path(a.join("cxx"))], vec![]);
+        p.cwd = Some(a.clone());
+        p.save(&root.join("profiles"), &driver.profile_key(&inv(&a), &a, &env(&[]))).unwrap();
+        assert!(driver.profile(&inv(&a), &a, &env(&[])).is_ok());
+        assert!(driver.profile(&inv(&b), &b, &env(&[])).is_err());
     }
 
     /// The driver forgets what it keeps for compilers and files no session
@@ -3237,8 +3346,7 @@ mod tests {
 
     #[test]
     fn profiles_decide_lookups() {
-        let dir = test_dirs::base().join(format!("cpp_deps_driver_lookups_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("cpp_deps_driver_lookups");
         let files = [
             ("src/main.cc", "#include <sub/a.h>\n#include \"x.h\"\n"),
             ("inc/sub/a.h", "#include \"b.h\"\n"),
@@ -3293,13 +3401,11 @@ mod tests {
         };
         assert_eq!(cl_scanned("clang-cl", clang_msvc), vec!["cl.cc", "other/x.h"]);
         assert_eq!(cl_scanned("cl", "#define _MSC_VER 1944\n"), vec!["cl.cc", "sys/x.h"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn real_dirs_once_per_session() {
-        let dir = test_dirs::base().join(format!("cpp_deps_real_dirs_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("cpp_deps_real_dirs");
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::create_dir_all(&a).unwrap();
         let driver = Driver::new(Cache::new(vec![], false));
@@ -3314,7 +3420,6 @@ mod tests {
         assert_eq!(driver.real_dir(&b), (b.clone(), PathKind::Missing));
         std::fs::create_dir_all(&b).unwrap();
         assert_eq!(driver.real_dir(&b), (std::fs::canonicalize(&b).unwrap(), PathKind::Dir));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A differential case: its files, and the arguments after the

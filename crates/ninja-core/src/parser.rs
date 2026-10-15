@@ -74,7 +74,7 @@ impl<'s, 'r> ManifestParser<'s, 'r> {
 
     fn warn(&mut self, msg: String) {
         if !self.options.quiet {
-            eprintln!("ninja: warning: {msg}");
+            crate::status::print_err(&format!("ninja: warning: {msg}\n"));
         }
         self.warnings.push(msg);
     }
@@ -353,9 +353,9 @@ fn check_ninja_version(required: &str) -> Result<(), String> {
     let (file_major, file_minor) = parse_version(required);
     if bin_major > file_major {
         // Newer major versions may break compatibility; warn only.
-        eprintln!(
-            "ninja: warning: ninja executable version ({NINJA_VERSION}) greater than build file ninja_required_version ({required}); versions may be incompatible."
-        );
+        crate::status::print_err(&format!(
+            "ninja: warning: ninja executable version ({NINJA_VERSION}) greater than build file ninja_required_version ({required}); versions may be incompatible.\n"
+        ));
         return Ok(());
     }
     if (bin_major == file_major && bin_minor < file_minor) || bin_major < file_major {

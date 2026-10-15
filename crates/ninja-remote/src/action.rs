@@ -65,8 +65,11 @@ pub struct Shared {
     pub profile_dir: Option<PathBuf>,
     /// Directories the build writes to, the build directory first: their
     /// contents may change during the build, so the scanners check them
-    /// every time.
+    /// every time (the preprocessor's cache, everything under them).
     pub volatile: Vec<PathBuf>,
+    /// The directories build edges write to (see `WrittenDirs`): the
+    /// conservative scanner's, those only.
+    pub written: scanner::WrittenDirs,
     /// `--action_env`: variables every action gets, as given.
     pub action_env: Vec<(String, String)>,
 }
@@ -134,6 +137,42 @@ pub struct Prepared {
     /// variable set here that a tool of the action reads, which the action
     /// can't carry (see `env`).
     pub env_refused: Option<String>,
+    /// The command a local run uses when the action's files span volumes:
+    /// None when it's the remote action's.
+    pub local: Option<LocalForm>,
+}
+
+/// The remote action's command as a local run uses it when the action's
+/// files span volumes (a source tree on `D:`, a toolchain on `C:`, a build
+/// directory on a share): run from the build directory, it can't reach the
+/// other volumes' files by relative paths, so those keep the host's (see
+/// `PathMapper::for_host`). The others are the remote action's, as are its
+/// outputs.
+#[derive(Clone, Debug)]
+pub struct LocalForm {
+    pub arguments: Vec<String>,
+    /// Response files: (local path, contents).
+    pub rsp_files: Vec<(PathBuf, Vec<u8>)>,
+    pub env: Vec<(String, String)>,
+}
+
+/// How a command run from the build directory names its program `exe`:
+/// relative to it (`./x` in it), or as the host does when it's on another
+/// volume (a local run, see `PathMapper::for_host`). None outside the
+/// tree.
+fn program_arg(mapper: &mut PathMapper, exe: &Path, windows: bool) -> Option<String> {
+    let rel = mapper.tree_path(&to_s(exe))?;
+    if mapper.on_other_volume(&rel) {
+        return Some(to_s(exe));
+    }
+    let mut p = mapper.rel_from_work_dir(&rel);
+    if !p.contains('/') {
+        p = format!("./{p}");
+    }
+    if windows {
+        p = p.replace('/', "\\");
+    }
+    Some(p)
 }
 
 fn to_s(p: &Path) -> String {
@@ -199,8 +238,14 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     // takes from there (cl's `CL`, link's `LINK`) are part of its command
     // line as the scanner and the check of definitions see it.
     let host_var = |name: &str| std::env::var_os(name);
+    // Whether a file a tool looks for is there: on the host, or only
+    // remotely (an output left in the remote CAS).
+    let present = |p: &Path| {
+        let p = scanner::normalize(&build_dir.join(p));
+        p.is_file() || shared.remote_outputs.as_ref().zip(p.strip_prefix(build_dir).ok()).is_some_and(|(r, rel)| r.get(&to_s(rel)).is_some())
+    };
     let first_style = scanner::compiler_style(&to_s(exe), argv);
-    let (env_before, env_after) = crate::env::env_options(&Tool::of(exe, &expanded, first_style, windows), &host_var);
+    let (env_before, env_after) = crate::env::env_options(&Tool::of_step(exe, argv, &expanded, first_style, windows, &present), &host_var);
     let effective: Vec<String> = expanded[..1].iter().chain(&env_before).chain(&expanded[1..]).chain(&env_after).cloned().collect();
     // Steps with cl-style command lines, and their response files.
     let cl_steps: Vec<bool> = steps.iter().zip(&exes).map(|(s, e)| cl_style(e, s)).collect();
@@ -219,9 +264,13 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
     // A compile's other files (split DWARF, coverage notes...), asked for.
     let compile_outputs =
         if style.is_some() && !driver_link { crate::compile_outputs::side_outputs(&effective, style == Some(Style::Msvc))? } else { Vec::new() };
-    // A driver without a dry run sends its declared inputs only.
+    // A driver without a dry run sends its declared inputs only. A driver
+    // reads its response files itself, in its dry run; a linker's command
+    // line is read as the linker reads it: expanded, with what `LINK` and
+    // `_LINK_` add.
     let link = if steps.len() == 1 && (driver_link || crate::link::linker_flavor(&exe.to_string_lossy()).is_some()) {
-        match crate::link::analyze(exe, argv, build_dir, driver_link, &host_var) {
+        let line = if driver_link { argv } else { &effective };
+        match crate::link::analyze(exe, line, build_dir, driver_link, &host_var, &|p| shared.store.link_directives(p)) {
             Ok(info) => Some(info),
             Err(e) => {
                 warnings.push(format!("link inputs: {e}"));
@@ -295,9 +344,9 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         }
     }
     if style.is_some() && !driver_link && !scanned {
-        let info = parse_compile(&effective, build_dir);
+        let mut info = parse_compile(&effective, build_dir);
         sources.extend(info.sources.iter().cloned());
-        let scanner = Scanner { cache: &shared.store.scan, windows, volatile_roots: shared.volatile.clone() };
+        let scanner = Scanner { cache: &shared.store.scan, windows, written: &shared.written };
         let builtin = match scanner.builtin_dirs(exe, &info) {
             Ok(d) => d,
             Err(e) => {
@@ -313,9 +362,13 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         };
         let mut sp = search_path(&info, &builtin);
         sp.msvc = scanner.msvc_lookup(exe, &info);
+        // Where forced includes are depends on it.
+        if sp.msvc != info.msvc_lookup {
+            info.place_forced_includes(sp.msvc);
+        }
         // The variables naming include directories the compiler reads.
         if info.style == Some(Style::Msvc) {
-            let tool = Tool::of(exe, &effective, first_style, windows);
+            let tool = Tool::of_step(exe, argv, &effective, first_style, windows, &present);
             for inc in tool.include_dir_vars().filter_map(std::env::var_os) {
                 sp.angled.extend(std::env::split_paths(&inc).filter(|p| !p.as_os_str().is_empty()).map(|p| scanner::normalize(&build_dir.join(p))));
             }
@@ -326,8 +379,9 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         if let Some(why) = r.local {
             return Err(why);
         }
+        let sent = scanner.computed_files(&r, &sp, &|d| shared.written.contains(d), &|n| scanner.predefined(exe, &info, n))?;
         files.extend(r.files);
-        files.extend(crate::store::dir_files(&r.dirs)?);
+        files.extend(sent);
         warnings.extend(r.warnings);
         files.extend(info.extra_files);
         whole_dirs.extend(info.extra_dirs);
@@ -569,37 +623,34 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         if windows && a.contains('\\') && input_keys.contains(&a.replace('\\', "/").to_ascii_lowercase()) { a.replace('\\', "/") } else { a }
     };
     // Rewrite response files now that the tree's top-level entries are known.
+    let rsp_bytes = |mapper: &mut PathMapper, path: &PathBuf, content: &str| {
+        let args: Vec<String> = mapper.rewrite_args(&split_rsp(content, windows), cl_rsp_files.contains(path)).into_iter().map(slashed).collect();
+        join_rsp(&args, windows).into_bytes()
+    };
     let mut rsp_files = Vec::new();
-    for (path, content) in rsp_rewritten {
-        let rel = mapper.tree_path(&to_s(&path)).ok_or_else(|| format!("{} is outside the exec root", path.display()))?;
-        let cl = cl_rsp_files.contains(&path);
-        let args: Vec<String> = mapper.rewrite_args(&split_rsp(&content, windows), cl).into_iter().map(slashed).collect();
-        let bytes = join_rsp(&args, windows).into_bytes();
+    for (path, content) in &rsp_rewritten {
+        let rel = mapper.tree_path(&to_s(path)).ok_or_else(|| format!("{} is outside the exec root", path.display()))?;
+        let bytes = rsp_bytes(&mut mapper, path, content);
         tree.add_bytes(&rel, bytes.clone(), false).map_err(|e| format!("{e:#}"))?;
-        rsp_files.push((path, bytes));
+        rsp_files.push((path.clone(), bytes));
         tree_files.push(rel);
     }
     let work_dir = mapper.work_dir.clone();
     tree.ensure_dir(&work_dir).map_err(|e| format!("{e:#}"))?;
 
     // Command line: one command, or a chain run by the shell.
-    let mut remote_steps: Vec<Vec<String>> = Vec::new();
-    for ((argv, exe), cl) in steps.iter().zip(&exes).zip(&cl_steps) {
-        let mut arguments: Vec<String> = mapper.rewrite_args(argv, *cl).into_iter().map(slashed).collect();
-        if let Some(rel) = mapper.tree_path(&to_s(exe)) {
-            let mut p = mapper.rel_from_work_dir(&rel);
-            if !p.contains('/') {
-                p = format!("./{p}");
+    let command_line = |mapper: &mut PathMapper| {
+        let mut steps_run: Vec<Vec<String>> = Vec::new();
+        for ((argv, exe), cl) in steps.iter().zip(&exes).zip(&cl_steps) {
+            let mut arguments: Vec<String> = mapper.rewrite_args(argv, *cl).into_iter().map(slashed).collect();
+            if let Some(p) = program_arg(mapper, exe, windows) {
+                arguments[0] = p;
             }
-            if windows {
-                p = p.replace('/', "\\");
-            }
-            arguments[0] = p;
+            steps_run.push(arguments);
         }
-        remote_steps.push(arguments);
-    }
-    let arguments =
-        if remote_steps.len() == 1 { remote_steps.pop().unwrap() } else { vec!["/bin/sh".to_string(), "-c".to_string(), join_posix_chain(&remote_steps)] };
+        if steps_run.len() == 1 { steps_run.pop().unwrap() } else { vec!["/bin/sh".to_string(), "-c".to_string(), join_posix_chain(&steps_run)] }
+    };
+    let arguments = command_line(&mut mapper);
     // The variables its tools read (see `env`).
     let tools: Vec<Tool> = steps
         .iter()
@@ -607,10 +658,23 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         .enumerate()
         .map(|(i, (argv, exe))| {
             let style = scanner::compiler_style(&to_s(exe), argv);
-            if i == 0 { Tool::of(exe, &effective, style, windows) } else { Tool::of(exe, argv, style, windows) }
+            let argv_read = if i == 0 { &effective } else { argv };
+            Tool::of_step(exe, argv, argv_read, style, windows, &present)
         })
         .collect();
     let (env, env_refused): (BTreeMap<String, String>, Option<String>) = crate::env::action_env(&tools, &mut mapper, &host_var, &shared.action_env);
+    // A local run (a disk cache miss, racing, a fallback) runs from the build
+    // directory, which can't reach another volume's files by relative
+    // paths: those keep the host's.
+    let local = if mapper.spans_volumes() {
+        let mut host = mapper.for_host();
+        let arguments = command_line(&mut host);
+        let rsp_files = rsp_rewritten.iter().map(|(path, content)| (path.clone(), rsp_bytes(&mut host, path, content))).collect();
+        let env = crate::env::action_env(&tools, &mut host, &host_var, &shared.action_env).0.into_iter().collect();
+        Some(LocalForm { arguments, rsp_files, env })
+    } else {
+        None
+    };
 
     // Outputs.
     let mut outputs = Vec::new();
@@ -694,6 +758,7 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
         local_inputs,
         sources,
         env_refused,
+        local,
     })
 }
 
@@ -707,8 +772,9 @@ fn digest_for(path: &Path, stamp: ninja_os::FileStamp, cache: &dyn DigestCache) 
     if let Some(d) = cache.get(&key, &stamp) {
         return Ok(d);
     }
+    let read_at = std::time::SystemTime::now();
     let d = rbe_client::tree::hash_file(path)?;
-    cache.put(&key, stamp, d.clone());
+    cache.put_read_at(&key, stamp, d.clone(), read_at);
     Ok(d)
 }
 
@@ -724,4 +790,59 @@ fn output_rel(mapper: &mut PathMapper, o: &str) -> Result<String, String> {
 /// Bytes of a blob source (for tests and the fake server).
 pub fn load_blob(src: &BlobSource) -> anyhow::Result<Vec<u8>> {
     src.load()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What actions of a build in `build_dir` share, without a toolchains
+    /// file, a remote nor a daemon.
+    fn shared(build_dir: &Path) -> Shared {
+        Shared {
+            build_dir: build_dir.to_path_buf(),
+            toolchains: Toolchains::default(),
+            exec_root: None,
+            store: Store::new(),
+            windows: cfg!(windows),
+            remote_outputs: None,
+            log_inputs: false,
+            include_scanner: IncludeScanner::default(),
+            verbose: false,
+            daemon: None,
+            daemon_error: Default::default(),
+            profile_dir: None,
+            volatile: vec![build_dir.to_path_buf()],
+            written: crate::scanner::WrittenDirs::new(std::iter::once(build_dir.to_path_buf()), cfg!(windows)),
+            action_env: Vec::new(),
+        }
+    }
+
+    /// A linker run directly with a response file (CMake puts the link's
+    /// libraries and their directories there): what it names there (a
+    /// version script, a library directory) is the link's, as the linker
+    /// reads it.
+    #[test]
+    fn linker_response_files() {
+        let dir = test_dirs::TestDir::new("ninja-rs-action-link-rsp");
+        let build = dir.join("build");
+        let linker = dir.join("tc").join(if cfg!(windows) { "ld.lld.exe" } else { "ld.lld" });
+        for (path, contents) in [(&linker, ""), (&build.join("a.o"), "A"), (&dir.join("src/v.map"), "{};"), (&dir.join("libs/libz.a"), "Z")] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, contents).unwrap();
+        }
+        let rsp = "a.o --version-script=../src/v.map -L../libs -lz";
+        std::fs::write(build.join("link.rsp"), rsp).unwrap();
+        let task = Task {
+            command: format!("{} @link.rsp -o app", linker.display()),
+            inputs: vec!["a.o".into()],
+            outputs: vec!["app".into()],
+            bindings: vec![("rbe_mnemonic".into(), "CLink".into())],
+            ..Default::default()
+        };
+        let p = prepare(&task, &shared(&build)).unwrap();
+        for input in ["build/a.o", "src/v.map", "libs/libz.a"] {
+            assert!(p.tree_index.contains(input, cfg!(windows)), "{input} isn't an input");
+        }
+    }
 }

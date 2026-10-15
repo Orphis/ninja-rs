@@ -74,7 +74,19 @@ pub struct Unwrapped {
 /// `cmd.exe /C` wrapper is removed (`windows`, the host's syntax), `&&`
 /// chains are split and shell no-ops dropped. Commands that need a shell
 /// otherwise (pipes, redirections, variables, a `cd` step) are an error.
+/// Commands run what this process's environment has (see `cmd_variable`).
 pub fn unwrap_command(command: &str, windows: bool) -> Result<Unwrapped, String> {
+    unwrap_command_with(command, windows, &set_here)
+}
+
+/// Whether a variable is set in this process's environment, which the
+/// commands it runs inherit: case-insensitively, as cmd.exe looks it up.
+fn set_here(name: &str) -> bool {
+    if cfg!(windows) { std::env::var_os(name).is_some() } else { std::env::vars_os().any(|(n, _)| n.eq_ignore_ascii_case(name)) }
+}
+
+/// `unwrap_command`, `set` telling which variables cmd.exe has.
+pub fn unwrap_command_with(command: &str, windows: bool, set: &dyn Fn(&str) -> bool) -> Result<Unwrapped, String> {
     let mut cmd = command.trim().to_string();
     // What cmd.exe runs: its other syntax (`&`, `^`, `%VAR%`, groups) too.
     let mut by_cmd = false;
@@ -93,6 +105,9 @@ pub fn unwrap_command(command: &str, windows: bool) -> Result<Unwrapped, String>
             }
             if by_cmd && let Some(what) = cmd_syntax(&seg) {
                 return Err(format!("command uses cmd.exe's {what}: {seg}"));
+            }
+            if by_cmd && let Some(name) = cmd_variable(&seg, set) {
+                return Err(format!("command uses cmd.exe's variable %{name}%"));
             }
             split_windows(&seg, true)
         } else {
@@ -153,10 +168,9 @@ fn strip_cmd_exe(cmd: &str) -> Option<String> {
     Some(out)
 }
 
-/// What of cmd.exe's syntax a segment it runs uses besides `&&`, which
-/// splitting it into arguments would pass on literally: `&`, `^` and
-/// parentheses outside quotes, variables (`%VAR%`, expanded in quotes
-/// too).
+/// What of cmd.exe's syntax a segment it runs uses besides `&&` and
+/// variables, which splitting it into arguments would pass on literally:
+/// `&`, `^` and parentheses outside quotes.
 fn cmd_syntax(seg: &str) -> Option<&'static str> {
     let mut in_q = false;
     for c in seg.chars() {
@@ -171,12 +185,31 @@ fn cmd_syntax(seg: &str) -> Option<&'static str> {
             }
         }
     }
-    let mut parts = seg.split('%');
-    parts.next();
-    let mut parts = parts.collect::<Vec<_>>();
-    // `%NAME%`: a name between two signs (the last part has no closing one).
-    parts.pop();
-    parts.iter().any(|name| !name.is_empty() && !name.contains([' ', '\t', '"'])).then_some("variables")
+    None
+}
+
+/// Variables cmd.exe has without the environment setting them.
+const CMD_DYNAMIC: &[&str] = &["CD", "DATE", "TIME", "RANDOM", "ERRORLEVEL", "CMDEXTVERSION", "CMDCMDLINE", "HIGHESTNUMANODENUMBER", "__CD__", "__APPDIR__"];
+
+/// The first variable cmd.exe expands in a segment it runs (in quotes
+/// too): `%NAME%`, or `%NAME:...%` (a substring or a substitution), whose
+/// NAME `set` says it has, or one of its own. On its command line, unlike
+/// in a batch file, cmd leaves `%NAME%` as it is when NAME isn't set (a
+/// linker's `/pdbaltpath:%_PDB%`, which the linker expands), and goes on
+/// from the closing sign, which may open another.
+fn cmd_variable(seg: &str, set: &dyn Fn(&str) -> bool) -> Option<String> {
+    let mut rest = seg;
+    while let Some(start) = rest.find('%') {
+        let after = &rest[start + 1..];
+        let end = after.find('%')?;
+        let spec = &after[..end];
+        let name = spec.split_once(':').map_or(spec, |(n, _)| n);
+        if !name.is_empty() && (set(name) || CMD_DYNAMIC.iter().any(|d| d.eq_ignore_ascii_case(name))) {
+            return Some(name.to_string());
+        }
+        rest = &after[end..];
+    }
+    None
 }
 
 /// Whether every `|`, `<`, `>` in a Windows segment is inside quotes.
@@ -303,21 +336,48 @@ mod tests {
         // Quoted metacharacters are fine.
         assert!(unwrap_command(r#"cl.exe "-DX=a>b" a.c"#, true).is_ok());
         // What else cmd.exe reads in what it runs.
+        let set = |name: &str| ["OUT", "X"].iter().any(|v| v.eq_ignore_ascii_case(name));
         for cmd in [
             r#"cmd.exe /C "a.exe & b.exe""#,
             r#"cmd.exe /C "a.exe ^"x^"""#,
             r#"cmd.exe /C "a.exe %OUT%\x.obj""#,
             r#"cmd.exe /C "(a.exe)""#,
-            r#"cmd.exe /C "a.exe "-D%X%"""#,
+            r#"cmd.exe /C "a.exe "-D%x%"""#,
             r#"cmd.exe /C "cd sub && cl.exe a.c""#,
         ] {
-            assert!(unwrap_command(cmd, true).is_err(), "{cmd}");
+            assert!(unwrap_command_with(cmd, true, &set).is_err(), "{cmd}");
         }
         // Not when it doesn't run the command; a lone % isn't a variable.
         assert!(unwrap_command(r#"cl.exe -DX=a&b -DFMT="%d" a.c"#, true).is_ok());
         assert!(unwrap_command(r#"cmd.exe /C "cl.exe -DFMT=\"%d\" a.c""#, true).is_ok());
         // The steps after a `cd` would run elsewhere.
         assert!(unwrap_command("cd sub && cc -c a.c", false).is_err());
+    }
+
+    /// cmd.exe expands `%NAME%` on its command line only when NAME is set
+    /// (in any case), or is one of its own: else it's left as it is, as
+    /// hermetic-llvm-cmake's links pass `/pdbaltpath:%_PDB%` to the linker.
+    #[test]
+    fn cmd_variables() {
+        let link = r#"C:\WINDOWS\system32\cmd.exe /C "cd . && C:\llvm\bin\lld-link.exe /nologo a.obj /out:a.exe /lldignoreenv "/pdbaltpath:%_PDB%" /MACHINE:X64 && cd .""#;
+        let unset = |_: &str| false;
+        assert_eq!(
+            unwrap_command_with(link, true, &unset).unwrap().steps,
+            vec![s(&[r"C:\llvm\bin\lld-link.exe", "/nologo", "a.obj", "/out:a.exe", "/lldignoreenv", "/pdbaltpath:%_PDB%", "/MACHINE:X64"])]
+        );
+        // Set, in another case: expanded. The reason names it.
+        let set = |name: &str| name.eq_ignore_ascii_case("_pdb");
+        assert_eq!(unwrap_command_with(link, true, &set).unwrap_err(), "command uses cmd.exe's variable %_PDB%");
+        // Its substrings and substitutions too; cmd's own variables, set or
+        // not; a closing sign opening another variable.
+        for (cmd, name) in
+            [(r#"cmd.exe /C "a.exe %_pdb:~0,3%""#, "_pdb"), (r#"cmd.exe /C "a.exe %CD%\x""#, "CD"), (r#"cmd.exe /C "a.exe %UNSET%_PDB%""#, "_PDB")]
+        {
+            assert_eq!(unwrap_command_with(cmd, true, &set).unwrap_err(), format!("command uses cmd.exe's variable %{name}%"), "{cmd}");
+        }
+        // Not where cmd doesn't run the command.
+        assert!(unwrap_command_with(r#"lld-link.exe a.obj /pdbaltpath:%_PDB%"#, true, &set).is_ok());
+        assert!(unwrap_command_with(r#"cmd.exe /C "printf %d%%s %%""#, true, &set).is_ok());
     }
 
     #[test]

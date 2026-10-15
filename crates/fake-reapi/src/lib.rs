@@ -16,6 +16,11 @@
 //! It is also a Build Event Service: it records the build events it
 //! receives (decoded) and acks each one.
 //!
+//! Failures are injected on request: calls failing with UNAVAILABLE
+//! ([`State::fail_next`]), execution streams and build event streams
+//! breaking, splices refused. [`misbehaving`] has servers misbehaving as
+//! what stands in front of one may.
+//!
 //! Split and spliced blobs are off by default; [`State::set_chunking`]
 //! turns them on, as in RE API v2.12 (`SplitBlob` / `SpliceBlob`) or v2.13
 //! (`GetChunkMapping` / `RegisterChunkMapping`), with FastCDC 2020 and
@@ -25,6 +30,7 @@
 //! advertises it for ByteStream, batch reads and batch updates.
 
 pub mod certs;
+pub mod misbehaving;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -112,6 +118,8 @@ pub struct State {
     /// for then.
     execute_delay_ms: AtomicU64,
     execute_gate: Mutex<Option<Gate>>,
+    /// What reads wait for (see `set_read_gate`).
+    read_gate: Mutex<Option<Gate>>,
     /// Milliseconds a ByteStream write waits before it reads the blob,
     /// and a read before it answers.
     write_delay_ms: AtomicU64,
@@ -120,6 +128,11 @@ pub struct State {
     writes_in_flight: AtomicU64,
     /// Calls to fail with UNAVAILABLE, by method (see `fail_next`).
     failures: Mutex<HashMap<&'static str, u32>>,
+    /// Build event streams breaking after so many acks (see
+    /// `break_next_bes_streams`): how many more, after how many.
+    bes_breaks: Mutex<(u32, usize)>,
+    /// Splices refused, for good (see `set_refuse_splices`).
+    refuse_splices: std::sync::atomic::AtomicBool,
     /// Executions whose stream breaks once the operation is named (see
     /// `break_next_executions`), and the operations they leave to follow.
     break_executions: Mutex<u64>,
@@ -164,11 +177,12 @@ impl State {
         self.cas.lock().unwrap().insert(d.hash.clone(), data);
         d
     }
+    /// The blob `d`: of its hash, and its size.
     pub fn get(&self, d: &re::Digest) -> Option<Vec<u8>> {
         if d.size_bytes == 0 {
             return Some(Vec::new());
         }
-        self.cas.lock().unwrap().get(&d.hash).cloned()
+        self.cas.lock().unwrap().get(&d.hash).filter(|b| b.len() as i64 == d.size_bytes).cloned()
     }
     pub fn clear_action_cache(&self) {
         self.ac.lock().unwrap().clear();
@@ -188,10 +202,19 @@ impl State {
     pub fn set_execute_gate(&self, gate: Option<Gate>) {
         *self.execute_gate.lock().unwrap() = gate;
     }
+    /// Makes every read (batches and ByteStream) wait, after its delay,
+    /// until `gate` returns true (polled), as `set_execute_gate` does
+    /// Execute; `None` opens it.
+    pub fn set_read_gate(&self, gate: Option<Gate>) {
+        *self.read_gate.lock().unwrap() = gate;
+    }
     /// Makes the next `times` calls of `method` (`FindMissingBlobs`,
     /// `BatchUpdateBlobs`, `BatchReadBlobs`, `GetActionResult`,
-    /// `UpdateActionResult`, `GetCapabilities`, `Read`, `Write`, `Execute`)
-    /// fail with UNAVAILABLE, as a transient failure would.
+    /// `UpdateActionResult`, `GetCapabilities`, `Read`, `Write`,
+    /// `QueryWriteStatus`, `Execute`, `WaitExecution`, `SplitBlob`,
+    /// `SpliceBlob`, `GetChunkMapping`, `RegisterChunkMapping`,
+    /// `PublishLifecycleEvent`, `PublishBuildToolEventStream`) fail with
+    /// UNAVAILABLE, as a transient failure would.
     pub fn fail_next(&self, method: &'static str, times: u32) {
         *self.failures.lock().unwrap().entry(method).or_default() += times;
     }
@@ -205,6 +228,16 @@ impl State {
             }
             _ => Ok(()),
         }
+    }
+    /// The next `times` build event streams break (UNAVAILABLE) once they
+    /// acked `after` events: the client must send the others again.
+    pub fn break_next_bes_streams(&self, times: u32, after: usize) {
+        *self.bes_breaks.lock().unwrap() = (times, after);
+    }
+    /// Refuses every splice (INVALID_ARGUMENT), as a server not serving
+    /// them after all would.
+    pub fn set_refuse_splices(&self, on: bool) {
+        self.refuse_splices.store(on, Ordering::SeqCst);
     }
     /// The next `times` executions run, but their stream breaks after the
     /// operation's name: the client must follow it (`WaitExecution`).
@@ -230,6 +263,13 @@ impl State {
         let delay = self.read_delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        loop {
+            let gate = self.read_gate.lock().unwrap().clone();
+            match gate {
+                Some(open) if !open() => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                _ => break,
+            }
         }
         Reading(self.clone())
     }
@@ -277,6 +317,9 @@ impl State {
     }
     /// Stores a blob made of chunks it holds, after checking its digest.
     fn splice(&self, d: Option<re::Digest>, chunks: &[re::Digest]) -> Result<re::Digest, Status> {
+        if self.refuse_splices.load(Ordering::SeqCst) {
+            return Err(Status::invalid_argument("splices refused"));
+        }
         let d = d.ok_or_else(|| Status::invalid_argument("no blob digest"))?;
         let mut data = Vec::new();
         for c in chunks {
@@ -339,7 +382,8 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
     async fn find_missing_blobs(&self, r: Request<re::FindMissingBlobsRequest>) -> Result<Response<re::FindMissingBlobsResponse>, Status> {
         self.0.injected("FindMissingBlobs")?;
         let cas = self.0.cas.lock().unwrap();
-        let missing = r.into_inner().blob_digests.into_iter().filter(|d| d.size_bytes != 0 && !cas.contains_key(&d.hash)).collect();
+        let missing =
+            r.into_inner().blob_digests.into_iter().filter(|d| d.size_bytes != 0 && cas.get(&d.hash).is_none_or(|b| b.len() as i64 != d.size_bytes)).collect();
         Ok(Response::new(re::FindMissingBlobsResponse { missing_blob_digests: missing }))
     }
 
@@ -401,12 +445,14 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
     }
     async fn split_blob(&self, r: Request<re::SplitBlobRequest>) -> Result<Response<re::SplitBlobResponse>, Status> {
         self.0.chunking_api(12)?;
+        self.0.injected("SplitBlob")?;
         let chunk_digests = self.0.split(r.into_inner().blob_digest)?;
         Ok(Response::new(re::SplitBlobResponse { chunk_digests, chunking_function: FAST_CDC }))
     }
     type GetChunkMappingStream = BoxStream<re::GetChunkMappingResponse>;
     async fn get_chunk_mapping(&self, r: Request<re::GetChunkMappingRequest>) -> Result<Response<Self::GetChunkMappingStream>, Status> {
         self.0.chunking_api(13)?;
+        self.0.injected("GetChunkMapping")?;
         let chunks = self.0.split(r.into_inner().blob_digest)?;
         // Streamed a few digests at a time, the function in the first
         // message only.
@@ -419,6 +465,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
     }
     async fn splice_blob(&self, r: Request<re::SpliceBlobRequest>) -> Result<Response<re::SpliceBlobResponse>, Status> {
         self.0.chunking_api(12)?;
+        self.0.injected("SpliceBlob")?;
         let r = r.into_inner();
         let d = self.0.splice(r.blob_digest, &r.chunk_digests)?;
         Ok(Response::new(re::SpliceBlobResponse { blob_digest: Some(d) }))
@@ -428,6 +475,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Svc {
         r: Request<Streaming<re::RegisterChunkMappingRequest>>,
     ) -> Result<Response<re::RegisterChunkMappingResponse>, Status> {
         self.0.chunking_api(13)?;
+        self.0.injected("RegisterChunkMapping")?;
         let mut stream = r.into_inner();
         let (mut blob, mut chunks) = (None, Vec::new());
         while let Some(m) = stream.next().await {
@@ -588,6 +636,7 @@ impl bs::byte_stream_server::ByteStream for Svc {
     }
 
     async fn query_write_status(&self, _r: Request<bs::QueryWriteStatusRequest>) -> Result<Response<bs::QueryWriteStatusResponse>, Status> {
+        self.0.injected("QueryWriteStatus")?;
         Err(Status::unimplemented("QueryWriteStatus"))
     }
 }
@@ -784,6 +833,7 @@ impl re::execution_server::Execution for Svc {
 
     type WaitExecutionStream = BoxStream<Operation>;
     async fn wait_execution(&self, r: Request<re::WaitExecutionRequest>) -> Result<Response<Self::WaitExecutionStream>, Status> {
+        self.0.injected("WaitExecution")?;
         let name = r.into_inner().name;
         let op = self.0.operations.lock().unwrap().remove(&name).ok_or_else(|| Status::not_found(format!("no operation {name}")))?;
         self.0.stats.lock().unwrap().wait_executions += 1;
@@ -794,6 +844,7 @@ impl re::execution_server::Execution for Svc {
 #[tonic::async_trait]
 impl bes::publish_build_event_server::PublishBuildEvent for Svc {
     async fn publish_lifecycle_event(&self, request: Request<bes::PublishLifecycleEventRequest>) -> Result<Response<()>, Status> {
+        self.0.injected("PublishLifecycleEvent")?;
         self.0.lifecycle_events.lock().unwrap().push(request.into_inner());
         Ok(Response::new(()))
     }
@@ -804,11 +855,27 @@ impl bes::publish_build_event_server::PublishBuildEvent for Svc {
         &self,
         request: Request<Streaming<bes::PublishBuildToolEventStreamRequest>>,
     ) -> Result<Response<Self::PublishBuildToolEventStreamStream>, Status> {
+        self.0.injected("PublishBuildToolEventStream")?;
         let mut input = request.into_inner();
         let state = self.0.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
+        // This stream breaks after so many acks (`break_next_bes_streams`).
+        let breaks_after = {
+            let mut breaks = self.0.bes_breaks.lock().unwrap();
+            (breaks.0 > 0).then(|| {
+                breaks.0 -= 1;
+                breaks.1
+            })
+        };
         tokio::spawn(async move {
+            let mut acked = 0;
             while let Some(Ok(req)) = input.next().await {
+                if breaks_after == Some(acked) {
+                    state.stats.lock().unwrap().injected_failures += 1;
+                    let _ = tx.send(Err(Status::unavailable("injected: the stream broke"))).await;
+                    break;
+                }
+                acked += 1;
                 let Some(ordered) = req.ordered_build_event else { continue };
                 match ordered.event.as_ref().and_then(|e| e.event.as_ref()) {
                     Some(bes::build_event::Event::BazelEvent(any)) => {

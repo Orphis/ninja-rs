@@ -1,6 +1,7 @@
 //! Caches that outlive a single action: file digests, include scanning
-//! results, toolchain input trees, the members of thin archives and the
-//! set of blobs known to be in the remote CAS. (The daemon keeps its own
+//! results, toolchain input trees, the members of thin archives, the
+//! linker directives of objects and libraries and the set of blobs known
+//! to be in the remote CAS. (The daemon keeps its own
 //! between builds: see `ninja_daemon`.)
 //!
 //! Everything lives behind this one `Store`, owned by the service; nothing
@@ -8,11 +9,10 @@
 //! (keyed by path and `FileStamp`); the other caches are in memory for now
 //! but keyed so that they could be persisted the same way.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rbe_client::proto as re;
 use rbe_client::tree::MemDigestCache;
@@ -56,30 +56,62 @@ pub fn walk_files(dir: &Path, rel: &str, out: &mut Vec<String>) {
 pub const DIR_FILES_MAX: usize = 1000;
 pub const DIR_BYTES_MAX: u64 = 64 << 20;
 
-/// The files directly in `dirs` (not their subdirectories': a source root
-/// may hold the build directory), for computed includes the scanner can't
-/// name. Err (the compile runs locally, with the reason) above
+/// How deep `dir_files` goes (links to directories are followed).
+pub const DIR_DEPTH_MAX: usize = 16;
+
+/// The files under `dirs`, for computed includes the scanner can't name:
+/// their subdirectories' too (Boost.MPL's reach `preprocessed/plain/`), but
+/// not those of the directories `written` says the build writes to (a
+/// source root may hold the build directory), of another build directory
+/// (a configuration's beside it), nor repositories' own (see
+/// `walk_skips`). Err (the compile runs locally, with the reason) above
 /// `DIR_FILES_MAX` files or `DIR_BYTES_MAX` bytes.
-pub fn dir_files<'a>(dirs: impl IntoIterator<Item = &'a PathBuf>) -> Result<Vec<PathBuf>, String> {
-    let (mut files, mut bytes) = (Vec::new(), 0u64);
-    for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+pub fn dir_files<'a>(dirs: impl IntoIterator<Item = &'a PathBuf>, written: &dyn Fn(&Path) -> bool) -> Result<Vec<PathBuf>, String> {
+    files_under(dirs.into_iter().map(|d| (d.clone(), DIR_DEPTH_MAX)), written)
+}
+
+/// `dir_files`, each directory with how deep under it to go (0: its own
+/// files only).
+pub fn files_under(dirs: impl IntoIterator<Item = (PathBuf, usize)>, written: &dyn Fn(&Path) -> bool) -> Result<Vec<PathBuf>, String> {
+    let (mut files, mut bytes) = (BTreeSet::new(), 0u64);
+    let mut todo: Vec<(PathBuf, usize)> = dirs.into_iter().collect();
+    let mut walked = HashSet::new();
+    let mb = DIR_BYTES_MAX >> 20;
+    while let Some((dir, depth)) = todo.pop() {
+        // (A directory under another one walked once; as many directories
+        // as files at most: links may loop.)
+        if !walked.insert((dir.clone(), depth)) {
+            continue;
+        }
+        if walked.len() > DIR_FILES_MAX {
+            return Err(format!("computed #include with over {DIR_FILES_MAX} directories to send: {}...", dir.display()));
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten().filter(|e| !ninja_daemon::watch::walk_skips(&e.file_name())) {
+            let p = e.path();
             // (Links followed.)
-            let Ok(meta) = std::fs::metadata(e.path()) else { continue };
-            if !meta.is_file() {
+            let Ok(meta) = std::fs::metadata(&p) else { continue };
+            if meta.is_dir() {
+                if depth > 0 && !written(&p) && !is_build_dir(&p) {
+                    todo.push((p, depth - 1));
+                }
+                continue;
+            }
+            if !meta.is_file() || !files.insert(p) {
                 continue;
             }
             bytes += meta.len();
-            files.push(e.path());
             if files.len() > DIR_FILES_MAX || bytes > DIR_BYTES_MAX {
-                let mb = DIR_BYTES_MAX >> 20;
-                return Err(format!("computed #include: the directories to send ({}...) have over {DIR_FILES_MAX} files or {mb} MB", dir.display()));
+                return Err(format!("computed #include with over {DIR_FILES_MAX} files or {mb} MB to send: {}...", dir.display()));
             }
         }
     }
-    files.sort();
-    Ok(files)
+    Ok(files.into_iter().collect())
+}
+
+/// Whether `dir` is a build directory: CMake's, or one ninja ran in.
+fn is_build_dir(dir: &Path) -> bool {
+    ["CMakeCache.txt", ".ninja_log"].iter().any(|f| dir.join(f).is_file())
 }
 
 impl ToolchainTree {
@@ -103,8 +135,21 @@ impl ToolchainTree {
 
 type TreeCell = Arc<Mutex<Option<Result<Arc<ToolchainTree>, String>>>>;
 
-/// The members of a file if it's a thin archive, for its size and mtime.
-type ThinEntry = (u64, SystemTime, Option<Arc<Vec<String>>>);
+/// What is known of files, for a version of each (its stamp).
+type Stamped<T> = Mutex<HashMap<PathBuf, (ninja_os::FileStamp, T)>>;
+
+/// Whether a toolchain tree's failure lasts: walking the directory again
+/// would fail the same way (a dangling link, a file gone or unreadable, a
+/// tree that can't be built), unlike when out of file descriptors, or with
+/// a file locked for a moment (an installer, a virus scanner), which the
+/// next action tries again, as the daemon does.
+fn lasting(e: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
+    match e.chain().find_map(|c| c.downcast_ref::<std::io::Error>()) {
+        Some(io) => matches!(io.kind(), NotFound | PermissionDenied | NotADirectory | IsADirectory | InvalidInput),
+        None => true,
+    }
+}
 
 #[derive(Default)]
 pub struct Store {
@@ -112,7 +157,10 @@ pub struct Store {
     pub scan: ScanCache,
     /// One cell per directory, so concurrent actions build each tree once.
     toolchain_trees: Mutex<HashMap<PathBuf, TreeCell>>,
-    thin_archives: Mutex<HashMap<PathBuf, ThinEntry>>,
+    /// The members of files if they're thin archives.
+    thin_archives: Stamped<Option<Arc<Vec<String>>>>,
+    /// The linker directives of objects and libraries (see `directives`).
+    directives: Stamped<Option<Arc<Vec<String>>>>,
     /// Hashes of blobs uploaded to (or found in) the CAS during this session.
     uploaded: Mutex<HashSet<String>>,
     /// The preprocessor scanning compiles (`--remote_include_scanner`):
@@ -128,8 +176,8 @@ impl Store {
     /// The Merkle tree of a toolchain input directory (cached; concurrent
     /// callers for the same directory wait for the first one): from the
     /// files `daemon` lists (None: no daemon), or read here (also when the
-    /// daemon couldn't list them). A failure is kept too: actions don't
-    /// each walk the directory again.
+    /// daemon couldn't list them). A lasting failure is kept too (see
+    /// `lasting`): actions don't each walk the directory again.
     pub fn toolchain_tree(&self, dir: &Path, daemon: &dyn Fn(&Path) -> Option<Result<TreeInfo, String>>) -> Result<Arc<ToolchainTree>, String> {
         let cell = self.toolchain_trees.lock().unwrap().entry(dir.to_path_buf()).or_default().clone();
         let mut kept = cell.lock().unwrap();
@@ -137,38 +185,58 @@ impl Store {
             return t.clone();
         }
         let listed = daemon(dir).and_then(Result::ok).and_then(|listed| ToolchainTree::from_listing(dir, listed).ok());
-        let t = match listed {
-            Some(t) => Ok(Arc::new(t)),
-            None => {
-                let mut tree = InputTree::new();
-                tree.add_dir_cached("", dir, &|p| p.file_name().is_some_and(ninja_daemon::watch::walk_skips), Some(&self.digests))
-                    .map_err(|e| format!("{e:#}"))
-                    .map(|()| {
-                        let mut blobs = BlobSet::default();
-                        let digest = tree.build(&mut blobs);
-                        let mut files = Vec::new();
-                        walk_files(dir, "", &mut files);
-                        Arc::new(ToolchainTree { digest, blobs: Arc::new(blobs), files: Arc::new(files) })
-                    })
+        if let Some(t) = listed {
+            let t = Arc::new(t);
+            *kept = Some(Ok(t.clone()));
+            return Ok(t);
+        }
+        let mut tree = InputTree::new();
+        match tree.add_dir_cached("", dir, &|p| p.file_name().is_some_and(ninja_daemon::watch::walk_skips), Some(&self.digests)) {
+            Ok(()) => {
+                let mut blobs = BlobSet::default();
+                let digest = tree.build(&mut blobs);
+                let mut files = Vec::new();
+                walk_files(dir, "", &mut files);
+                let t = Arc::new(ToolchainTree { digest, blobs: Arc::new(blobs), files: Arc::new(files) });
+                *kept = Some(Ok(t.clone()));
+                Ok(t)
             }
-        };
-        *kept = Some(t.clone());
-        t
+            Err(e) => {
+                let why = format!("{e:#}");
+                if lasting(&e) {
+                    *kept = Some(Err(why.clone()));
+                }
+                Err(why)
+            }
+        }
     }
 
     /// The members of `path` if it's a thin archive (see `archive`), read
-    /// once per version of the file.
+    /// once per version of the file (its `FileStamp`).
     pub fn thin_members(&self, path: &Path) -> Result<Option<Arc<Vec<String>>>, String> {
-        let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let (len, mtime) = (meta.len(), meta.modified().unwrap_or(UNIX_EPOCH));
-        if let Some((l, m, members)) = self.thin_archives.lock().unwrap().get(path)
-            && (*l, *m) == (len, mtime)
+        let (_, stamp) = ninja_os::stat(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some((s, members)) = self.thin_archives.lock().unwrap().get(path)
+            && *s == stamp
         {
             return Ok(members.clone());
         }
         let members = crate::archive::read_members(path).map_err(|e| format!("{}: {e}", path.display()))?.map(Arc::new);
-        self.thin_archives.lock().unwrap().insert(path.to_path_buf(), (len, mtime, members.clone()));
+        self.thin_archives.lock().unwrap().insert(path.to_path_buf(), (stamp, members.clone()));
         Ok(members)
+    }
+
+    /// The linker directives of an object or a library (see `directives`),
+    /// read once per version of the file. None when they can't be read.
+    pub fn link_directives(&self, path: &Path) -> Option<Arc<Vec<String>>> {
+        let (_, stamp) = ninja_os::stat(path).ok()?;
+        if let Some((s, options)) = self.directives.lock().unwrap().get(path)
+            && *s == stamp
+        {
+            return options.clone();
+        }
+        let options = crate::directives::read(path).ok().flatten().map(Arc::new);
+        self.directives.lock().unwrap().insert(path.to_path_buf(), (stamp, options.clone()));
+        options
     }
 
     /// The preprocessor, created on first use; `build_dir`'s contents may
@@ -217,22 +285,16 @@ impl Store {
         }
     }
 
-    /// Saves the file digest cache.
+    /// Saves the file digest cache: but the digests of files that could
+    /// still change unseen when hashed (see `MemDigestCache::entries`).
     pub fn save_digests(&self, file: &Path) -> std::io::Result<()> {
-        self.save_digests_at(file, std::time::SystemTime::now())
-    }
-
-    /// `save_digests`, `now` being the time.
-    fn save_digests_at(&self, file: &Path, now: SystemTime) -> std::io::Result<()> {
         let mut out = String::from(DIGESTS_SIGNATURE);
         out.push('\n');
         let mut entries = self.digests.entries();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         for (p, s, d) in entries {
             let ps = p.to_string_lossy();
-            // A file modified within the time granularity of now could
-            // change again unseen: hashed again next time.
-            if ps.contains(['\t', '\n']) || s.is_racy(now) {
+            if ps.contains(['\t', '\n']) {
                 continue;
             }
             out.push_str(&format!("{ps}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", s.len, s.mtime_ns, s.change, s.created, s.volume, s.id, d.hash));
@@ -290,9 +352,9 @@ mod tests {
         std::fs::write(&f, "hello").unwrap();
         std::fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
         assert_eq!(rbe_client::tree::file_digest(&f, Some(&s2.digests)).unwrap(), d);
-        // Modified within the time granularity: not saved. A second ago is
-        // only too recent for a file system counting in seconds. (Saved at
-        // that time: however long the test takes.)
+        // Modified within the time granularity of when they were hashed
+        // (later, whatever the time granularity): not saved. A second ago
+        // with a finer time is old enough.
         let now = std::time::SystemTime::now();
         let whole = |t: std::time::SystemTime| {
             let s = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -305,10 +367,11 @@ mod tests {
             rbe_client::tree::file_digest(&g, Some(&s2.digests)).unwrap();
             g
         };
-        let fresh = set("fresh.txt", now);
-        let second = set("second.txt", whole(now));
+        let hour = std::time::Duration::from_secs(3600);
+        let fresh = set("fresh.txt", now + hour + std::time::Duration::from_millis(1));
+        let second = set("second.txt", whole(now + hour));
         let fine = set("fine.txt", whole(now) - std::time::Duration::from_secs(1) + std::time::Duration::from_millis(1));
-        s2.save_digests_at(&dir.join("digests"), now).unwrap();
+        s2.save_digests(&dir.join("digests")).unwrap();
         let s3 = Store::default();
         s3.load_digests(&dir.join("digests"));
         assert!(s3.digests.get(&fresh, &stamp(&fresh)).is_none());
@@ -348,7 +411,8 @@ mod tests {
     }
 
     /// A tree that couldn't be built is kept for the invocation: actions
-    /// don't each walk it again. One the daemon couldn't list is read here.
+    /// don't each walk it again (its directory missing: until a change).
+    /// One the daemon couldn't list is read here.
     #[test]
     fn toolchain_tree_errors() {
         let base = test_dirs::TestDir::new("ninja_rs_tc_err");
@@ -366,6 +430,83 @@ mod tests {
         std::fs::write(dir.join(format!("{}1-2", ninja_daemon::watch::COOKIE_PREFIX)), "").unwrap();
         let c = Store::default().toolchain_tree(&dir, &|_| None).unwrap();
         assert_eq!((c.digest.clone(), c.files.clone()), (a.digest.clone(), a.files.clone()));
+    }
+
+    /// Which failures of a toolchain tree last the invocation: those
+    /// walking it again would meet (a file gone, unreadable, a dangling
+    /// link), not a file locked for a moment or too many open files.
+    #[test]
+    fn lasting_tree_failures() {
+        let io = |kind| anyhow::Error::from(std::io::Error::from(kind)).context("hashing tc/bin/cc");
+        for kind in [std::io::ErrorKind::NotFound, std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::NotADirectory] {
+            assert!(lasting(&io(kind)), "{kind:?}");
+        }
+        for kind in [std::io::ErrorKind::Other, std::io::ErrorKind::Interrupted, std::io::ErrorKind::ResourceBusy] {
+            assert!(!lasting(&io(kind)), "{kind:?}");
+        }
+        assert!(!lasting(&anyhow::Error::from(std::io::Error::from_raw_os_error(if cfg!(windows) { 32 } else { 24 }))));
+        assert!(lasting(&anyhow::anyhow!("path conflict at bin")));
+    }
+
+    /// A file locked for a moment while the tree is built (Windows: opened
+    /// without sharing, by an installer or a virus scanner): the next action
+    /// builds it again, once it's released.
+    #[cfg(windows)]
+    #[test]
+    fn locked_toolchain_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = test_dirs::TestDir::new("ninja_rs_tc_locked");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/cc"), "x").unwrap();
+        let s = Store::default();
+        let lock = std::fs::File::options().read(true).share_mode(0).open(dir.join("bin/cc")).unwrap();
+        assert!(s.toolchain_tree(&dir, &|_| None).is_err());
+        drop(lock);
+        assert_eq!(*s.toolchain_tree(&dir, &|_| None).unwrap().files, vec!["bin/cc".to_string()]);
+    }
+
+    /// Thin archives' members and linker directives are read again for a
+    /// new version of the file, even with the size and time of the old one.
+    #[test]
+    fn stamped_caches() {
+        let dir = test_dirs::TestDir::new("ninja_rs_stamped");
+        let s = Store::default();
+        let lib = dir.join("x.lib");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let write = |data: &[u8]| {
+            std::fs::write(&lib, data).unwrap();
+            std::fs::File::options().write(true).open(&lib).unwrap().set_modified(old).unwrap();
+        };
+        // Another version gets another change time: one tick of the file
+        // system's clock goes by.
+        let tick = || {
+            let (probe, last) = (dir.join("tick"), ninja_os::stat(&lib).unwrap().1.change);
+            while {
+                std::fs::write(&probe, "").unwrap();
+                ninja_os::stat(&probe).unwrap().1.change <= last
+            } {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let obj = |lib: &[u8]| crate::directives::tests::coff(&[(".drectve", [b"/DEFAULTLIB:".as_slice(), lib].concat().as_slice())]);
+        write(&obj(b"aaa"));
+        let first = s.link_directives(&lib).unwrap();
+        assert_eq!(crate::directives::default_libs(&first).collect::<Vec<_>>(), ["aaa"]);
+        // Rewritten in place, and removed and made again (which NTFS gives
+        // its old creation time back).
+        tick();
+        write(&obj(b"bbb"));
+        assert_eq!(crate::directives::default_libs(&s.link_directives(&lib).unwrap()).collect::<Vec<_>>(), ["bbb"]);
+        tick();
+        std::fs::remove_file(&lib).unwrap();
+        write(&obj(b"ccc"));
+        assert_eq!(crate::directives::default_libs(&s.link_directives(&lib).unwrap()).collect::<Vec<_>>(), ["ccc"]);
+        tick();
+        write(crate::archive::MAGIC);
+        assert_eq!(s.thin_members(&lib).unwrap().as_deref(), Some(&Vec::new()));
+        tick();
+        write(b"!<arch>\n");
+        assert_eq!(s.thin_members(&lib).unwrap(), None);
     }
 
     /// Repositories' own directories aren't part of toolchain trees (a

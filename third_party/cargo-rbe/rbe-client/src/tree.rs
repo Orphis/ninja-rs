@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use prost::Message;
@@ -85,6 +86,14 @@ pub use ninja_os::FileStamp;
 pub trait DigestCache: Send + Sync {
     fn get(&self, path: &Path, stamp: &FileStamp) -> Option<re::Digest>;
     fn put(&self, path: &Path, stamp: FileStamp, digest: re::Digest);
+    /// `put`, of a file read from `read_at` on: whether it could change
+    /// unseen is judged then (see `FileStamp::is_racy`), not once it was
+    /// read (a large file takes a while), when a change made while it was
+    /// read may look older than the file system's time granularity.
+    fn put_read_at(&self, path: &Path, stamp: FileStamp, digest: re::Digest, read_at: SystemTime) {
+        let _ = read_at;
+        self.put(path, stamp, digest);
+    }
 }
 
 /// A simple in-memory [`DigestCache`]. Each entry says whether its file
@@ -108,7 +117,10 @@ impl DigestCache for MemDigestCache {
         if s == stamp { Some(d.clone()) } else { None }
     }
     fn put(&self, path: &Path, stamp: FileStamp, digest: re::Digest) {
-        let racy = stamp.is_racy(std::time::SystemTime::now());
+        self.put_read_at(path, stamp, digest, SystemTime::now());
+    }
+    fn put_read_at(&self, path: &Path, stamp: FileStamp, digest: re::Digest, read_at: SystemTime) {
+        let racy = stamp.is_racy(read_at);
         self.0.lock().unwrap().insert(path.to_path_buf(), (stamp, digest, racy));
     }
 }
@@ -123,6 +135,8 @@ pub fn hash_file(path: &Path) -> Result<re::Digest> {
 /// The cache is keyed by the symlink-resolved path, so that many links to
 /// one file (e.g. LLVM's multi-call binary) are hashed once.
 pub fn file_digest(path: &Path, cache: Option<&dyn DigestCache>) -> Result<re::Digest> {
+    // Read after it's stamped: as of when (see `DigestCache::put_read_at`).
+    let read_at = SystemTime::now();
     let (_, stamp) = ninja_os::stat(path).with_context(|| format!("stat {}", path.display()))?;
     let Some(c) = cache else { return hash_file(path) };
     let is_link = fs::symlink_metadata(path).map(|m| m.file_type().is_symlink()).unwrap_or(false);
@@ -131,7 +145,7 @@ pub fn file_digest(path: &Path, cache: Option<&dyn DigestCache>) -> Result<re::D
         return Ok(d);
     }
     let d = hash_file(path)?;
-    c.put(&key, stamp, d.clone());
+    c.put_read_at(&key, stamp, d.clone(), read_at);
     Ok(d)
 }
 
@@ -457,13 +471,32 @@ pub fn valid_name(name: &str) -> bool {
 /// can stand for a huge one (2^40 paths).
 const MAX_TREE_ENTRIES: usize = 1 << 20;
 
-/// Counts `n` more entries of an output tree being expanded.
-fn expanding(entries: &mut usize, n: usize) -> Result<()> {
-    *entries += n;
-    if *entries > MAX_TREE_ENTRIES {
-        bail!("output tree expands to more than {MAX_TREE_ENTRIES} files and directories");
+/// The most bytes the paths of an output `Tree` may take together: a deep
+/// one with long names makes long paths of every file (1000 levels of
+/// 255-byte names, 366 MiB of paths from a 650 KiB tree).
+const MAX_TREE_PATH_BYTES: usize = 128 << 20;
+
+/// What an output tree being expanded came to: its entries, and the bytes
+/// of their paths.
+#[derive(Default)]
+struct Expansion {
+    entries: usize,
+    bytes: usize,
+}
+
+impl Expansion {
+    /// Counts an entry at `path`.
+    fn add(&mut self, path: &Path) -> Result<()> {
+        self.entries += 1;
+        self.bytes += path.as_os_str().len();
+        if self.entries > MAX_TREE_ENTRIES {
+            bail!("output tree expands to more than {MAX_TREE_ENTRIES} files and directories");
+        }
+        if self.bytes > MAX_TREE_PATH_BYTES {
+            bail!("output tree's paths take more than {} MiB", MAX_TREE_PATH_BYTES >> 20);
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Lists every file of an output `Tree` with its path relative to the root.
@@ -476,14 +509,16 @@ pub fn tree_files(tree: &re::Tree) -> Result<Vec<(PathBuf, re::FileNode)>> {
     let root = tree.root.as_ref().context("output tree without root")?;
     let mut files = Vec::new();
     let mut stack = vec![(PathBuf::new(), root)];
-    let mut entries = 0;
+    let mut expansion = Expansion::default();
     while let Some((rel, dir)) = stack.pop() {
-        expanding(&mut entries, 1 + dir.files.len())?;
+        expansion.add(&rel)?;
         for f in &dir.files {
             if !valid_name(&f.name) {
                 bail!("output tree names a file {:?}", f.name);
             }
-            files.push((rel.join(&f.name), f.clone()));
+            let path = rel.join(&f.name);
+            expansion.add(&path)?;
+            files.push((path, f.clone()));
         }
         if let Some(l) = dir.symlinks.first() {
             bail!("output tree holds a symlink ({:?}), which isn't supported", l.name);
@@ -511,9 +546,9 @@ pub fn tree_dirs(tree: &re::Tree) -> Result<Vec<PathBuf>> {
     let root = tree.root.as_ref().context("output tree without root")?;
     let mut dirs = Vec::new();
     let mut stack = vec![(PathBuf::new(), root)];
-    let mut entries = 0;
+    let mut expansion = Expansion::default();
     while let Some((rel, dir)) = stack.pop() {
-        expanding(&mut entries, 1)?;
+        expansion.add(&rel)?;
         for sub in &dir.directories {
             let h = sub.digest.as_ref().map(|d| d.hash.clone()).unwrap_or_default();
             let child = by_digest.get(&h).with_context(|| format!("tree is missing directory {h}"))?;
@@ -625,6 +660,46 @@ mod tests {
         let tree = re::Tree { root: Some(dir), children };
         assert!(format!("{:#}", tree_files(&tree).unwrap_err()).contains("expands to more than"));
         assert!(tree_dirs(&tree).is_err());
+    }
+
+    #[test]
+    fn trees_of_long_paths_are_bounded() {
+        // 520 levels of 255-byte names, 1000 files at the bottom: their
+        // paths take 133 MiB, from a tree of 360 KiB.
+        let name = |i: usize| format!("{i:0>255}");
+        let mut dir = re::Directory {
+            files: (0..1000).map(|i| re::FileNode { name: name(i), digest: Some(crate::digest_of(b"x")), ..Default::default() }).collect(),
+            ..Default::default()
+        };
+        let mut children = Vec::new();
+        for _ in 0..520 {
+            let d = crate::digest_of_message(&dir).0;
+            children.push(dir);
+            dir = re::Directory { directories: vec![re::DirectoryNode { name: name(0), digest: Some(d) }], ..Default::default() };
+        }
+        let tree = re::Tree { root: Some(dir), children };
+        assert!(format!("{:#}", tree_files(&tree).unwrap_err()).contains("paths take more than 128 MiB"));
+        // Its directories alone are fine.
+        assert_eq!(tree_dirs(&tree).unwrap().len(), 520);
+    }
+
+    /// A digest whose file was read within its time granularity of its
+    /// modification isn't persisted, however much later it's put.
+    #[test]
+    fn digests_are_judged_racy_as_of_their_read() {
+        let dir = test_dirs::TestDir::new("rbe-racy-reads");
+        let path = dir.join("f");
+        std::fs::write(&path, "data").unwrap();
+        // Whole seconds (2 s granularity), long enough ago to be put now.
+        let now = std::time::SystemTime::now();
+        let whole = std::time::UNIX_EPOCH + std::time::Duration::from_secs(now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 10);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(whole).unwrap();
+        let stamp = ninja_os::stat(&path).unwrap().1;
+        let cache = MemDigestCache::default();
+        cache.put_read_at(&path, stamp, crate::digest_of(b"data"), whole + std::time::Duration::from_secs(1));
+        assert!(cache.entries().is_empty());
+        cache.put(&path, stamp, crate::digest_of(b"data"));
+        assert_eq!(cache.entries().len(), 1);
     }
 
     #[test]

@@ -58,10 +58,7 @@ pub fn normalize_include(input: &str, cwd: &str, windows: bool) -> String {
     while common < a.len() && common < b.len() && eq(a[common], b[common]) {
         common += 1;
     }
-    let mut parts: Vec<&str> = Vec::new();
-    for _ in common..b.len() {
-        parts.push("..");
-    }
+    let mut parts: Vec<&str> = vec![".."; b.len() - common];
     parts.extend_from_slice(&a[common..]);
     if parts.is_empty() {
         return ".".into();

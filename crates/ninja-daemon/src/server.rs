@@ -25,19 +25,19 @@ const KEPT_SESSIONS: usize = 64;
 /// next build there names it again.
 const BUILD_DIRS_KEPT: Duration = Duration::from_secs(24 * 3600);
 
-/// The ninja-rs version, which the daemon reports and ninja-rs too (this
-/// is the lowest crate reporting it): the package's, with the commit it
-/// was built from when the build knew it (`build.rs` asks git; Bazel
-/// stamps it with `--stamp`), as `0.1.0+1a2b3c4d5e6f`.
+/// The version the daemon reports: its program's (`set_version`), the
+/// package's until then.
+static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the version the daemon reports, before it serves: ninja-rs gives
+/// its own, with the commit it was built from, which this crate doesn't
+/// know (it isn't built again for each commit).
+pub fn set_version(version: &str) {
+    let _ = VERSION.set(version.to_string());
+}
+
 pub fn version() -> &'static str {
-    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    VERSION.get_or_init(|| {
-        // An unstamped Bazel build leaves the placeholder.
-        match option_env!("NINJA_RS_COMMIT").filter(|c| !c.is_empty() && !c.starts_with('{')) {
-            Some(commit) => format!("{}+{commit}", env!("CARGO_PKG_VERSION")),
-            None => env!("CARGO_PKG_VERSION").to_string(),
-        }
-    })
+    VERSION.get().map_or(env!("CARGO_PKG_VERSION"), String::as_str)
 }
 
 pub struct Daemon {
@@ -234,10 +234,12 @@ impl Daemon {
 const LOG_LIMIT: u64 = 1 << 20;
 
 /// The log file `path`, started again when it would grow past `limit`
-/// (while the daemon runs too: it may run for days).
-fn logger(path: &Path, limit: u64) -> Box<dyn Fn(&str) + Send + Sync> {
-    let path = path.to_path_buf();
-    let file = std::fs::File::options().create(true).append(true).open(&path).ok().map(|f| {
+/// (while the daemon runs too: it may run for days), what it held moved to
+/// `old` (the one there before goes): what led to a problem stays.
+fn logger(path: &Path, old: &Path, limit: u64) -> Box<dyn Fn(&str) + Send + Sync> {
+    let (path, old) = (path.to_path_buf(), old.to_path_buf());
+    let open = |p: &Path| std::fs::File::options().create(true).append(true).open(p);
+    let file = open(&path).ok().map(|f| {
         let len = f.metadata().map_or(0, |m| m.len());
         Mutex::new((f, len))
     });
@@ -246,9 +248,15 @@ fn logger(path: &Path, limit: u64) -> Box<dyn Fn(&str) + Send + Sync> {
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
         let line = format!("{now} [{}] {msg}\n", std::process::id());
         let (f, len) = &mut *f.lock().unwrap();
-        // Emptied through another handle (one appending can't truncate on
-        // Windows): appends go to its new end.
-        if *len + line.len() as u64 > limit && std::fs::File::create(&path).is_ok() {
+        if *len + line.len() as u64 > limit {
+            // Moved aside (the handle follows it), then a new one; or, when
+            // it can't be (open elsewhere on Windows), emptied through
+            // another handle (one appending can't truncate there): appends
+            // go to its new end.
+            match std::fs::rename(&path, &old).and_then(|()| open(&path)) {
+                Ok(new) => *f = new,
+                Err(_) => drop(std::fs::File::create(&path)),
+            }
             *len = 0;
         }
         if f.write_all(line.as_bytes()).is_ok() {
@@ -292,22 +300,39 @@ const ACCEPT_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// Runs the daemon until it has been idle for `idle`, is asked to stop, or
 /// the binary it comes from (`exe`) is rebuilt: its watches go then rather
-/// than hours later. Returns at once when another one is running.
+/// than hours later. Returns at once when another one is running. Why it
+/// couldn't start, and panics (a thread's, not a request's only), go to
+/// its log: its standard streams go nowhere.
 pub fn serve(loc: &Location, idle: Duration, exe: Option<PathBuf>) -> std::io::Result<()> {
     loc.create_dir()?;
-    let lock = std::fs::File::options().create(true).truncate(false).write(true).open(loc.lock_file())?;
+    let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::from(logger(&loc.log_file(), &loc.old_log_file(), LOG_LIMIT));
+    let failed = |what: &str, e: std::io::Error| {
+        log(&format!("not started: {what}: {e}"));
+        std::io::Error::new(e.kind(), format!("{what}: {e}"))
+    };
+    let lock = std::fs::File::options().create(true).truncate(false).write(true).open(loc.lock_file()).map_err(|e| failed("opening its lock", e))?;
     match lock.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-        Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        Err(std::fs::TryLockError::Error(e)) => return Err(failed("locking", e)),
+    }
+    {
+        let (log, before) = (log.clone(), std::panic::take_hook());
+        std::panic::set_hook(Box::new(move |info| {
+            log(&info.to_string().replace('\n', " "));
+            before(info);
+        }));
     }
     #[cfg(unix)]
     raise_file_limit();
-    let log = Arc::new(logger(&loc.log_file(), LOG_LIMIT));
     let log2 = log.clone();
     let daemon = Daemon::new(Box::new(move |m| log2(m)));
     daemon.watcher.set_cookie_dir(&loc.cookie_dir());
-    let mut listener = ipc::Listener::bind(loc)?;
+    #[cfg(unix)]
+    let at = loc.socket().display().to_string();
+    #[cfg(windows)]
+    let at = loc.pipe();
+    let mut listener = ipc::Listener::bind(loc).map_err(|e| failed(&format!("listening at {at}"), e))?;
     log(&format!("started (ninja-rs {}), exiting after {idle:?} idle", version()));
     {
         let (daemon, log, loc) = (daemon.clone(), log.clone(), loc.clone());
@@ -411,18 +436,42 @@ mod tests {
     }
 
     /// The log starts again when it would grow past its limit, while the
-    /// daemon runs (it may run for days).
+    /// daemon runs (it may run for days), what it held kept beside it (it
+    /// used to go, and with it what led to a problem).
     #[test]
     fn log_trimmed() {
         let dir = TestDir::new("ninja_daemon_log");
-        let path = dir.join("daemon.log");
-        let log = logger(&path, 1000);
+        let (path, old) = (dir.join("daemon.log"), dir.join("daemon.log.1"));
+        let log = logger(&path, &old, 1000);
         for i in 0..200 {
             log(&format!("line {i}"));
             assert!(std::fs::metadata(&path).unwrap().len() <= 1000);
         }
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.ends_with(" line 199\n") && !text.contains(" line 0\n"), "{text}");
+        let first: usize = text.lines().next().and_then(|l| l.rsplit(' ').next()).unwrap().parse().unwrap();
+        let before = std::fs::read_to_string(&old).unwrap();
+        assert!(before.ends_with(&format!(" line {}\n", first - 1)), "{before}");
+    }
+
+    /// A daemon that can't start says why in its log (its standard streams
+    /// go nowhere), and so do panics outside requests.
+    #[test]
+    fn start_up_errors_logged() {
+        let base = TestDir::new("ninja_daemon_cant_start");
+        let loc = Location { dir: base.join("daemon"), id: "cant".into() };
+        loc.create_dir().unwrap();
+        // Something else where it would listen.
+        #[cfg(unix)]
+        std::fs::create_dir_all(loc.socket().join("x")).unwrap();
+        #[cfg(windows)]
+        let _taken = ipc::Listener::bind(&loc).unwrap();
+        let e = serve(&loc, Duration::from_secs(3600), None).unwrap_err();
+        let text = std::fs::read_to_string(loc.log_file()).unwrap();
+        assert!(text.contains("not started: listening at") && text.contains(&e.to_string()), "{e}: {text}");
+        std::thread::spawn(|| panic!("a reader's bug")).join().unwrap_err();
+        let text = std::fs::read_to_string(loc.log_file()).unwrap();
+        assert!(text.contains("a reader's bug"), "{text}");
     }
 
     /// A build's digests file, saved again by every build, is read once:
@@ -512,5 +561,64 @@ mod tests {
         let status = daemon.status();
         assert_eq!(status.ignored.len(), 3, "{:?}", status.ignored);
         assert!(status.ignored.contains(&(dir.clone(), false)) && status.ignored.contains(&(dir.join("gen"), true)), "{:?}", status.ignored);
+    }
+
+    /// Under a directory builds write to whose own files only are theirs
+    /// (one outside repositories, a repository's root), files are checked
+    /// every time unless a root in sync watches them: an output the build
+    /// doesn't name there (a generator's tree, a file copied after a link)
+    /// used to keep the digest of its first look for the build, as builds
+    /// without the daemon don't.
+    #[test]
+    fn unnamed_outputs() {
+        if cfg!(not(any(target_os = "linux", windows))) {
+            return;
+        }
+        use cpp_deps::scan::Watch;
+        let base = TestDir::new("ninja_daemon_unnamed");
+        for d in ["build", "out/sub", "repo/.git", "repo/sub"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let dir = watch::strip_verbatim(std::fs::canonicalize(&*base).unwrap());
+        let (out, repo) = (dir.join("out"), dir.join("repo"));
+        let files = [out.join("x.h"), out.join("sub/y.h"), repo.join("z.h"), repo.join("sub/w.h")];
+        for f in &files {
+            std::fs::write(f, "v1").unwrap();
+        }
+        let daemon = Daemon::new(Box::new(|_| {}));
+        daemon.watcher.set_cookie_dir(&dir.join("cookies"));
+        let begin = || {
+            let b = Begin { build_dir: dir.join("build"), volatile: vec![out.clone(), repo.clone()], ..Default::default() };
+            assert!(matches!(daemon.handle(Request::Begin(b)), Response::Begun { .. }));
+        };
+        let size = |p: &Path| match daemon.handle(Request::Files { paths: vec![p.to_path_buf()] }) {
+            Response::Files(v) => v[0].as_ref().unwrap().size,
+            r => panic!("{r:?}"),
+        };
+        begin();
+        assert!(files.iter().all(|f| size(f) == 2));
+        // A generator rewrites them, during the build.
+        for f in &files {
+            std::fs::write(f, "version 2").unwrap();
+        }
+        for f in &files {
+            assert_eq!(size(f), 9, "{}", f.display());
+        }
+        // Once the repository's root is in sync, its files under the
+        // directory are vouched for, and their changes seen.
+        let w = repo.join("sub/w.h");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while daemon.watcher.token(&w).is_none() {
+            assert!(Instant::now() < deadline, "{:?}", daemon.watcher.roots());
+            size(&w);
+            begin();
+        }
+        std::fs::write(&w, "version three").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while size(&w) != 13 {
+            assert!(Instant::now() < deadline, "the change wasn't seen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(daemon.watcher.token(&repo.join("z.h")), None);
     }
 }

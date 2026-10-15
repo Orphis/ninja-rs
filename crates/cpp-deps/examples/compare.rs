@@ -5,6 +5,8 @@
 //!
 //! `compare <compile_commands.json>`
 
+#![allow(clippy::disallowed_macros)] // It prints what it found.
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

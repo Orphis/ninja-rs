@@ -187,10 +187,7 @@ pub fn relative(from: &str, to: &str, windows: bool) -> String {
     while n < f.len() && n < t.len() && eq_comp(f[n], t[n], windows) {
         n += 1;
     }
-    let mut parts: Vec<&str> = Vec::new();
-    for _ in n..f.len() {
-        parts.push("..");
-    }
+    let mut parts: Vec<&str> = vec![".."; f.len() - n];
     parts.extend_from_slice(&t[n..]);
     if parts.is_empty() { ".".into() } else { parts.join("/") }
 }
@@ -210,16 +207,47 @@ pub struct PathMapper {
     /// system's root, absolute paths in arguments are only rewritten when
     /// they point into the tree.
     top_level: HashSet<String>,
+    /// Paths on other volumes than the build directory's are left as they
+    /// are (see `for_host`).
+    host_volumes: bool,
+}
+
+/// The volume a tree path of a multi-volume tree is on, case-folded: its
+/// drive (`C`), or a UNC path's server and share (`UNC/server/share`).
+fn tree_volume(tree: &str) -> String {
+    let n = if tree.split('/').next().is_some_and(|c| c.eq_ignore_ascii_case("UNC")) { 3 } else { 1 };
+    tree.split('/').take(n).collect::<Vec<_>>().join("/").to_ascii_lowercase()
 }
 
 impl PathMapper {
     pub fn new(exec_root: ExecRoot, build_dir: &str, windows: bool) -> Result<Self, String> {
         let build_dir = normalize_abs(build_dir, windows);
         let work_dir = exec_root.to_tree(&build_dir).ok_or_else(|| format!("build directory {build_dir} is outside the exec root {:?}", exec_root.root()))?;
-        let mut m = Self { windows, exec_root, work_dir: String::new(), build_dir, spelling: HashMap::new(), top_level: HashSet::new() };
+        let mut m = Self { windows, exec_root, work_dir: String::new(), build_dir, spelling: HashMap::new(), top_level: HashSet::new(), host_volumes: false };
         m.work_dir = m.fold(&work_dir);
         m.note_top_level(&m.work_dir.clone());
         Ok(m)
+    }
+
+    /// Whether the tree spans volumes (Windows drives, UNC shares): a
+    /// command run on the host, from the build directory, can't reach the
+    /// other volumes' files by relative paths.
+    pub fn spans_volumes(&self) -> bool {
+        self.exec_root.root().is_none()
+    }
+
+    /// The mapping for a command run on the host from the build directory
+    /// when the tree spans volumes (see `spans_volumes`): paths on the
+    /// build directory's volume are rewritten as for the remote action,
+    /// those on other volumes stay the host's.
+    pub fn for_host(&self) -> PathMapper {
+        PathMapper { host_volumes: self.spans_volumes(), ..self.clone() }
+    }
+
+    /// Whether a tree path is on another volume than the build directory,
+    /// for a command run on the host (see `for_host`).
+    pub fn on_other_volume(&self, tree: &str) -> bool {
+        self.host_volumes && tree_volume(tree) != tree_volume(&self.work_dir)
     }
 
     fn key(&self, s: &str) -> String {
@@ -287,6 +315,9 @@ impl PathMapper {
     fn rewrite_one(&mut self, path: &str, beside_tree: bool) -> Option<String> {
         let abs = normalize_abs(path, self.windows);
         let tree = self.exec_root.to_tree(&abs)?;
+        if self.on_other_volume(&tree) {
+            return None;
+        }
         let first = tree.split('/').next().unwrap_or("");
         if !first.is_empty() && !self.top_level.contains(&self.key(first)) && (!beside_tree || self.exec_root.is_fs_root()) {
             return None;
@@ -605,7 +636,7 @@ pub fn find_abs_paths(arg: &str, windows: bool) -> Vec<(usize, usize)> {
             let mut e = i;
             // '=' ends a path too: prefix maps are OLD=NEW
             // (-ffile-prefix-map, -fdebug-prefix-map, /pathmap:).
-            while e < b.len() && !matches!(b[e], b';' | b',' | b'"' | b'\'' | b'=') && !(!windows && b[e] == b':') {
+            while e < b.len() && !matches!(b[e], b';' | b',' | b'"' | b'\'' | b'=') && (windows || b[e] != b':') {
                 e += 1;
             }
             spans.push((i, e));
@@ -913,5 +944,38 @@ mod tests {
         assert_eq!(mixed.to_tree("//server/share/inc/x.h").as_deref(), Some("UNC/server/share/inc/x.h"));
         assert_eq!(mixed.to_local("UNC/server/share/inc/x.h"), "//server/share/inc/x.h");
         assert_eq!(mixed.to_tree("C:/proj/build").as_deref(), Some("C/proj/build"));
+    }
+
+    /// A command run on the host from the build directory, when the tree
+    /// spans volumes: paths on the build directory's volume as the remote
+    /// action has them, those on other drives and shares the host's (a
+    /// relative path can't reach them).
+    #[test]
+    fn host_paths_across_volumes() {
+        let paths = ["D:/proj/build", "D:/proj/src/a.c", "C:/llvm/bin/clang-cl.exe", "//srv/share/inc/x.h"];
+        let mut m = PathMapper::new(ExecRoot::common(&paths.map(String::from), true), "D:/proj/build", true).unwrap();
+        assert!(m.spans_volumes());
+        for p in &paths[1..] {
+            m.tree_path(p).unwrap();
+        }
+        let args: Vec<String> = ["/c", "D:/proj/src/a.c", r"/imsvcC:\llvm\include", r"-I\\srv\share\inc"].map(String::from).to_vec();
+        assert_eq!(m.rewrite_args(&args, true), ["/c", "../src/a.c", r"/imsvc..\..\..\C\llvm\include", r"-I..\..\..\UNC\srv\share\inc"]);
+        let mut host = m.for_host();
+        assert_eq!(host.rewrite_args(&args, true), ["/c", "../src/a.c", r"/imsvcC:\llvm\include", r"-I\\srv\share\inc"]);
+        assert!(host.on_other_volume("C/llvm/bin/clang-cl.exe") && host.on_other_volume("UNC/srv/share/inc/x.h"));
+        assert!(!host.on_other_volume("D/proj/src/a.c") && !m.on_other_volume("C/llvm/bin/clang-cl.exe"));
+        // A build directory on a share (the host's own drive, through its
+        // administrative share): the drive is another volume.
+        let paths = ["//localhost/C$/proj/build", "//localhost/C$/proj/src/a.c", "C:/llvm/bin/clang.exe"];
+        let m = PathMapper::new(ExecRoot::common(&paths.map(String::from), true), r"\\localhost\C$\proj\build", true).unwrap();
+        let mut host = m.for_host();
+        assert_eq!(host.rewrite_arg(r"\\localhost\C$\proj\src\a.c"), r"..\src\a.c");
+        assert_eq!(host.rewrite_arg("C:/llvm/bin/clang.exe"), "C:/llvm/bin/clang.exe");
+        // One volume: the remote action's paths.
+        let paths = ["C:/proj/build", "C:/llvm/bin/clang.exe"];
+        let mut m = PathMapper::new(ExecRoot::common(&paths.map(String::from), true), "C:/proj/build", true).unwrap();
+        m.tree_path(paths[1]).unwrap();
+        assert!(!m.spans_volumes());
+        assert_eq!(m.for_host().rewrite_arg("C:/llvm/bin/clang.exe"), "../../llvm/bin/clang.exe");
     }
 }

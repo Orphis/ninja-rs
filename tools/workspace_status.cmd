@@ -1,5 +1,5 @@
 @echo off
-rem Bazel's workspace status on Windows (see workspace_status.sh).
+rem Bazel's workspace status on Windows (see workspace_status).
 setlocal
 rem The top of a checkout prints no way up; outside one, git fails.
 git rev-parse --show-cdup >nul 2>&1 || exit /b 0

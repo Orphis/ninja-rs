@@ -65,7 +65,11 @@ pub struct RealDisk {
 impl RealDisk {
     /// A disk that records its stats in `counters`.
     pub fn with_counters(counters: Option<Arc<StatCounters>>) -> Self {
-        Self { counters, ..Self::default() }
+        Self {
+            counters,
+            #[cfg(windows)]
+            stat_cache: Mutex::default(),
+        }
     }
 
     fn stat_uncounted(&self, path: &str) -> Result<TimeStamp, String> {
@@ -285,8 +289,7 @@ mod tests {
 
     #[test]
     fn stat_cache_matches_uncached_stats() {
-        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-statcache", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("ninja-rs-statcache");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a.txt"), "a").unwrap();
         std::fs::write(dir.join("sub").join("B.txt"), "b").unwrap();
@@ -318,13 +321,11 @@ mod tests {
         }
         disk.allow_stat_cache(false);
         assert!(disk.stat(&format!("{root}/new.txt")).unwrap() > 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn removes_empty_directories() {
-        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-remove", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dirs::TestDir::new("ninja-rs-remove");
         std::fs::create_dir_all(dir.join("empty")).unwrap();
         std::fs::create_dir_all(dir.join("full")).unwrap();
         std::fs::write(dir.join("full/f"), "x").unwrap();
@@ -336,14 +337,11 @@ mod tests {
         assert!(disk.remove_file(&p("full")).is_err());
         assert_eq!(disk.remove_file(&p("full/f")), Ok(true));
         assert_eq!(disk.remove_file(&p("gone")), Ok(false));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn stat_follows_symlinks() {
-        let dir = test_dirs::base().join(format!("ninja-rs-test-{}-symlink", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dirs::TestDir::new("ninja-rs-symlink");
         let target = dir.join("target.txt");
         std::fs::write(&target, "t").unwrap();
         let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
@@ -352,9 +350,12 @@ mod tests {
         let linked = std::os::windows::fs::symlink_file(&target, dir.join("link.txt"));
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(&target, dir.join("link.txt"));
-        // Windows needs developer mode or a privilege for symlinks.
-        if linked.is_err() {
-            let _ = std::fs::remove_dir_all(&dir);
+        // Windows needs developer mode or a privilege for symlinks: not
+        // tested then, as said past libtest's capture (which shows nothing
+        // of a test that passed).
+        if let Err(e) = linked {
+            let said = format!("NOT TESTED: disk::tests::stat_follows_symlinks: can't make a symbolic link ({e}): developer mode lets one\n");
+            let _ = std::io::Write::write_all(&mut std::io::stderr(), said.as_bytes());
             return;
         }
         let link = format!("{}/link.txt", dir.to_string_lossy().replace('\\', "/"));
@@ -363,6 +364,5 @@ mod tests {
         assert_eq!(disk.stat(&link).unwrap(), want);
         disk.allow_stat_cache(true);
         assert_eq!(disk.stat(&link).unwrap(), want);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

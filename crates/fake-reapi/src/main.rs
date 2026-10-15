@@ -3,6 +3,8 @@
 //! [--tls-client-ca PEM]]` (with a client CA, clients need a certificate
 //! it signed).
 
+#![allow(clippy::disallowed_macros)] // A tool of the tests.
+
 use std::path::PathBuf;
 
 fn main() {

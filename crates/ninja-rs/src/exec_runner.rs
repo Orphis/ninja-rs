@@ -2,15 +2,18 @@
 //! remote backend, according to the backend's policy.
 //!
 //! Local tasks are limited by `-j`, or by a jobserver's tokens, remote ones
-//! by `--remote_jobs`. Tasks are started immediately and wait for a slot of
-//! their kind inside their own tokio task, so the engine may have up to
-//! `-j + --remote_jobs` tasks in flight.
+//! by `--remote_jobs`: the engine starts a task when a slot of its kind is
+//! free (see `CommandRunner::has_free_slot`), so that up to
+//! `-j + --remote_jobs` run at once, those waiting for a slot waiting in
+//! the plan. A task still waits for a slot inside its own tokio task when
+//! it needs another than the one it was started for (a remote action run
+//! locally after all), or a jobserver token held elsewhere.
 //!
 //! With racing (`--remote_racing`), a task sent remotely also runs locally
 //! when a local slot is free: the first branch to finish wins (see
 //! `run_raced`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -109,9 +112,13 @@ pub struct ExecRunner {
     env: Arc<Vec<(String, String)>>,
     remote_slots: Arc<Semaphore>,
     capacity: usize,
+    /// How many tasks of each kind run at once (`LOCAL`, `REMOTE`).
+    jobs: [usize; 2],
     tasks: JoinSet<TaskResult>,
     ids: HashMap<tokio::task::Id, EdgeId>,
-    active: HashSet<EdgeId>,
+    /// The tasks started and not finished, with the kind of slots each was
+    /// started for.
+    active: HashMap<EdgeId, usize>,
     remote: Option<Arc<dyn RemoteBackend>>,
     interrupt: Arc<Interrupt>,
     /// Stops the local commands (see `abort`).
@@ -131,9 +138,10 @@ impl ExecRunner {
             env: Arc::default(),
             remote_slots: Arc::new(Semaphore::new(remote_jobs.max(1))),
             capacity: parallelism.saturating_add(remote_jobs),
+            jobs: [parallelism, remote_jobs],
             tasks: JoinSet::new(),
             ids: HashMap::new(),
-            active: HashSet::new(),
+            active: HashMap::new(),
             remote,
             interrupt,
             stop: Stop::new(),
@@ -167,7 +175,7 @@ async fn run_local(
     if let Some(backend) = remote
         && let Err(e) = backend.materialize(task).await
     {
-        let output = format!("ninja-rs: fetching inputs: {}\n", e.message).into_bytes();
+        let output = format!("ninja: fetching inputs: {}\n", e.message).into_bytes();
         return TaskResult { edge: task.edge, status: ExitStatus::Failure(1), output, kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: e.lost };
     }
     let _permit = slots.acquire().await;
@@ -250,7 +258,7 @@ async fn race_local(
         if !race.state().local_needed {
             return None;
         }
-        let output = format!("ninja-rs: fetching inputs: {}\n", e.message).into_bytes();
+        let output = format!("ninja: fetching inputs: {}\n", e.message).into_bytes();
         return Some(TaskResult {
             edge: task.edge,
             status: ExitStatus::Failure(1),
@@ -361,7 +369,7 @@ async fn run_raced(
                     // The local branch gave up before running.
                     let command = race.state().command;
                     let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop).await;
-                    return finish_local(r, capture, reason, verbose).await;
+                    return finish_local(&task, r, capture, reason, verbose).await;
                 }
             }
             ran = &mut local, if !local_done => {
@@ -370,7 +378,7 @@ async fn run_raced(
                     if reason.is_none() && capture.is_none() {
                         racing.stats.local.fetch_add(1, Ordering::Relaxed);
                     }
-                    return finish_local(r, capture, reason, verbose).await;
+                    return finish_local(&task, r, capture, reason, verbose).await;
                 }
                 if remote_done {
                     if let Some(r) = pending.take() {
@@ -378,7 +386,7 @@ async fn run_raced(
                     }
                     let command = race.state().command;
                     let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_deref(), &stop).await;
-                    return finish_local(r, capture, reason, verbose).await;
+                    return finish_local(&task, r, capture, reason, verbose).await;
                 }
             }
         }
@@ -387,18 +395,22 @@ async fn run_raced(
 
 /// The result of a local run of a task the remote branch gave up on: given
 /// to the capture, explained in verbose mode.
-async fn finish_local(mut r: TaskResult, capture: Option<Box<dyn LocalCapture>>, reason: Option<String>, verbose: bool) -> TaskResult {
+async fn finish_local(task: &Task, r: TaskResult, capture: Option<Box<dyn LocalCapture>>, reason: Option<String>, verbose: bool) -> TaskResult {
     if let Some(capture) = capture {
         // Storing outputs reads files: off the async threads.
         let result = r.clone();
         let _ = tokio::task::spawn_blocking(move || capture.capture(&result)).await;
     }
     if verbose && let Some(reason) = reason {
-        let mut msg = format!("ninja-rs: running locally ({reason})\n").into_bytes();
-        msg.extend_from_slice(&r.output);
-        r.output = msg;
+        ran_locally(task, &reason);
     }
     r
+}
+
+/// `--remote_verbose`: says why a task sent remotely ran locally, on
+/// stderr, as the other remote decisions.
+fn ran_locally(task: &Task, reason: &str) {
+    ninja_core::status::message(&format!("{}: running locally ({reason})", task.outputs.join(" ")));
 }
 
 impl CommandRunner for ExecRunner {
@@ -408,11 +420,11 @@ impl CommandRunner for ExecRunner {
 
     fn start_command(&mut self, task: Task) -> Result<(), String> {
         let edge = task.edge;
-        self.active.insert(edge);
         let local_slots = self.local_slots.clone();
         let env = self.env.clone();
         let inputs_from = self.remote.clone();
         let remote = self.remote.clone().filter(|r| !task.use_console && r.wants(&task));
+        self.active.insert(edge, if remote.is_some() { REMOTE } else { LOCAL });
         let verbose = self.verbose_remote;
         let stop = self.stop.clone();
         match remote {
@@ -439,17 +451,15 @@ impl CommandRunner for ExecRunner {
                         RemoteOutcome::Lost => TaskResult {
                             edge: task.edge,
                             status: ExitStatus::Failure(1),
-                            output: b"ninja-rs: internal error: a task that wasn't raced lost\n".to_vec(),
+                            output: b"ninja: internal error: a task that wasn't raced lost\n".to_vec(),
                             kind: ExecKind::Remote,
                             cas_outputs: Vec::new(),
                             lost_inputs: Vec::new(),
                         },
                         RemoteOutcome::Fallback(reason, command) => {
-                            let mut r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop).await;
+                            let r = run_local(&task, &local_slots, &env, Some(&backend), command.as_ref(), &stop).await;
                             if verbose {
-                                let mut msg = format!("ninja-rs: running locally ({reason})\n").into_bytes();
-                                msg.extend_from_slice(&r.output);
-                                r.output = msg;
+                                ran_locally(&task, &reason);
                             }
                             r
                         }
@@ -474,7 +484,7 @@ impl CommandRunner for ExecRunner {
             let joined = tokio::select! {
                 r = self.tasks.join_next_with_id() => r,
                 _ = interrupt.wait() => {
-                    let edge = self.active.iter().next().copied().unwrap_or_default();
+                    let edge = self.active.keys().next().copied().unwrap_or_default();
                     return Some(TaskResult { edge, status: ExitStatus::Interrupted, output: Vec::new(), kind: ExecKind::Local, cas_outputs: Vec::new(), lost_inputs: Vec::new() });
                 }
             };
@@ -490,7 +500,7 @@ impl CommandRunner for ExecRunner {
                     Some(TaskResult {
                         edge,
                         status: ExitStatus::Failure(1),
-                        output: format!("ninja-rs: internal error: {e}\n").into_bytes(),
+                        output: format!("ninja: internal error: {e}\n").into_bytes(),
                         kind: ExecKind::Local,
                         cas_outputs: Vec::new(),
                         lost_inputs: Vec::new(),
@@ -501,7 +511,7 @@ impl CommandRunner for ExecRunner {
     }
 
     fn active_edges(&self) -> Vec<EdgeId> {
-        self.active.iter().copied().collect()
+        self.active.keys().copied().collect()
     }
 
     fn abort(&mut self) -> AbortFuture<'_> {
@@ -523,7 +533,25 @@ impl CommandRunner for ExecRunner {
     fn wants_inputs(&self) -> bool {
         self.remote.is_some()
     }
+
+    fn slot_kinds(&self) -> usize {
+        if self.remote.is_some() { 2 } else { 1 }
+    }
+
+    /// Remote slots for a task the backend's policy sends there (raced ones
+    /// too, which take a local slot only when one is free), else local.
+    fn slots_of(&self, task: &Task) -> usize {
+        if self.remote.as_ref().is_some_and(|r| !task.use_console && r.wants(task)) { REMOTE } else { LOCAL }
+    }
+
+    fn has_free_slot(&self, kind: usize) -> bool {
+        self.active.values().filter(|&&k| k == kind).count() < self.jobs[kind]
+    }
 }
+
+/// The kinds of slots of an `ExecRunner`'s tasks (see `CommandRunner::slots_of`).
+const LOCAL: usize = 0;
+const REMOTE: usize = 1;
 
 #[cfg(test)]
 mod tests {
@@ -552,6 +580,43 @@ mod tests {
         assert!(slots.try_acquire().is_none(), "a raced run took the slot a local task waits for");
         waiter.await.unwrap();
         assert!(slots.try_acquire().is_some());
+    }
+
+    /// A backend sending the tasks of the rule `remote` there, whose
+    /// executions never end.
+    struct Endless;
+
+    impl RemoteBackend for Endless {
+        fn wants(&self, task: &Task) -> bool {
+            task.rule == "remote"
+        }
+        fn execute(&self, _: Task) -> ninja_core::runner::RemoteFuture {
+            Box::pin(std::future::pending())
+        }
+        fn max_jobs(&self) -> usize {
+            1
+        }
+    }
+
+    /// A task takes a slot of its kind, local or remote, as the backend's
+    /// policy decides: the engine starts one only when one is free, other
+    /// kinds starting meanwhile (see `CommandRunner::has_free_slot`).
+    #[tokio::test]
+    async fn tasks_take_slots_of_their_kind() {
+        let task = |rule: &str, edge: u32| Task { edge: EdgeId(edge), rule: rule.into(), outputs: vec![format!("o{edge}")], ..Default::default() };
+        let mut runner = ExecRunner::new(2, Some(Arc::new(Endless)), Interrupt::new());
+        assert_eq!(runner.slot_kinds(), 2);
+        assert_eq!((runner.slots_of(&task("remote", 0)), runner.slots_of(&task("cc", 1))), (REMOTE, LOCAL));
+        // A console task runs on the terminal: locally.
+        assert_eq!(runner.slots_of(&Task { use_console: true, ..task("remote", 2) }), LOCAL);
+        assert!(runner.has_free_slot(REMOTE) && runner.has_free_slot(LOCAL));
+        runner.start_command(task("remote", 0)).unwrap();
+        assert!(!runner.has_free_slot(REMOTE) && runner.has_free_slot(LOCAL));
+        assert_eq!(runner.can_run_more(), 2);
+        runner.abort().await;
+        assert!(runner.has_free_slot(REMOTE));
+        // Without a backend, one kind.
+        assert_eq!(ExecRunner::new(2, None, Interrupt::new()).slot_kinds(), 1);
     }
 
     /// A backend whose inputs take until `release` to download, saying when

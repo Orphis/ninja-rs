@@ -1168,7 +1168,9 @@ pub fn tool_restat_after_flags(args: &[String]) -> i32 {
     let (_lock, access) = match crate::try_lock_logs(&lock_file) {
         Ok(crate::LogsAccess::Locked(lock)) => (Some(lock), Access::Exclusive),
         Ok(crate::LogsAccess::Busy(holder)) => {
-            println!("ninja: {}", crate::waiting_message(holder.as_ref()));
+            // On stderr: CMake discards the output of the `-t restat` it
+            // runs.
+            eprintln!("ninja: {}", crate::waiting_message(holder.as_ref()));
             let lock = LogLock::open(&lock_file).and_then(|mut lock| lock.lock(true).map(|_| lock));
             (lock.ok(), Access::Exclusive)
         }

@@ -7,8 +7,7 @@
 
 use ninja_os::FileStamp;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -18,6 +17,7 @@ use crate::hmap::HeaderMap;
 use crate::intern::{self, Sym};
 use crate::lex::{self, DirKind, Directive, FileDirectives, Kind, P, Token};
 use crate::macros::{self, Context, Expander, Macro, Pragmas, XTok};
+use crate::path_map::PathMap;
 use crate::vfs::{Overlay, Redirect};
 
 pub type MacroTable = HashMap<Sym, Arc<Macro>>;
@@ -238,31 +238,18 @@ pub enum Change {
     Tree,
 }
 
-/// Removes `key` and the entries under it from `map`: a path's descendants
-/// sort right after it (paths compare by components), so those are all
-/// that's looked at, however much else the map holds. Returns how many
-/// there were.
-pub fn remove_under<V>(map: &mut BTreeMap<PathBuf, V>, key: &Path) -> usize {
-    let under: Vec<PathBuf> =
-        map.range::<Path, _>((Bound::Included(key), Bound::Unbounded)).map(|(k, _)| k).take_while(|k| k.starts_with(key)).cloned().collect();
-    for k in &under {
-        map.remove(k);
-    }
-    under.len()
-}
-
 /// Lexed files and directory listings, shared by every scan (and thread).
 /// Within a session, files and directories outside the volatile ones are
 /// assumed unchanged; a new session checks them again, except for those a
 /// watch vouches for (`set_watch`). Lookups only take read locks, so that
-/// concurrent scans don't wait for each other. Ordered by path, so that
-/// what's under a directory goes without going through the rest.
+/// concurrent scans don't wait for each other. What's under a directory
+/// goes without going through the rest (see `PathMap`).
 pub struct Cache {
-    files: RwLock<BTreeMap<PathBuf, Arc<Entry>>>,
+    files: RwLock<PathMap<Arc<Entry>>>,
     /// Files being lexed (key and stamp): concurrent scans wait for the one
     /// lexing.
     lexing: Mutex<HashMap<Version, Lexing>>,
-    dirs: RwLock<BTreeMap<PathBuf, Listing>>,
+    dirs: RwLock<PathMap<Listing>>,
     /// Whether a path is a symbolic link leading elsewhere than its own
     /// directory (see `dotdot_after_link`), and the session it's from.
     links: RwLock<HashMap<PathBuf, (u64, bool)>>,
@@ -323,8 +310,8 @@ impl Cache {
                 self.dirs.write().unwrap().remove(key.as_ref());
             }
             Change::Tree => {
-                remove_under(&mut self.files.write().unwrap(), &key);
-                remove_under(&mut self.dirs.write().unwrap(), &key);
+                self.files.write().unwrap().remove_under(&key);
+                self.dirs.write().unwrap().remove_under(&key);
             }
         }
     }
@@ -380,7 +367,12 @@ impl Cache {
         }
         let key = self.key(p);
         let volatile = self.volatile.read().unwrap();
-        !volatile.is_empty() && key.ancestors().any(|a| volatile.contains_key(a))
+        !volatile.is_empty()
+            && key.ancestors().any(|a| {
+                #[cfg(test)]
+                tests::VOLATILE_LOOKUPS.with(|n| n.set(n.get() + 1));
+                volatile.contains_key(a)
+            })
     }
 
     fn name_key(&self, name: &str) -> String {
@@ -497,13 +489,15 @@ impl Cache {
 /// Where a `..` of `p` comes after a symbolic link that leads elsewhere
 /// than its own directory: compilers go to the parent of the link's target
 /// (`lnk/../b.h` is `real/b.h`), unlike remote workers, whose inputs are
-/// plain directories, and unlike `normalize`.
+/// plain directories, and unlike `normalize`. Never on Windows, which
+/// applies `..` to a path before following its links (or junctions), as
+/// `normalize` does.
 pub fn dotdot_after_link(p: &Path) -> Option<PathBuf> {
     dotdot_after(p, &mut |link| link_elsewhere(link))
 }
 
 fn dotdot_after(p: &Path, elsewhere: &mut dyn FnMut(&Path) -> bool) -> Option<PathBuf> {
-    if !p.components().any(|c| c == Component::ParentDir) {
+    if cfg!(windows) || !p.components().any(|c| c == Component::ParentDir) {
         return None;
     }
     let mut prefix = PathBuf::new();
@@ -568,9 +562,10 @@ struct Frame {
     line: u32,
     /// A `#line` changed `__LINE__` and `__FILE__`.
     line_set: bool,
-    /// Its identity and size (for `#pragma once`).
+    /// Its identity, size and contents' hash (for `#pragma once`).
     id: FileId,
     len: u64,
+    hash: u64,
 }
 
 /// A file found by a lookup: its path as the preprocessor knows it, its
@@ -602,12 +597,18 @@ struct State<'a> {
     /// expanded with (see `macros::operand_pragmas`), and those macros:
     /// classified again when one changes.
     pragma_users: HashMap<Sym, Vec<Sym>>,
-    /// The files with `#pragma once` (or `#import`ed), by key, and their
-    /// paths, identities and sizes (see `once_elsewhere`).
+    /// The macros defined so far whose pragmas their arguments make (see
+    /// `Context::arg_pragma`), and their names' hashes (see
+    /// `lex::name_hash`), for text that calls them.
+    arg_pragmas: HashSet<Sym>,
+    arg_pragma_hashes: Vec<u64>,
+    /// The macros undefined so far (see `text_runs_pragma`).
+    undefined: HashSet<Sym>,
+    /// The files with `#pragma once` (or `#import`ed), by key; their
+    /// paths by identity, and by size and contents (see `once_elsewhere`).
     once: HashSet<String>,
-    once_files: Vec<(PathBuf, FileId, u64)>,
-    /// Files whose contents were compared, and whether they're the same.
-    compared: HashMap<(PathBuf, PathBuf), bool>,
+    once_ids: HashMap<FileId, PathBuf>,
+    once_contents: HashMap<(u64, u64), PathBuf>,
     /// What lookups noted that makes the scan inexact (see `join`).
     notes: std::cell::RefCell<Vec<String>>,
     seen: HashSet<String>,
@@ -724,6 +725,10 @@ impl Context for State<'_> {
             _ => true,
         }
     }
+
+    fn arg_pragma(&self, name: Sym) -> bool {
+        !self.arg_pragmas.is_empty() && self.arg_pragmas.contains(&name)
+    }
 }
 
 impl State<'_> {
@@ -772,7 +777,7 @@ impl State<'_> {
     fn join(&self, dir: &Path, name: &Path) -> PathBuf {
         let joined = dir.join(name);
         if let Some(link) = self.cache.dotdot_after_link(&joined) {
-            let note = format!("{}: `..` after the symbolic link {}", self.here(), link.display());
+            let note = format!("{}: `..` after a symbolic link: {}", self.here(), link.display());
             let mut notes = self.notes.borrow_mut();
             if !notes.contains(&note) {
                 notes.push(note);
@@ -939,21 +944,34 @@ impl State<'_> {
             return;
         }
         if import {
-            self.mark_once(key, real.clone(), id, stamp.len);
+            self.mark_once(key, real.clone(), id, (stamp.len, fd.hash));
         }
         if self.stack.len() >= 200 {
             self.inexact(format!("{}: #include nested too deeply", self.here()));
             return;
         }
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        self.stack.push(Frame { path, real, dir, found_at, alt_at, relative, line: 0, line_set: false, id, len: stamp.len });
+        self.stack.push(Frame { path, real, dir, found_at, alt_at, relative, line: 0, line_set: false, id, len: stamp.len, hash: fd.hash });
         self.run(&fd);
-        self.stack.pop();
+        // Its text calls a macro whose pragmas its arguments make: text
+        // isn't expanded.
+        let frame = self.stack.pop();
+        if self.arg_pragma_hashes.iter().any(|h| fd.calls.binary_search(h).is_ok())
+            && let Some(f) = frame
+            && self.text_runs_pragma(&f.real, &fd)
+        {
+            self.inexact(format!("{}:{}: text calls a macro whose pragmas its arguments make", f.path.display(), f.line));
+        }
     }
 
-    fn mark_once(&mut self, key: String, real: PathBuf, id: FileId, len: u64) {
+    /// Marks a file `#pragma once` (or `#import`ed): `contents` its size
+    /// and contents' hash.
+    fn mark_once(&mut self, key: String, real: PathBuf, id: FileId, contents: (u64, u64)) {
         if self.once.insert(key) {
-            self.once_files.push((real, id, len));
+            if id != (0, 0) {
+                self.once_ids.entry(id).or_insert_with(|| real.clone());
+            }
+            self.once_contents.entry(contents).or_insert(real);
         }
     }
 
@@ -962,35 +980,18 @@ impl State<'_> {
     /// for it, given the same modification time): the compiler skips it
     /// here, but remote copies may differ (links not kept, identical files
     /// linked, other times): inexact, unless including it again changes
-    /// nothing.
+    /// nothing. (Contents compared by hash, as lexed: not read again.)
     fn once_elsewhere(&mut self, real: &Path, fd: &FileDirectives, len: u64, id: FileId) -> bool {
-        let known = id != (0, 0);
-        let candidates: Vec<(PathBuf, bool)> =
-            self.once_files.iter().filter(|(_, i, l)| (known && *i == id) || *l == len).map(|(p, i, _)| (p.clone(), known && *i == id)).collect();
-        for (other, same_file) in candidates {
-            if !same_file && !self.same_contents(&other, real) {
-                continue;
-            }
-            if !self.again_changes_nothing(fd) {
-                self.inexact(format!(
-                    "{}: the same as {}, which has #pragma once: whether it's read again depends on the file system",
-                    real.display(),
-                    other.display()
-                ));
-            }
-            return true;
+        let same_file = (id != (0, 0)).then(|| self.once_ids.get(&id)).flatten();
+        let Some(other) = same_file.or_else(|| self.once_contents.get(&(len, fd.hash))).cloned() else { return false };
+        if !self.again_changes_nothing(fd) {
+            self.inexact(format!(
+                "{}: the same as a file with #pragma once (whether it's read again depends on the file system): {}",
+                real.display(),
+                other.display()
+            ));
         }
-        false
-    }
-
-    fn same_contents(&mut self, a: &Path, b: &Path) -> bool {
-        let key = (a.to_path_buf(), b.to_path_buf());
-        if let Some(&same) = self.compared.get(&key) {
-            return same;
-        }
-        let same = matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y);
-        self.compared.insert(key, same);
-        same
+        true
     }
 
     /// Whether including a file again would change nothing the scan sees:
@@ -1015,6 +1016,50 @@ impl State<'_> {
                 | DirKind::Other => true,
                 _ => false,
             })
+    }
+
+    /// Whether a file's text, which may call macros whose pragmas their
+    /// arguments make (see `arg_pragmas`), runs one: unless their every
+    /// argument is words that aren't macros (nor were in this scan: text
+    /// came before the end of the file) nor pragmas' (`DO_PRAGMA(GCC
+    /// diagnostic push)`), strings that don't start with one, numbers or
+    /// punctuation. Its text is read again for this, once per version.
+    fn text_runs_pragma(&self, real: &Path, fd: &FileDirectives) -> bool {
+        let text = fd.text.get_or_init(|| {
+            let content = std::fs::read(real).ok().filter(|c| lex::content_hash(c) == fd.hash)?;
+            Some(lex::text_tokens(&content).into_boxed_slice())
+        });
+        let Some(toks) = text else { return true };
+        let harmless = |a: &Token| match a.kind {
+            Kind::Ident => {
+                !self.macros.contains_key(&a.sym)
+                    && !self.undefined.contains(&a.sym)
+                    && !DYNAMIC.contains(&a.sym)
+                    && !macros::PRAGMAS.contains(&a.sym)
+                    && a.sym != intern::PRAGMA_OPERATOR
+                    && a.sym != intern::MS_PRAGMA_OPERATOR
+            }
+            Kind::Str => !macros::pragma_string(a.sym.as_str()),
+            Kind::Number | Kind::Char => true,
+            Kind::Punct(p) => !matches!(p, P::Hash | P::HashHash),
+            _ => false,
+        };
+        let mut i = 0;
+        while i < toks.len() {
+            if toks[i].kind == Kind::Ident && self.arg_pragmas.contains(&toks[i].sym) {
+                // (Not called here: maybe through what follows.)
+                if !toks.get(i + 1).is_some_and(|p| p.is(P::LParen)) {
+                    return true;
+                }
+                let end = macros::closing(toks, i + 1);
+                if end == toks.len() || !toks[i + 2..end].iter().all(harmless) {
+                    return true;
+                }
+                i = end;
+            }
+            i += 1;
+        }
+        false
     }
 
     /// `#if`-family conditions: true, false, or unknown.
@@ -1095,6 +1140,14 @@ impl State<'_> {
 
     fn pragma(&mut self, d: &Directive) {
         let Some(first) = d.toks.first() else { return };
+        if first.kind == Kind::Unknown && first.sym == lex::CALLEES {
+            // Pragmas' words given to these in text: a pragma if one is a
+            // macro.
+            if d.toks[1..].iter().any(|c| self.macros.contains_key(&c.sym)) {
+                self.inexact(format!("{}: a pragma from a macro in text", self.here()));
+            }
+            return;
+        }
         if first.sym == intern::PRAGMA_OPERATOR {
             // `_Pragma(OPERAND)` in text, its operand made by macros (see
             // `macros::operand_pragmas`), or a pragma run through a macro.
@@ -1113,10 +1166,14 @@ impl State<'_> {
             self.inexact(format!("{}: #pragma include_alias", self.here()));
             return;
         }
+        if first.sym == intern::GCC && d.toks.get(1).is_some_and(|t| t.sym == intern::DEPENDENCY) && self.cfg.family != Family::Msvc {
+            self.dependency(&d.toks[2..]);
+            return;
+        }
         if first.sym == intern::ONCE {
             if let Some(f) = self.stack.last() {
-                let (key, real, id, len) = (self.key(&f.real), f.real.clone(), f.id, f.len);
-                self.mark_once(key, real, id, len);
+                let (key, real, id, contents) = (self.key(&f.real), f.real.clone(), f.id, (f.len, f.hash));
+                self.mark_once(key, real, id, contents);
             }
             return;
         }
@@ -1139,9 +1196,30 @@ impl State<'_> {
                 }
                 None => {
                     self.macros.remove(&name);
+                    self.undefined.insert(name);
                 }
             }
             self.changed(name);
+        }
+    }
+
+    /// `#pragma GCC dependency "file" [text]`: GCC and Clang look the file
+    /// up as an `#include`'s (an error when missing) to compare its time
+    /// with the current file's. No dependency list names it, but the
+    /// compile needs it: found, as `__has_include`'s.
+    fn dependency(&mut self, toks: &[Token]) {
+        let target = match toks {
+            [t, ..] if t.kind == Kind::Str => t.sym.as_str().strip_prefix('"').and_then(|s| s.strip_suffix('"')).map(|s| (s.to_string(), false)),
+            toks => header_name(toks),
+        };
+        let Some((name, angled)) = target else { return };
+        match self.resolve_checked(&name, angled, false) {
+            Some(f) => {
+                if !self.out.found.contains(&f.real) {
+                    self.out.found.push(f.real);
+                }
+            }
+            None => self.out.missing.push(name),
         }
     }
 
@@ -1149,7 +1227,7 @@ impl State<'_> {
     /// pop (see `Pragmas::Macros`) then has an unknown definition.
     fn changing(&mut self, name: Sym) {
         if self.pushed_in_text.contains(&name) {
-            self.inexact(format!("{}: {} changes while macros in text may push or pop it", self.here(), name.as_str()));
+            self.inexact(format!("{}: a macro changes while macros in text may push or pop it: {}", self.here(), name.as_str()));
         }
     }
 
@@ -1167,7 +1245,7 @@ impl State<'_> {
     /// What a macro does through pragmas where text uses it (which isn't
     /// expanded), with the macros defined now.
     fn classify(&mut self, m: &Macro) {
-        let (pragmas, deps) = m.pragmas_in(self);
+        let (pragmas, deps, arg) = m.pragmas_in(self);
         for d in deps {
             let users = self.pragma_users.entry(d).or_default();
             if !users.contains(&m.name) {
@@ -1179,7 +1257,18 @@ impl State<'_> {
             // Pushing and popping macros never changed in between does
             // nothing.
             Pragmas::Macros(names) => self.pushed_in_text.extend(names.iter().copied()),
-            Pragmas::Other => self.inexact(format!("{}: {} may run a pragma in text", self.here(), m.name.as_str())),
+            Pragmas::Other => self.inexact(format!("{}: a macro may run a pragma in text: {}", self.here(), m.name.as_str())),
+        }
+        // Its pragma is its arguments': the macros defined so far that name
+        // it are classified again (`#define WRAP(x) DO_PRAGMA(x)` before
+        // `DO_PRAGMA`), and text that calls it is seen.
+        if arg && self.arg_pragmas.insert(m.name) {
+            self.arg_pragma_hashes.push(lex::name_hash(m.name.as_str().as_bytes()));
+            let naming: Vec<Arc<Macro>> =
+                self.macros.values().filter(|o| o.name != m.name && o.body.iter().any(|t| t.kind == Kind::Ident && t.sym == m.name)).cloned().collect();
+            for o in naming {
+                self.classify(&o);
+            }
         }
     }
 
@@ -1240,6 +1329,7 @@ impl State<'_> {
                     if let Some(n) = d.toks.first().and_then(Token::ident)
                         && self.macros.remove(&n).is_some()
                     {
+                        self.undefined.insert(n);
                         self.changing(n);
                         self.changed(n);
                     }
@@ -1309,9 +1399,12 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
         pushed: HashMap::new(),
         pushed_in_text: HashSet::new(),
         pragma_users: HashMap::new(),
+        arg_pragmas: HashSet::new(),
+        arg_pragma_hashes: Vec::new(),
+        undefined: HashSet::new(),
         once: HashSet::new(),
-        once_files: Vec::new(),
-        compared: HashMap::new(),
+        once_ids: HashMap::new(),
+        once_contents: HashMap::new(),
         notes: Default::default(),
         seen: HashSet::new(),
         stack: Vec::new(),
@@ -1332,6 +1425,7 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
             line_set: false,
             id: (0, 0),
             len: 0,
+            hash: 0,
         };
         st.stack.push(frame);
         st.run(&fd);
@@ -1375,20 +1469,21 @@ pub fn scan(cache: &Cache, cfg: &Config, oracle: &dyn Oracle, main: &Path) -> Ou
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// The lookups `Cache::is_volatile` made on this thread.
+        pub(super) static VOLATILE_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
     #[test]
     fn many_volatile_dirs() {
         let cache = Cache::new(Vec::new(), false);
         for i in 0..50_000 {
             cache.add_volatile(&PathBuf::from(format!("/b/try_compile/{i}")));
         }
-        // A lookup per ancestor: milliseconds, where going through the
-        // directories takes over a minute (far from what a busy machine
-        // makes of the former).
-        let start = std::time::Instant::now();
-        for _ in 0..10_000 {
-            assert!(!cache.is_volatile(Path::new("/src/include/a.h")));
-        }
-        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
+        // A lookup per ancestor, however many there are.
+        VOLATILE_LOOKUPS.with(|n| n.set(0));
+        assert!(!cache.is_volatile(Path::new("/src/include/a.h")));
+        assert_eq!(VOLATILE_LOOKUPS.with(|n| n.get()), Path::new("/src/include/a.h").ancestors().count() as u64);
         assert!(cache.is_volatile(Path::new("/b/try_compile/4321/x.h")));
         assert!(!cache.is_volatile(Path::new("/b/try_compile/432100/x.h")));
     }
@@ -1657,6 +1752,25 @@ mod tests {
         assert!(!exact("operand.c", "#define ONCE_STR \"once\"\n_Pragma(ONCE_STR)\n"));
         assert!(!exact("operand2.c", "#define ONCE_STR \"once\"\n#define ONCE _Pragma(ONCE_STR)\nONCE\n"));
         assert!(exact("diagnostic.c", "#define DO_PRAGMA(x) _Pragma(#x)\n#define PUSH _Pragma(\"GCC diagnostic push\")\nDO_PRAGMA(GCC diagnostic pop)\n"));
+        // A pragma's words given to what isn't a macro (`if (once)`).
+        assert!(exact("if.c", "int f(int once) { if (once) return 1; return g(x, once); }\n#include \"a.h\"\n"));
+        // What a macro whose pragma is its argument's is given in text: a
+        // macro, or a pragma's words as another argument; or through
+        // another macro (defined before it or not).
+        let do_pragma = "#define STR(x) #x\n#define XSTR(x) STR(x)\n#define DO_PRAGMA(x) _Pragma(XSTR(x))\n";
+        assert!(!exact("arg_macro.c", &format!("{do_pragma}#define ONCE_WORD once\nDO_PRAGMA(ONCE_WORD)\n")));
+        assert!(!exact("arg_undef.c", &format!("{do_pragma}#define ONCE_WORD once\nDO_PRAGMA(ONCE_WORD)\n#undef ONCE_WORD\n")));
+        assert!(!exact("second_arg.c", "#define STR(x) #x\n#define P2(a, b) _Pragma(STR(b))\nP2(x, once)\n"));
+        assert!(!exact("wrap.c", &format!("{do_pragma}#define WRAP(x) DO_PRAGMA(x)\n#define ONCE_WORD once\nWRAP(ONCE_WORD)\n")));
+        assert!(!exact("wrap_before.c", &format!("#define WRAP(x) DO_PRAGMA(x)\n{do_pragma}#define ONCE_WORD once\nWRAP(ONCE_WORD)\n")));
+        assert!(!exact("alias.c", &format!("{do_pragma}#define DP DO_PRAGMA\n#define ONCE_WORD once\nDP(ONCE_WORD)\n")));
+        assert!(!exact("in_body.c", &format!("{do_pragma}#define ONCE_WORD once\n#define ONCE DO_PRAGMA(ONCE_WORD)\n")));
+        assert!(exact("arg_words.c", &format!("{do_pragma}DO_PRAGMA(GCC diagnostic ignored \"-Wx\")\nDO_PRAGMA(message(\"hi\" 1))\n#include \"a.h\"\n")));
+        // A TODO message with the place: harmless.
+        let todo = "#define TODO(m) _Pragma(XSTR(message(__FILE__ \":\" XSTR(__LINE__) \": \" m)))\n";
+        assert!(exact("todo.c", &format!("{do_pragma}{todo}TODO(\"later\")\n#include \"a.h\"\n")));
+        // The file's name, which may be a pragma's words.
+        assert!(!exact("file.c", "#define P _Pragma(__FILE__)\nP\n"));
         // Operands macros make, read with the macros defined: libc++'s,
         // Boost's and GLib's diagnostics and messages are harmless.
         let libcxx = "#define TOSTR2(x) #x\n#define TOSTR(x) TOSTR2(x)\n#define IGNORED(str) _Pragma(TOSTR(clang diagnostic ignored str))\n";
@@ -2039,17 +2153,6 @@ mod tests {
         }
     }
 
-    /// What's under a directory goes, nothing beside it (`a/b-x`, `a/b.h`
-    /// and `a/b0` sort among `a/b/...` as strings, not as paths).
-    #[test]
-    fn subtrees() {
-        let paths = ["a", "a/b", "a/b/c", "a/b/c/d", "a/b-x", "a/b.h", "a/b0", "a/bb/c", "b"];
-        let mut m: BTreeMap<PathBuf, ()> = paths.iter().map(|p| (PathBuf::from(p), ())).collect();
-        assert_eq!(remove_under(&mut m, Path::new("a/b")), 3);
-        assert_eq!(m.keys().map(|k| k.to_str().unwrap()).collect::<Vec<_>>(), ["a", "a/b-x", "a/b.h", "a/b0", "a/bb/c", "b"]);
-        assert_eq!(remove_under(&mut m, Path::new("a/c")), 0);
-    }
-
     /// A link to a directory: a symbolic link on Unix, a junction on
     /// Windows (which needs no privilege). False when it can't be made.
     fn link_dir(target: &Path, link: &Path) -> bool {
@@ -2071,7 +2174,7 @@ mod tests {
 
     /// A `..` after a link to a directory elsewhere: compilers go to the
     /// target's parent, remote workers (plain directories) to the link's:
-    /// inexact.
+    /// inexact. But on Windows, which applies `..` first, as they do.
     #[test]
     fn dotdot_after_links() {
         let d = Dir::new("dotdot");
@@ -2081,15 +2184,57 @@ mod tests {
         d.file("real/b.h", "");
         assert!(link_dir(&d.0.join("real/sub"), &d.0.join("lnk")), "can't link a directory");
         let out = scan(&Cache::new(vec![], cfg!(windows)), &cfg(&d), &NoOracle, &main);
-        assert!(out.inexact.iter().any(|w| w.contains("after the symbolic link")), "{:?}", out.inexact);
+        let argv: Vec<String> = ["cc", "-Ilnk/../inc", "-c", "main.c"].iter().map(|a| a.to_string()).collect();
+        if cfg!(windows) {
+            assert!(out.exact(), "{:?}", out.inexact);
+            assert_eq!(d.rel(&out.files), vec!["main.c", "lnk/a.h", "b.h"]);
+            assert!(crate::driver::parse(&argv, &d.0).is_ok());
+            return;
+        }
+        assert!(out.inexact.iter().any(|w| w.contains("after a symbolic link")), "{:?}", out.inexact);
         // Without a link, `..` is the same everywhere.
         let plain = d.file("plain.c", "#include \"real/sub/a.h\"\n");
         let out = scan(&Cache::new(vec![], cfg!(windows)), &cfg(&d), &NoOracle, &plain);
         assert!(out.exact(), "{:?}", out.inexact);
         assert_eq!(d.rel(&out.files), vec!["plain.c", "real/sub/a.h", "real/b.h"]);
         // The command line's: falls back.
-        let argv: Vec<String> = ["cc", "-Ilnk/../inc", "-c", "main.c"].iter().map(|a| a.to_string()).collect();
         assert!(crate::driver::parse(&argv, &d.0).unwrap_err().contains("symbolic link"));
+    }
+
+    /// Files with the contents of one with `#pragma once` are told by the
+    /// hash of their contents taken when they were lexed: not read again
+    /// by each scan (the session's view holds, as for their directives).
+    #[test]
+    fn once_contents_by_hash() {
+        let d = Dir::new("once_hash");
+        let once = "#pragma once\n#ifdef SEEN\n#include \"second.h\"\n#endif\n#define SEEN\n";
+        d.file("a.h", once);
+        d.file("copy.h", once);
+        d.file("second.h", "");
+        let main = d.file("main.c", "#include \"a.h\"\n#include \"copy.h\"\n");
+        let cache = Cache::new(vec![], false);
+        assert!(!scan(&cache, &cfg(&d), &NoOracle, &main).exact());
+        d.file("copy.h", &once.replace("SEEN", "XXXX"));
+        assert!(!scan(&cache, &cfg(&d), &NoOracle, &main).exact());
+    }
+
+    /// `#pragma GCC dependency`: GCC and Clang look the file up (an error
+    /// when it's missing), which no dependency list names.
+    #[test]
+    fn pragma_dependency() {
+        let d = Dir::new("dependency");
+        d.file("inc/dep.txt", "");
+        d.file("inc/dep2.txt", "");
+        let main =
+            d.file("main.c", "#pragma GCC dependency \"dep.txt\" newer than this\n#pragma GCC dependency <dep2.txt>\n#pragma GCC dependency \"none.txt\"\n");
+        let out = scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &main);
+        assert_eq!(d.rel(&out.found), vec!["inc/dep.txt", "inc/dep2.txt"]);
+        assert_eq!(out.missing, vec!["none.txt"]);
+        // Not cl's.
+        let mut c = cfg(&d);
+        c.family = Family::Msvc;
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &main);
+        assert!(out.found.is_empty() && out.missing.is_empty(), "{:?} {:?}", out.found, out.missing);
     }
 
     /// `#pragma once` is about the file, not its path: the same file under

@@ -1,6 +1,8 @@
 //! Prints a build event file (`--build_event_binary_file`) one event per
 //! line, checking that it's a valid stream: `bep_dump <file>`.
 
+#![allow(clippy::disallowed_macros)] // It prints what it found.
+
 use rbe_bes::proto::build_event_stream::build_event::Payload;
 use rbe_bes::proto::build_event_stream::build_event_id::Id;
 

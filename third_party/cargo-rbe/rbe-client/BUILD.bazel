@@ -13,6 +13,7 @@ rust_library(
         "@crates//:bazel-remote-apis",
         "@crates//:fastcdc",
         "@crates//:hex",
+        "@crates//:hyper-util",
         "@crates//:prost",
         "@crates//:rustls",
         "@crates//:sha2",
@@ -25,9 +26,13 @@ rust_library(
 
 rust_test(
     name = "rbe-client_test",
-    size = "small",
+    # Up to 53 s of a small test's 60 under load.
+    size = "medium",
     # The test certificates (TLS tests).
     compile_data = ["//crates/fake-reapi:test_certs"],
     crate = ":rbe-client",
-    deps = ["//crates/test-dirs"],
+    deps = [
+        "//crates/test-dirs",
+        "@crates//:h2",
+    ],
 )

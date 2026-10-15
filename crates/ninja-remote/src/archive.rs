@@ -395,7 +395,12 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(dir.join("out"), &link).unwrap();
         #[cfg(windows)]
-        assert!(std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(&link).arg(dir.join("out")).output().unwrap().status.success());
+        {
+            // mklink reads a slash as a switch's (Bazel's TEST_TMPDIR has them).
+            let native = |p: &std::path::Path| p.to_string_lossy().replace('/', "\\");
+            let mklink = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(native(&link)).arg(native(&dir.join("out"))).output().unwrap();
+            assert!(mklink.status.success(), "{mklink:?}");
+        }
         std::fs::write(build.join("lib/linked.a"), thin(&["../lnk/x.o"])).unwrap();
         let linked = v(&["lib/linked.a"]);
         assert!(expand(&linked, &build, None, &store, Outside::Refuse).unwrap_err().contains("through a link"));

@@ -108,10 +108,8 @@ impl CommandRunner for FakeRunner<'_> {
         let now = self.fs.now();
         // "lose-once" reports its inputs lost the first time it runs,
         // "lose-always" every time (action rewinding).
-        if let Some(task) = self.active.last()
-            && (task.rule == "lose-always" || (task.rule == "lose-once" && !self.lost.contains(&task.edge)))
-        {
-            let task = self.active.pop().unwrap();
+        let lost = &self.lost;
+        if let Some(task) = self.active.pop_if(|task| task.rule == "lose-always" || (task.rule == "lose-once" && !lost.contains(&task.edge))) {
             self.lost.push(task.edge);
             let r = TaskResult {
                 edge: task.edge,
@@ -1282,6 +1280,131 @@ fn records_follow_a_build_log_replaced_by_a_generator() {
     for o in ["first", "out", "after"] {
         assert!(log.lookup_by_output(o).is_some(), "{o} isn't in the log");
     }
+}
+
+/// The records of the commands a turn of the loop reaped (all those
+/// finished) are written at once, before the next commands start: one may
+/// read them (a build in the same directory).
+#[test]
+fn records_are_written_before_more_commands_start() {
+    let dir = test_dirs::TestDir::new("ninja_core_turns");
+    let path = dir.join("log").to_string_lossy().into_owned();
+    let mut t = BuildTest::new();
+    let mut log = BuildLog::new();
+    log.open_for_write(&path, &|_| true, crate::build_log::Access::Exclusive).unwrap();
+    t.build_log = Some(log);
+    t.parse(&format!(
+        "rule touch\n  command = touch $out\nrule read-log\n  command = read-log $out\nbuild a: touch\nbuild b: touch\nbuild c: read-log a b\n  test_dependency = {}\n",
+        path.replace('\\', "/").replace(':', "$:")
+    ));
+    /// Says how many records the log named by `test_dependency` holds when
+    /// a `read-log` command starts.
+    struct ReadsLog<'a> {
+        inner: FakeRunner<'a>,
+        seen: Vec<usize>,
+    }
+    impl CommandRunner for ReadsLog<'_> {
+        fn can_run_more(&self) -> usize {
+            self.inner.can_run_more()
+        }
+        fn start_command(&mut self, mut task: Task) -> Result<(), String> {
+            if task.rule == "read-log" {
+                let log = std::fs::read_to_string(task.binding("test_dependency").unwrap()).unwrap();
+                self.seen.push(log.lines().skip(1).count());
+                task.rule = "touch".into();
+            }
+            self.inner.start_command(task)
+        }
+        fn wait_for_command(&mut self) -> WaitFuture<'_> {
+            self.inner.wait_for_command()
+        }
+        fn active_edges(&self) -> Vec<EdgeId> {
+            self.inner.active_edges()
+        }
+        fn abort(&mut self) -> AbortFuture<'_> {
+            self.inner.abort()
+        }
+    }
+    let mut status = NullStatus::default();
+    let mut b = Builder::new(&mut t.state, &t.fs, t.build_log.as_mut(), None, &t.config, &mut status);
+    b.add_target_by_name("c").unwrap();
+    let inner = FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 2, lost: Vec::new() };
+    let mut runner = ReadsLog { inner, seen: Vec::new() };
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(b.build(&mut runner)).unwrap();
+    assert_eq!(runner.seen, [2]);
+    let mut log = BuildLog::new();
+    log.load(&path).unwrap();
+    assert_eq!(log.entries().len(), 3);
+}
+
+/// A runner with slots of two kinds (one local, two remote): the engine
+/// starts a task only when a slot of its kind is free, the others waiting
+/// in the plan meanwhile, so that those of the other kind start. It started
+/// the best ones up to the runner's room, a local task then waiting in the
+/// runner (counted as started) while a remote one could have run.
+#[test]
+fn tasks_wait_in_the_plan_for_their_kind_of_slots() {
+    let mut t = BuildTest::empty();
+    t.parse("rule touch\n  command = touch $out\nrule remote\n  command = remote $out\nbuild l1: touch\nbuild l2: touch\nbuild r1: remote\nbuild r2: remote\nbuild all: phony l1 l2 r1 r2\n");
+    /// Remote tasks are those of the rule `remote`.
+    struct Kinds<'a> {
+        inner: FakeRunner<'a>,
+        running: Arc<Mutex<crate::hash::HashMap<EdgeId, usize>>>,
+        started: Vec<(String, [usize; 2])>,
+    }
+    const JOBS: [usize; 2] = [1, 2];
+    impl CommandRunner for Kinds<'_> {
+        fn can_run_more(&self) -> usize {
+            (JOBS[0] + JOBS[1]).saturating_sub(self.running.lock().unwrap().len())
+        }
+        fn start_command(&mut self, mut task: Task) -> Result<(), String> {
+            let kind = self.slots_of(&task);
+            let mut running = self.running.lock().unwrap();
+            running.insert(task.edge, kind);
+            let counts = [0, 1].map(|k| running.values().filter(|&&r| r == k).count());
+            self.started.push((task.outputs[0].clone(), counts));
+            task.rule = "touch".into();
+            self.inner.start_command(task)
+        }
+        fn wait_for_command(&mut self) -> WaitFuture<'_> {
+            let running = self.running.clone();
+            let next = self.inner.wait_for_command();
+            Box::pin(async move {
+                let r = next.await;
+                if let Some(r) = &r {
+                    running.lock().unwrap().remove(&r.edge);
+                }
+                r
+            })
+        }
+        fn active_edges(&self) -> Vec<EdgeId> {
+            self.inner.active_edges()
+        }
+        fn abort(&mut self) -> AbortFuture<'_> {
+            self.inner.abort()
+        }
+        fn slot_kinds(&self) -> usize {
+            2
+        }
+        fn slots_of(&self, task: &Task) -> usize {
+            usize::from(task.rule == "remote")
+        }
+        fn has_free_slot(&self, kind: usize) -> bool {
+            self.running.lock().unwrap().values().filter(|&&k| k == kind).count() < JOBS[kind]
+        }
+    }
+    let mut status = NullStatus::default();
+    let mut b = Builder::new(&mut t.state, &t.fs, None, None, &t.config, &mut status);
+    b.add_target_by_name("all").unwrap();
+    let inner = FakeRunner { fs: &t.fs, commands_ran: t.commands_ran.clone(), active: Vec::new(), max_active: 10, lost: Vec::new() };
+    let mut runner = Kinds { inner, running: Arc::default(), started: Vec::new() };
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    rt.block_on(b.build(&mut runner)).unwrap();
+    let order: Vec<&str> = runner.started.iter().map(|(o, _)| o.as_str()).collect();
+    assert!(runner.started.iter().all(|(_, counts)| counts[0] <= JOBS[0] && counts[1] <= JOBS[1]), "{:?}", runner.started);
+    assert_eq!(order.len(), 4);
+    assert_eq!(&order[..3], ["l1", "r1", "r2"]);
 }
 
 #[test]

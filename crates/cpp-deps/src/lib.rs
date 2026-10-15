@@ -22,6 +22,7 @@ pub mod hmap;
 pub mod intern;
 pub mod lex;
 pub mod macros;
+pub mod path_map;
 pub mod probe;
 pub mod scan;
 pub mod vfs;

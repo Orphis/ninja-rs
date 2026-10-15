@@ -3,7 +3,9 @@
 //! when it fails; a panic fails its test only, and so does a test running
 //! longer than `TEST_TIMEOUT`. Arguments select tests as libtest's do (and
 //! Bazel's `--test_filter`), Bazel's sharding splits them, and the results
-//! go to Bazel's `XML_OUTPUT_FILE`, a test case each.
+//! go to Bazel's `XML_OUTPUT_FILE`, a test case each. The processes a
+//! test starts through `spawn` (or `output`, `status`) don't outlive it
+//! when it runs out of time.
 //! Tests decide from markers, counters and the order of events, with
 //! timeouts far above what a healthy run takes, rather than from how long
 //! things take: the machine may be busy.
@@ -11,8 +13,9 @@
 #![allow(dead_code)]
 
 use std::any::Any;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, Command, ExitCode, ExitStatus, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -55,6 +58,19 @@ static RESULTS: Mutex<Results> = Mutex::new(Results { suite: String::new(), done
 
 /// The running test, and when the watchdog fails it.
 static RUNNING: Mutex<Option<(&'static str, Instant, Instant)>> = Mutex::new(None);
+
+/// A process the running test started (`spawn`).
+struct Started {
+    pid: u32,
+    /// A handle of it, which keeps its id from naming another process.
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
+}
+
+/// What the running test started and hasn't waited for through this
+/// module: the watchdog kills it, rather than leave it running once the
+/// tests' binary exited.
+static STARTED: Mutex<Vec<Started>> = Mutex::new(Vec::new());
 
 /// What the arguments select, as libtest's: tests whose name contains one
 /// of the filters (or is one, with `--exact`) and none of `--skip`'s.
@@ -148,6 +164,7 @@ pub fn run(suite: &str, tests: Vec<Test>) -> ExitCode {
         let result = std::panic::catch_unwind(test).unwrap_or_else(|panic| Err(format!("panicked: {}", panic_message(&*panic))));
         // Blocks while the watchdog fails the test (and exits).
         RUNNING.lock().unwrap().take();
+        STARTED.lock().unwrap().clear();
         let current = CURRENT.lock().unwrap().take().expect("the current test");
         let outcome = match (result, current.not_tested) {
             (Err(e), _) => {
@@ -265,8 +282,8 @@ fn time_left() -> Duration {
 }
 
 /// Fails the running test once it's past its time: says so, sums up (the
-/// tests not run yet aren't in the results), and exits, leaving the
-/// tests' files and whatever the test started.
+/// tests not run yet aren't in the results), kills what the test started,
+/// and exits, leaving the tests' files.
 fn watchdog(dir: PathBuf) {
     time_left();
     std::thread::spawn(move || {
@@ -286,10 +303,71 @@ fn watchdog(dir: PathBuf) {
             RESULTS.lock().unwrap().done.push((name, started.elapsed(), Outcome::Failed(e)));
             sum_up();
             println!("kept: {}", dir.display());
+            kill_started();
             // Holding `RUNNING`: the test can't finish meanwhile.
             std::process::exit(1);
         }
     });
+}
+
+/// Starts `c` for the running test, as `Command::spawn`: a process the
+/// watchdog kills if the test runs out of time.
+pub fn spawn(c: &mut Command) -> io::Result<Child> {
+    let child = c.spawn()?;
+    #[cfg(windows)]
+    let Ok(handle) = std::os::windows::io::AsHandle::as_handle(&child).try_clone_to_owned() else { return Ok(child) };
+    STARTED.lock().unwrap().push(Started {
+        pid: child.id(),
+        #[cfg(windows)]
+        handle,
+    });
+    Ok(child)
+}
+
+/// Runs `c` through `spawn`, as `Command::status`.
+pub fn status(c: &mut Command) -> io::Result<ExitStatus> {
+    let mut child = spawn(c)?;
+    let status = child.wait();
+    forget(child.id());
+    status
+}
+
+/// Runs `c` through `spawn`, as `Command::output` with its default
+/// streams: none in, the output and errors piped.
+pub fn output(c: &mut Command) -> io::Result<Output> {
+    let child = spawn(c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()))?;
+    let pid = child.id();
+    let output = child.wait_with_output();
+    forget(pid);
+    output
+}
+
+/// Stops tracking process `pid`, waited for.
+fn forget(pid: u32) {
+    STARTED.lock().unwrap().retain(|s| s.pid != pid);
+}
+
+/// Kills what the running test started that still runs.
+fn kill_started() {
+    for s in STARTED.lock().unwrap().drain(..) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            // SAFETY: the handle is open (a process that exited stays so).
+            unsafe { windows_sys::Win32::System::Threading::TerminateProcess(s.handle.as_raw_handle(), 1) };
+        }
+        #[cfg(unix)]
+        {
+            let pid = s.pid as libc::pid_t;
+            // SAFETY: plain system calls. Only a child still running: one
+            // waited for may have given its id to another process.
+            unsafe {
+                if libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) == 0 {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
 }
 
 fn panic_message(panic: &(dyn Any + Send)) -> String {
@@ -353,14 +431,22 @@ pub fn ninja_exe() -> PathBuf {
         if Path::new(path).exists() {
             return std::path::absolute(path).unwrap();
         }
-        // Bazel on Windows: no runfiles tree, a manifest of them.
-        let manifest = std::env::var("RUNFILES_MANIFEST_FILE").expect("ninja-rs binary not found");
-        let key = format!("_main/{path} ");
-        let text = std::fs::read_to_string(manifest).unwrap();
-        let line = text.lines().find(|l| l.starts_with(&key)).expect("ninja-rs binary not in the runfiles");
-        PathBuf::from(&line[key.len()..])
+        runfile(path).expect("ninja-rs binary not found")
     })
     .clone()
+}
+
+/// A data file of the test's Bazel target, `path` from the workspace's
+/// top: in the runfiles tree, or (Bazel on Windows, which makes none)
+/// where the manifest of them says. None without Bazel.
+pub fn runfile(path: &str) -> Option<PathBuf> {
+    let key = format!("{}/{path}", std::env::var("TEST_WORKSPACE").unwrap_or_else(|_| "_main".into()));
+    let tree = PathBuf::from(std::env::var_os("TEST_SRCDIR")?).join(&key);
+    if tree.exists() {
+        return Some(tree);
+    }
+    let manifest = std::fs::read_to_string(std::env::var_os("RUNFILES_MANIFEST_FILE")?).ok()?;
+    manifest.lines().find_map(|l| l.strip_prefix(&key)?.strip_prefix(' ')).map(PathBuf::from)
 }
 
 /// Waits for `done`, polling, up to `PATIENCE`.

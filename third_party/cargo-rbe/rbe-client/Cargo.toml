@@ -13,16 +13,18 @@ anyhow.workspace = true
 bazel-remote-apis.workspace = true
 fastcdc.workspace = true
 hex.workspace = true
+hyper-util.workspace = true
 ninja-os = { path = "../../../crates/ninja-os" }
 prost.workspace = true
 rustls.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tokio-stream.workspace = true
 tonic.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+h2.workspace = true
 test-dirs = { path = "../../../crates/test-dirs" }
 # Servers misbehaving in ways the fake one doesn't (tests of lib.rs).
 tokio = { workspace = true, features = ["net"] }
