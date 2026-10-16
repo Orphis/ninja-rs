@@ -1,8 +1,9 @@
 //! Scanning a compile command: its flags turned into a scan configuration,
 //! the compiler probed once per compiler and set of flags that matter
 //! (predefined macros, operators, dialect, trigraphs, built-in include
-//! directories), and queries answered by probing the compiler, then
-//! scanning again.
+//! directories), and queries answered by probing the compiler (those of a
+//! known list in its first probe: see `Profile::seed`), then scanning
+//! again.
 //!
 //! GCC and Clang command lines, and `cl`-style ones (`cl.exe`, `clang-cl`).
 //! Every flag is either taken by the scan (directories, macros, forced
@@ -1567,7 +1568,11 @@ pub struct Profile {
     pub builtin_dirs: Vec<Dir>,
     /// Files every compile reads first (see `probe::Probe::implicit`).
     pub implicit: Vec<PathBuf>,
-    /// Query answers learned so far.
+    /// The answers to the seed queries (see `probe::seeds`), by index there:
+    /// from the probe (or the profile it replaces), not changed after
+    /// (`NOT_ASKED`, `UNANSWERABLE` or a value). Empty when none was asked.
+    seeded: Vec<i64>,
+    /// The answers to other queries, learned as scans meet them.
     answers: Mutex<HashMap<(String, String), Option<i64>>>,
     /// Held while the compiler answers queries, so that concurrent scans
     /// don't ask the same ones.
@@ -1584,7 +1589,13 @@ pub struct Profile {
     probed: u64,
 }
 
-const PROFILE_SIGNATURE: &str = "cpp-deps profile 5";
+/// Version 6: the seed queries are answered (see `Profile::seed`).
+const PROFILE_SIGNATURE: &str = "cpp-deps profile 6";
+
+/// In `Profile::seeded`: a seed query the compiler isn't asked (another
+/// family's, of an operator it lacks), or can't answer.
+const NOT_ASKED: i64 = i64::MIN;
+const UNANSWERABLE: i64 = i64::MIN + 1;
 
 /// Profiles unused for this long are removed when another is saved (at
 /// most once a day: see `CLEANED`).
@@ -1597,7 +1608,9 @@ const CLEAN_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 /// Profiles are probed again after this long, however often used: what the
 /// key doesn't see (a clang configuration file's contents, an SDK installed
-/// behind a shim) is then stale for a day at most.
+/// behind a shim) is then stale for a day at most. Not the answers to
+/// queries, kept while the compiler is the same (see
+/// `Profile::keep_answers`).
 const PROFILE_LIFETIME: Duration = Duration::from_secs(24 * 3600);
 
 fn unix_secs(t: SystemTime) -> u64 {
@@ -1637,6 +1650,7 @@ impl Profile {
             va_comma: Default::default(),
             builtin_dirs,
             implicit,
+            seeded: Vec::new(),
             answers: Mutex::default(),
             asking: Mutex::default(),
             gave_up: AtomicU64::new(0),
@@ -1697,6 +1711,21 @@ impl Profile {
                 out.push_str(&format!("answer\t{op}\t{arg}\t{}\n", v.map_or("-".to_string(), |v| v.to_string())));
             }
         }
+        // The seed queries' answers, by index, for this list: `~N` for N
+        // not asked, `-` for one it couldn't answer (a run of those not
+        // asked is a chunk, any other answer one alone).
+        if !self.seeded.is_empty() {
+            let values: Vec<String> = self
+                .seeded
+                .chunk_by(|a, b| *a == NOT_ASKED && *b == NOT_ASKED)
+                .map(|run| match run[0] {
+                    NOT_ASKED => format!("~{}", run.len()),
+                    UNANSWERABLE => "-".to_string(),
+                    v => v.to_string(),
+                })
+                .collect();
+            out.push_str(&format!("seeds\t{:016x}\t{}\n", probe::seeds_digest(), values.join(",")));
+        }
         out.push_str("predefines\n");
         out.push_str(&self.predefines);
         std::fs::create_dir_all(dir)?;
@@ -1723,8 +1752,90 @@ impl Profile {
         Ok(())
     }
 
-    /// The profile with `key` saved in `dir`, if any.
+    /// The profile with `key` saved in `dir`, unless it was probed over
+    /// `PROFILE_LIFETIME` ago.
     fn load(dir: &Path, key: &str) -> Option<Profile> {
+        let profile = Profile::read(dir, key).filter(|p| !p.expired())?;
+        Profile::used(dir, key);
+        Some(profile)
+    }
+
+    /// Notes that the profile with `key` in `dir` is used: kept by the
+    /// clean-up of `save`.
+    fn used(dir: &Path, key: &str) {
+        if let Ok(f) = std::fs::File::options().append(true).open(Profile::file(dir, key)) {
+            let _ = f.set_modified(SystemTime::now());
+        }
+    }
+
+    /// Probed over `PROFILE_LIFETIME` ago: to be probed again.
+    fn expired(&self) -> bool {
+        unix_secs(SystemTime::now()).saturating_sub(self.probed) > PROFILE_LIFETIME.as_secs()
+    }
+
+    /// The answer to a query: None if the compiler wasn't asked it,
+    /// Some(None) if it couldn't answer.
+    fn answer(&self, op: &str, arg: &str) -> Option<Option<i64>> {
+        match probe::seed_index(op, arg).and_then(|i| self.seeded.get(i)) {
+            Some(&UNANSWERABLE) => Some(None),
+            Some(&v) if v != NOT_ASKED => Some(Some(v)),
+            _ => self.answers.lock().unwrap().get(&(op.to_string(), arg.to_string())).copied(),
+        }
+    }
+
+    /// The seed queries (by index in `probe::seeds`) its compiler is
+    /// asked, of the operators it has, not answered yet.
+    fn unanswered_seeds(&self) -> Vec<usize> {
+        let operators: Vec<&str> = self.operators.iter().map(|o| o.as_str()).collect();
+        let asked = |i: usize, s: &probe::Seed| s.asked_of(self.family) && operators.contains(&s.op) && self.seeded.get(i).is_none_or(|v| *v == NOT_ASKED);
+        probe::seeds().iter().enumerate().filter(|&(i, s)| asked(i, s)).map(|(i, _)| i).collect()
+    }
+
+    /// Asks the compiler the seed queries it hasn't answered, in one batch
+    /// (split where it fails: see `probe::answer`), so that scans meeting
+    /// them don't ask, and scan again. A compiler failing (or taking too
+    /// long) isn't asked again in the session.
+    fn seed(&mut self, compiler: &probe::Compiler, session: u64) {
+        let which = self.unanswered_seeds();
+        if which.is_empty() {
+            return;
+        }
+        let seeds = probe::seeds();
+        let queries: Vec<(String, String)> = which.iter().map(|&i| (seeds[i].op.to_string(), seeds[i].arg.to_string())).collect();
+        match probe::answer(compiler, &queries) {
+            Ok(values) => {
+                self.seeded.resize(seeds.len(), NOT_ASKED);
+                for (i, v) in which.into_iter().zip(values) {
+                    self.seeded[i] = v.filter(|v| *v > UNANSWERABLE).unwrap_or(UNANSWERABLE);
+                }
+            }
+            Err(_) => self.gave_up.store(session, Ordering::Relaxed),
+        }
+    }
+
+    /// Keeps the answers of `old`, the profile with the same key this one
+    /// replaces after `PROFILE_LIFETIME`: the same compiler binary (the key
+    /// holds its fingerprint) with the same flags, unless its probe now says
+    /// otherwise (other predefined macros or operators: something the key
+    /// can't see changed). Not those it couldn't answer, asked again.
+    fn keep_answers(&mut self, old: &Profile) {
+        if old.predefines != self.predefines || old.operators != self.operators {
+            return;
+        }
+        let kept = old.answers.lock().unwrap();
+        self.answers.get_mut().unwrap().extend(kept.iter().filter(|(_, v)| v.is_some()).map(|(q, v)| (q.clone(), *v)));
+        if !old.seeded.is_empty() {
+            self.seeded.resize(old.seeded.len(), NOT_ASKED);
+            for (new, &v) in self.seeded.iter_mut().zip(&old.seeded) {
+                if *new == NOT_ASKED && v != UNANSWERABLE {
+                    *new = v;
+                }
+            }
+        }
+    }
+
+    /// The profile with `key` saved in `dir`, however old.
+    fn read(dir: &Path, key: &str) -> Option<Profile> {
         let file = Profile::file(dir, key);
         let text = std::fs::read_to_string(&file).ok()?;
         let (head, predefines) = text.split_once("\npredefines\n")?;
@@ -1732,8 +1843,8 @@ impl Profile {
         if lines.next() != Some(PROFILE_SIGNATURE) || lines.next()?.strip_prefix("key\t") != Some(key) {
             return None;
         }
-        let (mut probed, mut dialect, mut trigraphs, mut operators, mut dirs, mut implicit, mut answers) =
-            (None, None, None, Vec::new(), Vec::new(), Vec::new(), HashMap::new());
+        let (mut probed, mut dialect, mut trigraphs, mut operators, mut dirs, mut implicit, mut answers, mut seeded) =
+            (None, None, None, Vec::new(), Vec::new(), Vec::new(), HashMap::new(), Vec::new());
         let (mut cwd, mut va_comma) = (None, None);
         for line in lines {
             let f: Vec<&str> = line.split('\t').collect();
@@ -1751,22 +1862,31 @@ impl Profile {
                     let v = if *v == "-" { None } else { Some(v.parse().ok()?) };
                     answers.insert((op.to_string(), arg.to_string()), v);
                 }
+                // Those of another list (another version's) are dropped.
+                ["seeds", digest, values] if u64::from_str_radix(digest, 16).ok() == Some(probe::seeds_digest()) => {
+                    let n = probe::seeds().len();
+                    seeded = Vec::with_capacity(n);
+                    for v in values.split(',') {
+                        match v.strip_prefix('~') {
+                            Some(run) => seeded.resize(seeded.len() + run.parse::<usize>().ok().filter(|r| seeded.len() + r <= n)?, NOT_ASKED),
+                            None if v == "-" => seeded.push(UNANSWERABLE),
+                            None => seeded.push(v.parse().ok()?),
+                        }
+                    }
+                    if seeded.len() != n {
+                        return None;
+                    }
+                }
+                ["seeds", _, _] => {}
                 _ => return None,
             }
         }
-        let probed = probed?;
-        if unix_secs(SystemTime::now()).saturating_sub(probed) > PROFILE_LIFETIME.as_secs() {
-            return None;
-        }
         let mut profile = Profile::new(predefines.to_string(), operators, dialect?, trigraphs?, dirs, implicit);
-        profile.probed = probed;
+        profile.probed = probed?;
         profile.cwd = cwd;
         profile.va_comma = va_comma?;
+        profile.seeded = seeded;
         *profile.answers.lock().unwrap() = answers;
-        // Used: kept by the clean-up of `save`.
-        if let Ok(f) = std::fs::File::options().append(true).open(&file) {
-            let _ = f.set_modified(SystemTime::now());
-        }
         Some(profile)
     }
 }
@@ -1775,7 +1895,7 @@ struct ProfileOracle<'a>(&'a Profile);
 
 impl Oracle for ProfileOracle<'_> {
     fn query(&self, op: &str, arg: &str) -> Option<i64> {
-        self.0.answers.lock().unwrap().get(&(op.to_string(), arg.to_string())).copied().flatten()
+        self.0.answer(op, arg).flatten()
     }
 }
 
@@ -2048,12 +2168,19 @@ impl Driver {
     fn profile_with_key(&self, inv: &Invocation, cwd: &Path, env: &Environment, key: String) -> Result<Arc<Profile>, String> {
         let session = self.cache.session();
         let stale = |s: u64, loaded: &Result<Arc<Profile>, String>| match loaded {
-            Ok(p) => unix_secs(SystemTime::now()).saturating_sub(p.probed) > PROFILE_LIFETIME.as_secs(),
+            Ok(p) => p.expired(),
             Err(_) => s != session,
         };
+        // The profile a new probe would replace, as held (the daemon's).
+        let held = self.profiles.lock().unwrap().get(&key).and_then(|cell| cell.get()).and_then(|(_, p)| p.as_ref().ok().filter(|p| p.expired()).cloned());
         load_once(&self.profiles, key.clone(), session, stale, || {
-            if let Some(p) = env.profile_dir.as_deref().and_then(|d| Profile::load(d, &key)) {
-                return Ok(Arc::new(p));
+            let mut replaced: Vec<Arc<Profile>> = held.into_iter().collect();
+            if let Some(d) = env.profile_dir.as_deref() {
+                if let Some(p) = Profile::load(d, &key) {
+                    return Ok(Arc::new(p));
+                }
+                // Or as saved.
+                replaced.extend(Profile::read(d, &key).map(Arc::new));
             }
             let compiler = env.compiler(inv, cwd);
             let p = probe::probe(&compiler)?;
@@ -2077,6 +2204,10 @@ impl Driver {
             let mut profile = Profile::new(p.predefines, p.operators, p.dialect, p.trigraphs, builtin_dirs, implicit);
             profile.va_comma = p.va_comma;
             profile.cwd = relative.then(|| cwd.to_path_buf());
+            for old in &replaced {
+                profile.keep_answers(old);
+            }
+            profile.seed(&compiler, session);
             if let Some(d) = &env.profile_dir {
                 let _ = profile.save(d, &key);
             }
@@ -2120,15 +2251,9 @@ impl Driver {
             if out.unknown.is_empty() || rounds > 10 {
                 return Ok(out);
             }
-            let unanswered = |out: &Output| -> Vec<(String, String)> {
-                let answers = profile.answers.lock().unwrap();
-                out.unknown.iter().filter(|q| !answers.contains_key(q)).cloned().collect()
-            };
+            let unanswered = |out: &Output| out.unknown.iter().filter(|(op, arg)| profile.answer(op, arg).is_none()).cloned().collect::<Vec<_>>();
             // Answered now (with a value): scan again.
-            let answered = || {
-                let answers = profile.answers.lock().unwrap();
-                out.unknown.iter().any(|q| matches!(answers.get(q), Some(Some(_))))
-            };
+            let answered = || out.unknown.iter().any(|(op, arg)| matches!(profile.answer(op, arg), Some(Some(_))));
             if unanswered(&out).is_empty() {
                 if answered() {
                     continue;
@@ -2569,7 +2694,7 @@ mod tests {
     #[test]
     fn profiles_round_trip() {
         let dir = test_dirs::TestDir::new("cpp_deps_profiles");
-        let p = Profile::new(
+        let mut p = Profile::new(
             "#define __GNUC__ 13\n#define __cplusplus 201703L\n".into(),
             vec!["__has_include".into(), "__has_builtin".into()],
             crate::expr::Dialect::CXX,
@@ -2577,8 +2702,12 @@ mod tests {
             vec![Dir::Path(p("/usr/include")), Dir::Framework(p("/Library/Frameworks"))],
             vec![p("/usr/include/stdc-predef.h")],
         );
-        p.answers.lock().unwrap().insert(("__has_builtin".into(), "__builtin_expect".into()), Some(1));
+        p.answers.lock().unwrap().insert(("__has_builtin".into(), "__builtin_x".into()), Some(1));
         p.answers.lock().unwrap().insert(("__has_builtin".into(), "(".into()), None);
+        // The seed queries' answers, by index.
+        let (expect, rtti) = (probe::seed_index("__has_builtin", "__builtin_expect").unwrap(), probe::seed_index("__has_feature", "cxx_rtti").unwrap());
+        p.seeded = vec![NOT_ASKED; probe::seeds().len()];
+        (p.seeded[expect], p.seeded[rtti]) = (1, UNANSWERABLE);
         p.save(&dir, "k\u{1}1").unwrap();
         assert!(Profile::load(&dir, "k\u{1}2").is_none());
         let q = Profile::load(&dir, "k\u{1}1").unwrap();
@@ -2590,8 +2719,24 @@ mod tests {
         assert_eq!(q.builtin_dirs, p.builtin_dirs);
         assert_eq!(q.implicit, p.implicit);
         assert_eq!(*q.answers.lock().unwrap(), *p.answers.lock().unwrap());
+        assert_eq!(q.seeded, p.seeded);
+        assert_eq!((q.answer("__has_builtin", "__builtin_expect"), q.answer("__has_feature", "cxx_rtti")), (Some(Some(1)), Some(None)));
+        assert_eq!((q.answer("__has_builtin", "__builtin_x"), q.answer("__has_feature", "cxx_exceptions")), (Some(Some(1)), None));
         assert!(q.predefined.contains_key(&intern::intern("__GNUC__")));
         assert_eq!(q.probed, p.probed);
+        // Answers that don't fit the list: unreadable (probed again).
+        let file = Profile::file(&dir, "k\u{1}1");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let seeds = text.lines().find(|l| l.starts_with("seeds\t")).unwrap();
+        for wrong in [format!("~{}", probe::seeds().len() + 1), "1".to_string()] {
+            std::fs::write(&file, text.replace(seeds, &format!("seeds\t{:016x}\t{wrong}", probe::seeds_digest()))).unwrap();
+            assert!(Profile::load(&dir, "k\u{1}1").is_none(), "{wrong}");
+        }
+        // Another seed list's answers (another version's) are dropped.
+        std::fs::write(&file, text.replace(&format!("seeds\t{:016x}", probe::seeds_digest()), "seeds\t0123456789abcdef")).unwrap();
+        let q = Profile::load(&dir, "k\u{1}1").unwrap();
+        assert!(q.seeded.is_empty());
+        assert_eq!(q.answer("__has_builtin", "__builtin_x"), Some(Some(1)));
         // Probed over a day ago: probed again, used or not.
         let mut old = q;
         old.probed -= PROFILE_LIFETIME.as_secs() + 60;
@@ -3379,6 +3524,163 @@ mod tests {
         // have been busy, or suspended.
         driver.cache.new_session();
         assert!(driver.scan_in(&argv, &dir, &env).is_err());
+    }
+
+    /// A fake Clang in `dir` (`clang++`) answering probes and queries: its
+    /// version is `version.txt`'s, it predefines `__clang__` and what
+    /// `predefines.txt` holds, has `__has_include`, `__has_builtin` and
+    /// `__has_feature`, and answers every query with `answer.txt`'s value.
+    fn answering_clang(dir: &Path) -> PathBuf {
+        std::fs::write(dir.join("version.txt"), "1\n").unwrap();
+        std::fs::write(dir.join("answer.txt"), "1\n").unwrap();
+        crate::test_tool(
+            dir,
+            "clang++",
+            "@echo off\r\n\
+             set /p ANSWER=<\"%~dp0answer.txt\"\r\n\
+             set A= %* \r\n\
+             if not \"%A: --version =%\"==\"%A%\" goto version\r\n\
+             if not \"%A: -dM =%\"==\"%A%\" goto macros\r\n\
+             if not \"%A: -M =%\"==\"%A%\" goto deps\r\n\
+             if not \"%A: -v =%\"==\"%A%\" goto dirs\r\n\
+             for /f \"tokens=1,2\" %%a in ('findstr /b NINJA_RS_QUERY') do echo %%a %%b %ANSWER%\r\n\
+             exit /b 0\r\n\
+             :version\r\n\
+             set /p V=<\"%~dp0version.txt\"\r\n\
+             echo clang version 99.%V%\r\n\
+             exit /b 0\r\n\
+             :macros\r\n\
+             echo #define __clang__ 1\r\n\
+             if exist \"%~dp0predefines.txt\" type \"%~dp0predefines.txt\"\r\n\
+             for %%o in (__has_include __has_builtin __has_feature) do echo #define NINJA_RS_OPERATOR_%%o 1\r\n\
+             exit /b 0\r\n\
+             :deps\r\n\
+             echo -: \r\n\
+             exit /b 0\r\n\
+             :dirs\r\n\
+             echo #include ^<...^> search starts here: 1>&2\r\n\
+             echo End of search list. 1>&2\r\n",
+            "d=$(dirname \"$0\")\n\
+             case \" $* \" in\n\
+             *\" --version \"*) echo \"clang version 99.$(cat \"$d/version.txt\")\" ;;\n\
+             *\" -dM \"*) echo '#define __clang__ 1'; cat \"$d/predefines.txt\" 2>/dev/null\n\
+             \x20 for o in __has_include __has_builtin __has_feature; do echo \"#define NINJA_RS_OPERATOR_$o 1\"; done ;;\n\
+             *\" -M \"*) echo '-: ' ;;\n\
+             *\" -v \"*) printf '#include <...> search starts here:\\nEnd of search list.\\n' >&2 ;;\n\
+             *) sed -n \"s/^NINJA_RS_QUERY \\([0-9]*\\) .*/NINJA_RS_QUERY \\1 $(cat \"$d/answer.txt\")/p\" ;;\n\
+             esac\n",
+        )
+    }
+
+    /// The seed queries are answered in the profile's first probe: a scan
+    /// meeting only those asks the compiler nothing more (one meeting
+    /// another asks it).
+    #[test]
+    fn seeds_asked_in_first_probe() {
+        let dir = test_dirs::TestDir::new("cpp_deps_seeds");
+        let compiler = answering_clang(&dir);
+        let seeded = [("__has_builtin", "__builtin_expect"), ("__has_feature", "cxx_rtti"), ("__has_builtin", "__is_same")];
+        for (op, arg) in seeded {
+            assert!(probe::seeds().iter().any(|s| s.op == op && s.arg == arg && s.clang), "{op}({arg})");
+        }
+        std::fs::write(
+            dir.join("a.cc"),
+            "#if __has_builtin(__builtin_expect) && __has_feature(cxx_rtti)\n#include \"yes.h\"\n#endif\n#if __has_builtin(__is_same)\n#endif\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.cc"), "#if __has_builtin(__builtin_no_seed)\n#endif\n").unwrap();
+        std::fs::write(dir.join("yes.h"), "").unwrap();
+        let driver = Driver::new(Cache::new(vec![], false));
+        let env = Environment { vars: None, profile_dir: Some(dir.join("profiles")) };
+        let argv = |source: &str| s(&[&compiler.to_string_lossy(), "-c", source]);
+        let runs = || probe::RUNS.with(|r| r.replace(0));
+        let profile = driver.profile(&parse_in(&argv("a.cc"), &dir, &env).unwrap(), &dir, &env).unwrap();
+        runs();
+        for (op, arg) in seeded {
+            assert_eq!(profile.answer(op, arg), Some(Some(1)), "{op}({arg})");
+        }
+        // Only the operators it has, only its family's.
+        assert_eq!(profile.answer("__has_cpp_attribute", "nodiscard"), None);
+        assert_eq!(profile.answer("__has_builtin", "__builtin_ia32_addps"), None);
+        let out = driver.scan_in(&argv("a.cc"), &dir, &env).unwrap();
+        assert!(out.exact(), "{:?} {:?}", out.inexact, out.unknown);
+        assert!(out.files.iter().any(|f| f.ends_with("yes.h")));
+        assert_eq!(runs(), 0);
+        driver.scan_in(&argv("b.cc"), &dir, &env).unwrap();
+        assert_eq!(runs(), 1);
+        // Saved with the profile.
+        let key = driver.profile_key(&parse_in(&argv("a.cc"), &dir, &env).unwrap(), &dir, &env);
+        assert_eq!(Profile::load(&dir.join("profiles"), &key).unwrap().answer("__has_builtin", "__builtin_expect"), Some(Some(1)));
+    }
+
+    /// A profile probed again after `PROFILE_LIFETIME` keeps the answers of
+    /// the one it replaces while the compiler is the same (its fingerprint,
+    /// what it predefines): they aren't asked again, but those it couldn't
+    /// answer. Another compiler's profile asks.
+    #[test]
+    fn answers_kept_while_compiler_same() {
+        let dir = test_dirs::TestDir::new("cpp_deps_answers_kept");
+        let compiler = answering_clang(&dir);
+        std::fs::write(dir.join("a.cc"), "#if __has_builtin(__builtin_no_seed)\n#endif\n").unwrap();
+        let profiles = dir.join("profiles");
+        let env = Environment { vars: None, profile_dir: Some(profiles.clone()) };
+        let argv = s(&[&compiler.to_string_lossy(), "-c", "a.cc"]);
+        // A process scanning (its driver), and the profile it saved.
+        let scanned = || {
+            let driver = Driver::new(Cache::new(vec![], false));
+            driver.scan_in(&argv, &dir, &env).unwrap();
+            let key = driver.profile_key(&parse_in(&argv, &dir, &env).unwrap(), &dir, &env);
+            (Profile::read(&profiles, &key).unwrap(), key)
+        };
+        let (first, key) = scanned();
+        assert_eq!(first.answer("__has_builtin", "__builtin_no_seed"), Some(Some(1)));
+        assert_eq!(first.answer("__has_builtin", "__builtin_expect"), Some(Some(1)));
+        // A day later the compiler answers otherwise (it would not, being the
+        // same): the answers are kept, not asked again; but those it couldn't
+        // answer (a seed's, another's).
+        let unanswered_seed = probe::seed_index("__has_feature", "cxx_rtti").unwrap();
+        let age = |p: Profile| {
+            let mut p = p;
+            p.probed -= PROFILE_LIFETIME.as_secs() + 60;
+            p.answers.lock().unwrap().insert(("__has_builtin".into(), "__builtin_unanswered".into()), None);
+            p.seeded[unanswered_seed] = UNANSWERABLE;
+            p.save(&profiles, &key).unwrap();
+        };
+        age(first);
+        std::fs::write(dir.join("answer.txt"), "2\n").unwrap();
+        let (again, _) = scanned();
+        assert!(!again.expired());
+        assert_eq!(again.answer("__has_builtin", "__builtin_no_seed"), Some(Some(1)));
+        assert_eq!(again.answer("__has_builtin", "__builtin_expect"), Some(Some(1)));
+        assert_eq!(again.answer("__has_feature", "cxx_rtti"), Some(Some(2)));
+        assert_eq!(again.answer("__has_builtin", "__builtin_unanswered"), None);
+        // Held by a process that lives on (the daemon's), without a profile
+        // directory.
+        let driver = Driver::new(Cache::new(vec![], false));
+        let memory = Environment { vars: None, profile_dir: None };
+        let inv = parse_in(&argv, &dir, &memory).unwrap();
+        let mut held = Profile::read(&profiles, &key).unwrap();
+        held.probed -= PROFILE_LIFETIME.as_secs() + 60;
+        let cell = Loaded::default();
+        let _ = cell.set((driver.cache.session(), Ok(Arc::new(held))));
+        driver.profiles.lock().unwrap().insert(driver.profile_key(&inv, &dir, &memory), cell);
+        let renewed = driver.profile(&inv, &dir, &memory).unwrap();
+        assert!(!renewed.expired());
+        assert_eq!(renewed.answer("__has_builtin", "__builtin_no_seed"), Some(Some(1)));
+        // The same binary predefining otherwise: asked again.
+        age(again);
+        std::fs::write(dir.join("predefines.txt"), "#define CHANGED 1\n").unwrap();
+        let (changed, _) = scanned();
+        assert_eq!(changed.answer("__has_builtin", "__builtin_no_seed"), Some(Some(2)));
+        assert_eq!(changed.answer("__has_builtin", "__builtin_expect"), Some(Some(2)));
+        // Another version: another profile, asking.
+        std::fs::remove_file(dir.join("predefines.txt")).unwrap();
+        std::fs::write(dir.join("version.txt"), "2\n").unwrap();
+        std::fs::write(dir.join("answer.txt"), "3\n").unwrap();
+        let (other, other_key) = scanned();
+        assert_ne!(other_key, key);
+        assert_eq!(other.answer("__has_builtin", "__builtin_no_seed"), Some(Some(3)));
+        assert_eq!(other.answer("__has_builtin", "__builtin_expect"), Some(Some(3)));
     }
 
     /// Files the compiler searches for (named without a directory) are kept

@@ -6,6 +6,8 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "cpp-deps",
     srcs = glob(["src/**/*.rs"]),
+    # The queries profiles ask in their first probe (include_str!).
+    compile_data = ["src/query_seeds.txt"],
     crate_name = "cpp_deps",
     deps = ["//crates/ninja-os"],
 )

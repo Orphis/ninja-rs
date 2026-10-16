@@ -44,6 +44,88 @@ pub const OPERATORS: &[&str] = &[
     "__building_module",
 ];
 
+/// The operators of `OPERATORS` the scan answers itself (the others are
+/// queries, which the compiler answers).
+const SCANNED: &[&str] = &["__has_include", "__has_include_next", "__has_embed"];
+
+/// The queries a profile's first probe asks (written by
+/// `tools/query_seeds.py`): those GCC's and Clang's tables know, the
+/// standard attributes, and those real headers ask. A line is `op arg`,
+/// then where the query comes from: `std:c++`, `std:c23`, `gcc`, `clang`,
+/// `used:<headers>`.
+const SEEDS: &str = include_str!("query_seeds.txt");
+
+/// A query of `SEEDS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seed {
+    pub op: &'static str,
+    pub arg: &'static str,
+    /// A standard attribute, or asked by real headers: asked of every
+    /// compiler with the operator.
+    pub common: bool,
+    /// In GCC's tables, in Clang's.
+    pub gcc: bool,
+    pub clang: bool,
+}
+
+impl Seed {
+    /// Whether a compiler of `family` is asked it: not a query only the
+    /// other family's tables know (GCC has no Clang-only builtin), and cl,
+    /// in neither, only the common ones.
+    pub fn asked_of(&self, family: crate::scan::Family) -> bool {
+        use crate::scan::Family;
+        self.common
+            || match family {
+                Family::Gcc => self.gcc,
+                Family::Clang => self.clang,
+                Family::Msvc => false,
+            }
+    }
+}
+
+/// The queries of `SEEDS`, read once (sorted by operator and argument).
+pub fn seeds() -> &'static [Seed] {
+    static READ: std::sync::OnceLock<Vec<Seed>> = std::sync::OnceLock::new();
+    READ.get_or_init(|| SEEDS.lines().filter_map(seed).collect())
+}
+
+/// The index of a query in `seeds()`, if it's one.
+pub fn seed_index(op: &str, arg: &str) -> Option<usize> {
+    seeds().binary_search_by(|s| (s.op, s.arg).cmp(&(op, arg))).ok()
+}
+
+/// The digest of `SEEDS` (FNV-1a: the same in every build): answers kept by
+/// index in `seeds()` are this list's.
+pub fn seeds_digest() -> u64 {
+    static DIGEST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DIGEST.get_or_init(|| SEEDS.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)))
+}
+
+/// A line of `SEEDS`: None for a comment, or a line with an operator or a
+/// tag it doesn't know (the tests check there are none).
+fn seed(line: &'static str) -> Option<Seed> {
+    if line.starts_with('#') {
+        return None;
+    }
+    let mut words = line.split_ascii_whitespace();
+    let (op, arg) = (words.next()?, words.next()?);
+    // Not `__building_module`, whose answer is the compile's.
+    if !OPERATORS.contains(&op) || SCANNED.contains(&op) || op == "__building_module" {
+        return None;
+    }
+    let mut seed = Seed { op, arg, common: false, gcc: false, clang: false };
+    for tag in words {
+        match tag {
+            "gcc" => seed.gcc = true,
+            "clang" => seed.clang = true,
+            "std:c++" | "std:c23" => seed.common = true,
+            _ if tag.starts_with("used:") => seed.common = true,
+            _ => return None,
+        }
+    }
+    Some(seed)
+}
+
 const OPERATOR_MARK: &str = "NINJA_RS_OPERATOR_";
 const QUERY_MARK: &str = "NINJA_RS_QUERY";
 /// Defined by a trigraph (`??=` is `#`) when trigraphs are on.
@@ -205,7 +287,7 @@ struct Failure {
 #[cfg(test)]
 thread_local! {
     /// The compiler runs of this thread (each test's).
-    static RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn run_compiler(c: &Compiler, extra: &[&str], input: &str) -> Result<Ran, Failure> {
@@ -416,8 +498,11 @@ pub fn answer(c: &Compiler, queries: &[(String, String)]) -> Result<Vec<Option<i
     // A query the compiler can't evaluate fails the whole run: the others
     // are asked again in halves, so that only it stays unanswered. A run
     // that takes too long ends the asking (the compiler hangs: asking each
-    // half again would take as long, again and again).
-    ask(c, &all, &text, &mut answers).map_err(|f| f.message)?;
+    // half again would take as long, again and again). cl expands none in
+    // text (its `__has_cpp_attribute` only in `#if`): straight to `#if`.
+    if c.style != Style::Msvc {
+        ask(c, &all, &text, &mut answers).map_err(|f| f.message)?;
+    }
     let missing: Vec<usize> = all.into_iter().filter(|&i| answers[i].is_none()).collect();
     let as_if = |i: usize| {
         let (op, arg) = &queries[i];
@@ -429,7 +514,8 @@ pub fn answer(c: &Compiler, queries: &[(String, String)]) -> Result<Vec<Option<i
         lines
     };
     match ask(c, &missing, &as_if, &mut answers) {
-        Err(f) if f.timed_out => Err(f.message),
+        // (cl's only runs: it can't run.)
+        Err(f) if f.timed_out || c.style == Style::Msvc => Err(f.message),
         _ => Ok(answers),
     }
 }
@@ -492,6 +578,35 @@ mod tests {
         assert_eq!(answers_of("NINJA_RS_QUERY 1 7\n  NINJA_RS_QUERY 0 2L\nother\n", 3), vec![Some(2), Some(7), None]);
         // A value from `#if`, bit by bit.
         assert_eq!(answers_of("NINJA_RS_QUERY 0 +1\nNINJA_RS_QUERY 0 +4\nNINJA_RS_QUERY 1 0\n", 2), vec![Some(5), Some(0)]);
+    }
+
+    /// The seed list (see `tools/query_seeds.py`): every line read, sorted
+    /// without duplicates, queries only of the operators compilers answer,
+    /// with tags it knows.
+    #[test]
+    fn seed_list() {
+        let lines: Vec<&'static str> = SEEDS.lines().filter(|l| !l.starts_with('#')).collect();
+        let unread: Vec<&str> = lines.iter().copied().filter(|l| seed(l).is_none()).take(5).collect();
+        assert!(unread.is_empty(), "{unread:?}");
+        let seeds = seeds();
+        assert_eq!(seeds.len(), lines.len());
+        for w in seeds.windows(2) {
+            assert!((w[0].op, w[0].arg) < (w[1].op, w[1].arg), "{w:?}");
+        }
+        assert!(seeds.iter().all(|s| s.common || s.gcc || s.clang));
+        // What it reads: operators and tags it knows.
+        assert_eq!(
+            seed("__has_cpp_attribute nodiscard  std:c++ gcc clang used:libc++"),
+            Some(Seed { op: "__has_cpp_attribute", arg: "nodiscard", common: true, gcc: true, clang: true })
+        );
+        assert_eq!(seed("__has_builtin __builtin_ia32_addps  gcc").map(|s| (s.common, s.gcc, s.clang)), Some((false, true, false)));
+        for bad in ["__has_include <x.h>  used:a", "__building_module m  clang", "__has_nothing x  gcc", "__has_builtin x  msvc", "__has_builtin"] {
+            assert_eq!(seed(bad), None, "{bad}");
+        }
+        let asked = |s: &Seed| [crate::scan::Family::Gcc, crate::scan::Family::Clang, crate::scan::Family::Msvc].map(|f| s.asked_of(f));
+        assert_eq!(asked(&seed("__has_builtin a  gcc").unwrap()), [true, false, false]);
+        assert_eq!(asked(&seed("__has_builtin a  clang").unwrap()), [false, true, false]);
+        assert_eq!(asked(&seed("__has_builtin a  clang used:x").unwrap()), [true, true, true]);
     }
 
     /// A compiler that never answers is given up on: the processes it

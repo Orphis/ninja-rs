@@ -123,7 +123,7 @@ watcher vouched for (`WATCHED`) stays valid across sessions until an event conce
 | Kept | Where | Valid until |
 |---|---|---|
 | lexed files, directory listings | the daemon's `cpp_deps::Cache` | an event if vouched, else the session |
-| compiler profiles, query answers | the daemon's `cpp_deps::Driver` (and the disk cache) | a day after probing |
+| compiler profiles, query answers | the daemon's `cpp_deps::Driver` (and the disk cache) | profiles a day after probing; query answers while the compiler is unchanged |
 | file digests | `Files::files` by path; `Files::hashes` by real path and stamp | an event if vouched, else the session |
 | toolchain trees, every file with its digest | `Files::trees` | an event under it if vouched, else the session |
 | builds' environments | `Daemon::sessions`, the 64 used last | evicted; a scan of an evicted build gets `UnknownBuild` and begins again |

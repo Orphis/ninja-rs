@@ -180,9 +180,12 @@ See [platforms](platforms.md) for the rest of what Windows builds need.
   C++ (Boost, the MSVC STL), less for ordinary code. In measurements it was tens of times
   faster than the compiler's own preprocessing, and it scales with threads.
 - **Compiler profiles** are probed once per compiler and set of relevant flags: a few compiler
-  runs, a fraction of a second. With a `--disk_cache` they are kept in its `cpp-deps/`
-  directory, probed again after a day (to see what the key doesn't, such as a Clang
-  configuration file's contents), and removed after 30 days unused. The daemon keeps them too.
+  runs, a fraction of a second, which also answer a long list of known queries
+  (`__has_builtin` and the like) so that scans rarely need to ask the compiler again. With a
+  `--disk_cache` they are kept in its `cpp-deps/` directory, probed again after a day (to see
+  what the key doesn't, such as a Clang configuration file's contents) while keeping their query
+  answers if the compiler is unchanged, and removed after 30 days unused. The daemon keeps them
+  too.
 - **The compiler's list** costs a full preprocess per compile, every time the compile is
   prepared: about a second per compile for heavy C++ under `cl`. Many compiles going this way
   for one reason are worth fixing.

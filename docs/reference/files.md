@@ -351,9 +351,11 @@ live in memory only (or in the daemon).
 └── cleaned                    its modification time is the last clean-up's
 ```
 
-A profile is text: the signature `cpp-deps profile 5`, then `key`, `probed` (Unix seconds),
+A profile is text: the signature `cpp-deps profile 6`, then `key`, `probed` (Unix seconds),
 `dialect`, `trigraphs`, `va_comma`, `operator`, `dir` and `framework`, `implicit`, `cwd` and
-`answer` lines, tab-separated, then a `predefines` line followed by the predefined macros as
+`answer` lines, a `seeds` line (the seed list's digest, then the answers to its entries in order,
+runs of entries not asked written `~N`; answers saved against another list are dropped),
+tab-separated, then a `predefines` line followed by the predefined macros as
 `#define` lines. The key (the compiler's path, size and modification time, its version banner,
 the flags that matter, its configuration files' digest, the variables that matter: see
 [environment.md](environment.md#the-builds-environment-and-remote-actions)) is checked when

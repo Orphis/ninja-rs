@@ -263,6 +263,20 @@ minute; a later session asks again. One scan asks at a time (`Profile::asking`);
 answers and scan again. A query naming a macro the source defined is unknown, as compilers may
 expand it.
 
+Most queries are answered before any scan needs them: the first probe also asks a seed list,
+`src/query_seeds.txt` (about 14,000 `op arg` lines, embedded in the binary). It lists every
+builtin, feature, attribute and warning group in LLVM's and GCC's own tables (x86, AArch64 and ARM
+targets only), the C++ and C standard attributes, and the queries real headers ask (the MSVC STL,
+the Windows SDK, Boost, libc++, libstdc++, glibc). Each entry is tagged with where it comes from:
+`std:c++`, `std:c23`, `gcc`, `clang`, `used:<header set>`. The tags choose what each compiler is
+asked: GCC is asked the standard, `gcc` and `used:` entries, Clang the standard, `clang` and
+`used:` ones, `cl` only the standard and `used:` ones, and only for the operators it has. That is
+one batch, 20 to 60 ms more per probe. `cl` is asked through `#if` directly, since it never expands
+queries in text. Lazy asking stays for the rest: queries through a wrapper macro's parameter, and
+`__building_module`, whose answer belongs to the compile. `tools/query_seeds.py` regenerates the
+list from the LLVM and GCC sources and the header sets, which its header names with their
+versions; a new list takes effect at a profile's next probe.
+
 ### Include lookups per compiler
 
 `State::resolve_from` in `scan.rs` follows the compiler family the predefined macros show
@@ -326,11 +340,14 @@ directory is in the key only when it can change answers: relative `INCLUDE` or `
 relative `-specs=`, or a compiler that reported relative directories (then one profile per working
 directory).
 
-The file format is line-based, signed `cpp-deps profile 5`, with the whole key checked on load
-(the file name is two hashes of it). Version 5 added the comma rules; a profile of another version
-is probed again. A profile is probed again after a day however often it's used
-(`PROFILE_LIFETIME`), so what the key can't see (an SDK installed behind a shim) is stale for a
-day at most. Profiles unused for 30 days are removed, looked for once a day (the `cleaned` file's
+The file format is line-based, signed `cpp-deps profile 6`, with the whole key checked on load
+(the file name is two hashes of it). Version 5 added the comma rules, version 6 the seed answers;
+a profile of another version is probed again. A profile is probed again after a day however often
+it's used (`PROFILE_LIFETIME`), so what the key can't see (an SDK installed behind a shim) is
+stale for a day at most. Query answers outlive that re-probe: when the new probe finds the same
+predefined macros and operators, the expired profile's answers, seeded and lazy, are kept
+(`keep_answers`), apart from those the compiler couldn't give, which are asked again. A changed
+compiler has another key, so another profile. Profiles unused for 30 days are removed, looked for once a day (the `cleaned` file's
 time). `Driver::prune` drops in-memory profiles older than a day and per-session data from
 earlier sessions: the daemon's driver lives for days.
 
