@@ -245,11 +245,10 @@ can't be. These are the cases where that can go wrong; see [include scanning](in
 - **The conservative scanner** also ignores `#pragma include_alias`, misses header symlinks to
   files generated later, and looks up angled names built from macros literally: the remote
   compile fails.
-- **cl without `/Zc:preprocessor`** (its traditional preprocessor): some macro constructs, which
-  cl accepts without a warning, expand differently in ninja-rs's model, which may still claim to
-  be exact. A fix is in progress: such constructs will be inexact, and the compiler's list used.
-  Meanwhile, use `/Zc:preprocessor`, or `--remote_include_scanner=compiler` for code with heavy
-  macro tricks.
+- **cl without `/Zc:preprocessor`** (its traditional preprocessor): ninja-rs's model of it gives
+  up on the constructs it can't follow, so those compiles use cl's own list, which is slower. The
+  model is empirical: if a project with heavy macro tricks still scans wrong, use
+  `/Zc:preprocessor`, or `--remote_include_scanner=compiler`.
 - **When the preprocessor scan fails outright** (a flag it doesn't support, options in `CL`), the
   compiler's list is used without the files only `__has_include` probes, which compilers don't
   list: such a file isn't sent, and the remote compile takes the other branch. The same holds

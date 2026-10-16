@@ -54,7 +54,9 @@ build and plan tests (`build_test.rs`), depfile, dyndep, lexer, canonicalization
   `CPP_DEPS_TEST_LIBCXX`, `CPP_DEPS_TEST_BOOST`, `CPP_DEPS_TEST_GLIB` for libraries);
   `crates/cpp-deps/build.rs` turns them into cfgs, so the tests show as ignored rather than
   passing without testing. Bazel on Linux runs them with the hermetic toolchain's `clang++` and
-  `clang-cl`.
+  `clang-cl`. With `cl`, `real_cl_traditional_random` compares random macro programs (text,
+  `#if` and `#include` forms, fixed seeds) with `cl`'s own expansion and takes about 90 s; it is
+  how the traditional-preprocessor model is kept from claiming exact where it differs.
 
 ```sh
 cargo test -p ninja-core

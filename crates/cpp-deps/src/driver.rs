@@ -4108,11 +4108,13 @@ mod tests {
 
     /// The cases of cl's traditional preprocessor (`macros::tests::
     /// TRADITIONAL_CASES`) as cl expands them; and the standard expansion,
-    /// where it doesn't fail, as `/Zc:preprocessor` does.
+    /// where it doesn't fail, as `/Zc:preprocessor` does. What the model
+    /// doesn't follow (`TRADITIONAL_UNMODELLED`): as cl expands it, without
+    /// a warning.
     #[test]
     #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
     fn real_cl_traditional() {
-        use crate::macros::tests::{TRADITIONAL_CASES, TRADITIONAL_DEFS, TRADITIONAL_REFUSED, expanded, spelled};
+        use crate::macros::tests::{TRADITIONAL_CASES, TRADITIONAL_DEFS, TRADITIONAL_REFUSED, TRADITIONAL_UNMODELLED, expanded, spelled};
         let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
         let dir = test_dirs::TestDir::new("cpp_deps_cl_traditional");
         let (refused_defs, refused) = TRADITIONAL_REFUSED;
@@ -4139,6 +4141,660 @@ mod tests {
                     Err(e) => assert!(!traditional || want.is_none(), "{defs}{text}: {e}"),
                 }
             }
+        }
+        let programs: Vec<(String, String, Vec<String>)> = TRADITIONAL_UNMODELLED
+            .iter()
+            .map(|(defs, text, _)| {
+                (defs.to_string(), format!("@@ {text}\n"), crate::macros::parse_defines(defs).iter().map(|m| m.name.as_str().to_string()).collect())
+            })
+            .collect();
+        for ((defs, text, want), theirs) in TRADITIONAL_UNMODELLED.iter().zip(cl_programs(&cl, &dir, TRADITIONAL_DEFS, &programs)) {
+            let (lines, warned) = theirs.unwrap_or_else(|| panic!("cl printed nothing for {defs}{text}"));
+            assert!(!warned, "cl warns about {defs}{text}");
+            assert_eq!(lines, [spelled(&crate::lex::tokens(want.as_bytes()))], "cl's {defs}{text}");
+        }
+    }
+
+    /// A random generator for the differential tests (SplitMix64).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// In [0, 1).
+        fn random(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        /// In [lo, hi].
+        fn int(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next() % (hi - lo + 1) as u64) as usize
+        }
+
+        fn pick<'a, T>(&mut self, v: &'a [T]) -> &'a T {
+            &v[self.int(0, v.len() - 1)]
+        }
+    }
+
+    /// The macros of the random programs of text (Boost.Preprocessor's
+    /// idioms, stray parentheses and commas).
+    const RANDOM_LIB: &[(&str, &str)] = &[
+        ("F", "(x, y) [x|y]"),
+        ("F1", "(x) <x>"),
+        ("F3", "(a, b, c) {a|b|c}"),
+        ("ECHO", "(...) __VA_ARGS__"),
+        ("EXPAND", "(x) x"),
+        ("PAIR", " 1, 2"),
+        ("TRIPLE", " 1, 2, 3"),
+        ("NIL", ""),
+        ("EMPTYF", "()"),
+        ("COMMA", " ,"),
+        ("LP", " ("),
+        ("RP", " )"),
+        ("STR", "(x) #x"),
+        ("XSTR", "(x) STR(x)"),
+        ("DEFER", "(m) m EMPTYF()"),
+        ("OBSTRUCT", "(m) m DEFER(EMPTYF)()"),
+        ("CAT", "(a, b) CAT_I(a, b)"),
+        ("CAT_I", "(a, b) a ## b"),
+        ("FIRST", "(a, ...) a"),
+        ("REST", "(a, ...) __VA_ARGS__"),
+        ("APPLY", "(m, args) m args"),
+        ("CALL", "(m, ...) m(__VA_ARGS__)"),
+        ("VF", "(a, ...) f(a, __VA_ARGS__)"),
+        ("VG", "(a, ...) g(a, ## __VA_ARGS__)"),
+        ("VH", "(...) h(x, __VA_ARGS__)"),
+        ("NARG", "(...) NARG_I(__VA_ARGS__, 4, 3, 2, 1, 0)"),
+        ("NARG_I", "(a, b, c, d, n, ...) n"),
+        ("XNARG", "(...) ECHO(NARG_I(__VA_ARGS__, 4, 3, 2, 1, 0))"),
+        ("IIF", "(c) CAT(IIF_, c)"),
+        ("IIF_0", "(t, f) f"),
+        ("IIF_1", "(t, f) t"),
+        ("OBJF", " F"),
+        ("OBJF1", " F1"),
+        ("EAT", "(...)"),
+        ("REM", "(...) __VA_ARGS__"),
+        ("TUP", " (1, 2)"),
+        ("TUP3", " (a, b, c)"),
+        ("SEQ", " (a)(b)(c)"),
+        ("HEAD", "(x) HEAD_I x"),
+        ("HEAD_I", "(x) x EAT"),
+        ("TUPLE_ELEM0", "(t) TUPLE_ELEM0_I t"),
+        ("TUPLE_ELEM0_I", "(a, ...) a"),
+        ("WHEN", "(c) IIF(c)(EXPAND, EAT)"),
+        ("BOOL", "(x) CAT(BOOL_, x)"),
+        ("BOOL_0", " 0"),
+        ("BOOL_1", " 1"),
+        ("BOOL_2", " 1"),
+    ];
+
+    /// The macros of the random `#if` expressions.
+    const RANDOM_IF_LIB: &[(&str, &str)] = &[
+        ("F", "(x, y) (x + y)"),
+        ("F1", "(x) (x * 2)"),
+        ("F3", "(a, b, c) (a - b + c)"),
+        ("ECHO", "(...) __VA_ARGS__"),
+        ("EXPAND", "(x) x"),
+        ("PAIR", " 1, 2"),
+        ("NIL", ""),
+        ("EMPTYF", "()"),
+        ("COMMA", " ,"),
+        ("LP", " ("),
+        ("RP", " )"),
+        ("DEFER", "(m) m EMPTYF()"),
+        ("OBSTRUCT", "(m) m DEFER(EMPTYF)()"),
+        ("CAT", "(a, b) CAT_I(a, b)"),
+        ("CAT_I", "(a, b) a ## b"),
+        ("FIRST", "(a, ...) a"),
+        ("REST", "(a, ...) __VA_ARGS__"),
+        ("APPLY", "(m, args) m args"),
+        ("CALL", "(m, ...) m(__VA_ARGS__)"),
+        ("VF", "(a, ...) F(a, __VA_ARGS__)"),
+        ("VG", "(a, ...) G(a, ## __VA_ARGS__)"),
+        ("G", "(...) (0 ECHO(+ __VA_ARGS__))"),
+        ("NARG", "(...) NARG_I(__VA_ARGS__, 4, 3, 2, 1, 0)"),
+        ("NARG_I", "(a, b, c, d, n, ...) n"),
+        ("XNARG", "(...) ECHO(NARG_I(__VA_ARGS__, 4, 3, 2, 1, 0))"),
+        ("IIF", "(c) CAT(IIF_, c)"),
+        ("IIF_0", "(t, f) f"),
+        ("IIF_1", "(t, f) t"),
+        ("OBJF", " F"),
+        ("OBJF1", " F1"),
+        ("EAT", "(...)"),
+        ("TUP", " (1, 2)"),
+        ("BOOL", "(x) CAT(BOOL_, x)"),
+        ("BOOL_0", " 0"),
+        ("BOOL_1", " 1"),
+        ("BOOL_2", " 1"),
+        ("N1", " 1"),
+        ("N2", " 2"),
+        ("N10", " 10"),
+        ("PLUS", " +"),
+        ("WHEN", "(c) IIF(c)(EXPAND, EAT)"),
+    ];
+
+    /// `#define`s of a library.
+    fn lib_defines(lib: &[(&str, &str)]) -> String {
+        lib.iter().map(|(n, b)| format!("#define {n}{b}\n")).collect()
+    }
+
+    /// A library macro's parameters, if function-like.
+    fn lib_params(lib: &[(&str, &str)], name: &str) -> Option<Vec<String>> {
+        let body = lib.iter().find(|(n, _)| *n == name)?.1.strip_prefix('(')?;
+        Some(body[..body.find(')')?].split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+    }
+
+    /// A random program's own macro: its parameters (`...` last when
+    /// variadic) if function-like.
+    struct RandomMacro {
+        name: String,
+        params: Option<Vec<String>>,
+    }
+
+    /// A random program: its own macros' `#define`s, the text to expand,
+    /// and its macros' names.
+    struct RandomCase {
+        defs: String,
+        text: String,
+        names: Vec<String>,
+    }
+
+    /// Random programs of text, as the seventh review's `gen.py` makes
+    /// them: `profile` 0 mixed, 1 more variadic, 2 more deferred calls.
+    struct TextGen {
+        r: Rng,
+        profile: u8,
+    }
+
+    impl TextGen {
+        fn literal(&mut self) -> String {
+            self.r.pick(&["1", "2", "x", "y", "[", "]", "+", "a", "0", "1"]).to_string()
+        }
+
+        fn name(&mut self, mine: &[RandomMacro], func_only: bool) -> String {
+            let mut pool: Vec<String> = RANDOM_LIB.iter().filter(|(_, b)| b.starts_with('(')).map(|(n, _)| n.to_string()).collect();
+            pool.extend(mine.iter().filter(|m| m.params.is_some()).map(|m| m.name.clone()));
+            if !func_only {
+                pool.extend(RANDOM_LIB.iter().filter(|(_, b)| !b.starts_with('(')).map(|(n, _)| n.to_string()));
+                pool.extend(mine.iter().filter(|m| m.params.is_none()).map(|m| m.name.clone()));
+            }
+            self.r.pick(&pool).clone()
+        }
+
+        fn params_of(mine: &[RandomMacro], name: &str) -> (usize, bool) {
+            let ps = lib_params(RANDOM_LIB, name).or_else(|| mine.iter().find(|m| m.name == name).and_then(|m| m.params.clone())).unwrap_or_default();
+            (ps.len(), ps.last().is_some_and(|p| p == "..."))
+        }
+
+        fn call(&mut self, mine: &[RandomMacro], depth: usize, params: &[String]) -> Vec<String> {
+            let n = self.name(mine, true);
+            let (mut k, variadic) = Self::params_of(mine, &n);
+            if variadic && self.r.random() < 0.5 {
+                k = k - 1 + self.r.int(0, 3);
+            } else if self.r.random() < 0.08 {
+                k = if self.r.random() < 0.5 { k.saturating_sub(1) } else { k + 1 };
+            }
+            let args: Vec<String> = (0..k).map(|_| self.seq(mine, depth + 1, params, 3, true).join(" ")).collect();
+            vec![format!("{n}({})", args.join(", "))]
+        }
+
+        fn elem(&mut self, mine: &[RandomMacro], depth: usize, params: &[String]) -> Vec<String> {
+            let r = self.r.random();
+            if !params.is_empty() && r < if self.profile == 1 { 0.35 } else { 0.25 } {
+                let p = self.r.pick(params).clone();
+                return vec![if self.r.random() < 0.1 { format!("#{p}") } else { p }];
+            }
+            if depth < 3 && r < 0.6 {
+                return self.call(mine, depth, params);
+            }
+            if r < 0.75 {
+                let n = self.name(mine, false);
+                if self.profile == 2 && self.r.random() < 0.5 {
+                    return vec![n, self.r.pick(&["NIL", "EMPTYF()", "DEFER(EMPTYF)()"]).to_string()];
+                }
+                return vec![n];
+            }
+            if r < 0.82 {
+                return vec![self.r.pick(&["(", ")", ",", "LP", "RP", "COMMA", "( )", "(1, 2)"]).to_string()];
+            }
+            vec![self.literal()]
+        }
+
+        fn seq(&mut self, mine: &[RandomMacro], depth: usize, params: &[String], max: usize, empty: bool) -> Vec<String> {
+            let n = self.r.int(if empty { 0 } else { 1 }, max);
+            let mut out = Vec::new();
+            for _ in 0..n {
+                out.extend(self.elem(mine, depth, params));
+                if !params.is_empty() && self.r.random() < 0.06 {
+                    out.push("##".into());
+                }
+            }
+            while out.last().is_some_and(|t| t == "##") {
+                out.pop();
+            }
+            while out.first().is_some_and(|t| t == "##") {
+                out.remove(0);
+            }
+            out
+        }
+
+        fn define(&mut self, i: usize, mine: &[RandomMacro]) -> (RandomMacro, String) {
+            let name = format!("R{i}");
+            if self.r.random() < 0.25 {
+                let body = self.seq(mine, 1, &[], 3, false).join(" ");
+                return (RandomMacro { name: name.clone(), params: None }, format!("#define {name} {body}\n"));
+            }
+            let k = self.r.int(0, 3);
+            let mut params: Vec<String> = ["a", "b", "c"][..k].iter().map(|p| p.to_string()).collect();
+            let variadic = self.r.random() < if self.profile == 1 { 0.6 } else { 0.35 };
+            let mut body_params = params.clone();
+            if variadic {
+                params.push("...".into());
+                body_params.push("__VA_ARGS__".into());
+            }
+            let mut body = self.seq(mine, 1, &body_params, 5, false);
+            if variadic && self.r.random() < 0.3 {
+                if self.r.random() < 0.5 {
+                    body = vec![format!("{}(x,", self.name(mine, true)), "__VA_ARGS__)".into()];
+                } else {
+                    body.extend([",".to_string(), "__VA_ARGS__".to_string()]);
+                }
+            }
+            if variadic && self.r.random() < 0.15 {
+                body.extend([",".to_string(), "##".to_string(), "__VA_ARGS__".to_string()]);
+            }
+            if self.r.random() < 0.15 {
+                body.push(self.name(mine, true));
+            }
+            let define = format!("#define {name}({}) {}\n", params.join(", "), body.join(" "));
+            (RandomMacro { name, params: Some(params) }, define)
+        }
+
+        fn case(&mut self) -> RandomCase {
+            let mut mine = Vec::new();
+            let mut defs = String::new();
+            for i in 0..self.r.int(1, 4) {
+                let (m, d) = self.define(i, &mine);
+                mine.push(m);
+                defs.push_str(&d);
+            }
+            let mut text = self.seq(&mine, 0, &[], 3, false).join(" ");
+            if self.r.random() < 0.7 {
+                let m = self.r.int(0, mine.len() - 1);
+                let (name, params) = (mine[m].name.clone(), mine[m].params.clone());
+                text = match params {
+                    None => format!("{name} {text}"),
+                    Some(ps) => {
+                        let k = if ps.last().is_some_and(|p| p == "...") { ps.len() - 1 + self.r.int(0, 3) } else { ps.len() };
+                        let args: Vec<String> = (0..k).map(|_| self.seq(&mine, 1, &[], 3, true).join(" ")).collect();
+                        format!("{name}({}) {text}", args.join(", "))
+                    }
+                };
+            }
+            RandomCase { defs, text, names: mine.into_iter().map(|m| m.name).collect() }
+        }
+    }
+
+    /// Random `#if` expressions, as the seventh review's `genif.py` makes
+    /// them.
+    struct IfGen {
+        r: Rng,
+    }
+
+    impl IfGen {
+        fn atom(&mut self) -> String {
+            self.r.pick(&["0", "1", "2", "3", "N1", "N2", "N10", "BOOL_1", "BOOL_0"]).to_string()
+        }
+
+        fn objects(&self) -> Vec<&'static str> {
+            RANDOM_IF_LIB.iter().filter(|(_, b)| !b.starts_with('(')).map(|(n, _)| *n).collect()
+        }
+
+        fn functions(&self, mine: &[RandomMacro]) -> Vec<(String, Vec<String>)> {
+            let mut f: Vec<(String, Vec<String>)> = RANDOM_IF_LIB
+                .iter()
+                .filter(|(_, b)| b.starts_with('('))
+                .map(|(n, _)| (n.to_string(), lib_params(RANDOM_IF_LIB, n).unwrap_or_default()))
+                .collect();
+            f.extend(mine.iter().filter_map(|m| m.params.clone().map(|p| (m.name.clone(), p))));
+            f
+        }
+
+        fn expr(&mut self, depth: usize, mine: &[RandomMacro]) -> String {
+            let x = self.r.random();
+            if depth > 3 || x < 0.25 {
+                return self.atom();
+            }
+            if x < 0.75 {
+                let functions = self.functions(mine);
+                let (n, ps) = self.r.pick(&functions).clone();
+                let mut k = ps.len();
+                if ps.last().is_some_and(|p| p == "...") && self.r.random() < 0.5 {
+                    k = k - 1 + self.r.int(0, 3);
+                }
+                let mut args = Vec::new();
+                for _ in 0..k {
+                    let a = self.r.random();
+                    args.push(if a < 0.6 {
+                        self.expr(depth + 1, mine)
+                    } else if a < 0.8 {
+                        let mut names: Vec<String> = functions.iter().map(|(n, _)| n.clone()).collect();
+                        names.extend(self.objects().iter().map(|o| o.to_string()));
+                        self.r.pick(&names).clone()
+                    } else if a < 0.9 {
+                        String::new()
+                    } else {
+                        let op = self.r.pick(&["+", "*", "-"]).to_string();
+                        format!("{} {op} {}", self.expr(depth + 1, mine), self.expr(depth + 1, mine))
+                    });
+                }
+                return format!("{n}({})", args.join(", "));
+            }
+            if x < 0.85 {
+                let op = self.r.pick(&["+", "-", "*"]).to_string();
+                return format!("({} {op} {})", self.expr(depth + 1, mine), self.expr(depth + 1, mine));
+            }
+            if x < 0.92 {
+                let o = self.r.pick(&self.objects()).to_string();
+                return format!("{o} {}", self.expr(depth + 1, mine));
+            }
+            let d = self.r.pick(&["DEFER", "OBSTRUCT", "OBJF", "OBJF1"]).to_string();
+            if self.r.random() < 0.5 {
+                let a = self.atom();
+                format!("{d} ({}, {a})", self.expr(depth + 1, mine))
+            } else {
+                format!("{d} ({})", self.expr(depth + 1, mine))
+            }
+        }
+
+        fn case(&mut self) -> RandomCase {
+            let mut mine: Vec<RandomMacro> = Vec::new();
+            let mut defs = String::new();
+            for i in 0..self.r.int(0, 3) {
+                let name = format!("R{i}");
+                if self.r.random() < 0.3 {
+                    defs.push_str(&format!("#define {name} {}\n", self.expr(1, &mine)));
+                    mine.push(RandomMacro { name, params: None });
+                    continue;
+                }
+                let mut ps: Vec<String> = ["a", "b", "c"][..self.r.int(1, 3)].iter().map(|p| p.to_string()).collect();
+                if self.r.random() < 0.4 {
+                    ps.push("...".into());
+                }
+                let body_params: Vec<String> = ps.iter().map(|p| if p == "..." { "__VA_ARGS__".to_string() } else { p.clone() }).collect();
+                let mut toks = Vec::new();
+                for _ in 0..self.r.int(1, 4) {
+                    let y = self.r.random();
+                    toks.push(if y < 0.4 {
+                        self.r.pick(&body_params).clone()
+                    } else if y < 0.6 {
+                        self.r.pick(&["+", "*", "-", ",", "(", ")"]).to_string()
+                    } else if y < 0.65 {
+                        "##".to_string()
+                    } else {
+                        self.expr(2, &mine)
+                    });
+                }
+                while toks.first().is_some_and(|t| t == "##") {
+                    toks.remove(0);
+                }
+                while toks.last().is_some_and(|t| t == "##") {
+                    toks.pop();
+                }
+                if self.r.random() < 0.2 {
+                    let functions = self.functions(&mine);
+                    toks.push(self.r.pick(&functions).0.clone());
+                }
+                defs.push_str(&format!("#define {name}({}) {}\n", ps.join(", "), toks.join(" ")));
+                mine.push(RandomMacro { name, params: Some(ps) });
+            }
+            let text = self.expr(0, &mine);
+            RandomCase { defs, text, names: mine.into_iter().map(|m| m.name).collect() }
+        }
+    }
+
+    /// cl's `/E` of programs in one source, after `lib` (each program's
+    /// macros undefined after it): per program, the rest of its lines
+    /// starting with the marker `"@i@"` (see `macros::tests::spelled`), and
+    /// whether cl had a diagnostic on its lines; None for one whose lines
+    /// cl didn't print (a fatal error, or a call reading on).
+    fn cl_programs(cl: &Path, dir: &Path, lib: &str, programs: &[(String, String, Vec<String>)]) -> Vec<Option<(Vec<String>, bool)>> {
+        let mut source = lib.to_string();
+        let mut line = lib.matches('\n').count() + 1;
+        let mut ranges = Vec::new();
+        for (i, (defs, body, names)) in programs.iter().enumerate() {
+            let start = line;
+            source.push_str(defs);
+            source.push_str(&body.replace("@@", &format!("\"@{i}@\"")));
+            source.push_str(&format!("\"@{i}@\" end\n"));
+            for n in names {
+                source.push_str(&format!("#undef {n}\n"));
+            }
+            line = source.matches('\n').count() + 1;
+            ranges.push(start..line);
+        }
+        std::fs::write(dir.join("programs.cpp"), &source).unwrap();
+        let out = std::process::Command::new(cl).args(["/nologo", "/E", "programs.cpp"]).current_dir(dir).output().unwrap();
+        let mut lines: Vec<Vec<String>> = vec![Vec::new(); programs.len()];
+        let mut ended = vec![false; programs.len()];
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            let toks = crate::lex::tokens(l.as_bytes());
+            let marker = toks.first().and_then(|t| t.sym.as_str().strip_prefix("\"@")?.strip_suffix("@\"")?.parse::<usize>().ok());
+            if let Some(i) = marker.filter(|&i| i < programs.len()) {
+                let rest = crate::macros::tests::spelled(&toks[1..]);
+                if rest == "end" {
+                    ended[i] = true;
+                } else {
+                    lines[i].push(rest);
+                }
+            }
+        }
+        let mut warned = vec![false; programs.len()];
+        for l in String::from_utf8_lossy(&out.stderr).lines().chain(String::from_utf8_lossy(&out.stdout).lines()) {
+            let at = l.find("programs.cpp(").map(|p| &l[p + 13..]).and_then(|r| r.split(')').next()).and_then(|n| n.parse::<usize>().ok());
+            if let Some(n) = at.filter(|_| l.contains(": warning") || l.contains(": error") || l.contains(": fatal error"))
+                && let Some(i) = ranges.iter().position(|r| r.contains(&n))
+            {
+                warned[i] = true;
+            }
+        }
+        lines.into_iter().zip(warned).zip(ended).map(|((l, w), e)| e.then_some((l, w))).collect()
+    }
+
+    /// `cl_programs` in batches; a program lost in one is run again alone
+    /// (in halves of the batch while many are).
+    fn cl_batches(cl: &Path, dir: &Path, lib: &str, programs: &[(String, String, Vec<String>)]) -> Vec<Option<(Vec<String>, bool)>> {
+        let mut all = cl_programs(cl, dir, lib, programs);
+        let lost: Vec<usize> = (0..programs.len()).filter(|&i| all[i].is_none()).collect();
+        if lost.is_empty() || programs.len() == 1 {
+            return all;
+        }
+        if lost.len() > 4 {
+            let mid = programs.len() / 2;
+            let mut halves = cl_batches(cl, dir, lib, &programs[..mid]);
+            halves.extend(cl_batches(cl, dir, lib, &programs[mid..]));
+            return halves;
+        }
+        for i in lost {
+            all[i] = cl_programs(cl, dir, lib, std::slice::from_ref(&programs[i])).pop().unwrap();
+        }
+        all
+    }
+
+    /// The random programs (`TextGen`, `IfGen`) in the forms the scan
+    /// meets, against cl's traditional preprocessor: text lines (the
+    /// expansion), `#if` (the scan of each program choosing a file by the
+    /// expression's value, from -2 to 10) and `#include` (the scan of
+    /// `#include XSTR(text)`, the file it names). Where cl doesn't warn, the
+    /// scan must be inexact or as cl: none exact but wrong (each confirmed
+    /// with the program alone: a program cl reads on from in a batch spoils
+    /// the next). Fixed seeds; about a minute with cl 19.51.
+    #[test]
+    #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
+    fn real_cl_traditional_random() {
+        use crate::macros::tests::expanded;
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let dir = test_dirs::TestDir::new("cpp_deps_cl_traditional_random");
+        let driver = Driver::new(Cache::new(vec![], cfg!(windows)));
+        let squash = |s: &str| s.split_whitespace().collect::<String>();
+        let mut wrong: Vec<String> = Vec::new();
+        let mut summary = Vec::new();
+        let program = |c: &RandomCase, body: String| (c.defs.clone(), body, c.names.clone());
+
+        // Text: the expansion, as the model makes it.
+        let lib = lib_defines(RANDOM_LIB);
+        let mut cases = Vec::new();
+        for (seed, profile) in [(1, 0), (2, 1), (3, 2)] {
+            let mut g = TextGen { r: Rng(seed), profile };
+            cases.extend((0..300).map(|_| g.case()));
+        }
+        let (mut same, mut inexact, mut warned, mut rejected) = (0, 0, 0, 0);
+        for chunk in cases.chunks(150) {
+            let programs: Vec<_> = chunk.iter().map(|c| program(c, format!("@@ {}\n", c.text))).collect();
+            for ((c, p), theirs) in chunk.iter().zip(&programs).zip(cl_batches(&cl, &dir, &lib, &programs)) {
+                let Some((lines, warn)) = theirs else {
+                    rejected += 1;
+                    continue;
+                };
+                let Ok(ours) = expanded(&format!("{lib}{}", c.defs), &c.text, true, false) else {
+                    inexact += 1;
+                    continue;
+                };
+                if warn {
+                    warned += 1;
+                } else if lines.len() == 1 && squash(&lines[0]) == squash(&ours) {
+                    same += 1;
+                } else if let Some(Some((alone, false))) = cl_programs(&cl, &dir, &lib, std::slice::from_ref(p)).pop()
+                    && (alone.len() != 1 || squash(&alone[0]) != squash(&ours))
+                {
+                    wrong.push(format!("text: {}{}\n  ours: {ours}\n  cl:   {alone:?}", c.defs, c.text));
+                }
+            }
+        }
+        summary.push(format!("text: {} programs, {same} as cl, {inexact} inexact, {warned} cl warned about, {rejected} cl rejected", cases.len()));
+
+        // `#if`: the values the scan chooses.
+        let iflib = lib_defines(RANDOM_IF_LIB);
+        std::fs::create_dir_all(dir.join("v")).unwrap();
+        let value = |v: i64| if v < 0 { format!("m{}", -v) } else { v.to_string() };
+        for v in -2..=10 {
+            std::fs::write(dir.join(format!("v/{}.h", value(v))), "").unwrap();
+        }
+        let mut g = IfGen { r: Rng(4) };
+        let cases: Vec<RandomCase> = (0..600).map(|_| g.case()).collect();
+        let (mut same, mut inexact, mut warned, mut rejected) = (0, 0, 0, 0);
+        for (k, chunk) in cases.chunks(150).enumerate() {
+            let programs: Vec<_> =
+                chunk.iter().map(|c| program(c, (-2..=10).map(|v| format!("#if ({}) == {v}\n@@ {}\n#endif\n", c.text, value(v))).collect())).collect();
+            for (i, ((c, p), theirs)) in chunk.iter().zip(&programs).zip(cl_batches(&cl, &dir, &iflib, &programs)).enumerate() {
+                let Some((lines, warn)) = theirs else {
+                    rejected += 1;
+                    continue;
+                };
+                let name = format!("if{k}_{i}.cpp");
+                let body: String = (-2..=10).map(|v| format!("#if ({}) == {v}\n#include \"v/{}.h\"\n#endif\n", c.text, value(v))).collect();
+                std::fs::write(dir.join(&name), format!("{iflib}{}{body}", c.defs)).unwrap();
+                let argv = s(&[&cl.to_string_lossy(), "/nologo", "/c", &name]);
+                driver.cache.new_session();
+                let out = driver.scan(&argv, &dir).unwrap();
+                if !out.exact() {
+                    inexact += 1;
+                    continue;
+                }
+                let ours: Vec<String> = out.files[1..].iter().map(|f| f.file_stem().unwrap().to_string_lossy().into_owned()).collect();
+                if warn {
+                    warned += 1;
+                } else if lines == ours {
+                    same += 1;
+                } else if let Some(Some((alone, false))) = cl_programs(&cl, &dir, &iflib, std::slice::from_ref(p)).pop()
+                    && alone != ours
+                {
+                    wrong.push(format!("#if: {}#if {}\n  ours: {ours:?}\n  cl:   {alone:?}", c.defs, c.text));
+                }
+            }
+        }
+        summary.push(format!("#if: {} programs, {same} as cl, {inexact} inexact, {warned} cl warned about, {rejected} cl rejected", cases.len()));
+
+        // `#include`: the file the scan finds missing, cl's error names.
+        let mut g = TextGen { r: Rng(5), profile: 0 };
+        let (mut same, mut inexact, mut warned) = (0, 0, 0);
+        for i in 0..100 {
+            let c = g.case();
+            let name = format!("inc{i}.cpp");
+            std::fs::write(dir.join(&name), format!("{lib}{}#include XSTR({})\n", c.defs, c.text)).unwrap();
+            let argv = s(&[&cl.to_string_lossy(), "/nologo", "/c", &name]);
+            driver.cache.new_session();
+            let out = driver.scan(&argv, &dir).unwrap();
+            let [ours] = &out.missing[..] else {
+                inexact += 1;
+                continue;
+            };
+            if !out.exact() {
+                inexact += 1;
+                continue;
+            }
+            let theirs = std::process::Command::new(&cl).args(["/nologo", "/E", &name]).current_dir(&dir).output().unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&theirs.stdout), String::from_utf8_lossy(&theirs.stderr));
+            let file = text.lines().find_map(|l| l.split_once("Cannot open include file: '")?.1.rsplit_once("': ").map(|(f, _)| f.to_string()));
+            if text.contains(": warning") {
+                warned += 1;
+            } else if file.as_deref().is_some_and(|f| squash(f) == squash(ours)) {
+                same += 1;
+            } else {
+                wrong.push(format!("#include: {}#include XSTR({})\n  ours: {ours:?}\n  cl:   {file:?}", c.defs, c.text));
+            }
+        }
+        summary.push(format!("#include: 100 programs, {same} as cl, {inexact} inexact, {warned} cl warned about"));
+        println!("{}", summary.join("\n"));
+        assert!(wrong.is_empty(), "{} exact but not as cl:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
+    /// The seventh review's programs that the traditional model scanned
+    /// exactly but otherwise than cl reads them (see
+    /// `scan::tests::traditional_repros`), against cl: none exact but
+    /// wrong, by the files cl lists, and by cl's output with only the files
+    /// the scan names (as a remote compile has them: `__has_include` finds
+    /// another file there).
+    #[test]
+    #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
+    fn real_cl_traditional_repros() {
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let root = test_dirs::TestDir::new("cpp_deps_cl_traditional_repros");
+        let driver = Driver::new(Cache::new(vec![], cfg!(windows)));
+        let ep = |d: &Path| std::process::Command::new(&cl).args(["/nologo", "/EP", "main.cc"]).current_dir(d).output().unwrap();
+        for (name, files) in crate::scan::tests::TRADITIONAL_REPROS {
+            let dir = root.join(name);
+            for (f, text) in files.iter() {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(f), text).unwrap();
+            }
+            let theirs = ep(&dir);
+            assert!(theirs.status.success() && !String::from_utf8_lossy(&theirs.stderr).contains("warning"), "{name}: cl warns or fails");
+            let argv = s(&[&cl.to_string_lossy(), "/nologo", "/c", "main.cc"]);
+            let out = driver.scan(&argv, &dir).unwrap();
+            if !(out.exact() && out.missing.is_empty()) {
+                continue;
+            }
+            let listed: Vec<String> =
+                crate::external::compiler_deps(&argv, &dir, None).unwrap().iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            let ours: Vec<String> = out.files.iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
+            assert_eq!(
+                ours.iter().filter(|f| !f.starts_with("main")).collect::<Vec<_>>(),
+                listed.iter().filter(|f| !f.starts_with("main")).collect::<Vec<_>>(),
+                "{name}"
+            );
+            let sent = root.join(format!("{name}_sent"));
+            std::fs::create_dir_all(&sent).unwrap();
+            for f in out.files.iter().chain(&out.found) {
+                std::fs::copy(f, sent.join(f.file_name().unwrap())).unwrap();
+            }
+            assert_eq!(String::from_utf8_lossy(&ep(&sent).stdout), String::from_utf8_lossy(&theirs.stdout), "{name}: only the files scanned");
         }
     }
 

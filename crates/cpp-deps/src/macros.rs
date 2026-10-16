@@ -595,7 +595,8 @@ pub struct XTok {
     hide: Hide,
     /// cl's traditional preprocessor: a comma of an argument substituted
     /// into the replacement being expanded, outside the argument's
-    /// parentheses, which separates no arguments of a call there.
+    /// parentheses, which separates no arguments of a call there; or a
+    /// parenthesis of one without its pair in it (see `substitute_traditional`).
     glued: bool,
     /// cl's traditional preprocessor: a function-like macro's name seen
     /// followed by something else than `(` (see `expand_traditional`).
@@ -603,11 +604,28 @@ pub struct XTok {
     /// cl's traditional preprocessor: a comma before an empty
     /// `__VA_ARGS__`, gone at the end of its macro's expansion.
     elided: bool,
+    /// cl's traditional preprocessor: a function-like macro's name ending
+    /// the expansion of a call to a macro with parameters (see
+    /// `expand_traditional`).
+    tail: bool,
+    /// cl's traditional preprocessor: a token of an argument next to `##`
+    /// but not pasted, of a call that isn't at the top: not expanded before
+    /// the replacement of the call at the top (see `expand_traditional`),
+    /// with the hide set it had then (not the macros' it went through).
+    frozen: Option<Hide>,
+    /// cl's traditional preprocessor: whitespace before it follows a macro's
+    /// expansion to nothing (`EMPTY() x`), which a paste with it as second
+    /// token may paste instead (`CAT(a, EMPTY() x)` is `a x`, see `paste`).
+    gap: bool,
+    /// cl's traditional preprocessor: the name of the macro of whose
+    /// argument it is, but its first token, which cl doesn't hide for good
+    /// (see `expand_traditional`).
+    own: bool,
 }
 
 impl XTok {
     pub fn new(t: Token) -> Self {
-        XTok { t, hide: None, glued: false, rejected: false, elided: false }
+        XTok { t, hide: None, glued: false, rejected: false, elided: false, tail: false, frozen: None, gap: false, own: false }
     }
 }
 
@@ -712,8 +730,11 @@ fn stringize(arg: &[XTok]) -> Token {
 /// A step of substitution, before `##` pasting.
 enum Item {
     Tok(XTok),
-    /// A `##` of the macro's body.
-    Paste,
+    /// A `##` of the macro's body; `gnu`: between a comma and the variadic
+    /// parameter (`, ## __VA_ARGS__`), which keeps both (GNU's extension).
+    Paste {
+        gnu: bool,
+    },
     /// An empty argument next to `##` (`va`: the variadic one).
     Placemarker {
         va: bool,
@@ -747,12 +768,18 @@ pub struct Expander<'c> {
     va_comma: VaComma,
     /// The replacements being expanded, nested (traditional only).
     nesting: usize,
+    /// The hide set of the call at the top whose replacement is being
+    /// expanded (`Scan::TopReplacement`), which frozen tokens get there.
+    top_hide: Hide,
+    /// The macros whose arguments are being expanded, nested (traditional
+    /// only).
+    owners: Vec<Sym>,
 }
 
 impl<'c> Expander<'c> {
     pub fn new(ctx: &'c mut dyn Context, if_mode: bool) -> Self {
         let (traditional, va_comma) = (ctx.traditional(), ctx.va_comma());
-        Expander { ctx, if_mode, error: None, budget: 1_000_000, traditional, va_comma, nesting: 0 }
+        Expander { ctx, if_mode, error: None, budget: 1_000_000, traditional, va_comma, nesting: 0, top_hide: None, owners: Vec::new() }
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
@@ -767,14 +794,20 @@ impl<'c> Expander<'c> {
     }
 
     /// The operand of `defined`, `__has_include` or a query: `( ... )`,
-    /// raw. For `defined`, also the bare `defined X`.
+    /// raw. For `defined`, also the bare `defined X`. None too with a
+    /// parenthesis glued (see `substitute_traditional`).
     fn operand(&mut self, input: &mut VecDeque<XTok>, bare: bool) -> Option<Vec<XTok>> {
         match input.front() {
             Some(t) if t.t.is(P::LParen) => {
-                input.pop_front();
                 let mut depth = 1;
                 let mut out = Vec::new();
+                if input.pop_front()?.glued {
+                    return None;
+                }
                 while let Some(t) = input.pop_front() {
+                    if t.glued && (t.t.is(P::LParen) || t.t.is(P::RParen)) {
+                        return None;
+                    }
                     if t.t.is(P::LParen) {
                         depth += 1;
                     } else if t.t.is(P::RParen) {
@@ -888,7 +921,7 @@ impl<'c> Expander<'c> {
 
     /// Expands tokens (a line, or an operand) as the preprocessor does.
     pub fn expand(&mut self, input: Vec<XTok>) -> Vec<XTok> {
-        if self.traditional { self.expand_traditional(input, true) } else { self.expand_standard(input) }
+        if self.traditional { self.expand_traditional(input, Scan::Top) } else { self.expand_standard(input) }
     }
 
     /// Takes the next token, unless the budget is spent.
@@ -1013,7 +1046,7 @@ impl<'c> Expander<'c> {
         let params: &[Sym] = m.params.as_deref().unwrap_or(&[]);
         let mut items = Vec::new();
         self.substitute_into(m, params, args, &m.body, &mut items, drop_comma);
-        paste(items, hs, space)
+        self.paste(items, hs, space)
     }
 
     fn substitute_into(&mut self, m: &Macro, params: &[Sym], args: &[Vec<XTok>], body: &[Token], items: &mut Vec<Item>, drop_comma: bool) {
@@ -1030,7 +1063,7 @@ impl<'c> Expander<'c> {
                 continue;
             }
             if tok.is(P::HashHash) {
-                items.push(Item::Paste);
+                items.push(Item::Paste { gnu: gnu_comma(m, body, i) });
                 i += 1;
                 continue;
             }
@@ -1063,7 +1096,7 @@ impl<'c> Expander<'c> {
                 continue;
             }
             if let Some(pi) = param(&tok) {
-                let pasted = matches!(items.last(), Some(Item::Paste)) || body.get(i + 1).is_some_and(|t| t.is(P::HashHash));
+                let pasted = matches!(items.last(), Some(Item::Paste { .. })) || body.get(i + 1).is_some_and(|t| t.is(P::HashHash));
                 let arg = &args[pi];
                 let va = drop_comma && m.variadic && pi + 1 == params.len();
                 if pasted {
@@ -1094,49 +1127,139 @@ impl<'c> Expander<'c> {
     ///   macro's name followed there by anything but `(` is rejected, never
     ///   called (`#define D(m) m EMPTY()`); one ending it is called by a `(`
     ///   following it.
+    /// - Every argument is expanded, in order, used or not; `__VA_ARGS__`
+    ///   is substituted expanded next to `##` too (`#define P(...) x ##
+    ///   __VA_ARGS__` makes `P(PAIR)` `x1, 2`), the others as they're given.
     /// - The commas of an argument substituted into the replacement, outside
     ///   its parentheses, separate no arguments of the calls there
     ///   (`#define F(...) G(__VA_ARGS__)` gives G one argument: Boost's
     ///   `BOOST_PP_EXPAND` takes them apart again, as an argument).
-    /// - At the `top` (the `#if` line or `#include` operand), a replacement's
-    ///   expansion is scanned again with what follows, rejected names
-    ///   included: `#define A F ECHO((1, 2))` calls F there (and not in an
-    ///   argument).
+    /// - At the top (`Scan::Top`: the `#if` line or `#include` operand), a
+    ///   replacement's expansion is scanned again with what follows,
+    ///   rejected names included: `#define A F ECHO((1, 2))` calls F there
+    ///   (and not in an argument).
     /// - A comma before an empty `__VA_ARGS__` (`##` between them or not)
     ///   goes at the end of the macro's expansion, unless a call in it took
     ///   it as an argument (`f(x, __VA_ARGS__)` is `f(x )`, `ECHO(x,
     ///   __VA_ARGS__)` is `x,`); `()` is no argument (`#x` of a missing one
     ///   is nothing); `__VA_OPT__` is no operator.
+    /// - The tokens of an argument substituted next to `##` but not pasted
+    ///   (`ID(c)` in `CAT_I(ID(c) x, y)`, or with an empty argument
+    ///   `CAT_I(ID(c), )`) of a call that isn't at the top (in a
+    ///   replacement or an argument) are frozen: expanded in the
+    ///   replacement of the call at the top only (`Scan::TopReplacement`),
+    ///   as tokens of that macro (`ID(CAT_I(ID(c),))` is `ID(c)`,
+    ///   `ID(CAT_I(CAT_I(a, b),))` is `ab`); but a function-like macro's
+    ///   name frozen is called by a `(` that isn't (`CAT_I(x, y F)(1)`),
+    ///   unless its arguments are being expanded (`ID(CAT_I(x, y ID)(1))` is
+    ///   `xy ID(1)`).
+    /// - Pasting a token that isn't a parenthesis or a comma with a token
+    ///   that isn't `)` or a comma keeps both (Boost's
+    ///   `BOOST_PP_TUPLE_ELEM_O_3 ## (...)`).
     ///
     /// cl takes missing arguments as empty and drops extra ones (with a
-    /// warning): those fail here, which tells this model's mistakes.
-    fn expand_traditional(&mut self, input: Vec<XTok>, top: bool) -> Vec<XTok> {
+    /// warning): those fail here, which tells this model's mistakes. So do
+    /// what cl expands otherwise, in ways this model doesn't follow (cl
+    /// 19.51, mostly without a warning; see the tests against it, and
+    /// `macros::tests::TRADITIONAL_UNMODELLED`):
+    /// - A parenthesis of an argument substituted without its pair in it
+    ///   (`#define H(x) F(x)` and `H(1 RP + LP 0)`) delimits a call there
+    ///   or not, depending on the rest of the replacement: one after a
+    ///   function-like macro's name or among a call's arguments fails.
+    /// - In an argument (`Scan::Argument`), the expansion of a call to a
+    ///   macro with parameters ending with a function-like macro's name
+    ///   followed by more of the argument (`ECHO(ID(F) + 1)`, `ECHO(ID(F),
+    ///   2)`, an argument left out too): cl keeps a part of it only (`F`), or
+    ///   another argument's.
+    /// - Other pastes making no token (`STR(x) ## F(y)` doesn't call F), and
+    ///   pastes of whitespace after an expansion to nothing (see
+    ///   `XTok::gap`).
+    /// - A frozen macro's name hidden where it thaws (its expansion done,
+    ///   cl may expand it), or an operator of `#if` frozen.
+    /// - A macro's name in an argument of its own but first, followed by
+    ///   `(` where it's hidden (`AP(x AP)` for `#define AP(m) m(2)`): cl
+    ///   expands it later, when it's not.
+    /// - A comma before `__VA_ARGS__` expanding to nothing but given
+    ///   (`F(x, NIL)`), or before a call whose replacement starts with such
+    ///   a `__VA_ARGS__` (`ECHO(a, REM())`): cl drops it, but not always. A
+    ///   comma before an empty `__VA_ARGS__` that a call takes starting an
+    ///   argument, or in variadic arguments after others (`REST(, x,
+    ///   __VA_ARGS__)`): cl drops it too.
+    /// - `F()` for `#define F(x)` in an argument (cl warns, and may leave
+    ///   the call around it).
+    fn expand_traditional(&mut self, input: Vec<XTok>, scan: Scan) -> Vec<XTok> {
         let mut input: VecDeque<XTok> = input.into();
-        let mut out = Vec::new();
+        let mut out: Vec<XTok> = Vec::new();
+        // Where the tokens after whitespace after an expansion to nothing go.
+        let mut gaps = Vec::new();
         while let Some(mut t) = input.pop_front() {
             if !self.spend() {
                 break;
+            }
+            let thaws = matches!(scan, Scan::Top | Scan::TopReplacement);
+            if t.frozen.is_some() && thaws {
+                self.thaw(&mut t);
             }
             if t.t.kind != Kind::Ident {
                 out.push(t);
                 continue;
             }
             let name = t.t.sym;
+            if t.tail && scan == Scan::Argument && input.front().is_some_and(|n| !n.t.is(P::LParen)) {
+                self.fail(format!("{} ends an expansion in an argument, followed by more", name.as_str()));
+            }
+            if t.frozen.is_some() {
+                let operator = [intern::DEFINED, intern::HAS_INCLUDE, intern::HAS_INCLUDE_NEXT, intern::HAS_EMBED].contains(&name) || self.ctx.is_query(name);
+                if self.if_mode && operator {
+                    self.fail(format!("{} of an argument next to ## in #if", name.as_str()));
+                }
+                let called = input.front().is_some_and(|n| n.t.is(P::LParen) && n.frozen.is_none())
+                    && !hidden(&t.hide, name)
+                    && !self.owners.contains(&name)
+                    && !t.rejected
+                    && self.ctx.lookup(name).is_some_and(|m| m.params.is_some());
+                if !called {
+                    out.push(t);
+                    continue;
+                }
+                t.frozen = None;
+            }
+            if t.own && !thaws && hidden(&t.hide, name) && input.front().is_some_and(|n| n.t.is(P::LParen)) {
+                self.fail(format!("{} of its own argument hidden", name.as_str()));
+            }
             let Some(m) = self.macro_at(&t, &mut input, &mut out) else { continue };
             let one = Some(Rc::new(vec![name]));
             let (args, hs) = match &m.params {
                 None => (Args { toks: Vec::new(), given: 0 }, hide_union(&t.hide, &one)),
                 Some(params) => match input.front() {
+                    Some(n) if n.t.is(P::LParen) && n.glued => {
+                        self.fail(format!("an argument's parenthesis after {}", name.as_str()));
+                        out.push(t);
+                        continue;
+                    }
                     Some(n) if n.t.is(P::LParen) => {
-                        let Some((args, rparen)) = traditional_arguments(&mut input, params.len(), m.variadic) else {
-                            self.fail(format!("bad arguments for {}", name.as_str()));
-                            out.push(t);
-                            continue;
+                        let (mut args, rparen) = match traditional_arguments(&mut input, params.len(), m.variadic) {
+                            Ok(a) => a,
+                            Err(why) => {
+                                self.fail(format!("{why} for {}", name.as_str()));
+                                out.push(t);
+                                continue;
+                            }
                         };
+                        if thaws {
+                            for t in args.toks.iter_mut().flatten().filter(|t| t.frozen.is_some()) {
+                                self.thaw(t);
+                            }
+                        }
+                        // `F()` for `#define F(x)`: cl warns, and in an
+                        // argument expands otherwise (`XSTR(F())`).
+                        if args.given == 0 && params.len() == 1 && !m.variadic && !self.owners.is_empty() {
+                            self.fail(format!("no argument for {} in an argument", name.as_str()));
+                        }
                         (args, hide_union(&hide_intersection(&t.hide, &rparen), &one))
                     }
                     Some(_) => {
-                        t.rejected = !top;
+                        t.rejected = scan != Scan::Top;
                         out.push(t);
                         continue;
                     }
@@ -1153,25 +1276,73 @@ impl<'c> Expander<'c> {
                 continue;
             }
             self.nesting += 1;
-            let replacement = self.substitute_traditional(&m, &args, hs, t.t.space);
-            let expanded = self.expand_traditional(replacement, false);
+            let at_top = scan == Scan::Top;
+            let top_hide = if at_top { std::mem::replace(&mut self.top_hide, hs.clone()) } else { None };
+            let (replacement, va_nothing) = self.substitute_traditional(&m, &args, hs, t.t.space, !at_top);
+            // `__VA_ARGS__` expanding to nothing starting the replacement:
+            // cl drops a comma before the call (`ECHO(a, REM())` is `a`).
+            let va_first = m.params.as_ref().is_some_and(|p| m.variadic && m.body.first().and_then(Token::ident) == p.last().copied());
+            if va_first && va_nothing && (out.last().is_some_and(|p: &XTok| p.t.is(P::Comma)) || (out.is_empty() && scan != Scan::Top)) {
+                self.fail(format!("{}'s variadic arguments expand to nothing after a comma", name.as_str()));
+            }
+            let expanded = self.expand_traditional(replacement, if at_top { Scan::TopReplacement } else { Scan::Replacement });
+            if at_top {
+                self.top_hide = top_hide;
+            }
             self.nesting -= 1;
+            // A function-like macro's name ending a call's expansion (not
+            // `#define OBJ F`, nor `#define G() F`: those cl takes as the
+            // standard does).
+            let call = m.params.as_ref().is_some_and(|p| !p.is_empty());
+            let mut last = true;
             for mut r in expanded.into_iter().rev().filter(|r| !r.elided) {
                 r.glued = false;
-                r.rejected &= !top;
+                r.rejected &= scan != Scan::Top;
+                if last && call && !r.rejected && r.t.kind == Kind::Ident && self.ctx.lookup(r.t.sym).is_some_and(|f| f.params.is_some()) {
+                    r.tail = true;
+                }
+                last = false;
                 input.push_front(r);
+            }
+            if last && input.front().is_some_and(|n| n.t.space) {
+                gaps.push(out.len());
+            }
+        }
+        for g in gaps {
+            if let Some(t) = out.get_mut(g) {
+                t.gap = true;
             }
         }
         out
     }
 
+    /// A frozen token, read where it thaws (see `expand_traditional`): a
+    /// token of the call at the top, with the hide set it had when frozen.
+    /// One a macro's name hides fails (cl may expand it there).
+    fn thaw(&mut self, t: &mut XTok) {
+        let hide = t.frozen.take().unwrap_or_default();
+        if t.t.kind == Kind::Ident && hidden(&hide, t.t.sym) && self.ctx.lookup(t.t.sym).is_some() {
+            self.fail(format!("{} of an argument next to ## hidden", t.t.sym.as_str()));
+        }
+        t.hide = hide_union(&hide, &self.top_hide);
+    }
+
     /// `substitute`, by cl's traditional preprocessor (see
-    /// `expand_traditional`).
-    fn substitute_traditional(&mut self, m: &Macro, args: &Args, hs: Hide, space: bool) -> Vec<XTok> {
+    /// `expand_traditional`); `nested`, the call isn't at the top. And
+    /// whether the variadic arguments expand to nothing.
+    fn substitute_traditional(&mut self, m: &Macro, args: &Args, hs: Hide, space: bool, nested: bool) -> (Vec<XTok>, bool) {
         let params: &[Sym] = m.params.as_deref().unwrap_or(&[]);
         let param = |t: &Token| if m.params.is_some() { t.ident().and_then(|s| params.iter().position(|p| *p == s)) } else { None };
         let body = &m.body;
         let va_empty = m.variadic && args.toks.last().is_some_and(Vec::is_empty);
+        // Each argument expanded, in order: cl expands all, those next to
+        // `##` or `#` and those left out too (`SECOND(ID(F) +1, x)` shows
+        // where it fails at one, see `expand_traditional`).
+        self.owners.push(m.name);
+        let expanded: Vec<Vec<XTok>> =
+            args.toks.iter().map(|a| if a.is_empty() { Vec::new() } else { self.expand_traditional(a.clone(), Scan::Argument) }).collect();
+        self.owners.pop();
+        let mut va_checked = false;
         let mut items = Vec::new();
         let mut i = 0;
         while i < body.len() {
@@ -1186,33 +1357,78 @@ impl<'c> Expander<'c> {
                 continue;
             }
             if tok.is(P::HashHash) {
-                items.push(Item::Paste);
+                items.push(Item::Paste { gnu: gnu_comma(m, body, i) });
                 i += 1;
                 continue;
             }
             // A comma before an empty `__VA_ARGS__` (`##` between them or
             // not): gone from the expansion, unless a call in it takes it.
             let va_next = |at: usize| body.get(at).and_then(param) == Some(params.len().wrapping_sub(1));
-            if tok.is(P::Comma) && va_empty && (va_next(i + 1) || (body.get(i + 1).is_some_and(|t| t.is(P::HashHash)) && va_next(i + 2))) {
+            let before_va = tok.is(P::Comma) && m.variadic && (va_next(i + 1) || (body.get(i + 1).is_some_and(|t| t.is(P::HashHash)) && va_next(i + 2)));
+            if before_va && va_empty {
                 items.push(Item::Tok(XTok { elided: true, ..XTok::new(tok) }));
                 i += 1;
                 continue;
             }
+            // cl drops it too when they expand to nothing, but not always
+            // (`F(x, NIL)`, not `F(x, NIL NIL)`).
+            if before_va && !va_checked && expanded.last().is_some_and(Vec::is_empty) {
+                va_checked = true;
+                self.fail(format!("{}'s variadic arguments expand to nothing after a comma", m.name.as_str()));
+            }
             if let Some(pi) = param(&tok) {
-                let pasted = matches!(items.last(), Some(Item::Paste)) || body.get(i + 1).is_some_and(|t| t.is(P::HashHash));
-                let arg = &args.toks[pi];
-                if pasted && arg.is_empty() {
+                let after = matches!(items.last(), Some(Item::Paste { .. }));
+                let before = body.get(i + 1).is_some_and(|t| t.is(P::HashHash));
+                let pasted = after || before;
+                // Next to `##` too, cl substitutes `__VA_ARGS__` expanded
+                // (`#define P(...) x ## __VA_ARGS__` makes `P(PAIR)` `x1, 2`);
+                // other arguments as they're given.
+                let va = |p: usize| m.variadic && p + 1 == params.len();
+                let raw = pasted && !va(pi);
+                let empty = |p: usize| if va(p) { expanded[p].is_empty() } else { args.toks[p].is_empty() };
+                if pasted && empty(pi) {
                     items.push(Item::Placemarker { va: false });
                 } else {
-                    let mut x = if pasted { arg.clone() } else { self.expand_traditional(arg.clone(), false) };
-                    let mut depth = 0usize;
-                    for t in &mut x {
-                        if t.t.is(P::LParen) {
-                            depth += 1;
-                        } else if t.t.is(P::RParen) {
-                            depth = depth.saturating_sub(1);
+                    let mut x = if raw { args.toks[pi].clone() } else { expanded[pi].clone() };
+                    // An argument next to `##` of a call that isn't at the
+                    // top: its tokens but those pasted with a token
+                    // (not with an empty argument) are frozen.
+                    if raw && nested {
+                        let first_pasted = after && matches!(items.len().checked_sub(2).map(|k| &items[k]), Some(Item::Tok(_)));
+                        let last_pasted = before && body.get(i + 2).is_some_and(|n| param(n).is_none_or(|p| !empty(p)));
+                        let end = x.len() - 1;
+                        for (k, t) in x.iter_mut().enumerate() {
+                            let merged = (k == 0 && first_pasted) || (k == end && last_pasted);
+                            if !merged && t.frozen.is_none() {
+                                t.frozen = Some(t.hide.clone());
+                            }
                         }
-                        t.glued = depth == 0 && t.t.is(P::Comma);
+                    }
+                    // The argument's pairs of parentheses: its commas
+                    // outside them, and the parentheses without their pair,
+                    // are glued.
+                    let mut open = Vec::new();
+                    let mut paired = vec![false; x.len()];
+                    for (k, t) in x.iter().enumerate() {
+                        if t.t.is(P::LParen) {
+                            open.push(k);
+                        } else if t.t.is(P::RParen)
+                            && let Some(o) = open.pop()
+                        {
+                            (paired[o], paired[k]) = (true, true);
+                        }
+                    }
+                    let mut depth = 0usize;
+                    for (k, (t, paired)) in x.iter_mut().zip(paired).enumerate() {
+                        let paren = t.t.is(P::LParen) || t.t.is(P::RParen);
+                        if paired {
+                            depth = if t.t.is(P::LParen) { depth + 1 } else { depth - 1 };
+                        }
+                        t.glued = (paren && !paired) || (depth == 0 && t.t.is(P::Comma));
+                        t.tail = false;
+                        // The macro's own name, not first (`AP(x AP)` for
+                        // `#define AP(m) m(2)`, not `AP(AP)`).
+                        t.own = !raw && t.t.sym == m.name && t.t.kind == Kind::Ident && (k > 0 || t.gap);
                     }
                     if let Some(first) = x.first_mut().filter(|_| !pasted) {
                         first.t.space = tok.space;
@@ -1225,23 +1441,121 @@ impl<'c> Expander<'c> {
             items.push(Item::Tok(XTok::new(tok)));
             i += 1;
         }
-        paste(items, hs, space)
+        let va_nothing = m.variadic && expanded.last().is_some_and(Vec::is_empty);
+        (self.paste(items, hs, space), va_nothing)
     }
+
+    /// The tokens of a substitution, `##` pasted, with the hide set `hs`;
+    /// the first spaced as the macro's name was. A paste making no token
+    /// (`+ ## x`), which GCC and Clang reject and cl's conforming
+    /// preprocessor warns about, fails; cl's traditional one keeps both
+    /// tokens, which this model follows where it can.
+    fn paste(&mut self, items: Vec<Item>, hs: Hide, space: bool) -> Vec<XTok> {
+        let mut pasted: Vec<Item> = Vec::new();
+        let mut items = items.into_iter().peekable();
+        while let Some(item) = items.next() {
+            let Item::Paste { gnu } = item else {
+                pasted.push(item);
+                continue;
+            };
+            let Some(right) = items.next() else { break };
+            let left = pasted.pop();
+            match (left, right) {
+                (None, r) => pasted.push(r),
+                (Some(Item::Placemarker { .. }), r) => pasted.push(r),
+                // GNU: `, ## __VA_ARGS__` without variadic arguments.
+                (Some(Item::Tok(l)), Item::Placemarker { va: true }) if l.t.is(P::Comma) => {}
+                (Some(l), Item::Placemarker { .. }) => pasted.push(l),
+                // cl pastes whitespace first in b (`a ## b` is `a b`, see
+                // `XTok::gap`), but not always.
+                (Some(Item::Tok(l)), Item::Tok(r)) if r.gap => {
+                    self.fail(format!("pasting {} and whitespace before {}", l.t.sym.as_str(), r.t.sym.as_str()));
+                    pasted.push(Item::Tok(l));
+                    pasted.push(Item::Tok(r));
+                }
+                (Some(Item::Tok(l)), Item::Tok(r)) => {
+                    let text = format!("{}{}", l.t.sym.as_str(), r.t.sym.as_str());
+                    let toks = lex::tokens(text.as_bytes());
+                    if let [mut t] = toks[..] {
+                        t.space = l.t.space;
+                        pasted.push(Item::Tok(XTok::new(t)));
+                    } else {
+                        // GNU: `, ## __VA_ARGS__` with variadic arguments.
+                        // cl's traditional preprocessor keeps both tokens
+                        // (Boost's `BOOST_PP_TUPLE_ELEM_O_3 ## (...)`), but
+                        // pasting a parenthesis or comma first, or a `)` or
+                        // comma second, it expands otherwise (`STR(x) ## F(y)`
+                        // doesn't call F).
+                        let delimits = |t: &XTok, open: bool| t.t.is(P::RParen) || t.t.is(P::Comma) || (open && t.t.is(P::LParen));
+                        let kept = (gnu && l.t.is(P::Comma)) || (self.traditional && !delimits(&l, true) && !delimits(&r, false));
+                        if !kept {
+                            self.fail(format!("pasting {} and {} makes no token", l.t.sym.as_str(), r.t.sym.as_str()));
+                        }
+                        pasted.push(Item::Tok(l));
+                        pasted.push(Item::Tok(r));
+                    }
+                }
+                (Some(l), r) => {
+                    pasted.push(l);
+                    pasted.push(r);
+                }
+            }
+        }
+        let mut out: Vec<XTok> = pasted
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Tok(mut t) => {
+                    t.hide = hide_union(&t.hide, &hs);
+                    Some(t)
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some(first) = out.first_mut() {
+            first.t.space = space;
+        }
+        out
+    }
+}
+
+/// What cl's traditional preprocessor expands (see
+/// `Expander::expand_traditional`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scan {
+    /// A line: text, an `#if` expression, an `#include` operand.
+    Top,
+    /// The replacement of a call at the top, by itself.
+    TopReplacement,
+    /// Another macro's replacement, by itself.
+    Replacement,
+    /// An argument, before it's substituted.
+    Argument,
+}
+
+/// Whether the `##` at `i` of a macro's body is GNU's `, ## __VA_ARGS__`,
+/// which keeps both when there are variadic arguments.
+fn gnu_comma(m: &Macro, body: &[Token], i: usize) -> bool {
+    m.variadic && i > 0 && body[i - 1].is(P::Comma) && body.get(i + 1).and_then(Token::ident) == m.params.as_deref().and_then(<[Sym]>::last).copied()
 }
 
 /// `( args )` of a function-like macro, as cl's traditional preprocessor
 /// takes them (see `Expander::expand_traditional`): commas glued separate
-/// none; and the hide set of `)`. The arguments are glued and rejected
-/// nowhere. None for another number of arguments than the macro takes
-/// (`()` is none, and one missing is fine).
-fn traditional_arguments(input: &mut VecDeque<XTok>, nparams: usize, variadic: bool) -> Option<(Args, Hide)> {
+/// none; and the hide set of `)`. The arguments are glued, rejected and
+/// tails nowhere. An error for another number of arguments than the macro
+/// takes (`()` is none, and the variadic ones may be left out), a
+/// parenthesis glued, or a comma before an empty `__VA_ARGS__` starting
+/// one.
+fn traditional_arguments(input: &mut VecDeque<XTok>, nparams: usize, variadic: bool) -> Result<(Args, Hide), &'static str> {
     input.pop_front();
     let mut toks: Vec<Vec<XTok>> = Vec::new();
     let mut cur = Vec::new();
     let mut depth = 1;
     let rparen;
     loop {
-        let mut t = input.pop_front()?;
+        let Some(mut t) = input.pop_front() else { return Err("bad arguments") };
+        if t.glued && (t.t.is(P::LParen) || t.t.is(P::RParen)) {
+            return Err("an argument's parenthesis in the arguments");
+        }
         if t.t.is(P::LParen) {
             depth += 1;
         } else if t.t.is(P::RParen) {
@@ -1255,73 +1569,31 @@ fn traditional_arguments(input: &mut VecDeque<XTok>, nparams: usize, variadic: b
             toks.push(std::mem::take(&mut cur));
             continue;
         }
+        // A comma before an empty `__VA_ARGS__` starting an argument, or in
+        // the variadic ones after others (`#define R(...) REST(, x,
+        // __VA_ARGS__)`, for `#define REST(a, ...) __VA_ARGS__`): cl drops it
+        // there, or later (`R()` is `x`, but `ECHO(x, __VA_ARGS__)` keeps it).
+        if t.elided && (cur.is_empty() || (variadic && nparams > 1 && toks.len() + 1 == nparams)) {
+            return Err("a comma before an empty __VA_ARGS__ in an argument");
+        }
         t.glued = false;
         t.rejected = false;
         t.elided = false;
+        t.tail = false;
         cur.push(t);
     }
     if toks.len() == 1 && toks[0].is_empty() {
         toks.clear();
     }
     let given = toks.len();
-    // The variadic arguments may be left out, as may the only argument.
+    // The variadic arguments may be left out, as may the only argument
+    // (`()` is none; for `(x)`, cl warns).
     let fine = given == nparams || (given == 0 && nparams == 1) || (variadic && given + 1 == nparams);
     if !fine {
-        return None;
+        return Err("bad arguments");
     }
     toks.resize_with(nparams, Vec::new);
-    Some((Args { toks, given }, rparen))
-}
-
-/// The tokens of a substitution, `##` pasted, with the hide set `hs`; the
-/// first spaced as the macro's name was.
-fn paste(items: Vec<Item>, hs: Hide, space: bool) -> Vec<XTok> {
-    let mut pasted: Vec<Item> = Vec::new();
-    let mut items = items.into_iter().peekable();
-    while let Some(item) = items.next() {
-        if !matches!(item, Item::Paste) {
-            pasted.push(item);
-            continue;
-        }
-        let Some(right) = items.next() else { break };
-        let left = pasted.pop();
-        match (left, right) {
-            (None, r) => pasted.push(r),
-            (Some(Item::Placemarker { .. }), r) => pasted.push(r),
-            // GNU: `, ## __VA_ARGS__` without variadic arguments.
-            (Some(Item::Tok(l)), Item::Placemarker { va: true }) if l.t.is(P::Comma) => {}
-            (Some(l), Item::Placemarker { .. }) => pasted.push(l),
-            (Some(Item::Tok(l)), Item::Tok(r)) => {
-                let text = format!("{}{}", l.t.sym.as_str(), r.t.sym.as_str());
-                let toks = lex::tokens(text.as_bytes());
-                if let [mut t] = toks[..] {
-                    t.space = l.t.space;
-                    pasted.push(Item::Tok(XTok::new(t)));
-                } else {
-                    pasted.push(Item::Tok(l));
-                    pasted.push(Item::Tok(r));
-                }
-            }
-            (Some(l), r) => {
-                pasted.push(l);
-                pasted.push(r);
-            }
-        }
-    }
-    let mut out: Vec<XTok> = pasted
-        .into_iter()
-        .filter_map(|i| match i {
-            Item::Tok(mut t) => {
-                t.hide = hide_union(&t.hide, &hs);
-                Some(t)
-            }
-            _ => None,
-        })
-        .collect();
-    if let Some(first) = out.first_mut() {
-        first.t.space = space;
-    }
-    out
+    Ok((Args { toks, given }, rparen))
 }
 
 fn unknown() -> Token {
@@ -1503,7 +1775,7 @@ pub(crate) mod tests {
             "1 1 1 1",
         ),
         // `()` is no argument: `#x` is then nothing.
-        ("#define S1(...) #__VA_ARGS__\n#define S2(x, y) #x #y\n#define S3(x) #x\n", "S1() S1(,) S2(,) S2(a,) S3()", "\",\" \"\" \"\" \"a\" \"\""),
+        ("#define S1(...) #__VA_ARGS__\n#define S2(x, y) #x #y\n", "S1() S1(,) S2(,) S2(a,)", "\",\" \"\" \"\" \"a\" \"\""),
         ("#define V(a, ...) <a #__VA_ARGS__>\n", "V(x) V(x,) V(x, y)", "<x> <x \"\"> <x \"y\">"),
         ("#define V(...) [__VA_ARGS__]\n", "V() V(,)", "[] [,]"),
         // No `__VA_OPT__`.
@@ -1515,6 +1787,48 @@ pub(crate) mod tests {
             "BOOST_PP_CAT(A, B)(3) BOOST_PP_CAT(F, (1, 2))",
             "<ab 3> [1|2]",
         ),
+        // Pasting what makes no token keeps both (Boost's
+        // `BOOST_PP_TUPLE_ELEM_II(m, args)`, `BOOST_PP_CAT(m ## args,)`).
+        ("#define PC(a, b) a ## b\n#define G1(x) <x>\n", "PC(G1, (3)) PC(x G1, (3)) PC(+, 1) PC(1, +)", "<3> x <3> +1 1+"),
+        ("#define TE(m, args) CAT(m ## args,)\n#define M2(a, b) [a b]\n", "TE(M2, (1, 2))", "[1 2]"),
+        // The rest of an argument next to `##`, in a call that isn't at
+        // the top, is expanded in the replacement of the call at the top,
+        // as its tokens; at the top, in the replacement of that call.
+        (
+            "#define PAST(a, b) a ## b\n",
+            "EXPAND(PAST(EXPAND(c) NIL, )) PAST(EXPAND(c) NIL, ) EXPAND(PAST(PAST(a, b) NIL, )) EXPAND(PAST(, EXPAND(c)))",
+            "EXPAND(c) c ab EXPAND(c)",
+        ),
+        ("", "CAT_I(CAT_I(a, b) NIL, ) EXPAND(CAT_I(CAT_I(a, b) NIL, ))", "CAT_I(a, b) ab"),
+        ("#define PAST(a, b) a ## b\n#define SHOW_X(a, b) [a|b]\n", "EXPAND(PAST(SHOW_, X(1, EXPAND(c)))) PAST(SHOW_, X(1, EXPAND(c)))", "[1|EXPAND(c)] [1|c]"),
+        (
+            "#define PAST(a, b) a ## b\n#define R6 PAST(EXPAND(c) NIL, )\n#define R7 EXPAND(R6)\n",
+            "R7 ECHO(R6) EXPAND(R6) EXPAND(ECHO(R6))",
+            "c c EXPAND(c) EXPAND(c)",
+        ),
+        (
+            "#define IIF(c) CAT(IIF_, c)\n#define WHEN(c) IIF(c)(EXPAND, EAT)\n#define EAT(...)\n#define R3 CAT_I(WHEN(G1), )\n",
+            "CAT_I(WHEN(G1), ) R3 ECHO(CAT_I(WHEN(G1), ))",
+            "CAT_I(IIF_, G1)(EXPAND, EAT) IIF_G1(EXPAND, EAT) IIF_G1(EXPAND, EAT)",
+        ),
+        // A macro's name hidden for good: in a replacement (but in an
+        // argument of its own, see `TRADITIONAL_UNMODELLED`).
+        (
+            "#define OUT(x) IN(x)\n#define IN(y) y(5)\n#define G1(x) <x>\n#define G2(x) G1 G2 (x)\n",
+            "EXPAND(OUT(z OUT)) EXPAND(OUT(G1 OUT)) ECHO(G2(1))",
+            "z OUT(5) G1 OUT(5) G1 G2 (1)",
+        ),
+        // A frozen name called by a `(` that isn't, unless its arguments
+        // are being expanded.
+        (
+            "#define PAST(a, b) a ## b\n#define G7(x) PAST(a, z x)(c)\n",
+            "EXPAND(G7(EXPAND)) EXPAND(PAST(a, z EXPAND)(c)) ECHO(G7(EXPAND))",
+            "az EXPAND(c) az EXPAND(c) az c",
+        ),
+        // `__VA_ARGS__` expanded next to `##` too (GNU's `, ##
+        // __VA_ARGS__` or not).
+        ("#define VGX(a, ...) f(a, ## __VA_ARGS__)\n", "VGX(, VGX(q)) VGX(x, y EXPAND(c))", "f(,f(q )) f(x,y c)"),
+        ("#define PV(...) x ## __VA_ARGS__\n#define PV2(a, b) a ## b\n", "PV(PAIR) PV() PV2(x, PAIR)", "x1, 2 x xPAIR"),
     ];
 
     /// Calls cl warns about (it takes missing arguments as empty and drops
@@ -1522,8 +1836,47 @@ pub(crate) mod tests {
     /// (after `TRADITIONAL_DEFS`) and the calls.
     pub(crate) const TRADITIONAL_REFUSED: (&str, &[&str]) = (
         "#define G(x) F(x)\n#define V(...) F(__VA_ARGS__)\n#define W(x, y) F(x y)\n#define COMMA ,\n",
-        &["F(1)", "F(1, 2, 3)", "F()", "EXPAND(1, 2)", "G(PAIR)", "V(1, 2)", "W(1 COMMA, 2)"],
+        &["F(1)", "F(1, 2, 3)", "F()", "EXPAND(1, 2)", "ECHO(EXPAND())", "G(PAIR)", "V(1, 2)", "W(1 COMMA, 2)"],
     );
+
+    /// What cl expands without a warning, but otherwise than this model,
+    /// which fails there (see `Expander::expand_traditional`): macros
+    /// (after `TRADITIONAL_DEFS`), text, and cl's expansion (cl 19.51;
+    /// `driver::tests::real_cl_traditional` checks it).
+    pub(crate) const TRADITIONAL_UNMODELLED: &[(&str, &str, &str)] = &[
+        // A parenthesis of an argument without its pair there.
+        ("#define LP (\n#define RP )\n#define G1(a) [a]\n#define H(x) G1(x)\n", "H(1 RP + LP 0)", "[1 ) + ( 0]"),
+        ("#define RP )\n#define G1(a) [a]\n#define H8(x) G1(1 x\n", "H8(RP) 2)", "[1] 2)"),
+        ("#define LP (\n#define G1(a) [a]\n#define H7(x) G1 x 1)\n", "H7(LP)", "[1]"),
+        // A call's expansion ending with a function-like macro's name,
+        // followed by more of an argument, given or left out.
+        ("#define ID(x) x\n#define G1(x) <x>\n", "ECHO(ID(G1) + 1)", "G1"),
+        ("#define ID(x) x\n#define G1(x) <x>\n", "ECHO(1, ID(G1) 2)", "G1"),
+        ("#define G1(x) <x>\n#define GF(x) x G1\n", "ECHO(GF(1) + 1)", "1"),
+        ("#define ID(x) x\n#define G1(x) <x>\n#define SECOND(a, b) b\n", "SECOND(ID(G1) + 1, y)", "G1"),
+        // Its name frozen first (`CALL`, called by WHEN's `(`).
+        (
+            "#define SHOW(...) [__VA_ARGS__]\n#define NARG_I(a, b, c, d, n, ...) n\n#define XNARG(...) ECHO(NARG_I(__VA_ARGS__, 4, 3, 2, 1, 0))\n\
+             #define IIF(c) CAT(IIF_, c)\n#define WHEN(c) IIF(c)(EXPAND, EAT)\n#define EAT(...)\n#define HEAD_I(x) x EAT\n#define CALL(m, ...) m(__VA_ARGS__)\n",
+            "SHOW(XNARG(WHEN(HEAD_I CALL) DEFER, ))",
+            "[EAT]",
+        ),
+        // A paste making no token after a call (F isn't called).
+        ("#define G1(x) <x>\n#define SP2(b) STR(q) ## b\n", "SP2(G1(2))", "\"q\"G1(2)"),
+        // A macro's name in its own argument (but first), hidden there.
+        ("#define AP2(m) m(2)\n#define G1(x) <x>\n", "EXPAND(AP2(G1 AP2))", "G1 2(2)"),
+        ("#define AP2(m) m(2)\n", "EXPAND(AP2(x AP2))", "x 2(2)"),
+        // A macro's name pasted in an argument, hidden where it thaws.
+        ("#define PAST(a, b) a ## b\n#define R8 PAST(R8 x, )\n", "ECHO(R8)", "R8 x x"),
+        // Variadic arguments expanding to nothing after a comma.
+        ("#define REM(...) __VA_ARGS__\n", "ECHO(a, REM())", "a"),
+        ("#define E2(fmt, ...) f(fmt, __VA_ARGS__)\n", "E2(x, NIL)", "f(x )"),
+        // One empty taken in variadic arguments after others.
+        ("#define REST(a, ...) __VA_ARGS__\n#define A22(...) REST(, x, __VA_ARGS__)\n", "A22()", "x"),
+        // Whitespace after an expansion to nothing, pasted.
+        ("", "CAT(x, EMPTYF() 1)", "x 1"),
+        ("#define IIF(c) CAT(IIF_, c)\n", "IIF(EMPTYF() 1)", "IIF_ 1"),
+    ];
 
     /// cl's traditional preprocessor, as `cl /E` expands these (cl 19.51;
     /// `driver::tests::real_cl_traditional` checks them against cl).
@@ -1537,10 +1890,36 @@ pub(crate) mod tests {
         for text in refused {
             assert!(traditional(&format!("{TRADITIONAL_DEFS}{more}"), text, false).is_err(), "{text}");
         }
+        for (more, text, _) in TRADITIONAL_UNMODELLED {
+            assert!(traditional(&format!("{TRADITIONAL_DEFS}{more}"), text, false).is_err(), "{more}{text}");
+        }
         // In `#if`.
         let defs = "#define G(x, y) x + y\n#define ECHO(...) __VA_ARGS__\n#define EMPTYF()\n#define DEFER(m) m EMPTYF()\n#define PAIR 1, 2\n";
         assert_eq!(traditional(&format!("{defs}#define G1 G ECHO((1, 2))\n"), "G1 == 3", true), Ok(spaced("1 + 2 == 3")));
         assert_eq!(traditional(&format!("{defs}#define Q(x) DEFER(G)(x)\n"), "Q(PAIR) == 3", true), Ok(spaced("1 + 2 == 3")));
+        // What cl evaluates otherwise (1, `F1`, `F1`, `10 + 2`): see
+        // `TRADITIONAL_UNMODELLED`.
+        let defs = "#define LP (\n#define RP )\n#define F(a) (a)*2\n#define H(x) F(x)\n#define ECHO(...) __VA_ARGS__\n#define ID(x) x\n#define F1(x) [x]\n\
+            #define SECOND(a, b) b\n#define CAT(a, b) CAT_I(a, b)\n#define CAT_I(a, b) a ## b\n#define NIL\n#define V_ 10 +\n#define V_2 7\n";
+        for text in ["H(1 RP + LP 0) == 2", "ECHO(ID(F1) + 1) == 1", "SECOND(ID(F1) + 1, 1) == 1", "CAT(V_, NIL 2) == 12"] {
+            assert!(traditional(defs, text, true).is_err(), "{text}");
+        }
+        // `F()` for `#define F(x)` in an argument (cl warns, and leaves
+        // XSTR: `XSTR(<>)`); an operator of `#if` in an argument next to
+        // `##` (expanded later).
+        let defs = "#define F1(x) <x>\n#define STR(x) #x\n#define XSTR(x) STR(x)\n#define PAST(a, b) a ## b\n#define ID(x) x\n";
+        assert!(traditional(defs, "XSTR(F1())", false).is_err());
+        assert_eq!(traditional(defs, "F1()", false), Ok(spaced("<>")));
+        assert!(traditional(defs, "ID(PAST(defined(X) Y, ))", true).is_err());
+        // An argument's parenthesis without its pair delimiting an
+        // operator's operand.
+        assert!(traditional("#define RP )\n#define D(x) defined(x)\n", "D(A RP)", true).is_err());
+        // Pastes making no token: GCC and Clang reject them, cl's
+        // conforming preprocessor warns; not GNU's `, ## __VA_ARGS__`.
+        let defs = "#define CAT_I(a, b) a ## b\n#define ONE 1\n#define G(a, ...) g(a, ## __VA_ARGS__)\n";
+        assert!(expanded(defs, "CAT_I(+, ONE)", false, true).is_err());
+        assert_eq!(expanded(defs, "CAT_I(+, ONE)", true, true), Ok(spaced("+ 1")));
+        assert_eq!(expanded(defs, "G(x, y) G(x)", false, false), Ok(spaced("g(x, y) g(x)")));
         // Nested too deeply: an error, not the stack.
         let deep: String = (0..300).map(|i| format!("#define D{i}(x) D{}(x)\n", i + 1)).collect();
         assert!(traditional(&deep, "D0(1)", false).unwrap_err().contains("nested"));

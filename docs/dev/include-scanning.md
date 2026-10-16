@@ -343,17 +343,28 @@ Windows SDK header must scan exactly under it. `Profile::traditional` selects
 `Expander::expand_traditional`, a model of what `cl /E` does, built from experiments against `cl`
 19.51 and checked against it by gated tests:
 
+- Every argument is expanded once, in order, before substitution, whether it is used, pasted,
+  stringized or not used at all: `SECOND2(__COUNTER__, y) __COUNTER__` gives 1.
 - A macro's replacement is expanded by itself, its arguments substituted, before what follows it
   is seen. A function-like macro's name followed there by anything but `(` is rejected for good;
   one ending the replacement is called by a `(` that follows.
 - The commas of an argument substituted into a replacement, outside its parentheses, separate no
-  arguments of the calls there (they are "glued"). An argument collected again by another call is
-  split normally: this is how Boost's `BOOST_PP_EXPAND` takes them apart.
+  arguments of the calls there (they are "glued"), nor do its unpaired parentheses delimit them.
+  An argument collected again by another call is split normally: this is how Boost's
+  `BOOST_PP_EXPAND` takes them apart.
+- The tokens of an argument next to `##` that aren't pasted themselves are frozen: in a call that
+  isn't at the top, they are expanded only in the replacement of the top-level call, with its hide
+  set (`ID(PAST(ID(c) NIL,))` gives `ID(c)`). A frozen name is called by a `(` that isn't frozen.
+- `__VA_ARGS__` next to `##` is substituted expanded; named parameters there stay as given.
+- An invalid paste keeps both tokens, as Boost's `BOOST_PP_TUPLE_ELEM_II` relies on
+  (`m ## (args)`).
 - At the top (the `#if` line or `#include` operand), a replacement's expansion is scanned again
   with what follows, rejected names included.
 - A comma before an empty `__VA_ARGS__` (with `##` or not) goes at the end of that macro's
   expansion, unless a call inside took it as an argument. `()` is no argument; `#x` of a missing
   argument is nothing; `__VA_OPT__` is no operator.
+
+The full rule list is the comment on `expand_traditional`.
 
 The diagram expands one argument-counting macro both ways. Both results are valid programs, and
 `cl` accepts both without a warning; only the preprocessor mode differs.
@@ -385,15 +396,34 @@ separates them. Boost does exactly this. These cases and about 40 more are the
 The model must never claim exact where `cl` expands differently: an exact scan sends only its
 list, so a difference is a remote failure, or a silent wrong object when the expansion feeds
 `__has_include`. So the model fails closed: the scan is inexact, and the compiler's list is used.
-It fails where `cl` warns: a wrong argument count (C4002, C4003). It also fails past 200 nested
-expansions, and on every construct it can't follow exactly, even where `cl` accepts the code
-without a warning: a `(` or `)` from a substituted argument that could delimit a call, a
-function-like macro's name produced inside an argument's expansion and followed by more tokens
-(`cl` drops the rest), and an invalid `##` paste (in every mode: GCC and Clang reject those, so
-valid code never has one). Random macro programs compared with `cl` found these constructs. Where
-a construct can be modelled and proven against `cl` instead, it is modelled, so that real code
-stays exact: failing closed on Boost or the MSVC STL would send every such compile to the
-compiler.
+It fails where `cl` warns, on a wrong argument count (C4002, C4003), and past 200 nested
+expansions. It also fails on every construct it can't follow exactly, even where `cl` accepts the
+code without a warning, because `cl`'s result there depends on details the model doesn't
+reproduce:
+
+- a `(` or `)` from a substituted argument that would be a call's `(`, sit inside a call's
+  arguments, or be the operand of `defined` or `__has_include` (`H(1 RP + LP 0)` gives
+  `[1 ) + ( 0]`, but `H8(RP) 2)` closes the call);
+- a function-like macro's name ending a call's expansion inside an argument and followed by
+  anything but `(` (`ECHO(GF(1) + 1)` gives `1`, `TWO(ID(F1) + 1, 2)` gives `F1 F1`);
+- an invalid paste whose left token is `(`, `)` or `,`, or whose right one is `)` or `,`;
+- the whitespace an empty expansion leaves, pasted (`CAT(x, EMPTYF() 1)` gives `x 1`);
+- a macro's own name later in its argument, followed by `(` (`cl` doesn't paint it there);
+- a comma before a `__VA_ARGS__` that expands to nothing, in the forms the model can't place;
+- `F()` for a one-parameter `F` inside an argument (`cl` warns C4003 and may abandon the
+  enclosing call; at the top it is accepted, which `BOOST_PP_TUPLE_REM()` needs);
+- a frozen name that is hidden when thawed, or frozen `#if` operators.
+
+These constructs were found by random macro programs compared with `cl`: about 10,000 programs in
+text, `#if` and `#include` forms, from 150 expanded differently and claimed exact down to none.
+Where a construct can be modelled and proven against `cl` instead, it is modelled (frozen tokens,
+kept invalid pastes, expanded `__VA_ARGS__` next to `##`), so that real code stays exact: failing
+closed on Boost or the MSVC STL would send every such compile to the compiler. RandoBlazer's 321
+compiles stay exact, each listing what `cl /showIncludes` lists.
+
+Outside the traditional model, an invalid paste fails the scan in every mode (GCC and Clang reject
+those, so valid code never has one; GNU's `, ## __VA_ARGS__` is no paste), and an expansion error
+in a computed `#include`'s operand makes the scan inexact.
 
 ### /Zc:preprocessor explicit and implied
 
@@ -477,6 +507,7 @@ compiler. The causes, with where they're decided:
 | `#include_next` from a header Clang may place two ways | `scan.rs` `resolve_checked` |
 | a `..` after a symbolic link | `scan.rs` `join` |
 | a traditional-preprocessor call `cl` warns about, or one the model can't follow exactly | `macros.rs` `expand_traditional` |
+| an invalid `##` paste (GCC, Clang, conforming `cl`); an expansion error in a computed `#include` operand | `macros.rs` `paste`, `scan.rs` `include` |
 
 The chain also leaves to the compiler a scan with `missing` includes. A scan returns an error
 (no partial result) for an unsupported flag, `CL` or `_CL_` with a flag the scan reads, a
@@ -670,6 +701,10 @@ On the libc++ project, 30 compiles take 14 to 16 s warm.
 
 Known at `43f29d9`. The exact scanner and the chain:
 
+- The traditional model is empirical: `cl`'s traditional preprocessor has many interacting quirks,
+  several rules are fail-closed approximations, and no expansion differing from `cl`'s on the
+  random programs tried doesn't prove there is none. The random comparison ignores whitespace in
+  text. One divergence `cl` warns about remains (`CALL(LP XSTR, , )`, C4002).
 - A computed `#include` name may be formed differently from `cl`'s: under the traditional
   preprocessor, a `<` coming from a macro makes `cl` read the rest of the line as it is; under the
   conforming one, `cl` doesn't expand `<...>` inside a macro's arguments on an `#include` line.
@@ -719,18 +754,26 @@ Tests against real compilers are gated by variables naming them (`build.rs`):
 `CPP_DEPS_TEST_GLIB`. Without them they are reported ignored, not passed. Bazel gives the cfgs and
 the hermetic toolchain's compilers. See [testing.md](testing.md).
 
-- `macros.rs`: `traditional_preprocessor` (the `TRADITIONAL_CASES` table, the refused calls),
+- `macros.rs`: `traditional_preprocessor` (the `TRADITIONAL_CASES` table of modelled expansions,
+  the `TRADITIONAL_UNMODELLED` table of programs with `cl`'s output that the model must refuse,
+  `#if` forms, invalid pastes in standard mode),
   `standard_example_3`, `standard_example_4`, `standard_example_5_and_7` (C17's examples),
   `va_comma_rules`, `destringized`, `pragmas_of_bodies`, `recursion_is_blocked`.
 - `lex.rs`: `finds_directives_only`, `hidden_hashes`, `literals`, `line_endings`,
   `pragmas_in_text`, `text_names`, `guards`.
 - `scan.rs`: `pragmas_the_scan_cant_see`, `pragma_dependency`, `pragma_dependency_operators`,
   `pragma_once_by_file`, `once_contents_by_hash`, `same_size_and_time`, `dotdot_after_links`,
-  `include_next_rules`, `clang_msvc_lookup_places`, `names_found_as_on_disk`.
+  `include_next_rules`, `clang_msvc_lookup_places`, `names_found_as_on_disk`,
+  `traditional_repros` (files the model must scan inexact: parentheses, a swallowed tail, a
+  `__has_include` chosen silently, `#include` forms).
 - `driver.rs`: `search_list_rules`, `flag_policy`, `cl_flag_policy`, `cl_preprocessor_flags`,
   `profiles_round_trip`, `profiles_cleaned_daily`, `profiles_expire_in_memory`,
   `profiles_decide_lookups`, `asking_gives_up`, `fingerprints_taken_once`,
-  `config_files_in_profile_keys`, `profiles_of_relative_dirs`; gated: `real_cl_traditional`,
+  `config_files_in_profile_keys`, `profiles_of_relative_dirs`; gated: `real_cl_traditional` (also
+  checks that `cl` gives each unmodelled program's output without a warning),
+  `real_cl_traditional_repros` (exact scans compared with `cl`'s list, then `cl /EP` over only the
+  scanned files), `real_cl_traditional_random` (random text, `#if` and `#include` programs with
+  fixed seeds against `cl`, about 90 s; it fails on any exact scan expanding differently),
   `real_cl_preprocessor_mode`, `real_cl_boost_preprocessor`, `real_cl_boost_iteration`,
   `real_library_headers`, `dropped_flags_keep_predefines`, and `real_differential`,
   `real_cl_differential`, `real_clang_cl_differential` (scans against the compiler's list, the

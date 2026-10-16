@@ -1225,6 +1225,10 @@ impl State<'_> {
             toks => {
                 let mut x = Expander::new(self, false);
                 let expanded = x.expand(toks.iter().copied().map(XTok::new).collect());
+                if let Some(e) = x.error.take() {
+                    self.inexact(format!("{}: {e}", self.here()));
+                    return;
+                }
                 header_name(&expanded.iter().map(|t| t.t).collect::<Vec<_>>())
             }
         };
@@ -1687,8 +1691,87 @@ fn scanned<'a>(cache: &'a Cache, cfg: &'a Config, oracle: &'a dyn Oracle, main: 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Programs the seventh review found cl's traditional model scanning
+    /// exactly, but otherwise than cl 19.51 reads them: each one's files
+    /// (`main.cc` first). `#if` choosing a file (an argument's `)` and `(`
+    /// don't delimit F's arguments: cl's `H(...)` is 1; `ECHO(ID(F1) + 1)` is
+    /// `F1`), `__has_include` of a name `#if` chose (absent remotely), and
+    /// `#include` of a name made in an argument (`F1`, `F 1.h`).
+    pub(crate) const TRADITIONAL_REPROS: &[(&str, &[(&str, &str)])] = &[
+        (
+            "parens",
+            &[
+                (
+                    "main.cc",
+                    "#define LP (\n#define RP )\n#define F(a) (a)*2\n#define H(x) F(x)\n#if H(1 RP + LP 0) == 2\n#include \"model.h\"\n#else\n#include \"real.h\"\n#endif\n",
+                ),
+                ("model.h", ""),
+                ("real.h", ""),
+            ],
+        ),
+        (
+            "swallow",
+            &[
+                (
+                    "main.cc",
+                    "#define ECHO(...) __VA_ARGS__\n#define ID(x) x\n#define F1(x) [x]\n#if ECHO(ID(F1) + 1) == 1\n#include \"model.h\"\n#else\n#include \"real.h\"\n#endif\n",
+                ),
+                ("model.h", ""),
+                ("real.h", ""),
+            ],
+        ),
+        (
+            "silent",
+            &[
+                (
+                    "main.cc",
+                    "#define LP (\n#define RP )\n#define F(a) (a)*2\n#define H(x) F(x)\n#if H(1 RP + LP 0) == 2\n#define CFG \"model_cfg.h\"\n#else\n#define CFG \"real_cfg.h\"\n#endif\n\
+                     #if __has_include(CFG)\nint has_cfg = 1;\n#else\nint has_cfg = 0;\n#endif\n",
+                ),
+                ("model_cfg.h", ""),
+                ("real_cfg.h", ""),
+            ],
+        ),
+        (
+            "include_swallow",
+            &[
+                (
+                    "main.cc",
+                    "#define STR(x) #x\n#define XSTR(x) STR(x)\n#define ECHO(...) __VA_ARGS__\n#define ID(x) x\n#define F1(x) [x]\n#define NAME ECHO(ID(F1) b)\n#include XSTR(NAME)\n",
+                ),
+                ("F1", ""),
+                ("F1 b", ""),
+            ],
+        ),
+        (
+            "include_gap",
+            &[
+                (
+                    "main.cc",
+                    "#define STR(x) #x\n#define XSTR(x) STR(x)\n#define CAT(a, b) CAT_I(a, b)\n#define CAT_I(a, b) a ## b\n#define NIL\n#include XSTR(CAT(F, NIL 1).h)\n",
+                ),
+                ("F1.h", ""),
+                ("F 1.h", ""),
+            ],
+        ),
+    ];
+
+    /// `TRADITIONAL_REPROS` scanned with cl's traditional preprocessor:
+    /// inexact (`driver::tests::real_cl_traditional_repros` checks them
+    /// against cl).
+    #[test]
+    fn traditional_repros() {
+        for (name, files) in TRADITIONAL_REPROS {
+            let d = Dir::new(&format!("trad_{name}"));
+            let paths: Vec<PathBuf> = files.iter().map(|(f, text)| d.file(f, text)).collect();
+            let c = Config { family: Family::Msvc, msvc_lookup: true, traditional: true, ..cfg(&d) };
+            let out = scan(&Cache::new(vec![], cfg!(windows)), &c, &NoOracle, &paths[0]);
+            assert!(!out.exact(), "{name}: {:?} {:?}", d.rel(&out.files), d.rel(&out.found));
+        }
+    }
 
     thread_local! {
         /// The lookups `Cache::is_volatile` made on this thread.

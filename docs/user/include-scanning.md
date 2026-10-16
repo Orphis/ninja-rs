@@ -194,14 +194,15 @@ See [platforms](platforms.md) for the rest of what Windows builds need.
 
 These are known and being worked on. Most affect the fallbacks, not the default exact scan.
 
-- **`cl`'s traditional preprocessor.** On some unusual macro constructs that `cl` accepts
-  without a warning (parentheses coming from a macro argument, a function-like macro name
-  produced inside an argument and followed by more tokens, invalid `##` pastes), the model
-  currently expands differently from `cl` while claiming an exact scan. Usually the remote
-  compile then fails and runs locally; it is silent when the expansion feeds `__has_include`. A
-  fix in progress makes the model give up on these constructs, so the compiler's list is used.
-  Workaround for an affected project: `--remote_include_scanner=compiler` (which misses the
-  files `__has_include` only probes: see below).
+- **`cl`'s traditional preprocessor** is modelled from experiments with `cl`, whose
+  traditional expansion has many quirks. On the unusual constructs the model can't follow
+  exactly (parentheses coming from a macro argument, a macro name produced inside an argument
+  and followed by more tokens, invalid `##` pastes and a few more), it gives up and the
+  compiler's list is used: slower, still exact. No difference from `cl` is known on real code,
+  and none was left on thousands of random macro programs compared with `cl`, but the model
+  can't be proven complete. If a project still seems to scan wrong under `cl`,
+  `--remote_include_scanner=compiler` sidesteps the model (it misses the files `__has_include`
+  only probes: see below), and `/Zc:preprocessor` avoids the traditional preprocessor.
 - **Computed includes under `cl`.** `#include` lines whose `<` comes from a macro, and
   `<...>` names inside macro arguments on an `#include` line, are formed differently from `cl`.
 - **`.C` sources under `cl`.** `cl` compiles `X.C` as C; the scanner takes it as C++.
