@@ -122,6 +122,8 @@ pub enum DirKind {
 #[derive(Debug)]
 pub struct Directive {
     pub kind: DirKind,
+    /// Synthesized from text: a surrounding macro may suppress it.
+    pub from_text: bool,
     /// The tokens after the directive's name (for `#include <x>`, one
     /// `HeaderName`).
     pub toks: Box<[Token]>,
@@ -197,6 +199,7 @@ pub fn text_uses(content: &[u8]) -> Vec<TextUse> {
     let mut lx = Lexer { b: content, pos: 0, line: 0, line_pos: 0 };
     let mut out: Vec<TextUse> = Vec::new();
     let mut depth = 0i32;
+    let mut ambiguous = false;
     loop {
         lx.skip_space();
         let Some(c) = lx.peek() else { break };
@@ -212,6 +215,7 @@ pub fn text_uses(content: &[u8]) -> Vec<TextUse> {
             // (Parentheses still open: a directive inside a macro's
             // arguments, or branches that don't balance. Either way, what
             // follows isn't placeable until they close.)
+            ambiguous |= depth != 0;
             continue;
         }
         let toks = tokens(&lx.text(start));
@@ -220,11 +224,12 @@ pub fn text_uses(content: &[u8]) -> Vec<TextUse> {
                 depth += 1;
             } else if t.is(P::RParen) {
                 depth -= 1;
+                ambiguous |= depth < 0;
             } else if let Some(sym) = t.ident() {
                 let call = toks.get(i + 1).is_some_and(|n| n.is(P::LParen));
                 // (A `(` on the next line isn't seen: an object-like macro
                 // expands whatever follows.)
-                out.push(TextUse { line, sym, placeable: depth == 0 && !call });
+                out.push(TextUse { line, sym, placeable: !ambiguous && depth == 0 && !call });
             }
         }
     }
@@ -813,6 +818,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
                 let toks = tokens(text);
                 dirs.extend(pragma_operators(&toks).into_iter().map(|toks| Directive {
                     kind: DirKind::Pragma,
+                    from_text: true,
                     toks: toks.into_boxed_slice(),
                     line,
                     mac: None,
@@ -827,19 +833,19 @@ pub fn lex(content: &[u8]) -> FileDirectives {
                     ];
                     toks.extend(operand);
                     toks.push(Token { kind: Kind::Punct(P::RParen), sym: intern::intern(")"), space: false });
-                    Directive { kind: DirKind::Pragma, toks: toks.into_boxed_slice(), line, mac: None }
+                    Directive { kind: DirKind::Pragma, from_text: true, toks: toks.into_boxed_slice(), line, mac: None }
                 }));
                 // A pragma from a macro (`DO_PRAGMA(push_macro("M"))`,
                 // `__pragma(once)`): text isn't expanded, so it's marked.
                 if found.pragmas != macros::Pragmas::None {
                     let marker = Token { kind: Kind::Ident, sym: intern::PRAGMA_OPERATOR, space: false };
-                    dirs.push(Directive { kind: DirKind::Pragma, toks: Box::new([marker]), line, mac: None });
+                    dirs.push(Directive { kind: DirKind::Pragma, from_text: true, toks: Box::new([marker]), line, mac: None });
                 } else if !found.callees.is_empty() {
                     // Pragmas' words given to these (`DO_PRAGMA(once)`, not
                     // `if (once)`): one if a macro (see `CALLEES`).
                     let marker = Token { kind: Kind::Unknown, sym: CALLEES, space: false };
                     let callees = found.callees.iter().map(|&c| Token { kind: Kind::Ident, sym: c, space: true });
-                    dirs.push(Directive { kind: DirKind::Pragma, toks: std::iter::once(marker).chain(callees).collect(), line, mac: None });
+                    dirs.push(Directive { kind: DirKind::Pragma, from_text: true, toks: std::iter::once(marker).chain(callees).collect(), line, mac: None });
                 }
             }
             continue;
@@ -863,7 +869,7 @@ pub fn lex(content: &[u8]) -> FileDirectives {
         let toks = lx.directive_tokens(kind);
         let mac = if kind == DirKind::Define { macros::parse_define(&toks).map(Arc::new) } else { None };
         text_last = false;
-        dirs.push(Directive { kind, toks: toks.into_boxed_slice(), line, mac });
+        dirs.push(Directive { kind, from_text: false, toks: toks.into_boxed_slice(), line, mac });
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
     FileDirectives {

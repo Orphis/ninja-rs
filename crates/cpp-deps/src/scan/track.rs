@@ -68,6 +68,8 @@ pub(super) struct Region {
 /// The state of tracking unknown values (see the module comment).
 #[derive(Default)]
 pub(super) struct Tracking {
+    /// Macros that can change text's parenthesis nesting, and their users.
+    context: Option<ContextMacros>,
     /// Macros whose definition is unknown, and why.
     unknown: SymMap<String>,
     /// The definitions of macros that are or may become unknown (changed in
@@ -99,6 +101,68 @@ pub(super) struct Tracking {
     /// the predefined ones, once asked.
     bodies_test_files: bool,
     predefined_test_files: Option<bool>,
+}
+
+/// A conservative, monotone expansion graph. A macro with unbalanced
+/// parentheses, one expanding it, or a paste that could form its name can
+/// move a pusher into a discarded argument. Check the file's cached names
+/// only when this graph gains a dangerous name, not for every text token.
+#[derive(Default)]
+struct ContextMacros {
+    /// Until the first unbalanced body, there is no dangerous name to
+    /// propagate. Retain earlier definitions (including overwritten ones)
+    /// so a later definition can still make their users dangerous.
+    pending: Vec<Arc<Macro>>,
+    active: bool,
+    users: SymMap<Vec<Sym>>,
+    unsafe_names: SymSet,
+    pastes: SymSet,
+    hashes: Vec<u64>,
+}
+
+impl ContextMacros {
+    fn add(&mut self, m: &Arc<Macro>) -> bool {
+        if !self.active {
+            if !m.context.unbalanced {
+                self.pending.push(m.clone());
+                return false;
+            }
+            self.active = true;
+            for earlier in std::mem::take(&mut self.pending) {
+                self.add_edges(&earlier);
+            }
+        }
+        self.add_edges(m)
+    }
+
+    fn add_edges(&mut self, m: &Macro) -> bool {
+        let mut unsafe_body = m.context.unbalanced;
+        let new_paste = m.context.pastes && self.pastes.insert(m.name);
+        for &n in &m.context.names {
+            let users = self.users.entry(n).or_default();
+            if !users.contains(&m.name) {
+                users.push(m.name);
+            }
+            unsafe_body |= self.unsafe_names.contains(&n);
+        }
+        let before = self.unsafe_names.len();
+        let mut todo = Vec::new();
+        if unsafe_body {
+            todo.push(m.name);
+        }
+        if before == 0 && !todo.is_empty() {
+            todo.extend(self.pastes.iter().copied());
+        } else if before != 0 && new_paste {
+            todo.push(m.name);
+        }
+        while let Some(n) = todo.pop() {
+            if self.unsafe_names.insert(n) {
+                self.hashes.push(lex::name_hash(n.as_str().as_bytes()));
+                todo.extend(self.users.get(&n).into_iter().flatten().copied());
+            }
+        }
+        before != self.unsafe_names.len()
+    }
 }
 
 /// Whether a macro's body may make `__has_include`, `__has_include_next`
@@ -137,7 +201,7 @@ pub(super) fn once_always(fd: &FileDirectives) -> bool {
         match d.kind {
             DirKind::If | DirKind::Ifdef | DirKind::Ifndef => depth += 1,
             DirKind::Endif => depth = depth.saturating_sub(1),
-            DirKind::Pragma if depth == 0 && d.toks.first().is_some_and(|t| t.sym == intern::ONCE) => return true,
+            DirKind::Pragma if !d.from_text && depth == 0 && d.toks.first().is_some_and(|t| t.sym == intern::ONCE) => return true,
             _ => {}
         }
     }
@@ -232,11 +296,15 @@ impl State<'_> {
     }
 
     /// Notes a definition an unknown macro may have.
-    fn alt(t: &mut Tracking, name: Sym, m: &Arc<Macro>) {
+    fn alt(t: &mut Tracking, name: Sym, m: &Arc<Macro>) -> bool {
         let alts = t.alts.entry(name).or_default();
         if !alts.iter().any(|a| Arc::ptr_eq(a, m)) {
             alts.push(m.clone());
+            // A saved definition can first become possible when an
+            // unplaced pop restores it, after the graph was initialized.
+            return t.context.as_mut().is_some_and(|c| c.add(m));
         }
+        false
     }
 
     /// Before a macro changes: its definition is one it may have later, when
@@ -250,7 +318,7 @@ impl State<'_> {
             return;
         }
         if let Some(m) = self.macros.get(&name) {
-            Self::alt(t, name, m);
+            self.pushers_gen += usize::from(Self::alt(t, name, m));
         }
     }
 
@@ -270,7 +338,7 @@ impl State<'_> {
         }
         let cur = self.macros.get(&name);
         if let Some(m) = cur {
-            Self::alt(t, name, m);
+            self.pushers_gen += usize::from(Self::alt(t, name, m));
         }
         if let Some(id) = region {
             t.last.insert(name, (id, cur.filter(|_| !unknown).cloned()));
@@ -297,11 +365,14 @@ impl State<'_> {
     /// tracked.
     pub(super) fn pushed_in_text_add(&mut self, names: &[Sym]) {
         for &n in names {
-            if self.pushed_in_text.insert(n)
-                && let Some(t) = &mut self.taint
-                && let Some(m) = self.macros.get(&n)
-            {
-                Self::alt(t, n, m);
+            let newly_unknown = !self.is_unknown_macro(n);
+            self.pushed_in_text.insert(n);
+            // An unplaced pop can restore a value immediately, without a
+            // later #define or #undef. Its stack may also be different.
+            self.stack_uncertain(n);
+            self.track_after(n, true, "an unplaced push or pop in text");
+            if newly_unknown {
+                self.changed(n);
             }
         }
     }
@@ -314,7 +385,7 @@ impl State<'_> {
             return;
         }
         for m in self.pushed.get(&name).into_iter().flatten().flatten().chain(self.macros.get(&name)) {
-            Self::alt(t, name, m);
+            self.pushers_gen += usize::from(Self::alt(t, name, m));
         }
     }
 
@@ -353,9 +424,9 @@ impl State<'_> {
             self.changing(name);
             match prev {
                 Some(m) => {
-                    self.macros.insert(name, m);
+                    self.macros.insert(name, m.clone());
                     self.track_after(name, unknown, "popped from an unknown stack");
-                    self.defined(name);
+                    self.defined(&m);
                 }
                 None => {
                     self.macros.remove(&name);
@@ -376,20 +447,42 @@ impl State<'_> {
     /// or `__has_embed` (a file tested), with any definition the macros
     /// reached may have: those named, or made by pastes.
     pub(super) fn may_test_files(&mut self, toks: &[Token]) -> bool {
+        let (direct, pastes, parts) = self.reaches_operators(toks, &HAS_OPS);
+        direct || (pastes && (parts || self.some_body_tests_files()))
+    }
+
+    /// Pragmas in a condition can change the macro state used by later
+    /// directives. Treat hidden/pasted operators as effects too, including
+    /// operators in definitions an unknown macro may have.
+    pub(super) fn may_run_pragma(&self, toks: &[Token]) -> bool {
+        let ops = [intern::PRAGMA_OPERATOR, intern::MS_PRAGMA_OPERATOR];
+        let (direct, pastes, parts) = self.reaches_operators(toks, &ops);
+        direct
+            || (pastes
+                && (parts
+                    || self.macros.values().chain(self.cfg.predefined.values()).chain(self.taint.iter().flat_map(|t| t.alts.values().flatten())).any(|m| {
+                        let params = m.params.as_deref().unwrap_or(&[]);
+                        m.body.iter().any(|t| ops.contains(&t.sym))
+                            || (m.body.iter().any(|t| t.is(P::HashHash))
+                                && m.body.iter().filter_map(Token::ident).any(|n| !params.contains(&n) && ops.iter().any(|o| o.as_str().contains(n.as_str()))))
+                    })))
+    }
+
+    fn reaches_operators(&self, toks: &[Token], ops: &[Sym]) -> (bool, bool, bool) {
         let mut stack: Vec<Sym> = toks.iter().filter_map(Token::ident).collect();
         let mut seen = HashSet::new();
         let (mut pastes, mut parts) = (false, false);
         let empty = Vec::new();
         while let Some(n) = stack.pop() {
-            if HAS_OPS.contains(&n) {
-                return true;
+            if ops.contains(&n) {
+                return (true, false, false);
             }
-            parts |= part_of_has_op(n);
+            parts |= !n.as_str().is_empty() && ops.iter().any(|o| o.as_str().contains(n.as_str()));
             if !seen.insert(n) {
                 continue;
             }
             if seen.len() > 100_000 {
-                return true;
+                return (true, false, false);
             }
             let alts = self.taint.as_ref().filter(|t| t.unknown.contains_key(&n)).and_then(|t| t.alts.get(&n)).unwrap_or(&empty);
             for m in self.macros.get(&n).into_iter().chain(alts) {
@@ -406,7 +499,7 @@ impl State<'_> {
         }
         // A paste may make an operator of its parts, or the name of a macro
         // whose body has one.
-        pastes && (parts || self.some_body_tests_files())
+        (false, pastes, parts)
     }
 
     /// Whether a macro defined in this scan, or a predefined one, may make
@@ -465,12 +558,30 @@ impl State<'_> {
         if !self.replay || m.params.is_some() || m.name.as_str().bytes().any(|b| b.is_ascii_digit()) {
             return false;
         }
-        if self.pushers.get(&m.name).is_some_and(|n| **n == *names) {
+        if self.pushers.get(&m.name).is_some_and(|n| names.iter().all(|name| n.contains(name))) {
             return true;
         }
-        self.pushers.insert(m.name, names.into());
+        // Unknown definitions may target different stacks. The fallback
+        // must affect every target, including an earlier definition's.
+        let mut targets = self.pushers.get(&m.name).map(|n| n.to_vec()).unwrap_or_default();
+        for name in names {
+            if !targets.contains(name) {
+                targets.push(*name);
+            }
+        }
+        self.pushers.insert(m.name, targets.into());
+        if self.taint.as_ref().is_some_and(|t| t.context.is_none()) {
+            let mut context = ContextMacros::default();
+            for m in self.macros.values() {
+                context.add(m);
+            }
+            for m in self.taint.as_ref().unwrap().alts.values().flatten() {
+                context.add(m);
+            }
+            self.taint.as_mut().unwrap().context = Some(context);
+        }
         self.pushers_gen += 1;
-        self.pusher_hashes.push(lex::name_hash(m.name.as_str().as_bytes()));
+        self.pusher_hashes.push(m.name_hash);
         let name = m.name.as_str();
         let mut hashes: HashMap<u64, u8> = self.pusher_end_hashes.iter().copied().collect();
         for (i, _) in name.char_indices().skip(1) {
@@ -501,13 +612,14 @@ impl State<'_> {
     /// A macro is defined while there are pushers: one naming a pusher (a
     /// wrapper) pushes where text uses it, which isn't replayed; one
     /// spelling the ends of a pusher's name may paste it.
-    pub(super) fn pusher_named(&mut self, m: &Macro) {
-        if self.pushers.is_empty() {
+    pub(super) fn pusher_named(&mut self, m: &Arc<Macro>) {
+        if self.pushers.is_empty() || !self.replay {
             return;
         }
-        let params = m.params.as_deref().unwrap_or(&[]);
-        let named: Vec<Box<[Sym]>> =
-            m.body.iter().filter_map(|t| t.ident()).filter(|n| !params.contains(n) && *n != m.name).filter_map(|n| self.pushers.get(&n).cloned()).collect();
+        if self.taint.as_mut().and_then(|t| t.context.as_mut()).is_some_and(|c| c.add(m)) {
+            self.pushers_gen += 1;
+        }
+        let named: Vec<Box<[Sym]>> = m.context.names.iter().filter(|&&n| n != m.name).filter_map(|n| self.pushers.get(n).cloned()).collect();
         for names in named {
             self.pushed_in_text_add(&names);
         }
@@ -519,11 +631,8 @@ impl State<'_> {
         if !self.replay || self.pusher_ends.is_empty() {
             return;
         }
-        let params = m.params.as_deref().unwrap_or(&[]);
-        for t in m.body.iter() {
-            if let Some(n) = t.ident().filter(|n| !params.contains(n))
-                && let Some(&kind) = self.pusher_ends.get(&n)
-            {
+        for n in &m.context.names {
+            if let Some(&kind) = self.pusher_ends.get(n) {
                 self.spelled_ends |= kind;
             }
         }
@@ -547,6 +656,14 @@ impl State<'_> {
     /// Notes the ends of pushers' names a file's text spells (see
     /// `spells_ends`).
     fn text_ends(&mut self, fd: &FileDirectives) {
+        if self.taint.as_ref().and_then(|t| t.context.as_ref()).is_some_and(|c| c.hashes.iter().any(|h| fd.names.binary_search(h).is_ok())) {
+            self.replay = false;
+            let all: Vec<Box<[Sym]>> = self.pushers.values().cloned().collect();
+            for names in all {
+                self.pushed_in_text_add(&names);
+            }
+            return;
+        }
         use std::sync::atomic::Ordering::Relaxed;
         let known = fd.ends.load(Relaxed);
         let spelled = if known & !3 == self.pusher_ends_print {
@@ -641,11 +758,11 @@ impl State<'_> {
     /// pushed or popped in text, unplaced.
     fn replay_use(&mut self, name: Sym) {
         let Some(names) = self.pushers.get(&name).cloned() else { return };
-        let Some(m) = self.macros.get(&name).filter(|m| m.params.is_none()).cloned() else { return };
         if self.is_unknown_macro(name) {
             self.pushed_in_text_add(&names);
             return;
         }
+        let Some(m) = self.macros.get(&name).filter(|m| m.params.is_none()).cloned() else { return };
         // A body of pragmas only (libc++'s): its pushes and pops, once.
         let cached = self.pusher_ops.get(&name).filter(|(d, _)| Arc::ptr_eq(d, &m)).map(|(_, ops)| ops.clone());
         if let Some(ops) = cached.or_else(|| {
@@ -733,5 +850,41 @@ pub(super) struct Replay {
 impl Replay {
     pub(super) fn new() -> Self {
         Replay { gen_seen: usize::MAX, ..Default::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_context_matches_eager_graph() {
+        let definitions: Vec<_> = macros::parse_defines(
+            "#define ALIAS TARGET\n#define TARGET IGNORE(\n#define CAT(a,b) a##b\n#define WRAPPER ALIAS\n#define TARGET\n#define CLOSE )(\n",
+        )
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+        // All orders exercise forward references, redefinitions, a paste
+        // before/after activation, and a body with net-zero but unsafe nesting.
+        fn permutations(defs: &[Arc<Macro>], order: &mut Vec<usize>) {
+            if order.len() == defs.len() {
+                let mut lazy = ContextMacros::default();
+                let mut eager = ContextMacros { active: true, ..Default::default() };
+                for &i in order.iter() {
+                    assert_eq!(lazy.add(&defs[i]), eager.add(&defs[i]), "{order:?}, step {i}");
+                    assert_eq!(lazy.unsafe_names, eager.unsafe_names, "{order:?}, step {i}");
+                }
+                return;
+            }
+            for i in 0..defs.len() {
+                if !order.contains(&i) {
+                    order.push(i);
+                    permutations(defs, order);
+                    order.pop();
+                }
+            }
+        }
+        permutations(&definitions, &mut Vec::new());
     }
 }

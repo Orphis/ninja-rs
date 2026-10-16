@@ -25,8 +25,27 @@ use std::sync::Arc;
 use crate::intern::{self, Sym};
 use crate::lex::{self, Kind, P, Token};
 
+/// A parsed, immutable macro. Reparse to change a definition: body and
+/// parameter edits would invalidate the cached facts used by the scanner.
+///
+/// ```compile_fail
+/// let mut m = cpp_deps::macros::parse_defines("#define X 1\n").remove(0);
+/// m.body = Box::new([]);
+/// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct Macro {
+    definition: MacroDefinition,
+    pub(crate) name_hash: u64,
+    /// Immutable facts used by the scan's conservative text checks. Kept
+    /// with the cached definition instead of rediscovered in every scan.
+    pub(crate) context: BodyContext,
+}
+
+/// A parsed definition, readable through `Macro`. There is no `DerefMut`:
+/// changing a definition requires parsing it again so its summaries can't
+/// become stale, including for caller-supplied predefined macros.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MacroDefinition {
     pub name: Sym,
     /// None for an object-like macro.
     pub params: Option<Box<[Sym]>>,
@@ -47,6 +66,55 @@ pub struct Macro {
     /// A `_Pragma` or `__pragma` operand of the body is an argument's
     /// (`_Pragma(x)`, `__pragma(x)`).
     pub pragma_arg: bool,
+}
+
+impl std::ops::Deref for Macro {
+    type Target = MacroDefinition;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.definition
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BodyContext {
+    /// Identifier references, excluding parameters, sorted and unique.
+    pub names: Box<[Sym]>,
+    /// All spellings except parameters. Numeric fragments matter too:
+    /// a paste can form an argument-pragma macro whose name has digits.
+    pub spellings: Box<[Sym]>,
+    pub unbalanced: bool,
+    pub pastes: bool,
+}
+
+impl BodyContext {
+    fn new(body: &[Token], params: &[Sym]) -> Self {
+        let (mut depth, mut unbalanced, mut pastes) = (0i32, false, false);
+        let mut names = Vec::new();
+        let mut spellings = Vec::new();
+        for t in body {
+            if t.is(P::LParen) {
+                depth += 1;
+            } else if t.is(P::RParen) {
+                depth -= 1;
+                unbalanced |= depth < 0;
+            } else if t.is(P::HashHash) {
+                pastes = true;
+            }
+            if let Some(n) = t.ident().filter(|n| !params.contains(n)) {
+                names.push(n);
+            }
+            if !params.contains(&t.sym) {
+                spellings.push(t.sym);
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        spellings.sort_unstable();
+        spellings.dedup();
+        Self { names: names.into_boxed_slice(), spellings: spellings.into_boxed_slice(), unbalanced: unbalanced || depth != 0, pastes }
+    }
 }
 
 /// What tokens do through pragmas that change macros or inclusion
@@ -346,7 +414,12 @@ pub(crate) fn call_runs_pragma(call: &[Token], ctx: &mut dyn Context) -> bool {
         (out, x.error.is_some() || x.unsure())
     };
     let found = pragmas(&out, true, &[]);
-    failed || found.pragmas != Pragmas::None || !found.operands.is_empty() || out.iter().any(|t| t.kind == Kind::Ident && recording.ctx.arg_pragma(t.sym))
+    failed
+        || found.pragmas != Pragmas::None
+        || !found.operands.is_empty()
+        || out
+            .iter()
+            .any(|t| t.kind == Kind::Ident && (t.sym == intern::PRAGMA_OPERATOR || t.sym == intern::MS_PRAGMA_OPERATOR || recording.ctx.arg_pragma(t.sym)))
 }
 
 /// What a body that names macros whose pragmas their arguments make does
@@ -426,7 +499,7 @@ impl Macro {
             deps.extend(d);
             arg |= a;
         }
-        if self.body.iter().any(|t| t.ident().is_some_and(|n| !params.contains(&n) && n != self.name && ctx.arg_pragma(n))) {
+        if self.context.names.iter().any(|&n| n != self.name && ctx.arg_pragma(n)) {
             let (p, d, a) = body_pragmas(self, ctx);
             pragmas = pragmas.and(p);
             deps.extend(d);
@@ -531,15 +604,20 @@ pub fn parse_define(toks: &[Token]) -> Option<Macro> {
             first.space = false;
         }
         let found = pragmas(&body, true, &params);
+        let context = BodyContext::new(&body, &params);
         Some(Macro {
-            name,
-            params: Some(params.into_boxed_slice()),
-            variadic,
-            body: body.into_boxed_slice(),
-            pragmas: found.pragmas,
-            pragma_operands: found.operands.into_boxed_slice(),
-            pragma_callees: found.callees.into_boxed_slice(),
-            pragma_arg: found.arg,
+            name_hash: lex::name_hash(name.as_str().as_bytes()),
+            definition: MacroDefinition {
+                name,
+                params: Some(params.into_boxed_slice()),
+                variadic,
+                body: body.into_boxed_slice(),
+                pragmas: found.pragmas,
+                pragma_operands: found.operands.into_boxed_slice(),
+                pragma_callees: found.callees.into_boxed_slice(),
+                pragma_arg: found.arg,
+            },
+            context,
         })
     } else {
         let mut body: Vec<Token> = rest.to_vec();
@@ -547,15 +625,20 @@ pub fn parse_define(toks: &[Token]) -> Option<Macro> {
             first.space = false;
         }
         let found = pragmas(&body, true, &[]);
+        let context = BodyContext::new(&body, &[]);
         Some(Macro {
-            name,
-            params: None,
-            variadic: false,
-            body: body.into_boxed_slice(),
-            pragmas: found.pragmas,
-            pragma_operands: found.operands.into_boxed_slice(),
-            pragma_callees: found.callees.into_boxed_slice(),
-            pragma_arg: found.arg,
+            name_hash: lex::name_hash(name.as_str().as_bytes()),
+            definition: MacroDefinition {
+                name,
+                params: None,
+                variadic: false,
+                body: body.into_boxed_slice(),
+                pragmas: found.pragmas,
+                pragma_operands: found.operands.into_boxed_slice(),
+                pragma_callees: found.callees.into_boxed_slice(),
+                pragma_arg: found.arg,
+            },
+            context,
         })
     }
 }
@@ -1672,16 +1755,7 @@ pub fn parse_defines(text: &str) -> Vec<Macro> {
 
 impl Macro {
     fn clone_macro(&self) -> Macro {
-        Macro {
-            name: self.name,
-            params: self.params.clone(),
-            variadic: self.variadic,
-            body: self.body.clone(),
-            pragmas: self.pragmas.clone(),
-            pragma_operands: self.pragma_operands.clone(),
-            pragma_callees: self.pragma_callees.clone(),
-            pragma_arg: self.pragma_arg,
-        }
+        Macro { definition: self.definition.clone(), name_hash: self.name_hash, context: self.context.clone() }
     }
 }
 
@@ -1689,6 +1763,27 @@ impl Macro {
 pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn cached_body_context_preserves_references_and_spellings() {
+        let defs = parse_defines("#define F(x) A x B A 1 1 ()\n#define CAT(a,b) a##b\n#define CLOSE )(\n");
+        let f = &defs[0];
+        assert_eq!(f.context.names.len(), 2);
+        for name in ["A", "B"] {
+            assert!(f.context.names.contains(&intern::intern(name)));
+        }
+        assert!(!f.context.spellings.contains(&intern::intern("x")));
+        for spelling in ["1", "(", ")"] {
+            assert!(f.context.spellings.contains(&intern::intern(spelling)));
+        }
+        assert_eq!(f.context.spellings.iter().filter(|&&s| s == intern::intern("1")).count(), 1);
+        assert!(!f.context.unbalanced && !f.context.pastes);
+        assert!(defs[1].context.names.is_empty());
+        assert!(defs[1].context.pastes);
+        assert!(defs[2].context.unbalanced);
+        assert_eq!(f.name_hash, lex::name_hash(b"F"));
+        assert_eq!(*f, f.clone_macro());
+    }
 
     #[derive(Default)]
     struct Ctx {

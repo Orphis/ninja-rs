@@ -189,7 +189,7 @@ impl Parser<'_> {
                 }
             }
             Kind::Punct(P::LParen) => {
-                let v = self.conditional()?;
+                let v = self.expression()?;
                 if !self.eat(P::RParen) {
                     return Err("missing )".into());
                 }
@@ -255,13 +255,11 @@ impl Parser<'_> {
     fn conditional(&mut self) -> R {
         let c = self.binary(1)?;
         if !self.eat(P::Question) {
-            // The comma operator (allowed by GCC and Clang in #if).
-            if self.eat(P::Comma) {
-                return self.conditional();
-            }
             return Ok(c);
         }
-        let a = self.conditional()?;
+        // Only the middle operand is a full expression. A comma after
+        // the final operand belongs outside the conditional.
+        let a = self.expression()?;
         if !self.eat(P::Colon) {
             return Err("missing : in ?:".into());
         }
@@ -272,11 +270,24 @@ impl Parser<'_> {
             u => u,
         };
         Ok(match c.truth() {
+            // Unknown values carry no type. Even an unselected operand
+            // can make the conditional unsigned, changing later arithmetic
+            // and comparisons of a selected negative (or zero) value.
+            Some(true) if matches!((a, b), (Val::Known(_, false), Val::Unknown)) => Val::Unknown,
+            Some(false) if matches!((a, b), (Val::Unknown, Val::Known(_, false))) => Val::Unknown,
             Some(true) => conv(a),
             Some(false) => conv(b),
             None if a == b => a,
             None => Val::Unknown,
         })
+    }
+
+    fn expression(&mut self) -> R {
+        let mut value = self.conditional()?;
+        while self.eat(P::Comma) {
+            value = self.conditional()?;
+        }
+        Ok(value)
     }
 }
 
@@ -348,7 +359,7 @@ pub fn eval(toks: &[Token], dialect: Dialect) -> Result<Val, String> {
         toks
     };
     let mut p = Parser { toks, pos: 0, dialect };
-    let v = p.conditional()?;
+    let v = p.expression()?;
     if p.pos != toks.len() {
         return Err(format!("unexpected '{}' in #if", toks[p.pos].sym.as_str()));
     }
@@ -380,6 +391,8 @@ mod tests {
         assert_eq!(ev("0 ? 2 : 3u"), Ok(Val::Known(3, true)));
         assert_eq!(ev("undefined_ident + true + false"), Ok(Val::int(1)));
         assert_eq!(ev("1, 2"), Ok(Val::int(2)));
+        assert_eq!(ev("(1 ? 0 : 0, 1)"), Ok(Val::int(1)));
+        assert_eq!(ev("(0 ? 0, 1 : 0)"), Ok(Val::int(0)));
     }
 
     #[test]
@@ -430,5 +443,9 @@ mod tests {
         assert_eq!(with("U + 1"), Ok(Val::Unknown));
         assert_eq!(with("U ? 1 : 1"), Ok(Val::int(1)));
         assert_eq!(with("!U"), Ok(Val::Unknown));
+        assert_eq!(with("(1 ? -1 : (U + 0U)) < 0"), Ok(Val::Unknown));
+        assert_eq!(with("(0 ? (U + 0U) : -1) < 0"), Ok(Val::Unknown));
+        assert_eq!(with("1 ? -1U : U"), Ok(Val::Known(u64::MAX, true)));
+        assert_eq!(with("(1 || U ? 0 : 0, 1)"), Ok(Val::int(1)));
     }
 }
