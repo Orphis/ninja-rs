@@ -8,6 +8,9 @@
 
 mod track;
 
+#[cfg(test)]
+mod review;
+
 use track::{Elsewhere, Replay};
 pub use track::{UNION_BOUND, set_tracking, tracking};
 
@@ -1104,7 +1107,7 @@ impl State<'_> {
         // expanded.
         let frame = self.stack.pop();
         let mut pastes = HashMap::new();
-        if !self.arg_pragmas.is_empty()
+        if !self.fragmented.is_empty()
             && let Some(f) = frame
             && self.text_may_run_pragma(&fd, &mut pastes)
             && self.text_runs_pragma(&f.real, &fd, &mut pastes)
@@ -1315,6 +1318,10 @@ impl State<'_> {
                 let toks = x.expand_tokens(&d.toks);
                 let error = x.error.take();
                 let (tainted, garbled) = (x.tainted, x.garbled);
+                if toks.iter().any(|t| t.sym == intern::PRAGMA_OPERATOR || t.sym == intern::MS_PRAGMA_OPERATOR) {
+                    self.inexact(format!("{}: a pragma in a condition may change macros", self.here()));
+                    return None;
+                }
                 if self.taint.is_none() {
                     if let Some(e) = error {
                         self.inexact(format!("{}: {e}", self.here()));
@@ -1339,6 +1346,10 @@ impl State<'_> {
                     (None, None) => None,
                 };
                 if let Some(why) = why {
+                    if self.may_run_pragma(&d.toks) {
+                        self.inexact(format!("{}: {why}, where a pragma may change macros", self.here()));
+                        return None;
+                    }
                     if self.may_test_files(&d.toks) {
                         self.inexact(format!("{}: {why}, where __has_include or __has_embed may run", self.here()));
                     }
@@ -1507,7 +1518,7 @@ impl State<'_> {
     /// parts of names of macros whose pragmas their arguments make its
     /// replacement has (see `pasted_pragma_name`).
     fn defined(&mut self, name: Sym) {
-        if self.arg_pragmas.is_empty() {
+        if self.fragmented.is_empty() {
             return;
         }
         self.macro_hashes.insert(lex::name_hash(name.as_str().as_bytes()), name);
@@ -1604,26 +1615,31 @@ impl State<'_> {
             if self.arg_pragmas.len() == 1 {
                 self.macro_hashes = self.macros.keys().map(|&n| (lex::name_hash(n.as_str().as_bytes()), n)).collect();
             }
-            // Its name's parts, and the replacements that have one.
-            let name = m.name.as_str();
-            let mut parts = Vec::new();
-            for end in (1..=name.len()).filter(|&e| name.is_char_boundary(e)) {
-                for start in (0..end).filter(|&s| name.is_char_boundary(s) && end - s < name.len()) {
-                    let part = intern::intern(&name[start..end]);
-                    self.fragments.insert(part);
-                    self.fragment_hashes.insert(lex::name_hash(&name.as_bytes()[start..end]), part);
-                    parts.push((start, end, part));
-                }
-            }
-            self.fragmented.push((name.len(), parts));
-            for o in self.macros.values().cloned().collect::<Vec<_>>() {
-                self.replaced_fragments_of(&o);
-            }
+            self.pragma_name_parts(m.name);
             let naming: Vec<Arc<Macro>> =
                 self.macros.values().filter(|o| o.name != m.name && o.body.iter().any(|t| t.kind == Kind::Ident && t.sym == m.name)).cloned().collect();
             for o in naming {
                 self.classify(&o);
             }
+        }
+    }
+
+    /// Parts that token pastes could assemble into a pragma operator or
+    /// a macro whose arguments supply its pragma.
+    fn pragma_name_parts(&mut self, name: Sym) {
+        let name = name.as_str();
+        let mut parts = Vec::new();
+        for end in (1..=name.len()).filter(|&e| name.is_char_boundary(e)) {
+            for start in (0..end).filter(|&s| name.is_char_boundary(s) && end - s < name.len()) {
+                let part = intern::intern(&name[start..end]);
+                self.fragments.insert(part);
+                self.fragment_hashes.insert(lex::name_hash(&name.as_bytes()[start..end]), part);
+                parts.push((start, end, part));
+            }
+        }
+        self.fragmented.push((name.len(), parts));
+        for o in self.macros.values().cloned().collect::<Vec<_>>() {
+            self.replaced_fragments_of(&o);
         }
     }
 
@@ -1723,7 +1739,18 @@ impl State<'_> {
                 }
                 DirKind::Include | DirKind::IncludeNext | DirKind::Import => self.include(d),
                 DirKind::Embed => self.embed(d),
-                DirKind::Pragma => self.pragma(d),
+                DirKind::Pragma => {
+                    // Text may be a discarded macro argument. Its pragmas
+                    // are possible side effects, not certain directives.
+                    let uncertain = d.from_text && self.taint.is_some();
+                    if uncertain {
+                        self.enter_region();
+                    }
+                    self.pragma(d);
+                    if uncertain {
+                        self.exit_region();
+                    }
+                }
                 DirKind::Line => {
                     if let Some(f) = self.stack.last_mut() {
                         f.line_set = true;
@@ -1846,6 +1873,11 @@ fn scanned<'a>(cache: &'a Cache, cfg: &'a Config, oracle: &'a dyn Oracle, main: 
         spelled_ends: 0,
         pusher_ops: SymMap::default(),
     };
+    // Operators can themselves be pasted, with their operand supplied
+    // by a later call. Use the same fragment filter as argument pragmas.
+    st.pragma_name_parts(intern::PRAGMA_OPERATOR);
+    st.pragma_name_parts(intern::MS_PRAGMA_OPERATOR);
+    st.macro_hashes = st.macros.keys().map(|&n| (lex::name_hash(n.as_str().as_bytes()), n)).collect();
     if !cfg.commands.is_empty() {
         let fd = lex::lex(command_text(&cfg.commands).as_bytes());
         let frame = Frame {

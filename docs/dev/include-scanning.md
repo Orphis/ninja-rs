@@ -497,14 +497,16 @@ hard part is text, which the scan doesn't expand:
   libc++'s `_LIBCPP_PUSH_MACROS` and `_LIBCPP_POP_MACROS`); or something else (`Pragmas::Other`),
   which makes the scan inexact. An object-like macro that pushes and pops is replayed where text
   uses it (see [The replay](#the-replay-of-pushes-and-pops-in-text)). Otherwise, pushes and pops
-  change nothing unless the macros they name change meanwhile, which makes those macros unknown
-  (inexact without tracking: `State::changing`). A body whose `_Pragma` operand macros make is
+  make their target macros and stacks unknown when they can't be placed: a pop may immediately
+  restore a different definition (inexact without tracking). A body whose `_Pragma` operand macros make is
   classified with the macros defined then, and again when one of those changes (libc++ defines
   `_LIBCPP_VERSION` later); one reading a macro of unknown definition is `Pragmas::Other`.
 - A macro whose pragma comes from its arguments (`#define DO_PRAGMA(x) _Pragma(#x)`) can't be
   classified alone. Text calling it with `once` or `push_macro(...)` is found through the text's
   names: when a file names such a macro, or a macro that pastes names and could form one, its text
   is tokenized and the calls checked (`text_may_run_pragma`, `text_runs_pragma`).
+  The same fragment checks cover pasting `_Pragma` or `__pragma` itself, including when the
+  operand follows the pasted name in another call and is supplied through a macro.
 
 This keeps libc++ (pushes and pops on every header) and the MSVC STL exact, while code that runs
 `once` through a macro in text is caught.
@@ -530,14 +532,16 @@ which files are read.
 - **Sources.** An unanswered query, `__COUNTER__`, `__LINE__` or `__FILE__` after `#line`,
   `__FILE__` with relative paths (`Kind::Unknown` tokens); an expansion the traditional model gives
   up on, or a malformed condition (the whole condition); a macro that changes while text may push
-  or pop it, or popped from a stack that is unknown (an unknown macro).
+  or pop it, or popped from a stack that is unknown (an unknown macro). An unplaced push or pop
+  makes the target unknown immediately, including when no later directive redefines it.
 - **Unknown macros.** `Tracking::unknown` holds them, with why; `Tracking::alts` every definition
   each had while it was tracked (changed in a region, pushed or popped in text, on an unknown
   stack): an unknown macro is one of them, or undefined. An expansion reading one (expanding it,
   or meeting its name however it's hidden or followed) is unknown as a whole (`Expander::tainted`):
   another definition could expand to `)` or a comma. `defined(X)` and `#ifdef X` of one are an
   unknown value, which `||` and `&&` may still decide. A query naming one makes its condition
-  unknown.
+  unknown. Unknown expression values also have unknown signedness: an unselected `?:` operand
+  can change the selected operand's type, so a known condition alone doesn't make its result known.
 - **Garbled values.** An unknown value pasted or stringized looks known (`1 ## __COUNTER__` is
   `1`): the expansion is unknown as a whole (`Expander::garbled`).
 - **Uncertain regions.** A condition of unknown value processes every branch it can't rule out
@@ -548,7 +552,8 @@ which files are read.
 - **Maybe once.** A `#pragma once` (or `#import`) run in a region marks the file "maybe once": its
   next inclusion is an uncertain region (the compiler may skip it or not). Read certainly that way,
   it's skipped from then on when its `#pragma once` is outside any conditional (whatever the
-  macros, it ran). A copy of a `#pragma once` file, or a link to one, is an uncertain region too.
+  macros, it ran). This requires an actual directive: a pragma synthesized from text may be a
+  discarded macro argument. A copy of a `#pragma once` file, or a link to one, is an uncertain region too.
 - **Include guards.** A guard that is unknown doesn't skip its file: the file is read, and its
   `#ifndef` is a region. At that region's `#endif`, outside other regions, the guard is defined
   either way; when the region defined it last and every definition it may have had is the same, it
@@ -558,7 +563,9 @@ which files are read.
   `__has_include`, `__has_include_next` or `__has_embed` may run (`State::may_test_files`: the
   names it reaches through every definition the macros may have, and through pastes, which may
   make an operator of its parts or the name of a macro whose body has one); a `_Pragma` operand or
-  a macro's pragmas reading an unknown macro; more than `UNION_BOUND` (64) files first read or
+  a macro's pragmas reading an unknown macro; a pragma in a condition, including one reachable
+  through alternative definitions or token pastes (its macro side effects aren't modeled there);
+  more than `UNION_BOUND` (64) files first read or
   found inside uncertain regions.
 - **Once inexact,** a scan stops tracking (`State::inexact` drops it) and goes on as without
   it, for the files `__has_include` finds that the compiler's list lacks. Tracking on in an
@@ -614,13 +621,21 @@ where text uses it, in order with the directives, as the compiler expands it the
 
 - `lex::text_uses` lists the names a file's text uses, with their lines, once per file version
   (read again when a file names a pusher): a use outside parentheses (counted over the whole file,
-  across directives and branches) and not followed by `(` is placeable; it expands where it is and
-  is no macro's argument. One on a directive's line (a `_Pragma` the lexer made a directive) isn't.
+  across directives and branches) and not followed by `(` is a candidate for replay. A negative
+  depth, or a directive with open parentheses, makes subsequent uses unplaceable: inactive
+  branches mustn't cancel the parentheses of an active macro call. One on a directive's line
+  (a `_Pragma` the lexer made a directive) isn't placeable either.
+- Macro expansion can introduce parentheses absent from the text. A lazy, monotone graph tracks
+  macros with unbalanced bodies, their users, and possible pasted names. A file naming one stops
+  replay; the graph includes alternative definitions of unknown macros. It checks cached file
+  names instead of expanding all text.
 - `State::replay_until` replays the uses before each directive, in active branches (and in every
   branch of a region, as uncertain pushes). A pusher of pragmas only is parsed once per definition
   (`pusher_ops`); another is expanded.
 - What can't be placed falls back to tracking: the macros the pusher names are pushed or popped
-  in text (`pushed_in_text`), and unknown when they change. So do pushers in parentheses, a macro
+  in text (`pushed_in_text`), immediately making their values and stacks unknown. Every target
+  from every possible pusher definition is included, even if the current definition is absent.
+  So do pushers in parentheses, a macro
   naming a pusher (a wrapper, used where the replay doesn't see), and a pusher whose expansion
   reads an unknown value.
 - A paste could make a pusher's name unseen (`CAT(_LIBCPP_PUSH, _MACROS)`). It needs a part
@@ -641,7 +656,12 @@ where text uses it, in order with the directives, as the compiler expands it the
 - The join of include guards needs `#ifndef G` (or `#if !defined(G)`) without other branches, and
   happens only outside other regions.
 - The replay stops for a scan once parts of a pusher's name are spelled in it, even far apart.
-- A paste making `_Pragma` itself in text isn't seen (as before tracking).
+
+`scan/review.rs` checks adversarial tracking and replay examples for both header reads and
+positive existence probes. Compiler-gated tests compare accepted scans with Clang, clang-cl and
+native cl; generated cases combine uncertain definitions, stacks, suppressed pragmas and text
+contexts. Compiler dependency lists don't report existence probes, so generated cases pair each
+probe with a uniquely named included header to check both kinds of input.
 
 ### What makes a scan inexact
 

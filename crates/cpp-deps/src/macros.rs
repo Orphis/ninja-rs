@@ -346,7 +346,12 @@ pub(crate) fn call_runs_pragma(call: &[Token], ctx: &mut dyn Context) -> bool {
         (out, x.error.is_some() || x.unsure())
     };
     let found = pragmas(&out, true, &[]);
-    failed || found.pragmas != Pragmas::None || !found.operands.is_empty() || out.iter().any(|t| t.kind == Kind::Ident && recording.ctx.arg_pragma(t.sym))
+    failed
+        || found.pragmas != Pragmas::None
+        || !found.operands.is_empty()
+        || out
+            .iter()
+            .any(|t| t.kind == Kind::Ident && (t.sym == intern::PRAGMA_OPERATOR || t.sym == intern::MS_PRAGMA_OPERATOR || recording.ctx.arg_pragma(t.sym)))
 }
 
 /// What a body that names macros whose pragmas their arguments make does
