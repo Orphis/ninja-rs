@@ -8,6 +8,29 @@ use std::sync::{OnceLock, RwLock};
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Sym(u32);
 
+/// A hasher for symbols (their numbers, multiplied): cheaper than the
+/// default one where a scan looks names up for every definition.
+#[derive(Default, Clone, Copy)]
+pub struct SymHasher(u64);
+
+impl std::hash::Hasher for SymHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ b as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
+/// Maps and sets of symbols, with `SymHasher`.
+pub type SymMap<V> = HashMap<Sym, V, std::hash::BuildHasherDefault<SymHasher>>;
+pub type SymSet = std::collections::HashSet<Sym, std::hash::BuildHasherDefault<SymHasher>>;
+
 impl std::fmt::Debug for Sym {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self.as_str())

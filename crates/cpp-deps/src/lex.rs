@@ -160,6 +160,75 @@ pub struct FileDirectives {
     /// The tokens of the text, when a scan looks at such a call: read
     /// again then (rarely), once (None: the file changed since).
     pub text: OnceLock<Option<Box<[Token]>>>,
+    /// The names used in text, with their lines and whether they're
+    /// placeable (see `text_uses`), when a scan replays the macros text
+    /// pushes and pops: read again then, once (None: the file changed
+    /// since).
+    pub uses: OnceLock<Option<std::sync::Arc<[TextUse]>>>,
+    /// Which ends of the names of the pushers of a scan the text spells
+    /// (see `scan`'s replay), for the last set of them asked: their
+    /// fingerprint, its two low bits the answer.
+    pub ends: std::sync::atomic::AtomicU64,
+}
+
+/// A name used in text (see `text_uses`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextUse {
+    pub line: u32,
+    pub sym: Sym,
+    /// Outside any parentheses (counted over the whole file's text, across
+    /// directives and whatever the conditionals) and not followed by `(`:
+    /// an object-like macro there expands where it is, in order with the
+    /// directives, and is no macro's argument.
+    pub placeable: bool,
+}
+
+/// The names a file's text uses, in order, with their lines (as `lex`
+/// numbers them).
+pub fn text_uses(content: &[u8]) -> Vec<TextUse> {
+    let content = content.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(content);
+    let unix;
+    let content = if content.iter().enumerate().any(|(i, &c)| c == b'\r' && content.get(i + 1) != Some(&b'\n')) {
+        unix = content.iter().enumerate().map(|(i, &c)| if c == b'\r' && content.get(i + 1) != Some(&b'\n') { b'\n' } else { c }).collect::<Vec<u8>>();
+        &unix[..]
+    } else {
+        content
+    };
+    let mut lx = Lexer { b: content, pos: 0, line: 0, line_pos: 0 };
+    let mut out: Vec<TextUse> = Vec::new();
+    let mut depth = 0i32;
+    loop {
+        lx.skip_space();
+        let Some(c) = lx.peek() else { break };
+        if c == b'\n' {
+            lx.bump();
+            continue;
+        }
+        let directive = c == b'#' || (c == b'%' && lx.peek2() == Some(b':'));
+        let start = lx.pos;
+        let line = lx.line_at(start);
+        lx.skip_text_line();
+        if directive {
+            // (Parentheses still open: a directive inside a macro's
+            // arguments, or branches that don't balance. Either way, what
+            // follows isn't placeable until they close.)
+            continue;
+        }
+        let toks = tokens(&lx.text(start));
+        for (i, t) in toks.iter().enumerate() {
+            if t.is(P::LParen) {
+                depth += 1;
+            } else if t.is(P::RParen) {
+                depth -= 1;
+            } else if let Some(sym) = t.ident() {
+                let call = toks.get(i + 1).is_some_and(|n| n.is(P::LParen));
+                // (A `(` on the next line isn't seen: an object-like macro
+                // expands whatever follows.)
+                out.push(TextUse { line, sym, placeable: depth == 0 && !call });
+            }
+        }
+    }
+    out
 }
 
 /// A name's hash (see `FileDirectives::names`): never 0.
@@ -797,7 +866,19 @@ pub fn lex(content: &[u8]) -> FileDirectives {
         dirs.push(Directive { kind, toks: toks.into_boxed_slice(), line, mac });
     }
     let guard = if text_first || text_last { None } else { include_guard(&dirs) };
-    FileDirectives { dirs, guard, utf16: false, lone_cr, trigraphs, asm_include, hash, names: named.sorted(), text: OnceLock::new() }
+    FileDirectives {
+        dirs,
+        guard,
+        utf16: false,
+        lone_cr,
+        trigraphs,
+        asm_include,
+        hash,
+        names: named.sorted(),
+        text: OnceLock::new(),
+        uses: OnceLock::new(),
+        ends: Default::default(),
+    }
 }
 
 /// The first token of a `#pragma` the lexer makes for text that gives a

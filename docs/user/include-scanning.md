@@ -64,10 +64,15 @@ flowchart TD
 
 - **Exact.** The scan evaluates `#if`, macros, `__has_include`, `__has_builtin` and the like,
   with what the compiler predefines and answers (its *profile*, probed by running the compiler
-  with the command's flags). It is exact unless it meets something it doesn't model: an
-  unsupported flag, a query the compiler can't answer, a construct of `cl`'s traditional
-  preprocessor it can't reproduce faithfully. It also gives up when an `#include` isn't found:
-  a lookup it got wrong could drop inputs.
+  with the command's flags). What it can't know (a query the compiler can't answer,
+  `__COUNTER__`, a construct of `cl`'s traditional preprocessor it can't reproduce faithfully, a
+  macro libc++ pushes in text that `<windows.h>` changes) it tracks: where it only decides an
+  `#if` choosing between headers, the scan sends the headers of every branch the compiler might
+  take (a *union*: a few headers more, never one less). It gives up where an unknown value names
+  the file read: an `#include` whose name it can't compute, a `__has_include` it can't follow, a
+  pragma run through a macro it can't follow, or a union of more than 64 such headers; and on an
+  unsupported flag. It also gives up when an `#include` isn't found: a lookup it got wrong could
+  drop inputs.
 - **The compiler's list.** ninja-rs runs the compiler's preprocessor on the command, without its
   outputs, and reads the files it lists. GCC and `cl` don't list the files `__has_include`,
   `__has_embed` or `#pragma GCC dependency` merely probe, so ninja-rs adds those the partial
@@ -124,6 +129,16 @@ reasons:
 ```text
 ninja: 7 compiles' includes were the compiler's, the preprocessor's scan being unable to tell (6: not exact (a pragma from a macro in text); 1: unsupported flag /clr). 1 compiles were scanned conservatively (1: C:\VS\bin\cl.exe failed).
 ```
+
+Compiles whose list was a union (see **Exact** above) are counted too, when there are any, with
+the most files they may have sent that the compiler doesn't read:
+
+```text
+ninja: 12 compiles' includes were a union over conditions the scan couldn't decide (at most 30 files more than the compiler reads).
+```
+
+Nothing needs fixing there: those compiles were sent with every header they read. An extra header
+only makes the action's key change when that header changes.
 
 - `--remote_verbose` names every compile and its reason.
 - The fix depends on the reason. `an #include not found` usually means a generated header that
@@ -215,8 +230,9 @@ These are known and being worked on. Most affect the fallbacks, not the default 
   only probes: such a file present on your machine but not sent changes the object silently.
 - **A localized `cl` without `msvc_deps_prefix`** lists no headers to ninja-rs, which sends only
   the source: the remote compile fails and runs locally.
-- **Windows with libc++ and `<windows.h>`** without `NOMINMAX`: these compiles are never exact,
-  and each one asks the compiler. Define `NOMINMAX` where the code allows it.
+- **Unions send a few headers the compile doesn't read.** When the scan can't decide an `#if`
+  choosing between headers, it sends all of them: a change to one the compile doesn't read still
+  changes the action's key, and the cache misses once.
 - **The compiler's lists aren't cached:** a compile left to the compiler pays for it at every
   build that prepares it.
 - **The conservative scanner can miss headers** reached through computed includes it can't

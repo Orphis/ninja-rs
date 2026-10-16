@@ -305,7 +305,7 @@ pub fn operand_pragmas(operand: &[Token], own: Option<Sym>, params: &[Sym], ctx:
     let mut recording = Recording { ctx, looked_up: Default::default() };
     let mut x = Expander::new(&mut recording, false);
     let out = x.expand(input);
-    let failed = x.error.is_some();
+    let failed = x.error.is_some() || x.unsure();
     let mut looked_up = recording.looked_up.into_inner();
     looked_up.sort();
     looked_up.dedup();
@@ -328,7 +328,7 @@ pub(crate) fn operand_words(operand: &[Token], ctx: &mut dyn Context) -> Option<
     let mut x = Expander::new(&mut recording, false);
     let out = x.expand(input);
     match &out[..] {
-        [s] if x.error.is_none() && s.t.kind == Kind::Str => Some(lex::tokens(destringize(s.t.sym.as_str()).as_bytes())),
+        [s] if x.error.is_none() && !x.unsure() && s.t.kind == Kind::Str => Some(lex::tokens(destringize(s.t.sym.as_str()).as_bytes())),
         _ => None,
     }
 }
@@ -343,7 +343,7 @@ pub(crate) fn call_runs_pragma(call: &[Token], ctx: &mut dyn Context) -> bool {
     let (out, failed) = {
         let mut x = Expander::new(&mut recording, false);
         let out = x.expand_tokens(call);
-        (out, x.error.is_some())
+        (out, x.error.is_some() || x.unsure())
     };
     let found = pragmas(&out, true, &[]);
     failed || found.pragmas != Pragmas::None || !found.operands.is_empty() || out.iter().any(|t| t.kind == Kind::Ident && recording.ctx.arg_pragma(t.sym))
@@ -361,7 +361,7 @@ fn body_pragmas(m: &Macro, ctx: &mut dyn Context) -> (Pragmas, Vec<Sym>, bool) {
     let mut recording = Recording { ctx, looked_up: Default::default() };
     let mut x = Expander::new(&mut recording, false);
     let out: Vec<Token> = x.expand(input).into_iter().map(|t| t.t).collect();
-    let failed = x.error.is_some();
+    let failed = x.error.is_some() || x.unsure();
     let mut looked_up = recording.looked_up.into_inner();
     looked_up.sort();
     looked_up.dedup();
@@ -416,7 +416,7 @@ impl Macro {
         // A pragma's words given to a macro.
         for &c in self.pragma_callees.iter() {
             deps.push(c);
-            if ctx.lookup(c).is_some() {
+            if ctx.lookup(c).is_some() || ctx.is_unknown(c) {
                 pragmas = pragmas.and(Pragmas::Other);
             }
         }
@@ -470,6 +470,9 @@ impl Context for Recording<'_> {
     }
     fn va_comma(&self) -> VaComma {
         self.ctx.va_comma()
+    }
+    fn is_unknown(&self, name: Sym) -> bool {
+        self.ctx.is_unknown(name)
     }
     fn has_include(&mut self, _name: &str, _angled: bool, _next: bool) -> bool {
         false
@@ -666,6 +669,12 @@ pub trait Context {
     fn va_comma(&self) -> VaComma {
         VaComma::default()
     }
+    /// Whether `name`'s definition is unknown here (it may be any
+    /// definition it had in this scan, or none: see `scan`'s tracking of
+    /// unknown values).
+    fn is_unknown(&self, _name: Sym) -> bool {
+        false
+    }
 }
 
 /// When the compiler drops the comma before `__VA_ARGS__` (with `##`
@@ -760,6 +769,15 @@ pub struct Expander<'c> {
     pub if_mode: bool,
     /// Set on malformed input (the expansion is then not trustworthy).
     pub error: Option<String>,
+    /// The first macro of unknown definition (see `Context::is_unknown`)
+    /// the expansion read: its result is then unknown as a whole (another
+    /// definition may expand to anything, a `)` or a comma).
+    pub tainted: Option<Sym>,
+    /// An unknown value (`Kind::Unknown`: an unanswered query, `__COUNTER__`)
+    /// was pasted or stringized: the result looks known but isn't.
+    pub garbled: bool,
+    /// How many unknown values the expansion made.
+    pub unknown_values: usize,
     budget: usize,
     /// Macros expand as cl's traditional preprocessor expands them.
     traditional: bool,
@@ -779,7 +797,43 @@ pub struct Expander<'c> {
 impl<'c> Expander<'c> {
     pub fn new(ctx: &'c mut dyn Context, if_mode: bool) -> Self {
         let (traditional, va_comma) = (ctx.traditional(), ctx.va_comma());
-        Expander { ctx, if_mode, error: None, budget: 1_000_000, traditional, va_comma, nesting: 0, top_hide: None, owners: Vec::new() }
+        Expander {
+            ctx,
+            if_mode,
+            error: None,
+            tainted: None,
+            garbled: false,
+            unknown_values: 0,
+            budget: 1_000_000,
+            traditional,
+            va_comma,
+            nesting: 0,
+            top_hide: None,
+            owners: Vec::new(),
+        }
+    }
+
+    /// An identifier met while expanding: one whose definition is unknown
+    /// (whatever it's hidden by or followed by: another definition it may
+    /// have would be called otherwise) makes the result unknown.
+    fn taint(&mut self, name: Sym) {
+        if self.tainted.is_none() && self.ctx.is_unknown(name) {
+            self.tainted = Some(name);
+        }
+    }
+
+    /// Whether the result can't be trusted as known: it read a macro of
+    /// unknown definition, or pasted or stringized an unknown value.
+    pub fn unsure(&self) -> bool {
+        self.tainted.is_some() || self.garbled
+    }
+
+    /// Stringizes an argument (an unknown value in it garbles the result).
+    fn stringized(&mut self, arg: &[XTok]) -> Token {
+        if arg.iter().any(|t| t.t.kind == Kind::Unknown) {
+            self.garbled = true;
+        }
+        stringize(arg)
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
@@ -859,6 +913,7 @@ impl<'c> Expander<'c> {
         if name == intern::DEFINED {
             let op = self.operand(input, true);
             return Some(match op.as_deref() {
+                Some([t]) if t.t.kind == Kind::Ident && self.ctx.is_unknown(t.t.sym) => unknown(),
                 Some([t]) if t.t.kind == Kind::Ident => number(self.ctx.is_defined(t.t.sym) as i64),
                 _ => {
                     self.fail("malformed defined()");
@@ -942,6 +997,7 @@ impl<'c> Expander<'c> {
         if self.if_mode
             && let Some(mut v) = self.if_operator(name, input)
         {
+            self.unknown_values += (v.kind == Kind::Unknown) as usize;
             v.space = t.t.space;
             out.push(XTok::new(v));
             return None;
@@ -954,6 +1010,7 @@ impl<'c> Expander<'c> {
         if m.is_none() {
             match self.ctx.dynamic(name) {
                 Some(mut d) => {
+                    self.unknown_values += (d.kind == Kind::Unknown) as usize;
                     d.space = t.t.space;
                     out.push(XTok::new(d));
                 }
@@ -975,6 +1032,7 @@ impl<'c> Expander<'c> {
                 continue;
             }
             let name = t.t.sym;
+            self.taint(name);
             let Some(m) = self.macro_at(&t, &mut input, &mut out) else { continue };
             let replacement = match &m.params {
                 None => {
@@ -1058,7 +1116,7 @@ impl<'c> Expander<'c> {
                 && m.params.is_some()
                 && let Some(pi) = body.get(i + 1).and_then(param)
             {
-                items.push(Item::Tok(XTok::new(Token { space: tok.space, ..stringize(&args[pi]) })));
+                items.push(Item::Tok(XTok::new(Token { space: tok.space, ..self.stringized(&args[pi]) })));
                 i += 2;
                 continue;
             }
@@ -1205,6 +1263,7 @@ impl<'c> Expander<'c> {
                 continue;
             }
             let name = t.t.sym;
+            self.taint(name);
             if t.tail && scan == Scan::Argument && input.front().is_some_and(|n| !n.t.is(P::LParen)) {
                 self.fail(format!("{} ends an expansion in an argument, followed by more", name.as_str()));
             }
@@ -1351,7 +1410,7 @@ impl<'c> Expander<'c> {
                 && let Some(pi) = body.get(i + 1).and_then(param)
             {
                 if pi < args.given {
-                    items.push(Item::Tok(XTok::new(Token { space: tok.space, ..stringize(&args.toks[pi]) })));
+                    items.push(Item::Tok(XTok::new(Token { space: tok.space, ..self.stringized(&args.toks[pi]) })));
                 }
                 i += 2;
                 continue;
@@ -1460,6 +1519,11 @@ impl<'c> Expander<'c> {
             };
             let Some(right) = items.next() else { break };
             let left = pasted.pop();
+            if let (Some(Item::Tok(l)), Item::Tok(r)) = (&left, &right)
+                && (l.t.kind == Kind::Unknown || r.t.kind == Kind::Unknown)
+            {
+                self.garbled = true;
+            }
             match (left, right) {
                 (None, r) => pasted.push(r),
                 (Some(Item::Placemarker { .. }), r) => pasted.push(r),

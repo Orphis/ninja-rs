@@ -442,7 +442,7 @@ check each other:
 
 Messages (`proto.rs`) are a little-endian `u32` length, then JSON; larger than 1 GiB is refused. A
 connection carries one request at a time; the client keeps a pool, so concurrent actions ask in
-parallel, and drops a connection that answered late. `PROTOCOL` is 4; the first message is
+parallel, and drops a connection that answered late. `PROTOCOL` is 5; the first message is
 `Hello`, and a daemon speaking another protocol is given up on at once (another can't start: it
 holds the lock). Requests: `Hello`, `Begin`, `Scan`, `Files`, `Tree`, `Status`, `Stop`. A scan
 naming a build the daemon no longer keeps gets `UnknownBuild`, and the client begins again, once.

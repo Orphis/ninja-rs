@@ -63,6 +63,7 @@ jobserver. With `--jobserver-pool`, ninja-rs sets `MAKEFLAGS` for its commands i
 | `NINJA_RS_DAEMON_DIR` | every invocation, the daemon | The daemon's directory, instead of the default (see [files.md](files.md#daemon-directory)). Relay sockets and the private option files of nested invocations go there too. |
 | `NINJA_RS_DAEMON_IDLE` | the daemon, as it starts | Seconds without builds after which it exits; default 10800 (3 hours). A daemon a build starts inherits that build's environment. |
 | `NINJA_RS_BES_DEBUG` | builds with `--bes_backend` | Not empty: the Build Event Service uploader traces its connection and stream on stderr, as `[bes    1.234s] ...` lines. |
+| `CPP_DEPS_TRACKING` | the preprocessor include scanner (in the build, or the daemon as it starts) | For diagnosis: `off` (or `0`) stops it tracking unknown values, so that every compile where it meets one goes to the compiler (see [include scanning](../dev/include-scanning.md#unknown-values-and-tracking)). |
 
 ### The system's
 

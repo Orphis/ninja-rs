@@ -15,6 +15,7 @@ scanner's caches between builds is described in [The daemon](daemon.md).
 | `crates/cpp-deps/src/macros.rs` | definitions, the standard expander, cl's traditional model, what macros do through pragmas |
 | `crates/cpp-deps/src/expr.rs` | `#if` arithmetic with unknown values, by `Dialect` |
 | `crates/cpp-deps/src/scan.rs` | a translation unit: conditionals, lookups, `#pragma once`, `Cache`, `Output` |
+| `crates/cpp-deps/src/scan/track.rs` | unknown values: uncertain regions, unknown macros, the union's bound; the replay of pushes and pops in text |
 | `crates/cpp-deps/src/probe.rs` | running the compiler: predefined macros, dialect, comma rules, query answers |
 | `crates/cpp-deps/src/driver.rs` | command lines to an `Invocation`, `Profile`, `Driver::scan_in` |
 | `crates/cpp-deps/src/external.rs` | the compiler's own list (`compiler_deps`), `clang_scan_deps` |
@@ -147,6 +148,10 @@ compiler's, the preprocessor's scan being unable to tell (...)". Reasons drop wh
 compile (file names, operands), so that one header used everywhere makes one line, and the summary
 names the four most frequent. Compiles left to the conservative scanner are counted the same way
 by `ScanCache::fell_back` and `fallback_summary` ("N compiles were scanned conservatively").
+`CompilerScans` also counts the exact scans that are a union over conditions the scan couldn't
+decide (`Output::union`, see [Unknown values](#unknown-values-and-tracking)), apart: "N compiles'
+includes were a union over conditions the scan couldn't decide (at most M files more than the
+compiler reads)", only when there are some.
 
 ## The exact scanner (cpp-deps)
 
@@ -161,14 +166,16 @@ flowchart LR
     C --> D
     D --> E["scan: conditionals, macros, lookups"]
     F["lexed files, cached per version"] --> E
-    E --> G["Output: files, found, missing, unknown, inexact"]
+    E --> G["Output: files, found, missing, unknown, inexact, union"]
     G -->|"unknown queries"| H["compiler asked"]
     H --> E
 ```
 
-`Output::exact()` holds when nothing made the scan inexact and every query has an answer.
-`files` are what the preprocessor reads (the main file first), `found` what `__has_include`,
-`__has_embed` and `#pragma GCC dependency` found, `missing` the includes not found.
+`Output::exact()` holds when nothing made the scan inexact. `files` are what the preprocessor
+reads (the main file first), `found` what `__has_include`, `__has_embed` and `#pragma GCC
+dependency` found, `missing` the includes not found, `unknown` the queries without an answer.
+`union` is set when uncertain regions read files: the lists are then a union, with at most that
+many files the compiler doesn't read (see [Unknown values](#unknown-values-and-tracking)).
 
 ### Command lines and flags
 
@@ -246,9 +253,10 @@ and the alternative operators by dialect (C++; for `cl`, only with `/permissive-
 implies; the probe tells), and MSVC's integer suffixes for `cl` and Clang with Microsoft
 extensions. A value
 may be unknown: an unanswered query, `__COUNTER__`, `__LINE__` or `__FILE__` after `#line`,
-`__FILE__` with relative paths on the command line. `&&`, `||` and `?:` still decide when the
-known side is enough. Otherwise every branch that can't be ruled out is processed, and the result
-is inexact (likely a superset, but no guarantee).
+`__FILE__` with relative paths on the command line, `defined` of a macro of unknown definition.
+`&&`, `||` and `?:` still decide when the known side is enough. Otherwise the condition is
+unknown, and its branches are an uncertain region (see
+[Unknown values](#unknown-values-and-tracking)).
 
 Queries (`__has_builtin(x)`, `__has_cpp_attribute(x)`...) go to the profile. Unknown ones are
 collected; `Driver::scan_in` asks the compiler (`probe::answer`), saves the answers with the
@@ -261,7 +269,8 @@ ends the asking at once (each half would hang again). When asking fails, the pro
 again in that session (`Profile::gave_up`): its scans stay inexact rather than each wait a
 minute; a later session asks again. One scan asks at a time (`Profile::asking`); others find the
 answers and scan again. A query naming a macro the source defined is unknown, as compilers may
-expand it.
+expand it. A query still without an answer after asking is an unknown value: the scan is a union
+over the conditions it can't decide.
 
 Most queries are answered before any scan needs them: the first probe also asks a seed list,
 `src/query_seeds.txt` (about 14,000 `op arg` lines, embedded in the binary). It lists every
@@ -295,7 +304,8 @@ versions; a new list takes effect at a profile's next probe.
   the include stack, innermost first, then the main file's directory for forced includes and what
   they include. Clang then gives a file found next to an outer includer one of two places in the
   chain for its `#include_next`, depending on `-Wmicrosoft-include`; when the two places find
-  different files, the scan is inexact.
+  different files, both are included, each an uncertain region (inexact when one of them isn't
+  found, or for `__has_include_next`).
 - Search lists are merged as each compiler merges them (`driver::search_lists`): GCC drops an
   `-I` or `-iquote` directory that is also a system one, and the last `-iquote` one when it is the
   first of the chain it joins; Clang drops only such `-I` directories; `cl` drops an `/I` that is
@@ -467,10 +477,12 @@ The scan keeps the files that ran `#pragma once` (and those `#import`ed) by path
 its path is skipped. One reached by another path to the same file, or with the same contents
 (which GCC takes for the same file when the times match too), is skipped as well, but remote
 copies may differ: links aren't kept, and identical files may be linked or not. So
-`State::once_elsewhere` makes the scan inexact unless including the file again would change
-nothing (its guard is defined, or it holds nothing but `#pragma once`, conditionals and directives
-that change nothing). Contents are compared by the hash taken at lexing, never by reading the
-files again (reading them cost up to 4 s per scan on Windows).
+`State::once_elsewhere` makes the copy an uncertain region (read, as remotely it may be) unless
+including the file again would change nothing (its guard is defined, or it holds nothing but
+`#pragma once`, conditionals and directives that change nothing). Contents are compared by the
+hash taken at lexing, never by reading the files again (reading them cost up to 4 s per scan on
+Windows). A `#pragma once` run in an uncertain region makes the file "maybe once" (see
+[Unknown values](#unknown-values-and-tracking)).
 
 ### _Pragma and pragma macros
 
@@ -483,10 +495,12 @@ hard part is text, which the scan doesn't expand:
 - A macro whose body runs a pragma is classified when it's defined (`Macro::pragmas`,
   `State::classify`): nothing that matters; pushes and pops of named macros (`Pragmas::Macros`:
   libc++'s `_LIBCPP_PUSH_MACROS` and `_LIBCPP_POP_MACROS`); or something else (`Pragmas::Other`),
-  which makes the scan inexact. Pushes and pops change nothing unless the macros they name change
-  meanwhile, which makes the scan inexact (`State::changing`). A body whose `_Pragma` operand
-  macros make is classified with the macros defined then, and again when one of those changes
-  (libc++ defines `_LIBCPP_VERSION` later).
+  which makes the scan inexact. An object-like macro that pushes and pops is replayed where text
+  uses it (see [The replay](#the-replay-of-pushes-and-pops-in-text)). Otherwise, pushes and pops
+  change nothing unless the macros they name change meanwhile, which makes those macros unknown
+  (inexact without tracking: `State::changing`). A body whose `_Pragma` operand macros make is
+  classified with the macros defined then, and again when one of those changes (libc++ defines
+  `_LIBCPP_VERSION` later); one reading a macro of unknown definition is `Pragmas::Other`.
 - A macro whose pragma comes from its arguments (`#define DO_PRAGMA(x) _Pragma(#x)`) can't be
   classified alone. Text calling it with `once` or `push_macro(...)` is found through the text's
   names: when a file names such a macro, or a macro that pastes names and could form one, its text
@@ -505,6 +519,130 @@ body, the file is found where the macro is defined and the scan is inexact, as w
 macro the file may be another; so is a call through a macro in text
 (`DO_PRAGMA(GCC dependency "file")`). `cl` has no such pragma.
 
+### Unknown values and tracking
+
+Before tracking, anything uncertain made the whole scan inexact, and the compile went to the
+compiler (0.4 s to 5 s each). Most of it never reaches the file list: libc++'s units including
+`<windows.h>` changed `min` and `max` while libc++ pushes them in text, but no condition reads them.
+`scan/track.rs` tracks where unknown values go, and the scan gives up only where one may change
+which files are read.
+
+- **Sources.** An unanswered query, `__COUNTER__`, `__LINE__` or `__FILE__` after `#line`,
+  `__FILE__` with relative paths (`Kind::Unknown` tokens); an expansion the traditional model gives
+  up on, or a malformed condition (the whole condition); a macro that changes while text may push
+  or pop it, or popped from a stack that is unknown (an unknown macro).
+- **Unknown macros.** `Tracking::unknown` holds them, with why; `Tracking::alts` every definition
+  each had while it was tracked (changed in a region, pushed or popped in text, on an unknown
+  stack): an unknown macro is one of them, or undefined. An expansion reading one (expanding it,
+  or meeting its name however it's hidden or followed) is unknown as a whole (`Expander::tainted`):
+  another definition could expand to `)` or a comma. `defined(X)` and `#ifdef X` of one are an
+  unknown value, which `||` and `&&` may still decide. A query naming one makes its condition
+  unknown.
+- **Garbled values.** An unknown value pasted or stringized looks known (`1 ## __COUNTER__` is
+  `1`): the expansion is unknown as a whole (`Expander::garbled`).
+- **Uncertain regions.** A condition of unknown value processes every branch it can't rule out
+  (`Cond::region`); so are a file that may be skipped (below) and each of two files Clang may pick
+  for an `#include_next`. Every macro defined, undefined, pushed or popped there is unknown
+  afterwards (`State::track_after`), and the stacks of those pushed or popped (`stack_unknown`). A
+  region changing nothing that matters costs nothing; one reading files makes the list a union.
+- **Maybe once.** A `#pragma once` (or `#import`) run in a region marks the file "maybe once": its
+  next inclusion is an uncertain region (the compiler may skip it or not). Read certainly that way,
+  it's skipped from then on when its `#pragma once` is outside any conditional (whatever the
+  macros, it ran). A copy of a `#pragma once` file, or a link to one, is an uncertain region too.
+- **Include guards.** A guard that is unknown doesn't skip its file: the file is read, and its
+  `#ifndef` is a region. At that region's `#endif`, outside other regions, the guard is defined
+  either way; when the region defined it last and every definition it may have had is the same, it
+  is known again (`State::join_guard`), and later inclusions are skipped as usual.
+- **Fatal.** The scan is inexact where the file read can't be named: an `#include`, `#import` or
+  `#include_next` operand reading an unknown value or macro; an unknown condition from which
+  `__has_include`, `__has_include_next` or `__has_embed` may run (`State::may_test_files`: the
+  names it reaches through every definition the macros may have, and through pastes, which may
+  make an operator of its parts or the name of a macro whose body has one); a `_Pragma` operand or
+  a macro's pragmas reading an unknown macro; more than `UNION_BOUND` (64) files first read or
+  found inside uncertain regions.
+- **Once inexact,** a scan stops tracking (`State::inexact` drops it) and goes on as without
+  it, for the files `__has_include` finds that the compiler's list lacks. Tracking on in an
+  inexact scan cost up to three times its time on Boost's iterations (macros unknown in one
+  region make the next conditions unknown, and so on), for nothing.
+
+The diagram shows how an unknown value flows to a decision.
+
+```mermaid
+flowchart TD
+    S["unanswered query, __COUNTER__, an expansion the model gives up on, a macro text may push or pop"] --> V["an unknown value, or a macro of unknown definition"]
+    V --> R{"what reads it"}
+    R -->|"text"| T["nothing: text isn't expanded"]
+    R -->|"an include operand, a _Pragma operand, a macro's pragmas"| F["inexact: the compiler's list"]
+    R -->|"a condition"| D{"decided anyway, as 1 or x"}
+    D -->|"yes"| K["the branch it chooses"]
+    D -->|"no"| H{"may __has_include or __has_embed run in it"}
+    H -->|"yes"| F
+    H -->|"no"| U["an uncertain region: every branch processed"]
+    U --> M["what it changes is unknown: macros, stacks, maybe once"]
+    M --> V
+    U --> B{"over 64 files first read in regions"}
+    B -->|"yes"| F
+    B -->|"no"| X["exact, a union: Output::union"]
+```
+
+Why a union is enough: the compiler reads the files of one outcome, and the remote file system
+then holds them (and a few more). An extra file changes the action's key when it changes, nothing
+else. The bound keeps such keys from depending on many unread files.
+
+Coverage of the causes of inexact scans, as the experiment that led to tracking classified them:
+
+| Cause | With tracking |
+|---|---|
+| a query the compiler can't answer | an unknown value |
+| `__COUNTER__`; `__LINE__` or `__FILE__` after `#line`; relative `__FILE__` | an unknown value; inexact in an include operand |
+| an expansion the traditional model gives up on, a malformed condition | an unknown condition; inexact in an include operand, or where `__has_include` may run |
+| a macro changing while text may push or pop it | an unknown macro (or exact, replayed) |
+| a copy of a `#pragma once` file | an uncertain region |
+| `#include_next` from a header Clang may place two ways | both files, uncertain regions (inexact for `__has_include_next`, or when one is missing) |
+| `#include` operands, `__has_include` choices, pragmas through macros, `#pragma include_alias`, UTF-16, trigraphs, `#import` of type libraries, `..` after links, nesting | still inexact: what is read can't be named |
+
+`CPP_DEPS_TRACKING=off` (or `0`) turns tracking and the replay off, for diagnosis: the scan is then
+inexact wherever a value is unknown, as before. Tests use `scan::set_tracking`.
+
+### The replay of pushes and pops in text
+
+libc++ pushes `min` and `max` in text at the top of every header (`_LIBCPP_PUSH_MACROS`) and pops
+them at its end; `<windows.h>` and `__undef_macros` change them in between. Tracking alone makes
+them unknown there (every `#ifdef min` an uncertain region). The replay keeps them known: an
+object-like macro whose body pushes or pops macros (a "pusher", `State::add_pusher`) is replayed
+where text uses it, in order with the directives, as the compiler expands it there.
+
+- `lex::text_uses` lists the names a file's text uses, with their lines, once per file version
+  (read again when a file names a pusher): a use outside parentheses (counted over the whole file,
+  across directives and branches) and not followed by `(` is placeable; it expands where it is and
+  is no macro's argument. One on a directive's line (a `_Pragma` the lexer made a directive) isn't.
+- `State::replay_until` replays the uses before each directive, in active branches (and in every
+  branch of a region, as uncertain pushes). A pusher of pragmas only is parsed once per definition
+  (`pusher_ops`); another is expanded.
+- What can't be placed falls back to tracking: the macros the pusher names are pushed or popped
+  in text (`pushed_in_text`), and unknown when they change. So do pushers in parentheses, a macro
+  naming a pusher (a wrapper, used where the replay doesn't see), and a pusher whose expansion
+  reads an unknown value.
+- A paste could make a pusher's name unseen (`CAT(_LIBCPP_PUSH, _MACROS)`). It needs a part
+  starting the name and one ending it, spelled in a body or in text (numbers can't be parts: a
+  name with a digit isn't replayed). Once both are spelled in a scan, the replay stops for it
+  (`State::spells_ends`). Which parts a file's text spells is kept with the file
+  (`FileDirectives::ends`).
+
+### Limits of tracking
+
+- Alternatives aren't combined: every branch of a region is processed with the state the
+  previous one left, macros it changed unknown. That covers every outcome but may read files no
+  outcome reads (a superset, counted in `union`).
+- A macro of unknown definition taints whole expansions, and an unknown condition from which
+  `__has_include` may run is inexact even when the operand is known: single-letter names pasted
+  in such a condition count as parts of the operators.
+- Stacks made unknown stay so for the scan; a pop from one makes its macro unknown.
+- The join of include guards needs `#ifndef G` (or `#if !defined(G)`) without other branches, and
+  happens only outside other regions.
+- The replay stops for a scan once parts of a pusher's name are spelled in it, even far apart.
+- A paste making `_Pragma` itself in text isn't seen (as before tracking).
+
 ### What makes a scan inexact
 
 An inexact scan isn't wrong for sure: it can't prove it's right. The chain then asks the
@@ -512,19 +650,23 @@ compiler. The causes, with where they're decided:
 
 | Cause | Where |
 |---|---|
-| a query without an answer (`Output::unknown`) | `scan.rs` `query` |
-| an `#if` that can't be evaluated: malformed, an expansion error | `scan.rs` `condition` |
-| `__COUNTER__`; `__LINE__` or `__FILE__` after `#line`; `__FILE__` with relative paths on the command line | `scan.rs` `dynamic` |
+| an `#include` operand reading an unknown value or a macro of unknown definition | `scan.rs` `include` |
+| an unknown condition from which `__has_include` or `__has_embed` may run | `scan.rs` `condition`, `track.rs` `may_test_files` |
+| more than 64 files first read in uncertain regions | `track.rs` `finish_tracking` |
 | a UTF-16 file; trigraphs when the compiler replaces them; a lone carriage return under `cl`; an assembler's `.include` | `scan.rs` `include_file` |
 | includes nested over 200 deep; a macro expansion too large | `scan.rs`, `macros.rs` |
 | `#import` of a type library (`cl`); `#pragma include_alias`; a malformed `#include`; an unsupported `#embed` | `scan.rs` |
-| a pragma run through a macro in text, a macro that may run one, text calling a macro whose pragma its arguments make | `scan.rs` `pragma`, `classify` |
-| a macro changing while text may push or pop it | `scan.rs` `changing` |
-| a copy of a `#pragma once` file whose re-inclusion would change something | `scan.rs` `once_elsewhere` |
-| `#include_next` from a header Clang may place two ways | `scan.rs` `resolve_checked` |
+| a pragma run through a macro in text, a macro that may run one (or whose pragmas read an unknown macro), text calling a macro whose pragma its arguments make | `scan.rs` `pragma`, `classify` |
+| `__has_include_next` from a header Clang may place two ways, or an `#include_next` one of whose places finds nothing | `scan.rs` `resolve_checked`, `include` |
 | a `..` after a symbolic link | `scan.rs` `join` |
-| a traditional-preprocessor call `cl` warns about, or one the model can't follow exactly | `macros.rs` `expand_traditional` |
-| an invalid `##` paste (GCC, Clang, conforming `cl`); an expansion error in a computed `#include` operand | `macros.rs` `paste`, `scan.rs` `include` |
+| a traditional-preprocessor call `cl` warns about, or one the model can't follow exactly, in an `#include` operand | `macros.rs` `expand_traditional`, `scan.rs` `include` |
+| an invalid `##` paste (GCC, Clang, conforming `cl`) or another expansion error in a computed `#include` operand | `macros.rs` `paste`, `scan.rs` `include` |
+
+The same in a condition, and the other causes before tracking (unanswered queries,
+`__COUNTER__`, a macro changing while text may push or pop it, a copy of a `#pragma once` file,
+`#include_next` placed two ways), are unknown values (see
+[Unknown values](#unknown-values-and-tracking)); without tracking (`CPP_DEPS_TRACKING=off`), each
+makes the scan inexact.
 
 The chain also leaves to the compiler a scan with `missing` includes. A scan returns an error
 (no partial result) for an unsupported flag, `CL` or `_CL_` with a flag the scan reads, a
@@ -704,10 +846,28 @@ compiler's list was timed on a sample of up to 20 compiles.
 | the hermetic toolchain's `hello` test, every preset | 5 | 5 | 0 | 5 of 5 | | |
 
 The libc++ project's 7: six units including `<windows.h>`, whose `min` and `max` change while
-libc++ pushes them (a known limit), and one command with a module map response file the
-measurement read as a second input. 34 more units were checked (Boost.MPL and Fusion with
+libc++ pushes them, and one command with a module map response file the measurement read as a
+second input. Tracking unknown values and the replay (see below) made the six exact. 34 more units were checked (Boost.MPL and Fusion with
 preprocessed headers off, Spirit, Hana, every MSVC STL header, Windows SDK, ATL and WRL headers,
 in C and C++) against `cl` and `clang-cl` in every accepted mode: no exact scan was wrong.
+
+Tracking unknown values and the replay, measured at `0e9a9ce` with them, each compile scanned
+with tracking off (`CPP_DEPS_TRACKING=off`) and on; warm times are the best of several passes:
+
+| Project | Exact, off | Exact, on | Unions | Compared with the compiler | Warm, off / on |
+|---|---|---|---|---|---|
+| RandoBlazer, `cl` 19.51 | 321 | 321 | 0 | 321 equal | 40.5 / 40.4 ms (-0.3 %) |
+| the libc++ project, Clang on Windows | 111 | 117 | 0 | 117 equal | 23.6 / 24.5 ms (+3.9 %) |
+| the 34 library units | 29 | 29 | 0 | 29 equal | 459 / 456 ms (-0.7 %) |
+| Dolphin, Linux (WSL) | 734 | 734 | 0 | identical lists both ways | 60.8 / 61.3 ms (+0.8 %) |
+| the reviewers' `lcx` repros (libc++ with `<windows.h>`) | 2 | 4 | 0 | 4 equal | 75.1 / 78.4 ms (+4.5 %) |
+| the SY1 repros (`parens`, `swallow`, `paste`, `badpaste`, `silent`), 10 commands | 3 | 9 | 6 | each union `cl`'s list and one more file | |
+
+The six libc++ units became exact through the replay (no union, the lists equal Clang's). The
+five library units still inexact are Boost's iterations under the traditional preprocessor (an
+invalid paste in an `#include` operand); `silent.cpp` (a `__has_include` of a name an unknown
+condition chose) stays inexact. Of the random `#if` programs of `real_cl_traditional_random`, every
+scan the traditional model gave up on became a union holding `cl`'s file (see the tests).
 
 The conservative scanner on the same projects: RandoBlazer sends 307 compiles and runs 17
 locally (computed includes over the cap even narrowed); it sends 6,144 distinct files (77 MB)
@@ -734,8 +894,6 @@ Known at `43f29d9`. The exact scanner and the chain:
   remotely, silently.
 - A `cl`-style list with no notes counts as success: a localized `cl` without the build's
   `msvc_deps_prefix` sends only the source.
-- Every Windows libc++ unit including `<windows.h>` without `NOMINMAX` is inexact (libc++ pushes
-  `min` and `max` in text, and `<windows.h>` changes them): each costs a full preprocess.
 - The compiler's lists aren't cached: every build preprocesses its inexact compiles again.
 - A compiler failure's reason may be a `/showIncludes` note line rather than the error; `cl` runs
   five times per profile where fewer would do.
@@ -781,23 +939,35 @@ the hermetic toolchain's compilers. See [testing.md](testing.md).
 - `scan.rs`: `pragmas_the_scan_cant_see`, `pragma_dependency`, `pragma_dependency_operators`,
   `pragma_once_by_file`, `once_contents_by_hash`, `same_size_and_time`, `dotdot_after_links`,
   `include_next_rules`, `clang_msvc_lookup_places`, `names_found_as_on_disk`,
-  `traditional_repros` (files the model must scan inexact: parentheses, a swallowed tail, a
-  `__has_include` chosen silently, `#include` forms).
+  `traditional_repros` (files the model can't follow: a union holding cl's file for parentheses
+  and a swallowed tail; inexact for a `__has_include` chosen silently and `#include` forms).
+  Tracking: `three_valued_decisions`, `uncertain_regions` (macros changed, pushed or popped in a
+  region), `include_operands_reading_unknowns`, `unknown_values_pasted`, `has_include_reachable`
+  (directly, through a definition a macro may have, through pastes of its name or a macro's),
+  `pragma_operands_reading_unknowns`, `union_bound`, `maybe_once`, `unknown_guards` (the join,
+  and where it mustn't happen), `replayed_pushes` (order, unplaceable uses, a directive in
+  arguments, a pasted pusher, a wrapper, skipped branches); the tests above that became unions
+  check the tracking-off result too (`untracked`).
 - `driver.rs`: `search_list_rules`, `flag_policy`, `cl_flag_policy`, `cl_preprocessor_flags`,
   `profiles_round_trip`, `profiles_cleaned_daily`, `profiles_expire_in_memory`,
   `profiles_decide_lookups`, `asking_gives_up`, `fingerprints_taken_once`,
   `config_files_in_profile_keys`, `profiles_of_relative_dirs`; gated: `real_cl_traditional` (also
   checks that `cl` gives each unmodelled program's output without a warning),
-  `real_cl_traditional_repros` (exact scans compared with `cl`'s list, then `cl /EP` over only the
-  scanned files), `real_cl_traditional_random` (random text, `#if` and `#include` programs with
-  fixed seeds against `cl`, about 90 s; it fails on any exact scan expanding differently),
+  `real_cl_traditional_repros` (exact scans compared with `cl`'s list, a union holding it, then
+  `cl /EP` over only the scanned files), `real_cl_traditional_random` (random text, `#if` and
+  `#include` programs with fixed seeds against `cl`, untracked, about 90 s; it fails on any exact
+  scan expanding differently), `real_cl_traditional_random_tracked` (the `#if` programs of
+  another seed, and a form whose value names the include, with and without tracking: every scan
+  that becomes exact a union holding `cl`'s file, the naming form never exact, no exact scan
+  changed; about a minute),
   `real_cl_preprocessor_mode`, `real_cl_boost_preprocessor`, `real_cl_boost_iteration`,
   `real_library_headers`, `dropped_flags_keep_predefines`, and `real_differential`,
   `real_cl_differential`, `real_clang_cl_differential` (scans against the compiler's list, the
   `va_comma*` cases among them).
 - `probe.rs`: `hung_compiler` (one run for a batch that times out), `real_compiler`, `real_cl`.
 - `external.rs`: `nothing_listed`.
-- `ninja-remote` `action.rs`: `scanner_fallbacks` (the chain with fake compilers),
+- `ninja-remote` `action.rs`: `scanner_fallbacks` (the chain with fake compilers, and a union
+  counted apart),
   `command_line_header_macros`, `forced_includes_where_the_compiler_says`.
 - `ninja-remote` `scanner.rs`: `listings_by_stamp`, `headers_made_after_a_scan`,
   `computed_include_directories`, `computed_include_paths`, `computed_include_macro_paths`,

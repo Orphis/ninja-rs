@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Changes with the messages: a client and a daemon must agree.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// Larger frames are refused (a corrupt length).
 const MAX_FRAME: usize = 1 << 30;
@@ -93,17 +93,18 @@ pub struct ScanOutput {
     pub missing: Vec<String>,
     pub unknown: Vec<(String, String)>,
     pub inexact: Vec<String>,
+    pub union: Option<usize>,
 }
 
 impl From<cpp_deps::Output> for ScanOutput {
     fn from(o: cpp_deps::Output) -> Self {
-        ScanOutput { files: o.files, found: o.found, missing: o.missing, unknown: o.unknown, inexact: o.inexact }
+        ScanOutput { files: o.files, found: o.found, missing: o.missing, unknown: o.unknown, inexact: o.inexact, union: o.union }
     }
 }
 
 impl From<ScanOutput> for cpp_deps::Output {
     fn from(o: ScanOutput) -> Self {
-        cpp_deps::Output { files: o.files, found: o.found, missing: o.missing, unknown: o.unknown, inexact: o.inexact }
+        cpp_deps::Output { files: o.files, found: o.found, missing: o.missing, unknown: o.unknown, inexact: o.inexact, union: o.union }
     }
 }
 

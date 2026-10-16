@@ -150,6 +150,7 @@ has something to say, in this order:
 | `ninja: warning: the daemon failed (...): ...` | The daemon gave up during the build. |
 | `ninja: N of M remote actions ran locally: ...` | Actions the policy sent remotely that ran locally: those that `couldn't be sent` (by reason) and those `after remote failures` (the first quoted). A warning when there were remote failures. See [remote execution](remote-execution.md#why-an-action-runs-locally). |
 | `N compiles' includes were the compiler's, ...`, `N compiles were scanned conservatively (...)` | Compiles whose includes the preprocessor scanner couldn't tell exactly (see [include scanning](include-scanning.md)). Part of the line above when there is one. |
+| `N compiles' includes were a union over conditions the scan couldn't decide (at most M files more than the compiler reads).` | Compiles sent with the headers of every branch of conditions the preprocessor scanner couldn't decide: correct, with a few headers more (see [include scanning](include-scanning.md#warnings-and-the-summary)). Part of the line above when there is one. |
 | `ninja: N local results were not cached: ...` | Results of local runs on a cache miss that weren't stored, by reason (see [caching](caching.md#the-summary-of-results-not-cached)). |
 | `ninja: N disk cache hits.` | Actions restored from the disk cache. |
 | `ninja: disk cache: evicted N entries (M MiB).` | With `--remote_verbose`, when eviction ran. |

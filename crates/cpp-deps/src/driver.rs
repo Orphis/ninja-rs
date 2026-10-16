@@ -3915,10 +3915,10 @@ mod tests {
             }
             let ours: BTreeSet<String> = out.files.iter().map(key).collect();
             let found: BTreeSet<String> = out.found.iter().map(key).collect();
-            assert!(
-                ours.is_subset(&theirs) && theirs.iter().all(|f| ours.contains(f) || found.contains(f)),
-                "{compiler}, {name}: scanned {ours:?}, the compiler read {theirs:?}"
-            );
+            let complete = theirs.iter().all(|f| ours.contains(f) || found.contains(f));
+            // A union (see `scan::track`): a superset, by `union` files at most.
+            let extra = ours.difference(&theirs).count();
+            assert!(complete && extra <= out.union.unwrap_or(0), "{compiler}, {name}: scanned {ours:?}, the compiler read {theirs:?} (union {:?})", out.union);
             exact.push(name.clone());
         }
         exact
@@ -3928,8 +3928,9 @@ mod tests {
     /// through macros (libc++'s diagnostics, Boost's messages, GLib's
     /// deprecations), scanned exactly and as the compiler reads them: with
     /// `CPP_DEPS_TEST_CXX`, libc++ (`CPP_DEPS_TEST_LIBCXX`, its include
-    /// directory), Boost (`CPP_DEPS_TEST_BOOST`, the directory holding
-    /// `boost/`) and GLib (`CPP_DEPS_TEST_GLIB`, its flags), each when set.
+    /// directory; on Windows, with `<windows.h>` too), Boost
+    /// (`CPP_DEPS_TEST_BOOST`, the directory holding `boost/`) and GLib
+    /// (`CPP_DEPS_TEST_GLIB`, its flags), each when set.
     #[test]
     #[cfg_attr(
         not(all(cpp_deps_test_cxx, any(cpp_deps_test_libcxx, cpp_deps_test_boost, cpp_deps_test_glib))),
@@ -3951,6 +3952,33 @@ mod tests {
                 vec!["-std=c++20".into(), "-nostdinc++".into(), "-isystem".into(), dir],
             )),
             None => println!("NOT TESTED: libc++ (CPP_DEPS_TEST_LIBCXX names no include directory)"),
+        }
+        // On Windows, `<windows.h>` changes `min` and `max` while libc++
+        // pushes them in text: replayed, exact.
+        if let Some(dir) = var("CPP_DEPS_TEST_LIBCXX").filter(|_| cfg!(windows)) {
+            let flags = vec!["-std=c++20".into(), "-nostdinc++".into(), "-isystem".into(), dir];
+            let headers = "#include <vector>
+#include <string>
+#include <algorithm>
+";
+            cases.push(case(
+                "libcxx_windows_first",
+                "main.cc",
+                &format!(
+                    "#include <windows.h>
+{headers}"
+                ),
+                flags.clone(),
+            ));
+            cases.push(case(
+                "libcxx_windows_last",
+                "main.cc",
+                &format!(
+                    "{headers}#include <windows.h>
+"
+                ),
+                flags,
+            ));
         }
         match var("CPP_DEPS_TEST_BOOST") {
             Some(dir) => cases.push(case(
@@ -4218,7 +4246,7 @@ mod tests {
             &[("main.cc", "#if 0xffui64 == 255 && 1i64\n#include \"a.h\"\n#endif\n"), ("a.h", "")],
             &["--target=x86_64-pc-windows-msvc", "-c", "main.cc"],
         ),
-        // Inexact: where Clang goes on depends on -Wmicrosoft-include.
+        // Where Clang goes on depends on -Wmicrosoft-include: a union of both.
         (
             "msvc_found_elsewhere_next",
             &[
@@ -4349,9 +4377,10 @@ mod tests {
         .contains("clang")
         {
             let exact = differential(&cxx, CLANG_CASES);
+            // (`msvc_found_elsewhere_next` and `forced_source_dir_next`, whose
+            // `#include_next` Clang may place two ways: unions of both.)
             for &(name, _, _) in CLANG_CASES {
-                let inexact = ["msvc_found_elsewhere_next", "forced_source_dir_next"].contains(&name);
-                assert_eq!(exact.contains(&name), !inexact, "{name}: {exact:?}");
+                assert!(exact.contains(&name), "{name}: {exact:?}");
             }
         }
     }
@@ -4936,7 +4965,9 @@ mod tests {
     /// `#include XSTR(text)`, the file it names). Where cl doesn't warn, the
     /// scan must be inexact or as cl: none exact but wrong (each confirmed
     /// with the program alone: a program cl reads on from in a batch spoils
-    /// the next). Fixed seeds; about a minute with cl 19.51.
+    /// the next). The `#if` form without tracking unknown values (see
+    /// `real_cl_traditional_random_tracked`). Fixed seeds; about a minute
+    /// with cl 19.51.
     #[test]
     #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
     fn real_cl_traditional_random() {
@@ -5004,7 +5035,9 @@ mod tests {
                 std::fs::write(dir.join(&name), format!("{iflib}{}{body}", c.defs)).unwrap();
                 let argv = s(&[&cl.to_string_lossy(), "/nologo", "/c", &name]);
                 driver.cache.new_session();
-                let out = driver.scan(&argv, &dir).unwrap();
+                // The model alone: tracking would make a union of what it
+                // gives up on (see `real_cl_traditional_random_tracked`).
+                let out = crate::scan::tests::untracked(|| driver.scan(&argv, &dir)).unwrap();
                 if !out.exact() {
                     inexact += 1;
                     continue;
@@ -5057,12 +5090,171 @@ mod tests {
         assert!(wrong.is_empty(), "{} exact but not as cl:\n{}", wrong.len(), wrong.join("\n"));
     }
 
+    /// `real_cl_traditional_random`'s `#if` and `#include` programs (another
+    /// seed), and a form where the value chosen names the include, each
+    /// scanned without tracking unknown values and with it: the scans that
+    /// become exact are a union (a superset) holding the file cl reads
+    /// (confirmed with the program alone); the form naming the include
+    /// stays inexact; no exact scan changes; tracking changes nothing for
+    /// `#include`. About a minute with cl 19.51.
+    #[test]
+    #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
+    fn real_cl_traditional_random_tracked() {
+        let cl = crate::test_compiler("CPP_DEPS_TEST_CL");
+        let dir = test_dirs::TestDir::new("cpp_deps_cl_traditional_random_tracked");
+        let driver = Driver::new(Cache::new(vec![], cfg!(windows)));
+        let mut wrong: Vec<String> = Vec::new();
+        let mut summary = Vec::new();
+        let program = |c: &RandomCase, body: String| (c.defs.clone(), body, c.names.clone());
+        let scan_both = |name: &str| {
+            let argv = s(&[&cl.to_string_lossy(), "/nologo", "/c", name]);
+            driver.cache.new_session();
+            crate::scan::set_tracking(Some(false));
+            let before = driver.scan(&argv, &dir).unwrap();
+            crate::scan::set_tracking(Some(true));
+            let after = driver.scan(&argv, &dir).unwrap();
+            crate::scan::set_tracking(None);
+            (before, after)
+        };
+        let reason = |o: &crate::scan::Output| {
+            o.inexact.first().map(|w| w.split(": ").skip(1).collect::<Vec<_>>().join(": ")).unwrap_or_else(|| format!("missing {:?}", o.missing))
+        };
+        let short = |r: String| -> String {
+            // The kind of reason, without the program's own names.
+            if r.contains("over the bound") {
+                "union over the bound".into()
+            } else if r.contains("__has_include") {
+                "__has_include may run".into()
+            } else if r.contains("#include operand") {
+                "#include operand reads an unknown".into()
+            } else {
+                r.split(" for ").next().unwrap_or_default().chars().take(60).collect()
+            }
+        };
+
+        let iflib = lib_defines(RANDOM_IF_LIB);
+        std::fs::create_dir_all(dir.join("v")).unwrap();
+        let value = |v: i64| if v < 0 { format!("m{}", -v) } else { v.to_string() };
+        for v in -2..=10 {
+            std::fs::write(dir.join(format!("v/{}.h", value(v))), "").unwrap();
+        }
+        // (Seed 4 is `real_cl_traditional_random`'s; CPP_DEPS_TEST_SEEDS=4,6,7
+        // runs more.)
+        let seeds: Vec<u64> = std::env::var("CPP_DEPS_TEST_SEEDS").ok().map(|s| s.split(',').map(|n| n.parse().unwrap()).collect()).unwrap_or(vec![6]);
+        for seed in seeds {
+            let mut g = IfGen { r: Rng(seed) };
+            let cases: Vec<RandomCase> = (0..600).map(|_| g.case()).collect();
+            let (mut same, mut inexact, mut warned, mut rejected, mut became, mut became_unchecked) = (0, 0, 0, 0, 0, 0);
+            let (mut still, mut def_exact, mut def_inexact) = (std::collections::BTreeMap::<String, usize>::new(), 0, 0);
+            let mut extra_hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+            let mut became_reasons: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+            for (k, chunk) in cases.chunks(150).enumerate() {
+                let programs: Vec<_> =
+                    chunk.iter().map(|c| program(c, (-2..=10).map(|v| format!("#if ({}) == {v}\n@@ {}\n#endif\n", c.text, value(v))).collect())).collect();
+                for (i, ((c, p), theirs)) in chunk.iter().zip(&programs).zip(cl_batches(&cl, &dir, &iflib, &programs)).enumerate() {
+                    let Some((lines, warn)) = theirs else {
+                        rejected += 1;
+                        continue;
+                    };
+                    let name = format!("if{seed}_{k}_{i}.cpp");
+                    let body: String = (-2..=10).map(|v| format!("#if ({}) == {v}\n#include \"v/{}.h\"\n#endif\n", c.text, value(v))).collect();
+                    std::fs::write(dir.join(&name), format!("{iflib}{}{body}", c.defs)).unwrap();
+                    let (before, after) = scan_both(&name);
+                    let stems =
+                        |o: &crate::scan::Output| o.files[1..].iter().map(|f| f.file_stem().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>();
+                    // The form where the value names the include: inexact
+                    // whenever the value is unknown.
+                    let dname = format!("def{seed}_{k}_{i}.cpp");
+                    let dbody: String = (-2..=10).map(|v| format!("#if ({}) == {v}\n#define CHOSEN \"v/{}.h\"\n#endif\n", c.text, value(v))).collect();
+                    std::fs::write(dir.join(&dname), format!("{iflib}{}{dbody}#ifdef CHOSEN\n#include CHOSEN\n#endif\n", c.defs)).unwrap();
+                    let (dbefore, dafter) = scan_both(&dname);
+                    if dafter.exact() {
+                        def_exact += 1;
+                        if !dbefore.exact() {
+                            wrong.push(format!("define form became exact: {}#if {}", c.defs, c.text));
+                        } else if stems(&dafter) != stems(&dbefore) {
+                            wrong.push(format!("define form differs with tracking: {}#if {}", c.defs, c.text));
+                        }
+                    } else {
+                        def_inexact += 1;
+                    }
+                    if before.exact() {
+                        assert!(after.exact() && after.files == before.files, "tracking changed an exact scan: {}#if {}", c.defs, c.text);
+                        let ours = stems(&before);
+                        if warn {
+                            warned += 1;
+                        } else if lines == ours {
+                            same += 1;
+                        } else if let Some(Some((alone, false))) = cl_programs(&cl, &dir, &iflib, std::slice::from_ref(p)).pop()
+                            && alone != ours
+                        {
+                            wrong.push(format!("#if: {}#if {}\n  ours: {ours:?}\n  cl:   {alone:?}", c.defs, c.text));
+                        }
+                        continue;
+                    }
+                    inexact += 1;
+                    if !after.exact() {
+                        *still.entry(short(reason(&after))).or_default() += 1;
+                        continue;
+                    }
+                    became += 1;
+                    assert!(after.union.is_some(), "a union: {}#if {}", c.defs, c.text);
+                    *became_reasons.entry(short(reason(&before))).or_default() += 1;
+                    let ours = stems(&after);
+                    if warn {
+                        became_unchecked += 1;
+                        continue;
+                    }
+                    let covered = |theirs: &[String]| theirs.iter().all(|f| ours.contains(f));
+                    let theirs = if covered(&lines) {
+                        Some(lines.clone())
+                    } else {
+                        match cl_programs(&cl, &dir, &iflib, std::slice::from_ref(p)).pop() {
+                            Some(Some((alone, false))) => Some(alone),
+                            _ => None,
+                        }
+                    };
+                    match theirs {
+                        Some(t) if covered(&t) => *extra_hist.entry(ours.len() - t.len()).or_default() += 1,
+                        Some(t) => wrong.push(format!("#if (became exact): {}#if {}\n  ours: {ours:?}\n  cl:   {t:?}", c.defs, c.text)),
+                        None => became_unchecked += 1,
+                    }
+                }
+            }
+            summary.push(format!(
+                "#if seed {seed}: 600 programs, {same} exact as cl, {inexact} inexact without tracking, of which {became} exact with it ({became_unchecked} unchecked: cl warned or lost), {warned} cl warned about, {rejected} cl rejected\n  became exact, by the reason before: {became_reasons:?}\n  extra files in the union (ours - cl's): {extra_hist:?}\n  still inexact: {still:?}\n  define form: {def_exact} exact, {def_inexact} inexact with tracking"
+            ));
+        }
+
+        // `#include`: the operand is a file name; tracking changes nothing.
+        let lib = lib_defines(RANDOM_LIB);
+        let mut g = TextGen { r: Rng(5), profile: 0 };
+        let (mut both, mut neither, mut changed) = (0, 0, 0);
+        for i in 0..100 {
+            let c = g.case();
+            let name = format!("inc{i}.cpp");
+            std::fs::write(dir.join(&name), format!("{lib}{}#include XSTR({})\n", c.defs, c.text)).unwrap();
+            let (before, after) = scan_both(&name);
+            match (before.inexact.is_empty(), after.inexact.is_empty()) {
+                (true, true) => both += 1,
+                (false, false) => neither += 1,
+                _ => {
+                    changed += 1;
+                    wrong.push(format!("#include changed: {}#include XSTR({})\n  before: {:?}\n  after: {:?}", c.defs, c.text, before.inexact, after.inexact));
+                }
+            }
+        }
+        summary.push(format!("#include: 100 programs, {both} without an inexact cause either way, {neither} inexact either way, {changed} changed"));
+        println!("{}", summary.join("\n"));
+        assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+    }
+
     /// The seventh review's programs that the traditional model scanned
     /// exactly but otherwise than cl reads them (see
     /// `scan::tests::traditional_repros`), against cl: none exact but
-    /// wrong, by the files cl lists, and by cl's output with only the files
-    /// the scan names (as a remote compile has them: `__has_include` finds
-    /// another file there).
+    /// wrong, by the files cl lists (each of them in a union), and by cl's
+    /// output with only the files the scan names (as a remote compile has
+    /// them: `__has_include` finds another file there).
     #[test]
     #[cfg_attr(not(cpp_deps_test_cl), ignore = "needs CPP_DEPS_TEST_CL, a cl.exe with INCLUDE set")]
     fn real_cl_traditional_repros() {
@@ -5086,11 +5278,14 @@ mod tests {
             let listed: Vec<String> =
                 crate::external::compiler_deps(&argv, &dir, None).unwrap().iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
             let ours: Vec<String> = out.files.iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
-            assert_eq!(
-                ours.iter().filter(|f| !f.starts_with("main")).collect::<Vec<_>>(),
-                listed.iter().filter(|f| !f.starts_with("main")).collect::<Vec<_>>(),
-                "{name}"
-            );
+            let ours: Vec<&String> = ours.iter().filter(|f| !f.starts_with("main")).collect();
+            let listed: Vec<&String> = listed.iter().filter(|f| !f.starts_with("main")).collect();
+            // A union holds what cl reads; otherwise, exactly.
+            if out.union.is_some() {
+                assert!(listed.iter().all(|f| ours.contains(f)), "{name}: {ours:?} {listed:?}");
+            } else {
+                assert_eq!(ours, listed, "{name}");
+            }
             let sent = root.join(format!("{name}_sent"));
             std::fs::create_dir_all(&sent).unwrap();
             for f in out.files.iter().chain(&out.found) {

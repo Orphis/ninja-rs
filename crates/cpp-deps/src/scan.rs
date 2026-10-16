@@ -1,9 +1,15 @@
 //! Scanning a translation unit: the preprocessor's directives evaluated
 //! exactly (macros, conditionals, includes), text skipped.
 //!
-//! A conditional the scanner can't decide (an unanswered compiler query, a
-//! malformed expression) processes every branch it can't rule out, and the
-//! result is marked inexact: it's then likely a superset, but no guarantee.
+//! What the scan can't know is tracked as unknown values (see `track`): a
+//! conditional it can't decide processes every branch (the result is then
+//! a union, a superset), and the scan is inexact only where an unknown
+//! value may change which files are read.
+
+mod track;
+
+use track::{Elsewhere, Replay};
+pub use track::{UNION_BOUND, set_tracking, tracking};
 
 use ninja_os::FileStamp;
 use std::borrow::Cow;
@@ -14,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::expr;
 use crate::hmap::HeaderMap;
-use crate::intern::{self, Sym};
+use crate::intern::{self, Sym, SymMap, SymSet};
 use crate::lex::{self, DirKind, Directive, FileDirectives, Kind, P, Token};
 use crate::macros::{self, Context, Expander, Macro, Pragmas, XTok};
 use crate::path_map::{PathKey, PathMap};
@@ -152,15 +158,23 @@ pub struct Output {
     /// `#include`s not found (an error for the compile, or a header not
     /// generated yet).
     pub missing: Vec<String>,
-    /// Queries without an answer: (operator, argument).
+    /// Queries without an answer: (operator, argument). The driver asks
+    /// the compiler; unanswered, they're unknown values.
     pub unknown: Vec<(String, String)>,
     /// Why the result may be incomplete.
     pub inexact: Vec<String>,
+    /// Some when uncertain regions (conditions of unknown value, files that
+    /// may be skipped: see `track`) read or looked for files: the list is
+    /// then the union of what each outcome reads, with at most this many
+    /// files (in `files` and `found`) the compiler doesn't read.
+    pub union: Option<usize>,
 }
 
 impl Output {
+    /// Nothing made the scan inexact: `files` and `found` hold every file
+    /// the compiler reads (with `union`, maybe a few more).
     pub fn exact(&self) -> bool {
-        self.inexact.is_empty() && self.unknown.is_empty()
+        self.inexact.is_empty()
     }
 }
 
@@ -608,6 +622,12 @@ struct Cond {
     taking: bool,
     /// A branch was certainly taken: the others are skipped.
     decided: bool,
+    /// Of unknown value: its branches are an uncertain region (its
+    /// number).
+    region: Option<u64>,
+    /// The include guard an uncertain `#ifndef G` without other branches
+    /// tests (see `State::join_guard`).
+    guard: Option<Sym>,
 }
 
 struct State<'a> {
@@ -656,6 +676,27 @@ struct State<'a> {
     base: Option<PathBuf>,
     main: PathBuf,
     out: Output,
+    /// Tracking unknown values (None: off, see `track`).
+    taint: Option<Box<track::Tracking>>,
+    /// What the last unknown value the scan made was (`__COUNTER__`...).
+    unknown_what: &'static str,
+    /// Replaying the macros text pushes and pops (see `track`): the
+    /// object-like macros whose bodies push or pop macros (by name, with
+    /// those macros), their names' hashes, a count of their changes, the
+    /// ends of their names (and by their hashes: `PREFIX`, `SUFFIX` or
+    /// both) and which a body or text spells.
+    replay: bool,
+    pushers: SymMap<Box<[Sym]>>,
+    pusher_hashes: Vec<u64>,
+    pushers_gen: usize,
+    pusher_ends: SymMap<u8>,
+    pusher_end_hashes: Vec<(u64, u8)>,
+    /// A fingerprint of `pusher_end_hashes` (see `FileDirectives::ends`).
+    pusher_ends_print: u64,
+    spelled_ends: u8,
+    /// The pushes and pops of pushers whose bodies are only pragmas, by
+    /// their definitions.
+    pusher_ops: SymMap<(Arc<Macro>, PushPops)>,
 }
 
 fn number(v: i64) -> Token {
@@ -666,6 +707,13 @@ fn string(s: &str) -> Token {
     let escaped: String = s.chars().flat_map(|c| if c == '\\' || c == '"' { vec!['\\', c] } else { vec![c] }).collect();
     Token { kind: Kind::Str, sym: intern::intern(&format!("\"{escaped}\"")), space: true }
 }
+
+/// Pushes (true) and pops of macros, in order.
+type PushPops = Arc<[(bool, Sym)]>;
+
+/// Why an `#include_next` from a header Clang may place two ways is
+/// uncertain.
+const TWO_PLACES: &str = "#include_next in a header found next to an outer includer (where Clang goes on depends on -Wmicrosoft-include)";
 
 /// The dynamic macros, defined although not in the macro table.
 const DYNAMIC: &[Sym] =
@@ -700,7 +748,12 @@ impl Context for State<'_> {
             None
         };
         if let Some(what) = unknown {
-            self.inexact(format!("{}: {what} in a condition or #include", self.here()));
+            // An unknown value: a condition decides with it or not (see
+            // `track`), an #include operand can't be named.
+            self.unknown_what = what;
+            if self.taint.is_none() {
+                self.inexact(format!("{}: {what} in a condition or #include", self.here()));
+            }
             return Some(Token { kind: Kind::Unknown, sym: intern::EMPTY, space: true });
         }
         let frame = self.stack.last()?;
@@ -718,9 +771,7 @@ impl Context for State<'_> {
     fn has_include(&mut self, name: &str, angled: bool, next: bool) -> bool {
         match self.resolve_checked(name, angled, next) {
             Some(f) => {
-                if !self.out.found.contains(&f.real) {
-                    self.out.found.push(f.real);
-                }
+                self.found(f.real);
                 true
             }
             None => false,
@@ -731,9 +782,7 @@ impl Context for State<'_> {
         match self.resolve_embed(name, angled) {
             Some(real) => {
                 let empty = limit_zero || std::fs::metadata(&real).map(|m| m.len() == 0).unwrap_or(false);
-                if !self.out.found.contains(&real) {
-                    self.out.found.push(real);
-                }
+                self.found(real);
                 // __STDC_EMBED_FOUND__ or __STDC_EMBED_EMPTY__.
                 if empty { 2 } else { 1 }
             }
@@ -752,11 +801,17 @@ impl Context for State<'_> {
             if !self.out.unknown.contains(&q) {
                 self.out.unknown.push(q);
             }
+            if self.taint.is_none() {
+                self.inexact(format!("{}: unknown {}: {arg}", self.here(), op.as_str()));
+            }
         }
         v
     }
 
     fn redefined(&self, name: Sym) -> bool {
+        if self.is_unknown_macro(name) {
+            return true;
+        }
         match (self.macros.get(&name), self.cfg.predefined.get(&name)) {
             (None, None) => false,
             (Some(m), Some(p)) => !Arc::ptr_eq(m, p),
@@ -775,6 +830,10 @@ impl Context for State<'_> {
     fn va_comma(&self) -> macros::VaComma {
         self.cfg.va_comma
     }
+
+    fn is_unknown(&self, name: Sym) -> bool {
+        self.is_unknown_macro(name)
+    }
 }
 
 impl State<'_> {
@@ -787,6 +846,10 @@ impl State<'_> {
         if self.out.inexact.len() < 20 && !self.out.inexact.contains(&why) {
             self.out.inexact.push(why);
         }
+        // Tracking unknown values is pointless from now on, and may cost
+        // much (Boost's iterations in uncertain regions): the rest is
+        // scanned as without it, for what it finds.
+        self.taint = None;
     }
 
     fn here(&self) -> String {
@@ -842,17 +905,24 @@ impl State<'_> {
     /// one of two ways (see `resolve_from`): inexact when they find
     /// different files.
     fn resolve_checked(&mut self, name: &str, angled: bool, next: bool) -> Option<Found> {
-        let found = self.resolve(name, angled, next);
-        let alt = self.stack.last().filter(|_| next).and_then(|f| f.alt_at.map(|at| (at, f.relative)));
-        if let Some(from) = alt {
-            let other = self.resolve_from(name, angled, true, from);
-            let place = |f: &Option<Found>| f.as_ref().map(|f| (f.real.clone(), f.at));
-            if place(&other) != place(&found) {
-                let why = "#include_next in a header found next to an outer includer (where Clang goes on depends on -Wmicrosoft-include)";
-                self.inexact(format!("{}: {why}", self.here()));
-            }
+        let (found, other) = self.resolve_two(name, angled, next);
+        if other.is_some() {
+            self.inexact(format!("{}: {TWO_PLACES}", self.here()));
         }
         found
+    }
+
+    /// `resolve`, and the file found from the other place Clang may give
+    /// the current file for `#include_next` (see `resolve_from`), when it's
+    /// another (Some).
+    fn resolve_two(&self, name: &str, angled: bool, next: bool) -> (Option<Found>, Option<Option<Found>>) {
+        let found = self.resolve(name, angled, next);
+        let alt = self.stack.last().filter(|_| next).and_then(|f| f.alt_at.map(|at| (at, f.relative)));
+        let Some(from) = alt else { return (found, None) };
+        let other = self.resolve_from(name, angled, true, from);
+        let place = |f: &Option<Found>| f.as_ref().map(|f| (f.real.clone(), f.at));
+        let differs = place(&other) != place(&found);
+        (found, differs.then_some(other))
     }
 
     /// Finds an included file; for `#include_next`, `from` is where the
@@ -954,6 +1024,16 @@ impl State<'_> {
     fn record(&mut self, p: &Path) {
         if self.seen.insert(self.key(p)) {
             self.out.files.push(p.to_path_buf());
+            self.first_read();
+        }
+    }
+
+    /// A file `__has_include`, `__has_embed` or `#pragma GCC dependency`
+    /// found.
+    fn found(&mut self, real: PathBuf) {
+        if !self.out.found.contains(&real) {
+            self.out.found.push(real);
+            self.first_read();
         }
     }
 
@@ -967,10 +1047,16 @@ impl State<'_> {
             self.out.missing.push(path.to_string_lossy().into_owned());
             return;
         };
+        let contents = (stamp.len, fd.hash);
+        // A file whose #pragma once ran in an uncertain region, or a copy of
+        // a #pragma once file, may be skipped or not: an uncertain region.
+        let maybe = self.maybe_once(&key, id, contents);
         self.record(&real);
-        if self.once_elsewhere(&real, &fd, stamp.len, id) {
-            return;
-        }
+        let copy = match self.once_elsewhere(&real, &fd, stamp.len, id) {
+            Elsewhere::No => false,
+            Elsewhere::Skip => return,
+            Elsewhere::Uncertain => true,
+        };
         if fd.utf16 {
             self.inexact(format!("{}: UTF-16 text isn't scanned", real.display()));
             return;
@@ -986,19 +1072,34 @@ impl State<'_> {
         }
         if let Some(g) = fd.guard
             && self.macros.contains_key(&g)
+            && !self.is_unknown_macro(g)
         {
             return;
         }
         if import {
-            self.mark_once(key, real.clone(), id, (stamp.len, fd.hash));
+            self.mark_once(key.clone(), real.clone(), id, contents);
         }
         if self.stack.len() >= 200 {
             self.inexact(format!("{}: #include nested too deeply", self.here()));
             return;
         }
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let uncertain = maybe || copy;
+        let certain_before = !self.in_region();
+        if uncertain {
+            self.enter_region();
+        }
+        let once_real = real.clone();
         self.stack.push(Frame { path, real, dir, found_at, alt_at, relative, line: 0, line_set: false, id, len: stamp.len, hash: fd.hash });
         self.run(&fd);
+        if uncertain {
+            self.exit_region();
+            // Skipped from now on whether it was read here or before, when
+            // reading it runs #pragma once whatever the macros.
+            if certain_before && (import || track::once_always(&fd)) {
+                self.mark_once(key, once_real, id, contents);
+            }
+        }
         // Its text runs a pragma a macro's arguments make: text isn't
         // expanded.
         let frame = self.stack.pop();
@@ -1013,8 +1114,11 @@ impl State<'_> {
     }
 
     /// Marks a file `#pragma once` (or `#import`ed): `contents` its size
-    /// and contents' hash.
+    /// and contents' hash. In an uncertain region, it may be skipped later.
     fn mark_once(&mut self, key: String, real: PathBuf, id: FileId, contents: (u64, u64)) {
+        if self.mark_maybe_once(&key, id, contents) {
+            return;
+        }
         if self.once.insert(key) {
             if id != (0, 0) {
                 self.once_ids.entry(id).or_insert_with(|| real.clone());
@@ -1027,19 +1131,24 @@ impl State<'_> {
     /// another name (a link), or has the contents of one (which GCC takes
     /// for it, given the same modification time): the compiler skips it
     /// here, but remote copies may differ (links not kept, identical files
-    /// linked, other times): inexact, unless including it again changes
-    /// nothing. (Contents compared by hash, as lexed: not read again.)
-    fn once_elsewhere(&mut self, real: &Path, fd: &FileDirectives, len: u64, id: FileId) -> bool {
+    /// linked, other times): an uncertain region (inexact without
+    /// tracking), unless including it again changes nothing. (Contents
+    /// compared by hash, as lexed: not read again.)
+    fn once_elsewhere(&mut self, real: &Path, fd: &FileDirectives, len: u64, id: FileId) -> Elsewhere {
         let same_file = (id != (0, 0)).then(|| self.once_ids.get(&id)).flatten();
-        let Some(other) = same_file.or_else(|| self.once_contents.get(&(len, fd.hash))).cloned() else { return false };
-        if !self.again_changes_nothing(fd) {
-            self.inexact(format!(
-                "{}: the same as a file with #pragma once (whether it's read again depends on the file system): {}",
-                real.display(),
-                other.display()
-            ));
+        let Some(other) = same_file.or_else(|| self.once_contents.get(&(len, fd.hash))).cloned() else { return Elsewhere::No };
+        if self.again_changes_nothing(fd) {
+            return Elsewhere::Skip;
         }
-        true
+        if self.taint.is_some() {
+            return Elsewhere::Uncertain;
+        }
+        self.inexact(format!(
+            "{}: the same as a file with #pragma once (whether it's read again depends on the file system): {}",
+            real.display(),
+            other.display()
+        ));
+        Elsewhere::Skip
     }
 
     /// Whether including a file again would change nothing the scan sees:
@@ -1049,7 +1158,7 @@ impl State<'_> {
     fn again_changes_nothing(&self, fd: &FileDirectives) -> bool {
         let once = |d: &Directive| d.kind == DirKind::Pragma && d.toks.first().is_some_and(|t| t.sym == intern::ONCE);
         let after_once = fd.dirs.iter().position(|d| !once(d)).unwrap_or(fd.dirs.len());
-        fd.guard.or_else(|| lex::include_guard(&fd.dirs[after_once..])).is_some_and(|g| self.macros.contains_key(&g))
+        fd.guard.or_else(|| lex::include_guard(&fd.dirs[after_once..])).is_some_and(|g| self.macros.contains_key(&g) && !self.is_unknown_macro(g))
             || fd.dirs.iter().all(|d| match d.kind {
                 DirKind::Pragma => d.toks.first().is_some_and(|t| t.sym == intern::ONCE),
                 DirKind::If
@@ -1100,6 +1209,9 @@ impl State<'_> {
         if let Some(&p) = pastes.get(&name) {
             return p;
         }
+        if self.is_unknown_macro(name) {
+            return true;
+        }
         let Some(m) = self.macros.get(&name) else { return false };
         if depth > 64 {
             return true;
@@ -1120,6 +1232,7 @@ impl State<'_> {
         match a.kind {
             Kind::Ident => {
                 !self.macros.contains_key(&a.sym)
+                    && !self.is_unknown_macro(a.sym)
                     && !self.undefined.contains(&a.sym)
                     && !DYNAMIC.contains(&a.sym)
                     && !macros::PRAGMAS.contains(&a.sym)
@@ -1148,7 +1261,7 @@ impl State<'_> {
         let Some(toks) = text else { return true };
         let mut i = 0;
         while i < toks.len() {
-            let name = toks[i].ident().filter(|n| self.macros.contains_key(n));
+            let name = toks[i].ident().filter(|n| self.macros.contains_key(n) || self.is_unknown_macro(*n));
             if let Some(n) = name
                 && self.arg_pragmas.contains(&n)
             {
@@ -1179,7 +1292,10 @@ impl State<'_> {
         false
     }
 
-    /// `#if`-family conditions: true, false, or unknown.
+    /// `#if`-family conditions: true, false, or unknown. Tracking unknown
+    /// values, an unknown one is an uncertain region (see `track`), unless
+    /// `__has_include` or `__has_embed` may run in it (which files they
+    /// test isn't known then): inexact.
     fn condition(&mut self, d: &Directive) -> Option<bool> {
         match d.kind {
             DirKind::Ifdef | DirKind::Ifndef | DirKind::Elifdef | DirKind::Elifndef => {
@@ -1187,6 +1303,9 @@ impl State<'_> {
                     self.inexact(format!("{}: malformed #{:?}", self.here(), d.kind));
                     return None;
                 };
+                if self.is_unknown_macro(name) {
+                    return None;
+                }
                 let defined = self.is_defined(name);
                 Some(if matches!(d.kind, DirKind::Ifdef | DirKind::Elifdef) { defined } else { !defined })
             }
@@ -1195,18 +1314,39 @@ impl State<'_> {
                 let mut x = Expander::new(self, true);
                 let toks = x.expand_tokens(&d.toks);
                 let error = x.error.take();
-                let v = expr::eval(&toks, dialect);
-                if let Some(e) = error {
-                    self.inexact(format!("{}: {e}", self.here()));
+                let (tainted, garbled) = (x.tainted, x.garbled);
+                if self.taint.is_none() {
+                    if let Some(e) = error {
+                        self.inexact(format!("{}: {e}", self.here()));
+                        return None;
+                    }
+                    return match expr::eval(&toks, dialect) {
+                        Ok(v) => v.truth(),
+                        Err(e) => {
+                            self.inexact(format!("{}: {e}", self.here()));
+                            None
+                        }
+                    };
+                }
+                // An expansion the model gave up on, one reading a macro of
+                // unknown definition, or one that pasted or stringized an
+                // unknown value: unknown as a whole; the operators in it may
+                // not have run, or on other operands.
+                let why = match (error, tainted) {
+                    (Some(e), _) => Some(e),
+                    (None, Some(m)) => Some(format!("reads {}, whose definition is unknown ({})", m.as_str(), self.why_unknown(m))),
+                    (None, None) if garbled => Some(format!("an unknown value ({}) pasted or stringized", self.unknown_what)),
+                    (None, None) => None,
+                };
+                if let Some(why) = why {
+                    if self.may_test_files(&d.toks) {
+                        self.inexact(format!("{}: {why}, where __has_include or __has_embed may run", self.here()));
+                    }
                     return None;
                 }
-                match v {
-                    Ok(v) => v.truth(),
-                    Err(e) => {
-                        self.inexact(format!("{}: {e}", self.here()));
-                        None
-                    }
-                }
+                // Otherwise every operator ran, and an unknown value may
+                // still be decided (`1 || x`, `0 && x`).
+                expr::eval(&toks, dialect).ok().and_then(|v| v.truth())
             }
         }
     }
@@ -1225,8 +1365,18 @@ impl State<'_> {
             toks => {
                 let mut x = Expander::new(self, false);
                 let expanded = x.expand(toks.iter().copied().map(XTok::new).collect());
+                let (tainted, unknown_values) = (x.tainted, x.unknown_values);
                 if let Some(e) = x.error.take() {
                     self.inexact(format!("{}: {e}", self.here()));
+                    return;
+                }
+                // (Without tracking, `dynamic` made the scan inexact.)
+                if let Some(m) = tainted {
+                    self.inexact(format!("{}: #include operand reads {}, whose definition is unknown ({})", self.here(), m.as_str(), self.why_unknown(m)));
+                    return;
+                }
+                if unknown_values > 0 && self.taint.is_some() {
+                    self.inexact(format!("{}: #include operand reads an unknown value ({})", self.here(), self.unknown_what));
                     return;
                 }
                 header_name(&expanded.iter().map(|t| t.t).collect::<Vec<_>>())
@@ -1236,9 +1386,26 @@ impl State<'_> {
             self.inexact(format!("{}: malformed #include", self.here()));
             return;
         };
-        match self.resolve_checked(&name, angled, next) {
-            Some(f) => self.include_file(f, d.kind == DirKind::Import),
-            None => self.out.missing.push(name),
+        self.region_include();
+        let import = d.kind == DirKind::Import;
+        match self.resolve_two(&name, angled, next) {
+            // Clang finds one of two files: both are uncertain regions.
+            (Some(f), Some(Some(other))) if self.taint.is_some() => {
+                for f in [f, other] {
+                    self.enter_region();
+                    self.include_file(f, import);
+                    self.exit_region();
+                }
+            }
+            (found, other) => {
+                if other.is_some() {
+                    self.inexact(format!("{}: {TWO_PLACES}", self.here()));
+                }
+                match found {
+                    Some(f) => self.include_file(f, import),
+                    None => self.out.missing.push(name),
+                }
+            }
         }
     }
 
@@ -1253,6 +1420,7 @@ impl State<'_> {
             self.inexact(format!("{}: unsupported #embed", self.here()));
             return;
         };
+        self.region_include();
         match self.resolve_embed(&name, angled) {
             Some(real) => self.record(&real),
             None => self.out.missing.push(name),
@@ -1264,7 +1432,7 @@ impl State<'_> {
         if first.kind == Kind::Unknown && first.sym == lex::CALLEES {
             // Pragmas' words given to these in text: a pragma if one is a
             // macro.
-            if d.toks[1..].iter().any(|c| self.macros.contains_key(&c.sym)) {
+            if d.toks[1..].iter().any(|c| self.macros.contains_key(&c.sym) || self.is_unknown_macro(c.sym)) {
                 self.inexact(format!("{}: a pragma from a macro in text", self.here()));
             }
             return;
@@ -1288,7 +1456,7 @@ impl State<'_> {
             };
             match pragmas {
                 Pragmas::None => {}
-                Pragmas::Macros(names) => self.pushed_in_text.extend(names.iter().copied()),
+                Pragmas::Macros(names) => self.pushed_in_text_add(&names),
                 Pragmas::Other => self.inexact(format!("{}: a pragma from a macro in text", self.here())),
             }
             return;
@@ -1316,23 +1484,7 @@ impl State<'_> {
             _ => return,
         };
         let name = intern::intern(&name);
-        if first.sym == intern::PUSH_MACRO {
-            let cur = self.macros.get(&name).cloned();
-            self.pushed.entry(name).or_default().push(cur);
-        } else if let Some(prev) = self.pushed.get_mut(&name).and_then(Vec::pop) {
-            self.changing(name);
-            match prev {
-                Some(m) => {
-                    self.macros.insert(name, m);
-                    self.defined(name);
-                }
-                None => {
-                    self.macros.remove(&name);
-                    self.undefined.insert(name);
-                }
-            }
-            self.changed(name);
-        }
+        self.push_pop(first.sym == intern::PUSH_MACRO, name);
     }
 
     /// `#pragma GCC dependency "file" [text]`: GCC and Clang look the file
@@ -1346,11 +1498,7 @@ impl State<'_> {
         };
         let Some((name, angled)) = target else { return };
         match self.resolve_checked(&name, angled, false) {
-            Some(f) => {
-                if !self.out.found.contains(&f.real) {
-                    self.out.found.push(f.real);
-                }
-            }
+            Some(f) => self.found(f.real),
             None => self.out.missing.push(name),
         }
     }
@@ -1405,6 +1553,10 @@ impl State<'_> {
     /// Before a macro's definition changes: a macro that text may push or
     /// pop (see `Pragmas::Macros`) then has an unknown definition.
     fn changing(&mut self, name: Sym) {
+        if self.taint.is_some() {
+            // Tracked: unknown then (see `State::track_after`).
+            return;
+        }
         if self.pushed_in_text.contains(&name) {
             self.inexact(format!("{}: a macro changes while macros in text may push or pop it: {}", self.here(), name.as_str()));
         }
@@ -1431,11 +1583,17 @@ impl State<'_> {
                 users.push(m.name);
             }
         }
+        self.pusher_named(m);
         match pragmas {
             Pragmas::None => {}
-            // Pushing and popping macros never changed in between does
-            // nothing.
-            Pragmas::Macros(names) => self.pushed_in_text.extend(names.iter().copied()),
+            // Replayed where text uses it (see `track`), or: pushing and
+            // popping macros never changed in between does nothing (and
+            // tracked, a change makes them unknown).
+            Pragmas::Macros(names) => {
+                if !self.add_pusher(m, &names) {
+                    self.pushed_in_text_add(&names);
+                }
+            }
             Pragmas::Other => self.inexact(format!("{}: a macro may run a pragma in text: {}", self.here(), m.name.as_str())),
         }
         // Its pragma is its arguments': the macros defined so far that name
@@ -1471,7 +1629,12 @@ impl State<'_> {
 
     fn run(&mut self, fd: &FileDirectives) {
         let mut conds: Vec<Cond> = Vec::new();
+        let mut replay = Replay::new();
         for d in &fd.dirs {
+            if self.replay {
+                let active = conds.last().is_none_or(|c| c.parent_active && c.taking);
+                self.replay_until(fd, &mut replay, d.line, active);
+            }
             if let Some(f) = self.stack.last_mut() {
                 f.line = d.line;
             }
@@ -1479,23 +1642,31 @@ impl State<'_> {
             match d.kind {
                 DirKind::If | DirKind::Ifdef | DirKind::Ifndef => {
                     if !active {
-                        conds.push(Cond { parent_active: false, taking: false, decided: true });
+                        conds.push(Cond { parent_active: false, taking: false, decided: true, region: None, guard: None });
                         continue;
                     }
                     let v = self.condition(d);
-                    conds.push(Cond { parent_active: true, taking: v != Some(false), decided: v == Some(true) });
+                    let (region, guard) = match v {
+                        None if self.taint.is_some() => (Some(self.enter_region()), track::guard_of(d)),
+                        _ => (None, None),
+                    };
+                    conds.push(Cond { parent_active: true, taking: v != Some(false), decided: v == Some(true), region, guard });
                 }
                 DirKind::Elif | DirKind::Elifdef | DirKind::Elifndef => {
-                    let Some(c) = conds.last() else { continue };
+                    let Some(c) = conds.last_mut() else { continue };
                     if !c.parent_active {
                         continue;
                     }
+                    c.guard = None;
                     if c.decided {
-                        conds.last_mut().unwrap().taking = false;
+                        c.taking = false;
                         continue;
                     }
                     let v = self.condition(d);
+                    let enter = v.is_none() && self.taint.is_some() && conds.last().is_some_and(|c| c.region.is_none());
+                    let region = enter.then(|| self.enter_region());
                     let c = conds.last_mut().unwrap();
+                    c.region = c.region.or(region);
                     c.taking = v != Some(false);
                     c.decided = v == Some(true);
                 }
@@ -1503,34 +1674,51 @@ impl State<'_> {
                     if let Some(c) = conds.last_mut()
                         && c.parent_active
                     {
+                        c.guard = None;
                         c.taking = !c.decided;
                         c.decided = true;
                     }
                 }
                 DirKind::Endif => {
-                    conds.pop();
+                    if let Some(Cond { region: Some(region), guard, .. }) = conds.pop() {
+                        self.exit_region();
+                        if let Some(g) = guard {
+                            self.join_guard(g, region);
+                        }
+                    }
                 }
                 _ if !active => {}
                 DirKind::Define => {
                     if let Some(m) = &d.mac {
                         // (Defined again the same: no change.)
                         if self.macros.get(&m.name).is_none_or(|old| **old != **m) {
+                            self.track_before(m.name);
                             self.changing(m.name);
                             self.macros.insert(m.name, m.clone());
+                            self.track_after(m.name, false, "");
+                            self.note_body(m);
                             self.defined(m.name);
                             self.classify(m);
                             self.changed(m.name);
                             self.dependencies_of(m);
+                        } else if self.is_unknown_macro(m.name) {
+                            self.track_before(m.name);
+                            self.track_after(m.name, false, "");
                         }
                     }
                 }
                 DirKind::Undef => {
-                    if let Some(n) = d.toks.first().and_then(Token::ident)
-                        && self.macros.remove(&n).is_some()
-                    {
-                        self.undefined.insert(n);
-                        self.changing(n);
-                        self.changed(n);
+                    if let Some(n) = d.toks.first().and_then(Token::ident) {
+                        if self.macros.contains_key(&n) {
+                            self.track_before(n);
+                            self.macros.remove(&n);
+                            self.track_after(n, false, "");
+                            self.undefined.insert(n);
+                            self.changing(n);
+                            self.changed(n);
+                        } else if self.is_unknown_macro(n) {
+                            self.track_after(n, false, "");
+                        }
                     }
                 }
                 DirKind::Include | DirKind::IncludeNext | DirKind::Import => self.include(d),
@@ -1542,6 +1730,16 @@ impl State<'_> {
                     }
                 }
                 DirKind::Other => {}
+            }
+        }
+        if self.replay {
+            let active = conds.last().is_none_or(|c| c.parent_active && c.taking);
+            self.replay_until(fd, &mut replay, u32::MAX, active);
+        }
+        // Unterminated uncertain conditionals.
+        for c in conds {
+            if c.region.is_some() {
+                self.exit_region();
             }
         }
     }
@@ -1636,6 +1834,17 @@ fn scanned<'a>(cache: &'a Cache, cfg: &'a Config, oracle: &'a dyn Oracle, main: 
         base: None,
         main: main.clone(),
         out: Output::default(),
+        taint: tracking().then(Default::default),
+        unknown_what: "",
+        replay: tracking(),
+        pushers: SymMap::default(),
+        pusher_hashes: Vec::new(),
+        pushers_gen: 0,
+        pusher_ends: SymMap::default(),
+        pusher_end_hashes: Vec::new(),
+        pusher_ends_print: 0,
+        spelled_ends: 0,
+        pusher_ops: SymMap::default(),
     };
     if !cfg.commands.is_empty() {
         let fd = lex::lex(command_text(&cfg.commands).as_bytes());
@@ -1686,6 +1895,7 @@ fn scanned<'a>(cache: &'a Cache, cfg: &'a Config, oracle: &'a dyn Oracle, main: 
     for note in st.notes.take() {
         st.inexact(note);
     }
+    st.finish_tracking();
     // The main file first.
     st
 }
@@ -1759,18 +1969,45 @@ pub(crate) mod tests {
         ),
     ];
 
-    /// `TRADITIONAL_REPROS` scanned with cl's traditional preprocessor:
-    /// inexact (`driver::tests::real_cl_traditional_repros` checks them
-    /// against cl).
+    /// `TRADITIONAL_REPROS` scanned with cl's traditional preprocessor
+    /// (`driver::tests::real_cl_traditional_repros` checks them against
+    /// cl): a condition the model can't follow is a union of its branches
+    /// (cl reads `real.h`); inexact where it chooses what `__has_include`
+    /// tests or an `#include` names. Without tracking, all inexact.
     #[test]
     fn traditional_repros() {
-        for (name, files) in TRADITIONAL_REPROS {
+        let union: &[&str] = &["main.cc", "model.h", "real.h"];
+        let expected: &[(&str, Option<&[&str]>)] =
+            &[("parens", Some(union)), ("swallow", Some(union)), ("silent", None), ("include_swallow", None), ("include_gap", None)];
+        assert_eq!(expected.len(), TRADITIONAL_REPROS.len());
+        for ((name, files), (named, want)) in TRADITIONAL_REPROS.iter().zip(expected) {
+            assert_eq!(name, named);
             let d = Dir::new(&format!("trad_{name}"));
             let paths: Vec<PathBuf> = files.iter().map(|(f, text)| d.file(f, text)).collect();
             let c = Config { family: Family::Msvc, msvc_lookup: true, traditional: true, ..cfg(&d) };
             let out = scan(&Cache::new(vec![], cfg!(windows)), &c, &NoOracle, &paths[0]);
-            assert!(!out.exact(), "{name}: {:?} {:?}", d.rel(&out.files), d.rel(&out.found));
+            match want {
+                Some(want) => {
+                    assert!(out.exact(), "{name}: {:?}", out.inexact);
+                    assert_eq!(d.rel(&out.files), *want, "{name}");
+                    assert_eq!(out.union, Some(2), "{name}");
+                }
+                None => assert!(!out.exact(), "{name}: {:?} {:?}", d.rel(&out.files), d.rel(&out.found)),
+            }
+            if *name == "silent" {
+                assert!(out.inexact[0].contains("__has_include or __has_embed may run"), "{:?}", out.inexact);
+            }
+            let off = untracked(|| scan(&Cache::new(vec![], cfg!(windows)), &c, &NoOracle, &paths[0]));
+            assert!(!off.exact(), "{name} without tracking");
         }
+    }
+
+    /// Runs `f` with tracking unknown values off (`CPP_DEPS_TRACKING=off`).
+    pub(crate) fn untracked<T>(f: impl FnOnce() -> T) -> T {
+        set_tracking(Some(false));
+        let r = f();
+        set_tracking(None);
+        r
     }
 
     thread_local! {
@@ -1985,16 +2222,24 @@ pub(crate) mod tests {
             out
         };
         // __COUNTER__ counts its uses in text, which isn't expanded: both
-        // branches, inexact.
-        let out = scanned("counter.c", "int x = __COUNTER__;\n#if __COUNTER__ == 1\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n");
+        // branches, a union (the compiler reads a.h).
+        let counter = "int x = __COUNTER__;\n#if __COUNTER__ == 1\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n";
+        let out = scanned("counter.c", counter);
         assert_eq!(d.rel(&out.files), vec!["counter.c", "a.h", "b.h"]);
-        assert!(!out.exact());
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert_eq!(out.union, Some(2));
+        assert!(!untracked(|| scanned("counter.c", counter)).exact());
         assert!(scanned("text.c", "int x = __COUNTER__;\n#include \"a.h\"\n").exact());
-        // #line changes __LINE__ and __FILE__, not lookups.
-        assert!(!scanned("line.c", "#line 100\n#if __LINE__ == 101\n#include \"a.h\"\n#endif\n").exact());
-        assert!(!scanned("marker.c", "# 100 \"x.c\"\n#if __LINE__ == 101\n#include \"a.h\"\n#endif\n").exact());
+        // #line changes __LINE__ and __FILE__, not lookups: unknown values.
+        let out = scanned("line.c", "#line 100\n#if __LINE__ == 101\n#include \"a.h\"\n#endif\n");
+        assert_eq!((d.rel(&out.files), out.union), (vec!["line.c".to_string(), "a.h".to_string()], Some(1)));
+        assert!(out.exact(), "{:?}", out.inexact);
+        let out = scanned("marker.c", "# 100 \"x.c\"\n#if __LINE__ == 101\n#include \"a.h\"\n#endif\n");
+        assert!(out.exact() && out.union == Some(1), "{:?}", out.inexact);
+        assert!(!untracked(|| scanned("marker.c", "# 100 \"x.c\"\n#if __LINE__ == 101\n#include \"a.h\"\n#endif\n")).exact());
+        // (Nothing in the branches: no union.)
         let out = scanned("line2.c", "#line 10 \"sub/x.c\"\n#include \"a.h\"\n#if __LINE__ == 3\n#endif\n");
-        assert!(!out.exact());
+        assert!(out.exact() && out.union.is_none(), "{:?}", out.inexact);
         let out = scanned("line3.c", "#line 10 \"sub/x.c\"\n#include \"a.h\"\n");
         assert_eq!(d.rel(&out.files), vec!["line3.c", "a.h"]);
         assert!(out.exact(), "{:?}", out.inexact);
@@ -2047,8 +2292,14 @@ pub(crate) mod tests {
         // macros that don't change meanwhile (libc++'s _LIBCPP_PUSH_MACROS).
         let push = "#define PUSH _Pragma(\"push_macro(\\\"M\\\")\") _Pragma(\"push_macro(\\\"N\\\")\")\n#define POP _Pragma(\"pop_macro(\\\"M\\\")\")\n";
         assert!(exact("push.c", &format!("{push}PUSH\n#include \"a.h\"\nPOP\n")));
-        assert!(!exact("push2.c", &format!("{push}PUSH\n#define M 2\nPOP\n#if M == 2\n#endif\n")));
-        assert!(!exact("push3.c", &format!("#define N 1\n{push}PUSH\n#undef N\nPOP\n")));
+        // Replayed where text uses them: M is undefined again after POP.
+        let push2 = format!("{push}PUSH\n#define M 2\nPOP\n#if M == 2\n#include \"a.h\"\n#endif\n");
+        let out = scan(&Cache::new(vec![], false), &cfg(&d), &NoOracle, &d.file("push2.c", &push2));
+        assert_eq!((d.rel(&out.files), out.union), (vec!["push2.c".to_string()], None));
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert!(!untracked(|| exact("push2.c", &push2)));
+        assert!(exact("push3.c", &format!("#define N 1\n{push}PUSH\n#undef N\nPOP\n")));
+        assert!(!untracked(|| exact("push3.c", &format!("#define N 1\n{push}PUSH\n#undef N\nPOP\n"))));
         assert!(!exact("once.c", "#define ONCE _Pragma(\"once\")\nONCE\n"));
         assert!(!exact("ms.c", "#define ONCE __pragma(once)\nONCE\n"));
         assert!(!exact("generic.c", "#define DO_PRAGMA(x) _Pragma(#x)\nDO_PRAGMA(push_macro(\"M\"))\n"));
@@ -2128,12 +2379,16 @@ pub(crate) mod tests {
         // GCC expands a query's operand, Clang mostly doesn't: a macro of
         // the source makes the answer unknown.
         let query = "#if __has_builtin(B)\n#include \"yes.h\"\n#endif\n";
-        assert!(!scanned("macro.c", &format!("#define B __builtin_expect\n{query}")).exact());
+        let out = scanned("macro.c", &format!("#define B __builtin_expect\n{query}"));
+        assert_eq!((d.rel(&out.files), out.union), (vec!["macro.c".to_string(), "yes.h".to_string()], Some(1)));
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert!(!untracked(|| scanned("macro.c", &format!("#define B __builtin_expect\n{query}"))).exact());
         assert!(scanned("plain.c", "#if __has_builtin(__builtin_expect)\n#include \"yes.h\"\n#endif\n").exact());
         // A predefined one is the compiler's: it answered for it.
         let out = scanned("predefined.c", "#if __has_builtin(P)\n#include \"yes.h\"\n#endif\n");
         assert!(out.exact(), "{:?}", out.inexact);
-        assert!(!scanned("redefined.c", "#undef P\n#define P x\n#if __has_builtin(P)\n#endif\n").exact());
+        assert!(scanned("redefined.c", "#undef P\n#define P x\n#if __has_builtin(P)\n#endif\n").exact());
+        assert!(!untracked(|| scanned("redefined.c", "#undef P\n#define P x\n#if __has_builtin(P)\n#endif\n")).exact());
     }
 
     #[test]
@@ -2167,11 +2422,231 @@ pub(crate) mod tests {
         let cache = Cache::new(vec![], false);
         let oracle = Answers([(("__has_builtin".to_string(), "__builtin_expect".to_string()), 1)].into_iter().collect());
         let out = scan(&cache, &cfg(&d), &oracle, &main);
-        // The unknown feature takes both branches.
+        // The unknown feature takes both branches: a union.
         assert_eq!(d.rel(&out.files), vec!["main.cc", "inc/expect.h", "inc/maybe.h", "inc/maybe_not.h", "inc/has.h", "inc/op.h"]);
         assert_eq!(d.rel(&out.found), vec!["inc/probe.h"]);
         assert_eq!(out.unknown, vec![("__has_feature".to_string(), "unknown_feature".to_string())]);
-        assert!(!out.exact());
+        assert!(out.exact(), "{:?}", out.inexact);
+        assert_eq!(out.union, Some(2));
+        let off = untracked(|| scan(&cache, &cfg(&d), &oracle, &main));
+        assert_eq!(off.inexact.len(), 1, "{:?}", off.inexact);
+        assert!(off.inexact[0].ends_with(": unknown __has_feature: unknown_feature"), "{:?}", off.inexact);
+    }
+
+    /// Files, found and union; or why inexact.
+    type Tracked = Result<(Vec<String>, Vec<String>, Option<usize>), Vec<String>>;
+
+    /// Scans `text` as `name` in `d` (`#if U` reads an unanswered query, an
+    /// unknown value): its files, `found` and `union`, or why it's inexact.
+    fn tracked(d: &Dir, name: &str, text: &str) -> Tracked {
+        let out = scan(&Cache::new(vec![], false), &cfg(d), &NoOracle, &d.file(name, &text.replace("#if U\n", "#if __has_feature(x)\n")));
+        assert!(out.missing.is_empty(), "{name}: {:?}", out.missing);
+        if out.exact() { Ok((d.rel(&out.files)[1..].to_vec(), d.rel(&out.found), out.union)) } else { Err(out.inexact) }
+    }
+
+    fn files(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// `1 || x` and `0 && x` are decided with an unknown `x` (an unanswered
+    /// query, `defined` of a macro of unknown definition); `x` alone isn't.
+    #[test]
+    fn three_valued_decisions() {
+        let d = Dir::new("three_valued");
+        for f in ["yes1.h", "no1.h", "yes2.h", "no2.h", "yes3.h", "no3.h"] {
+            d.file(f, "");
+        }
+        let text = "#if 1 || __has_feature(x)\n#include \"yes1.h\"\n#else\n#include \"no1.h\"\n#endif\n\
+                    #if 0 && __has_feature(x)\n#include \"no2.h\"\n#else\n#include \"yes2.h\"\n#endif\n\
+                    #if U\n#define X\n#endif\n#if defined(X) || 1\n#include \"yes3.h\"\n#else\n#include \"no3.h\"\n#endif\n";
+        assert_eq!(tracked(&d, "decided.c", text), Ok((files(&["yes1.h", "yes2.h", "yes3.h"]), vec![], None)));
+        assert_eq!(tracked(&d, "undecided.c", "#if __has_feature(x) || 0\n#include \"yes1.h\"\n#endif\n"), Ok((files(&["yes1.h"]), vec![], Some(1))));
+    }
+
+    /// What an uncertain region changes is unknown after it: macros
+    /// defined in either branch, pushed or popped there.
+    #[test]
+    fn uncertain_regions() {
+        let d = Dir::new("regions");
+        for f in ["a.h", "b.h", "c.h", "e.h"] {
+            d.file(f, "");
+        }
+        // Defined in both branches, differently.
+        let both = "#if U\n#define M 1\n#else\n#define M 2\n#endif\n#if M == 1\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n";
+        assert_eq!(tracked(&d, "both.c", both), Ok((files(&["a.h", "b.h"]), vec![], Some(2))));
+        // A pop in the region: the stack is unknown, so is what a pop gives
+        // later (1 when the region didn't pop, else 2).
+        let popped = "#define M 1\n#pragma push_macro(\"M\")\n#if U\n#pragma pop_macro(\"M\")\n#endif\n#undef M\n#define M 2\n\
+                      #pragma pop_macro(\"M\")\n#if M == 1\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n";
+        assert_eq!(tracked(&d, "popped.c", popped), Ok((files(&["a.h", "b.h"]), vec![], Some(2))));
+        // A push in the region: the pop gives 1 or leaves 2.
+        let pushed = "#define N 1\n#if U\n#pragma push_macro(\"N\")\n#endif\n#undef N\n#define N 2\n#pragma pop_macro(\"N\")\n\
+                      #if N == 1\n#include \"c.h\"\n#else\n#include \"e.h\"\n#endif\n";
+        assert_eq!(tracked(&d, "pushed.c", pushed), Ok((files(&["c.h", "e.h"]), vec![], Some(2))));
+        // Undefined in the region; defined again after it: known.
+        let again = "#define K 1\n#if U\n#undef K\n#endif\n#define K 3\n#if K == 3\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n";
+        assert_eq!(tracked(&d, "again.c", again), Ok((files(&["a.h"]), vec![], None)));
+    }
+
+    /// The scan gives up where an unknown value names the file read: an
+    /// `#include` operand reading one.
+    #[test]
+    fn include_operands_reading_unknowns() {
+        let d = Dir::new("operands_unknown");
+        d.file("a.h", "");
+        d.file("b.h", "");
+        let chosen = "#if U\n#define H \"a.h\"\n#else\n#define H \"b.h\"\n#endif\n#include H\n";
+        let why = tracked(&d, "chosen.c", chosen).unwrap_err();
+        assert!(why[0].contains("#include operand reads H, whose definition is unknown (H changed in an uncertain region at"), "{why:?}");
+        let counted = "#define HDR_0 \"a.h\"\n#define CAT(a, b) a ## b\n#define XCAT(a, b) CAT(a, b)\n#include XCAT(HDR_, __COUNTER__)\n";
+        let why = tracked(&d, "counted.c", counted).unwrap_err();
+        assert!(why[0].contains("#include operand reads an unknown value (__COUNTER__)"), "{why:?}");
+    }
+
+    /// An unknown value pasted or stringized looks known: the condition is
+    /// unknown as a whole (cl reads a.h: `10 == 10`), and inexact when it
+    /// names what `__has_include` tests (`"0"`).
+    #[test]
+    fn unknown_values_pasted() {
+        let d = Dir::new("pasted_unknown");
+        d.file("a.h", "");
+        let cat = "#define CAT(a, b) a ## b\n#define XCAT(a, b) CAT(a, b)\n#define STR(x) #x\n#define XSTR(x) STR(x)\n";
+        let pasted = format!("{cat}#if XCAT(1, __COUNTER__) == 10\n#include \"a.h\"\n#endif\n");
+        assert_eq!(tracked(&d, "pasted.c", &pasted), Ok((files(&["a.h"]), vec![], Some(1))));
+        d.file("0", "");
+        let stringized = format!("{cat}#if __has_include(XSTR(__COUNTER__))\n#endif\n");
+        assert!(tracked(&d, "stringized.c", &stringized).unwrap_err()[0].contains("an unknown value (__COUNTER__) pasted or stringized"));
+    }
+
+    /// An unknown condition from which `__has_include` may run (directly,
+    /// through a definition a macro may have, through a paste of its name
+    /// or of a macro's) is inexact: which files it tests isn't known.
+    #[test]
+    fn has_include_reachable() {
+        let d = Dir::new("has_include_reach");
+        d.file("a.h", "");
+        d.file("b.h", "");
+        let inexact = |name: &str, text: &str| {
+            let why = tracked(&d, name, text).unwrap_err();
+            assert!(why[0].contains("where __has_include or __has_embed may run"), "{name}: {why:?}");
+        };
+        inexact("direct.c", "#if U\n#define F \"a.h\"\n#else\n#define F \"b.h\"\n#endif\n#if __has_include(F)\n#endif\n");
+        // T is 0 here, but may be the other definition.
+        inexact("alternative.c", "#if U\n#define T __has_include(\"a.h\")\n#else\n#define T 0\n#endif\n#if T\n#endif\n");
+        let cat = "#define CAT(a, b) a ## b\n#if U\n#define V 1\n#endif\n";
+        inexact("paste.c", &format!("{cat}#if V || CAT(__has_, include)(\"a.h\")\n#endif\n"));
+        inexact("paste_name.c", &format!("#define HAS_A __has_include(\"a.h\")\n{cat}#if V || CAT(HAS_, A)\n#endif\n"));
+        // Nothing reaches one: a union.
+        assert_eq!(
+            tracked(&d, "harmless.c", &format!("{cat}#if V || CAT(1, 0)\n#include \"a.h\"\n#endif\n#if __has_include(\"b.h\")\n#endif\n")),
+            Ok((files(&["a.h"]), files(&["b.h"]), Some(1)))
+        );
+    }
+
+    /// What a macro's `_Pragma` operand reads is unknown: what it does where
+    /// text uses it too.
+    #[test]
+    fn pragma_operands_reading_unknowns() {
+        let d = Dir::new("pragma_unknown");
+        let text = "#if U\n#define S \"once\"\n#else\n#define S \"message(\\\"hi\\\")\"\n#endif\n#define P _Pragma(S)\nP\n";
+        let why = tracked(&d, "operand.c", text).unwrap_err();
+        assert!(why[0].contains("a macro may run a pragma in text: P"), "{why:?}");
+        // Classified first, then the operand changes.
+        let text = "#define S \"message(\\\"hi\\\")\"\n#define P _Pragma(S)\n#if U\n#undef S\n#define S \"once\"\n#endif\nP\n";
+        assert!(tracked(&d, "later.c", text).is_err());
+    }
+
+    /// A union reading more than `UNION_BOUND` files is inexact.
+    #[test]
+    fn union_bound() {
+        let d = Dir::new("union_bound");
+        let includes: String = (0..=UNION_BOUND).map(|i| format!("#include \"f{i}.h\"\n")).collect();
+        for i in 0..=UNION_BOUND {
+            d.file(&format!("f{i}.h"), "");
+        }
+        let (files, _, union) = tracked(&d, "under.c", &format!("#if U\n{}#endif\n", &includes[includes.find("#include \"f1.h\"").unwrap()..])).unwrap();
+        assert_eq!((files.len(), union), (UNION_BOUND, Some(UNION_BOUND)));
+        let why = tracked(&d, "over.c", &format!("#if U\n{includes}#endif\n")).unwrap_err();
+        assert!(why[0].contains("too many: over 64"), "{why:?}");
+        // Files read before the region don't count.
+        let (_, _, union) = tracked(&d, "seen.c", &format!("{includes}#if U\n{includes}#endif\n")).unwrap();
+        assert_eq!(union, Some(0));
+    }
+
+    /// A file whose `#pragma once` ran in an uncertain region may be
+    /// skipped later, or not: read again as an uncertain region; skipped
+    /// from then on when its `#pragma once` runs whatever the macros.
+    #[test]
+    fn maybe_once() {
+        let d = Dir::new("maybe_once");
+        d.file("once.h", "#pragma once\n#ifdef AGAIN\n#include \"again.h\"\n#endif\n");
+        d.file("again.h", "");
+        let text = "#if U\n#include \"once.h\"\n#endif\n#define AGAIN\n#include \"once.h\"\n";
+        assert_eq!(tracked(&d, "maybe.c", text), Ok((files(&["once.h", "again.h"]), vec![], Some(2))));
+        // Not skipped from then on when its #pragma once is conditional.
+        d.file("cond_once.h", "#ifndef NO_ONCE\n#pragma once\n#endif\n#ifdef AGAIN2\n#include \"again2.h\"\n#endif\n");
+        d.file("again2.h", "");
+        let text = "#if U\n#include \"cond_once.h\"\n#endif\n#define NO_ONCE\n#include \"cond_once.h\"\n#define AGAIN2\n#include \"cond_once.h\"\n";
+        assert_eq!(tracked(&d, "cond.c", text), Ok((files(&["cond_once.h", "again2.h"]), vec![], Some(2))));
+        // Skipped when it's not.
+        d.file("once2.h", "#pragma once\n#ifdef AGAIN3\n#include \"again3.h\"\n#endif\n#ifdef AGAIN4\n#include \"again4.h\"\n#endif\n");
+        d.file("again3.h", "");
+        d.file("again4.h", "");
+        let text = "#if U\n#include \"once2.h\"\n#endif\n#define AGAIN3\n#include \"once2.h\"\n#define AGAIN4\n#include \"once2.h\"\n";
+        assert_eq!(tracked(&d, "always.c", text), Ok((files(&["once2.h", "again3.h"]), vec![], Some(2))));
+    }
+
+    /// An include guard changed in an uncertain region is unknown: the file
+    /// is read again, its `#ifndef` an uncertain region; at its `#endif`, the
+    /// guard is defined either way, as every definition it may have had,
+    /// and known again. Not when it may have had another definition, nor
+    /// inside another uncertain region.
+    #[test]
+    fn unknown_guards() {
+        let d = Dir::new("unknown_guards");
+        d.file("g.h", "#ifndef G_H\n#define G_H\n#include \"inner.h\"\n#endif\n");
+        for f in ["inner.h", "after.h", "never.h", "one.h", "zero.h"] {
+            d.file(f, "");
+        }
+        let check = "#ifdef G_H\n#include \"after.h\"\n#else\n#include \"never.h\"\n#endif\n";
+        let joined = format!("#if U\n#include \"g.h\"\n#endif\n#include \"g.h\"\n#include \"g.h\"\n{check}");
+        assert_eq!(tracked(&d, "joined.c", &joined), Ok((files(&["g.h", "inner.h", "after.h"]), vec![], Some(2))));
+        let other = "#if U\n#define G_H 1\n#endif\n#include \"g.h\"\n#if G_H + 0 == 1\n#include \"one.h\"\n#else\n#include \"zero.h\"\n#endif\n";
+        assert_eq!(tracked(&d, "other.c", other), Ok((files(&["g.h", "inner.h", "one.h", "zero.h"]), vec![], Some(3))));
+        let nested = format!("#if U\n#include \"g.h\"\n#include \"g.h\"\n#endif\n{check}");
+        assert_eq!(tracked(&d, "nested.c", &nested), Ok((files(&["g.h", "inner.h", "after.h", "never.h"]), vec![], Some(4))));
+    }
+
+    /// Pushers (object-like macros pushing or popping macros in text) are
+    /// replayed where text uses them, in order with the directives; where
+    /// a use can't be placed (inside parentheses: maybe a macro's
+    /// argument), or a paste may make one's name, the macros they push are
+    /// unknown when they change.
+    #[test]
+    fn replayed_pushes() {
+        let d = Dir::new("replayed");
+        for f in ["a.h", "b.h", "c.h"] {
+            d.file(f, "");
+        }
+        let push = "#define PUSH _Pragma(\"push_macro(\\\"M\\\")\")\n#define POP _Pragma(\"pop_macro(\\\"M\\\")\")\n#define M 1\n";
+        let ordered = format!(
+            "{push}PUSH\n#undef M\n#define M 2\n#if M == 2\n#include \"a.h\"\n#endif\nint x;\nPOP\n#if M == 1\n#include \"b.h\"\n#else\n#include \"c.h\"\n#endif\n"
+        );
+        assert_eq!(tracked(&d, "ordered.c", &ordered), Ok((files(&["a.h", "b.h"]), vec![], None)));
+        let union = Ok((files(&["a.h", "b.h", "c.h"]), vec![], Some(3)));
+        assert_eq!(tracked(&d, "unplaced.c", &ordered.replace("PUSH\n", "int f(PUSH);\n")), union);
+        // A directive inside a macro's arguments.
+        assert_eq!(tracked(&d, "argument.c", &ordered.replace("PUSH\n", "F(\n#define Z\nPUSH)\n")), union);
+        // PUSH is CAT(PU, SH): the replay stops.
+        let pasted = ordered.replace("PUSH\n#undef", "#define CAT(a, b) a ## b\nCAT(PU, SH)\n#undef");
+        assert_eq!(tracked(&d, "pasted.c", &pasted), union);
+        // A macro naming PUSH pushes where it's used.
+        let wrapped = ordered.replace("PUSH\n#undef", "#define WRAP PUSH\nWRAP\n#undef");
+        assert_eq!(tracked(&d, "wrapped.c", &wrapped), union);
+        // The order holds through includes, and not in skipped branches.
+        d.file("push.h", "PUSH\n");
+        let included = ordered.replace("PUSH\n#undef", "#include \"push.h\"\n#if 0\nPOP\n#endif\n#undef");
+        assert_eq!(tracked(&d, "included.c", &included), Ok((files(&["push.h", "a.h", "b.h"]), vec![], None)));
     }
 
     #[test]
@@ -2530,9 +3005,13 @@ pub(crate) mod tests {
         d.file("second.h", "");
         let main = d.file("main.c", "#include \"a.h\"\n#include \"copy.h\"\n");
         let cache = Cache::new(vec![], false);
-        assert!(!scan(&cache, &cfg(&d), &NoOracle, &main).exact());
+        // Read again where copies differ: an uncertain region.
+        let out = scan(&cache, &cfg(&d), &NoOracle, &main);
+        assert_eq!(d.rel(&out.files), vec!["main.c", "a.h", "copy.h", "second.h"]);
+        assert!(out.exact() && out.union == Some(1), "{:?}", out.inexact);
+        assert!(!untracked(|| scan(&cache, &cfg(&d), &NoOracle, &main)).exact());
         d.file("copy.h", &once.replace("SEEN", "XXXX"));
-        assert!(!scan(&cache, &cfg(&d), &NoOracle, &main).exact());
+        assert!(scan(&cache, &cfg(&d), &NoOracle, &main).exact());
     }
 
     /// `#pragma GCC dependency`: GCC and Clang look the file up (an error
@@ -2589,11 +3068,15 @@ pub(crate) mod tests {
         d.file("second.h", "");
         std::fs::hard_link(d.0.join("a.h"), d.0.join("lnk.h")).unwrap();
         let scanned = |name: &str, text: &str| scan(&Cache::new(vec![], cfg!(windows)), &cfg(&d), &NoOracle, &d.file(name, text));
+        // Links aren't kept remotely: the link is read again there, as an
+        // uncertain region.
         let linked = scanned("linked.c", "#include \"a.h\"\n#include \"lnk.h\"\n");
-        assert!(!linked.exact());
-        assert_eq!(d.rel(&linked.files), vec!["linked.c", "a.h", "lnk.h"]);
+        assert!(linked.exact() && linked.union == Some(1), "{:?}", linked.inexact);
+        assert_eq!(d.rel(&linked.files), vec!["linked.c", "a.h", "lnk.h", "second.h"]);
+        assert!(!untracked(|| scanned("linked.c", "#include \"a.h\"\n#include \"lnk.h\"\n")).exact());
         d.file("copy.h", once);
-        assert!(!scanned("copied.c", "#include \"a.h\"\n#include \"copy.h\"\n").exact());
+        assert!(scanned("copied.c", "#include \"a.h\"\n#include \"copy.h\"\n").exact());
+        assert!(!untracked(|| scanned("copied.c", "#include \"a.h\"\n#include \"copy.h\"\n")).exact());
         // Another file, or one whose second inclusion does nothing.
         d.file("other.h", "#pragma once\n#define OTHER\n");
         assert!(scanned("other.c", "#include \"a.h\"\n#include \"other.h\"\n").exact());
@@ -2623,8 +3106,18 @@ pub(crate) mod tests {
         c.angled_dirs = vec![d.0.join("inc").into(), d.0.join("other").into(), d.0.join("third").into()];
         c.family = Family::Clang;
         c.msvc_lookup = true;
-        // other/x.h with the warning, third/x.h without.
+        // other/x.h with the warning, third/x.h without: both, as uncertain
+        // regions.
         let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &main);
+        assert_eq!(d.rel(&out.files), vec!["src/main.cc", "other/sub/a.h", "src/x.h", "other/x.h", "third/x.h"]);
+        assert!(out.exact() && out.union == Some(2), "{:?}", out.inexact);
+        let out = untracked(|| scan(&Cache::new(vec![], false), &c, &NoOracle, &main));
+        assert!(out.inexact.iter().any(|w| w.contains("-Wmicrosoft-include")), "{:?}", out.inexact);
+        // One of them missing: inexact.
+        d.file("src/y.h", "#include_next <y.h>\n");
+        d.file("other/sub/b.h", "#include \"y.h\"\n");
+        d.file("third/y.h", "");
+        let out = scan(&Cache::new(vec![], false), &c, &NoOracle, &d.file("src/main2.cc", "#include <sub/b.h>\n"));
         assert!(out.inexact.iter().any(|w| w.contains("-Wmicrosoft-include")), "{:?}", out.inexact);
         // Both ways the same: exact.
         std::fs::remove_file(d.0.join("other/x.h")).unwrap();

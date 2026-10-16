@@ -80,10 +80,15 @@ pub struct Shared {
 /// Compiles whose includes the preprocessor's scanner left to the
 /// compiler, by reason (without what is the compile's): each reason told
 /// once, and those the compiler listed summed up at the end of the build.
+/// Also those the scanner listed as a union over conditions it couldn't
+/// decide (see `cpp_deps::Output::union`).
 #[derive(Default)]
 pub struct CompilerScans {
     told: Mutex<std::collections::HashSet<String>>,
     listed: Mutex<BTreeMap<String, usize>>,
+    /// Compiles listed as a union, and the files at most they sent that
+    /// the compiler doesn't read.
+    unions: Mutex<(usize, usize)>,
 }
 
 impl CompilerScans {
@@ -97,8 +102,16 @@ impl CompilerScans {
         *self.listed.lock().unwrap().entry(reason).or_default() += 1;
     }
 
+    /// Notes a compile the scanner listed as a union, with at most `extra`
+    /// files the compiler doesn't read.
+    fn union(&self, extra: usize) {
+        let mut u = self.unions.lock().unwrap();
+        u.0 += 1;
+        u.1 += extra;
+    }
+
     /// A line for the end of the build: how many the compiler listed, and
-    /// why (the most frequent reasons).
+    /// why (the most frequent reasons); how many were a union.
     pub fn summary(&self) -> Option<String> {
         let reasons = self.listed.lock().unwrap();
         let total: usize = reasons.values().sum();
@@ -108,7 +121,16 @@ impl CompilerScans {
         if by.len() > 4 {
             listed.push(format!("{} more reasons", by.len() - 4));
         }
-        (total > 0).then(|| format!("{total} compiles' includes were the compiler's, the preprocessor's scan being unable to tell ({}).", listed.join("; ")))
+        let compiler = (total > 0)
+            .then(|| format!("{total} compiles' includes were the compiler's, the preprocessor's scan being unable to tell ({}).", listed.join("; ")));
+        let (unions, extra) = *self.unions.lock().unwrap();
+        let union = (unions > 0).then(|| {
+            format!("{unions} compiles' includes were a union over conditions the scan couldn't decide (at most {extra} files more than the compiler reads).")
+        });
+        match (compiler, union) {
+            (Some(c), Some(u)) => Some(format!("{c} {u}")),
+            (c, u) => c.or(u),
+        }
     }
 }
 
@@ -349,7 +371,12 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
                 // file only the remote has, or a lookup it got wrong) means
                 // inputs may be missing too: the compiler's then.
                 match scanned {
-                    Ok(out) if out.exact() && out.missing.is_empty() => (Ok(out.files.into_iter().chain(out.found).collect()), IncludeScanner::Preprocessor),
+                    Ok(out) if out.exact() && out.missing.is_empty() => {
+                        if let Some(extra) = out.union {
+                            shared.compiler_scans.union(extra);
+                        }
+                        (Ok(out.files.into_iter().chain(out.found).collect()), IncludeScanner::Preprocessor)
+                    }
                     left => {
                         // Why, and the reason without what is the compile's.
                         let (why, reason, looked_for) = match left {
@@ -358,8 +385,6 @@ pub fn prepare(task: &Task, shared: &Shared) -> Result<Prepared, String> {
                                     // ("file:line: what: details", or "what".)
                                     let what = w.split_once(": ").map_or(w.as_str(), |(_, w)| w);
                                     (w.clone(), what.split(": ").next().unwrap_or_default().to_string())
-                                } else if let Some((o, a)) = out.unknown.first() {
-                                    (format!("unknown {o}({a})"), format!("unknown {o}"))
                                 } else {
                                     (format!("{} not found", out.missing.first().cloned().unwrap_or_default()), "an #include not found".to_string())
                                 };
@@ -1037,13 +1062,17 @@ mod tests {
     /// The preprocessor's scanner leaves what it can't tell exactly to the
     /// compiler (`-M`), with what the compile looks for that the compiler
     /// doesn't list (`__has_include`); that one, when the compiler fails,
-    /// to the conservative scanner (which takes both branches).
+    /// to the conservative scanner (which takes both branches). An include
+    /// operand that reads `__COUNTER__` can't be told; a condition reading it
+    /// is a union of its branches.
     #[test]
     fn scanner_fallbacks() {
         let dir = test_dirs::TestDir::new("ninja-rs-action-scanner-fallbacks");
         let build = dir.join("build");
         let compiler = fake_clang(&dir);
-        let main = "#if __has_include(\"probe.h\")\n#endif\n#if __COUNTER__ == 0\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n";
+        let counted = "#define HDR_0 \"a.h\"\n#define CAT(a, b) a ## b\n#define XCAT(a, b) CAT(a, b)\n#include XCAT(HDR_, __COUNTER__)\n";
+        let main = format!("#if __has_include(\"probe.h\")\n#endif\n#if __COUNTER__ == 0\n#include \"a.h\"\n#else\n#include \"b.h\"\n#endif\n{counted}");
+        let main = main.as_str();
         for (path, contents) in [("src/main.c", main), ("src/probe.h", ""), ("inc/a.h", ""), ("inc/b.h", "")] {
             std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
             std::fs::write(dir.join(path), contents).unwrap();
@@ -1069,5 +1098,17 @@ mod tests {
         assert!(shared.store.scan.fallback_summary().is_some());
         // (Not one the compiler listed.)
         assert_eq!(shared.compiler_scans.summary(), Some(summary));
+
+        // Without the include of `__COUNTER__`, the scan is a union: both
+        // branches sent, and counted apart.
+        std::fs::remove_file(dir.join("fail-deps")).unwrap();
+        std::fs::write(dir.join("src/main.c"), main.replace(counted, "")).unwrap();
+        let shared = self::shared(&build);
+        let p = prepare(&task, &shared).unwrap();
+        assert_eq!(inputs(&p), [true, true, true, true]);
+        assert_eq!(
+            shared.compiler_scans.summary().as_deref(),
+            Some("1 compiles' includes were a union over conditions the scan couldn't decide (at most 2 files more than the compiler reads).")
+        );
     }
 }
