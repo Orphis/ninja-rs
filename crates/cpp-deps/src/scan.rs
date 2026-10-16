@@ -1517,24 +1517,21 @@ impl State<'_> {
     /// After a macro is defined: noted for the text that names it, and the
     /// parts of names of macros whose pragmas their arguments make its
     /// replacement has (see `pasted_pragma_name`).
-    fn defined(&mut self, name: Sym) {
+    fn defined(&mut self, m: &Macro) {
         if self.fragmented.is_empty() {
             return;
         }
-        self.macro_hashes.insert(lex::name_hash(name.as_str().as_bytes()), name);
-        if let Some(m) = self.macros.get(&name).cloned() {
-            self.replaced_fragments_of(&m);
-        }
+        self.macro_hashes.insert(m.name_hash, m.name);
+        self.replaced_fragments_of(m);
     }
 
     /// Notes the parts of names of macros whose pragmas their arguments make
     /// a macro's replacement has (not its parameters: what they stand for
     /// is the arguments').
     fn replaced_fragments_of(&mut self, m: &Macro) {
-        let params = m.params.as_deref().unwrap_or(&[]);
-        for t in m.body.iter() {
-            if self.fragments.contains(&t.sym) && !params.contains(&t.sym) {
-                self.replaced_fragments.insert(t.sym);
+        for &n in &m.context.spellings {
+            if self.fragments.contains(&n) {
+                self.replaced_fragments.insert(n);
             }
         }
     }
@@ -1586,7 +1583,7 @@ impl State<'_> {
 
     /// What a macro does through pragmas where text uses it (which isn't
     /// expanded), with the macros defined now.
-    fn classify(&mut self, m: &Macro) {
+    fn classify(&mut self, m: &Arc<Macro>) {
         let (pragmas, deps, arg) = m.pragmas_in(self);
         for d in deps {
             let users = self.pragma_users.entry(d).or_default();
@@ -1613,7 +1610,7 @@ impl State<'_> {
         if arg && self.arg_pragmas.insert(m.name) {
             self.arg_pragma_hashes.push(lex::name_hash(m.name.as_str().as_bytes()));
             if self.arg_pragmas.len() == 1 {
-                self.macro_hashes = self.macros.keys().map(|&n| (lex::name_hash(n.as_str().as_bytes()), n)).collect();
+                self.macro_hashes = self.macros.values().map(|m| (m.name_hash, m.name)).collect();
             }
             self.pragma_name_parts(m.name);
             let naming: Vec<Arc<Macro>> =
@@ -1713,7 +1710,7 @@ impl State<'_> {
                             self.macros.insert(m.name, m.clone());
                             self.track_after(m.name, false, "");
                             self.note_body(m);
-                            self.defined(m.name);
+                            self.defined(m);
                             self.classify(m);
                             self.changed(m.name);
                             self.dependencies_of(m);
@@ -1877,7 +1874,7 @@ fn scanned<'a>(cache: &'a Cache, cfg: &'a Config, oracle: &'a dyn Oracle, main: 
     // by a later call. Use the same fragment filter as argument pragmas.
     st.pragma_name_parts(intern::PRAGMA_OPERATOR);
     st.pragma_name_parts(intern::MS_PRAGMA_OPERATOR);
-    st.macro_hashes = st.macros.keys().map(|&n| (lex::name_hash(n.as_str().as_bytes()), n)).collect();
+    st.macro_hashes = st.macros.values().map(|m| (m.name_hash, m.name)).collect();
     if !cfg.commands.is_empty() {
         let fd = lex::lex(command_text(&cfg.commands).as_bytes());
         let frame = Frame {

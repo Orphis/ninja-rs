@@ -109,6 +109,11 @@ pub(super) struct Tracking {
 /// only when this graph gains a dangerous name, not for every text token.
 #[derive(Default)]
 struct ContextMacros {
+    /// Until the first unbalanced body, there is no dangerous name to
+    /// propagate. Retain earlier definitions (including overwritten ones)
+    /// so a later definition can still make their users dangerous.
+    pending: Vec<Arc<Macro>>,
+    active: bool,
     users: SymMap<Vec<Sym>>,
     unsafe_names: SymSet,
     pastes: SymSet,
@@ -116,31 +121,33 @@ struct ContextMacros {
 }
 
 impl ContextMacros {
-    fn add(&mut self, m: &Macro) -> bool {
-        let params = m.params.as_deref().unwrap_or(&[]);
-        let mut depth = 0i32;
-        let mut unsafe_body = false;
-        let mut new_paste = false;
-        for t in m.body.iter() {
-            if t.is(P::LParen) {
-                depth += 1;
-            } else if t.is(P::RParen) {
-                depth -= 1;
-                unsafe_body |= depth < 0;
-            } else if t.is(P::HashHash) {
-                new_paste |= self.pastes.insert(m.name);
+    fn add(&mut self, m: &Arc<Macro>) -> bool {
+        if !self.active {
+            if !m.context.unbalanced {
+                self.pending.push(m.clone());
+                return false;
             }
-            if let Some(n) = t.ident().filter(|n| !params.contains(n)) {
-                let users = self.users.entry(n).or_default();
-                if !users.contains(&m.name) {
-                    users.push(m.name);
-                }
-                unsafe_body |= self.unsafe_names.contains(&n);
+            self.active = true;
+            for earlier in std::mem::take(&mut self.pending) {
+                self.add_edges(&earlier);
             }
+        }
+        self.add_edges(m)
+    }
+
+    fn add_edges(&mut self, m: &Macro) -> bool {
+        let mut unsafe_body = m.context.unbalanced;
+        let new_paste = m.context.pastes && self.pastes.insert(m.name);
+        for &n in &m.context.names {
+            let users = self.users.entry(n).or_default();
+            if !users.contains(&m.name) {
+                users.push(m.name);
+            }
+            unsafe_body |= self.unsafe_names.contains(&n);
         }
         let before = self.unsafe_names.len();
         let mut todo = Vec::new();
-        if unsafe_body || depth != 0 {
+        if unsafe_body {
             todo.push(m.name);
         }
         if before == 0 && !todo.is_empty() {
@@ -417,9 +424,9 @@ impl State<'_> {
             self.changing(name);
             match prev {
                 Some(m) => {
-                    self.macros.insert(name, m);
+                    self.macros.insert(name, m.clone());
                     self.track_after(name, unknown, "popped from an unknown stack");
-                    self.defined(name);
+                    self.defined(&m);
                 }
                 None => {
                     self.macros.remove(&name);
@@ -574,7 +581,7 @@ impl State<'_> {
             self.taint.as_mut().unwrap().context = Some(context);
         }
         self.pushers_gen += 1;
-        self.pusher_hashes.push(lex::name_hash(m.name.as_str().as_bytes()));
+        self.pusher_hashes.push(m.name_hash);
         let name = m.name.as_str();
         let mut hashes: HashMap<u64, u8> = self.pusher_end_hashes.iter().copied().collect();
         for (i, _) in name.char_indices().skip(1) {
@@ -605,16 +612,14 @@ impl State<'_> {
     /// A macro is defined while there are pushers: one naming a pusher (a
     /// wrapper) pushes where text uses it, which isn't replayed; one
     /// spelling the ends of a pusher's name may paste it.
-    pub(super) fn pusher_named(&mut self, m: &Macro) {
+    pub(super) fn pusher_named(&mut self, m: &Arc<Macro>) {
         if self.pushers.is_empty() || !self.replay {
             return;
         }
         if self.taint.as_mut().and_then(|t| t.context.as_mut()).is_some_and(|c| c.add(m)) {
             self.pushers_gen += 1;
         }
-        let params = m.params.as_deref().unwrap_or(&[]);
-        let named: Vec<Box<[Sym]>> =
-            m.body.iter().filter_map(|t| t.ident()).filter(|n| !params.contains(n) && *n != m.name).filter_map(|n| self.pushers.get(&n).cloned()).collect();
+        let named: Vec<Box<[Sym]>> = m.context.names.iter().filter(|&&n| n != m.name).filter_map(|n| self.pushers.get(n).cloned()).collect();
         for names in named {
             self.pushed_in_text_add(&names);
         }
@@ -626,11 +631,8 @@ impl State<'_> {
         if !self.replay || self.pusher_ends.is_empty() {
             return;
         }
-        let params = m.params.as_deref().unwrap_or(&[]);
-        for t in m.body.iter() {
-            if let Some(n) = t.ident().filter(|n| !params.contains(n))
-                && let Some(&kind) = self.pusher_ends.get(&n)
-            {
+        for n in &m.context.names {
+            if let Some(&kind) = self.pusher_ends.get(n) {
                 self.spelled_ends |= kind;
             }
         }
@@ -848,5 +850,41 @@ pub(super) struct Replay {
 impl Replay {
     pub(super) fn new() -> Self {
         Replay { gen_seen: usize::MAX, ..Default::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_context_matches_eager_graph() {
+        let definitions: Vec<_> = macros::parse_defines(
+            "#define ALIAS TARGET\n#define TARGET IGNORE(\n#define CAT(a,b) a##b\n#define WRAPPER ALIAS\n#define TARGET\n#define CLOSE )(\n",
+        )
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+        // All orders exercise forward references, redefinitions, a paste
+        // before/after activation, and a body with net-zero but unsafe nesting.
+        fn permutations(defs: &[Arc<Macro>], order: &mut Vec<usize>) {
+            if order.len() == defs.len() {
+                let mut lazy = ContextMacros::default();
+                let mut eager = ContextMacros { active: true, ..Default::default() };
+                for &i in order.iter() {
+                    assert_eq!(lazy.add(&defs[i]), eager.add(&defs[i]), "{order:?}, step {i}");
+                    assert_eq!(lazy.unsafe_names, eager.unsafe_names, "{order:?}, step {i}");
+                }
+                return;
+            }
+            for i in 0..defs.len() {
+                if !order.contains(&i) {
+                    order.push(i);
+                    permutations(defs, order);
+                    order.pop();
+                }
+            }
+        }
+        permutations(&definitions, &mut Vec::new());
     }
 }

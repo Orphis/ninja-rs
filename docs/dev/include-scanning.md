@@ -628,7 +628,13 @@ where text uses it, in order with the directives, as the compiler expands it the
 - Macro expansion can introduce parentheses absent from the text. A lazy, monotone graph tracks
   macros with unbalanced bodies, their users, and possible pasted names. A file naming one stops
   replay; the graph includes alternative definitions of unknown macros. It checks cached file
-  names instead of expanding all text.
+  names instead of expanding all text. Until the first unbalanced body appears, it retains earlier
+  definitions and defers building reverse edges; activation processes every retained definition,
+  including overwritten ones. `Macro` caches identifier references, all non-parameter spellings,
+  parenthesis balance, pastes and its name hash with the parsed definition. Definitions are
+  read-only so those facts can't become stale. Numeric spellings are retained: token pastes can
+  form pragma macro names containing digits. Only immutable lexical facts are shared; unknown
+  values, alternative definitions, stacks and replay decisions remain local to each scan.
 - `State::replay_until` replays the uses before each directive, in active branches (and in every
   branch of a region, as uncertain pushes). A pusher of pragmas only is parsed once per definition
   (`pusher_ops`); another is expanded.
@@ -941,6 +947,44 @@ The first four give a remote failure, or a silent wrong object when the missing 
 `__has_include`. The conservative scanner runs only when the compiler can't, which limits the
 exposure.
 
+## Benchmarking the preprocessor
+
+`cpp-deps`'s `scanperf` example times just the scanner over a compilation database. Each process
+uses one `Driver` and shared file/probe caches across passes, like the daemon. Pass zero includes
+probing and lexing; later passes reuse those caches. The database's compiler flags are unchanged
+by whether this Rust example is built in debug or release mode:
+
+```sh
+cargo run --release -p cpp-deps --example scanperf -- compile_commands.json --threads 4 --passes 6
+cargo run -p cpp-deps --example scanperf -- compile_commands.json --threads 4 --passes 6
+```
+
+Compare medians of the later passes, repeat with version order rotated, and avoid simultaneous
+compiler tests or builds. Fixed CPU affinity can reduce scheduling variation on hybrid CPUs.
+The first-pass time is cold for the scanner's caches, not necessarily the operating system's
+file cache. Accepted/inexact/error counts and input totals should also be compared. These counts
+alone don't prove correctness: use `cpp-deps`'s `compare` example or `ninja-remote`'s `scanbench`
+for compiler-reference coverage, and run the existence-dependency regression tests.
+
+On 2026-10-16, the 118-command Windows Clang/libc++ database from CMakeLibCxx was measured on
+a Ryzen 9 5950X with four threads pinned to logical CPUs 0, 2, 4 and 6. The table gives median
+wall times for a complete corpus pass, in milliseconds. Release used three runs per version
+with five warm passes each; debug used two runs with three warm passes each. Version order was
+rotated. Cold here means a fresh `Driver`, with the OS file cache already warm.
+
+| Version | Debug cold | Debug warm | Release cold | Release warm |
+|---|---:|---:|---:|---:|
+| Original tracking (`06d6760`) | 7869 | 5736 | 1671 | 1080 |
+| Correctness fixes (`c331707`) | 8225 | 6565 | 1981 | 1102 |
+| Cached macro facts and deferred graph | 6713 | 5160 | 1512 | 988 |
+
+The optimized warm scan was about 21% faster in debug and 10% faster in release than the
+correctness-fix version. All passes retained 117 accepted commands, zero inexact commands,
+one existing response-file parse error, and the same input total. Timings varied between runs;
+these are corpus measurements rather than a general performance guarantee. Temporary timing
+instrumentation identified repeated macro hashing, reference/fragment scans and graph maintenance
+as the costs; whole-text pragma checks were rare. That instrumentation is not part of the scanner.
+
 ## Tests
 
 Tests against real compilers are gated by variables naming them (`build.rs`):
@@ -953,7 +997,12 @@ the hermetic toolchain's compilers. See [testing.md](testing.md).
   the `TRADITIONAL_UNMODELLED` table of programs with `cl`'s output that the model must refuse,
   `#if` forms, invalid pastes in standard mode),
   `standard_example_3`, `standard_example_4`, `standard_example_5_and_7` (C17's examples),
-  `va_comma_rules`, `destringized`, `pragmas_of_bodies`, `recursion_is_blocked`.
+  `va_comma_rules`, `destringized`, `pragmas_of_bodies`, `recursion_is_blocked`,
+  `cached_body_context_preserves_references_and_spellings` (including parameter exclusion,
+  numeric fragments, deduplication and net-zero unsafe nesting); a compile-fail doc test checks
+  that a parsed body can't be modified without reparsing.
+- `scan/track.rs`: `deferred_context_matches_eager_graph` compares lazy and eager graph effects
+  after every addition in all 720 orders of definitions with aliases, redefinitions and pastes.
 - `lex.rs`: `finds_directives_only`, `hidden_hashes`, `literals`, `line_endings`,
   `pragmas_in_text`, `text_names`, `guards`.
 - `scan.rs`: `pragmas_the_scan_cant_see`, `pragma_dependency`, `pragma_dependency_operators`,

@@ -20,6 +20,7 @@ PUSH
         ("pasted_parens", format!("{prefix}#define CAT(a,b) a##b\n#define OPEN IGNORE(\nCAT(OP,EN)\nPOP\n)\n#if X == 0\n#include \"actual.h\"\n#endif\n")),
         ("computed_pop", format!("{prefix}#define OPERAND \"pop_macro(\\\"X\\\")\"\n_Pragma(OPERAND)\n#if X == 1\n#include \"actual.h\"\n#endif\n")),
         ("pasted_operator", format!("{prefix}#define OPERAND \"pop_macro(\\\"X\\\")\"\n#define CAT(a,b) a##b\nCAT(_Pra,gma)(OPERAND)\n#if X == 1\n#include \"actual.h\"\n#endif\n")),
+        ("numeric_pragma_fragment", format!("{prefix}#define OPERAND \"pop_macro(\\\"X\\\")\"\n#define DP1(x) _Pragma(x)\n#define ONE 1\n#define CAT(a,b) a##b\n#define XCAT(a,b) CAT(a,b)\nXCAT(DP,ONE)(OPERAND)\n#if X == 1\n#include \"actual.h\"\n#endif\n")),
         ("function_pop", format!("{prefix}#define FPOP() _Pragma(\"pop_macro(\\\"X\\\")\")\nFPOP()\n#if X == 1\n#include \"actual.h\"\n#endif\n")),
         ("suppressed_literal", format!("{prefix}IGNORE(_Pragma(\"pop_macro(\\\"X\\\")\"))\n#if X == 0\n#include \"actual.h\"\n#endif\n")),
         ("unknown_true_type", "#if (1 ? -1 : (__COUNTER__ + 0U)) < 0\n#else\n#include \"actual.h\"\n#endif\n".into()),
