@@ -340,6 +340,9 @@ pub trait RemoteBackend: Send + Sync {
     fn execute_raced(&self, task: Task, _race: Arc<Race>) -> RemoteFuture {
         self.execute(task)
     }
+    /// A command ran on the host (a local task ended): what it wrote
+    /// without the build naming it may change what later actions read.
+    fn host_wrote(&self) {}
 }
 
 pub trait CommandRunner: Send {

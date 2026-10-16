@@ -187,6 +187,15 @@ pub struct Stats {
 /// A directory's files (None: not a directory), and the session it's from.
 type Listing = (u64, Option<Arc<HashSet<String>>>);
 
+/// A volatile directory's files, with the directory's stamp when listed,
+/// whether that stamp can be trusted, and the host-writes generation it was
+/// last checked in (see `Cache::volatile_listing`).
+type StampedListing = (FileStamp, bool, u64, Arc<HashSet<String>>);
+
+/// The listings of volatile directories one scan has looked in, by key
+/// (None: not a directory): each directory's stamp is taken once a scan.
+pub(crate) type ScanListings = std::cell::RefCell<HashMap<PathBuf, Option<Arc<HashSet<String>>>>>;
+
 /// A file's identity: its volume's serial number and file ID (Windows),
 /// its device and inode (Unix); zeros when the file system has none.
 pub type FileId = (u64, u128);
@@ -239,6 +248,9 @@ struct Entry {
     id: FileId,
     /// The session it was last checked in, or `WATCHED`.
     session: AtomicU64,
+    /// The host-writes generation it was last checked in (see
+    /// `Cache::host_wrote`).
+    generation: AtomicU64,
     fd: Arc<FileDirectives>,
 }
 
@@ -283,6 +295,18 @@ pub struct Cache {
     /// lexing.
     lexing: Mutex<HashMap<Version, Lexing>>,
     dirs: RwLock<PathMap<Listing>>,
+    /// Listings of volatile directories, kept while their stamp is the same
+    /// (see `volatile_listing`).
+    volatile_dirs: RwLock<HashMap<PathBuf, StampedListing>>,
+    /// The directories build edges write to, by key: within a session,
+    /// their files are checked on every scan (see `file`).
+    written: RwLock<HashSet<PathBuf>>,
+    /// Bumped whenever a command run on the host ended (`host_wrote`):
+    /// volatile files outside `written` checked in the current generation
+    /// aren't checked again, once the cache's owner says it reports those
+    /// commands (`track_host_writes`).
+    generation: AtomicU64,
+    host_writes_tracked: std::sync::atomic::AtomicBool,
     /// Whether a path is a symbolic link leading elsewhere than its own
     /// directory (see `dotdot_after_link`), and the session it's from.
     links: RwLock<HashMap<PathBuf, (u64, bool)>>,
@@ -305,6 +329,10 @@ impl Cache {
             files: RwLock::default(),
             lexing: Mutex::default(),
             dirs: RwLock::default(),
+            volatile_dirs: RwLock::default(),
+            written: RwLock::default(),
+            generation: AtomicU64::new(0),
+            host_writes_tracked: std::sync::atomic::AtomicBool::new(false),
             links: RwLock::default(),
             session: AtomicU64::new(1),
             volatile: RwLock::default(),
@@ -324,6 +352,35 @@ impl Cache {
     pub fn add_volatile(&self, dir: &Path) {
         let key = self.key(dir).into_owned();
         self.volatile.write().unwrap().insert(key, std::time::Instant::now());
+    }
+
+    /// A directory a build edge writes to: its files are checked on every
+    /// scan of a session (remote results land there without a command on
+    /// the host).
+    pub fn add_written(&self, dir: &Path) {
+        let key = self.key(dir).into_owned();
+        self.written.write().unwrap().insert(key);
+    }
+
+    /// Its owner knows the directories build edges write to (`add_written`)
+    /// and reports every command run on the host (`host_wrote`): volatile
+    /// files elsewhere are then checked once per such command rather than
+    /// on every scan.
+    pub fn track_host_writes(&self) {
+        self.host_writes_tracked.store(true, Ordering::Relaxed);
+    }
+
+    /// A command run on the host ended: it may have written files in
+    /// volatile directories without the build declaring them, so they are
+    /// checked again.
+    pub fn host_wrote(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether `p`'s directory is one a build edge writes to.
+    fn is_written(&self, p: &Path) -> bool {
+        let written = self.written.read().unwrap();
+        !written.is_empty() && p.parent().is_some_and(|d| written.contains(self.key(d).as_ref()))
     }
 
     /// Lets `watch` vouch for files (once).
@@ -423,22 +480,10 @@ impl Cache {
             return l.clone();
         }
         let token = self.token(dir);
-        let mut linked = false;
-        let l = std::fs::read_dir(dir).ok().map(|rd| {
-            Arc::new(
-                rd.flatten()
-                    .filter(|e| match e.file_type() {
-                        Ok(t) if t.is_symlink() => {
-                            linked = true;
-                            e.path().is_file()
-                        }
-                        Ok(t) => t.is_file(),
-                        Err(_) => false,
-                    })
-                    .map(|e| self.name_key(&e.file_name().to_string_lossy()))
-                    .collect(),
-            )
-        });
+        let (l, linked) = match self.list(dir) {
+            Some((l, linked)) => (Some(l), linked),
+            None => (None, false),
+        };
         let mut dirs = self.dirs.write().unwrap();
         // Where a link leads changes without its directory: a listing with
         // one holds for the session.
@@ -451,6 +496,93 @@ impl Cache {
         if self.is_volatile(p) {
             return p.is_file();
         }
+        self.exists_listed(p)
+    }
+
+    /// `exists` for a scan: in a volatile directory (the build directory,
+    /// where dependencies fetched at configure time often are), the
+    /// directory's listing, checked by its stamp once in the scan, rather
+    /// than one stat per candidate path along the search path. A file
+    /// created or removed there changes the directory's stamp, so it's seen
+    /// by the next scan; a stamp within the clock tick of when it was taken
+    /// isn't trusted (the directory is listed again next time).
+    pub(crate) fn exists_in_scan(&self, p: &Path, listings: &ScanListings) -> bool {
+        if !self.is_volatile(p) {
+            return self.exists_listed(p);
+        }
+        let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return false };
+        let name = name.to_string_lossy();
+        let key = self.key(dir).into_owned();
+        let listing = listings.borrow().get(&key).cloned();
+        let listing = match listing {
+            Some(l) => l,
+            None => {
+                let l = self.volatile_listing(dir, &key);
+                listings.borrow_mut().insert(key, l.clone());
+                l
+            }
+        };
+        listing.is_some_and(|l| l.contains(&self.name_key(&name))) || (self.case_insensitive && !name.is_ascii() && p.is_file())
+    }
+
+    /// A volatile directory's listing: the one kept, if the directory's
+    /// stamp is the same and was trusted, else listed again.
+    fn volatile_listing(&self, dir: &Path, key: &Path) -> Option<Arc<HashSet<String>>> {
+        let generation = self.generation.load(Ordering::Relaxed);
+        // Outside the directories build edges write to, a listing checked
+        // since the last command on the host ended holds (see `file`).
+        let written = self.written.read().unwrap().contains(key);
+        if !written
+            && self.host_writes_tracked.load(Ordering::Relaxed)
+            && let Some((_, trusted, g, l)) = self.volatile_dirs.read().unwrap().get(key)
+            && *trusted
+            && *g == generation
+        {
+            return Some(l.clone());
+        }
+        let at = std::time::SystemTime::now();
+        let stamp = match ninja_os::stat(dir) {
+            Ok((meta, stamp)) if meta.is_dir() => stamp,
+            _ => return None,
+        };
+        if let Some((s, trusted, g, l)) = self.volatile_dirs.write().unwrap().get_mut(key)
+            && *trusted
+            && *s == stamp
+        {
+            *g = generation;
+            return Some(l.clone());
+        }
+        let (l, linked) = self.list(dir)?;
+        // Where a link leads changes without its directory: a listing with
+        // one isn't kept.
+        let trusted = !linked && !stamp.is_racy(at);
+        self.volatile_dirs.write().unwrap().insert(key.to_path_buf(), (stamp, trusted, generation, l.clone()));
+        Some(l)
+    }
+
+    /// A directory's files (following links to files), and whether there
+    /// were links.
+    fn list(&self, dir: &Path) -> Option<(Arc<HashSet<String>>, bool)> {
+        let mut linked = false;
+        let rd = std::fs::read_dir(dir).ok()?;
+        let l = rd
+            .flatten()
+            .filter(|e| match e.file_type() {
+                Ok(t) if t.is_symlink() => {
+                    linked = true;
+                    e.path().is_file()
+                }
+                Ok(t) => t.is_file(),
+                Err(_) => false,
+            })
+            .map(|e| self.name_key(&e.file_name().to_string_lossy()))
+            .collect();
+        Some((Arc::new(l), linked))
+    }
+
+    /// `exists` outside volatile directories: through the session's
+    /// listings.
+    fn exists_listed(&self, p: &Path) -> bool {
         let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return false };
         let name = name.to_string_lossy();
         // Names are compared as the file system does but for other letters
@@ -476,11 +608,34 @@ impl Cache {
             self.files_reused.fetch_add(1, Ordering::Relaxed);
             return Some((e.fd.clone(), e.stamp, e.id));
         }
+        let generation = self.generation.load(Ordering::Relaxed);
+        if let Some(e) = &known
+            && volatile
+            && self.current(e.session.load(Ordering::Relaxed))
+        {
+            // Outside the directories build edges write to, only commands
+            // run on the host change files the build doesn't declare: one
+            // checked since the last of those ended is the same.
+            if self.host_writes_tracked.load(Ordering::Relaxed) && e.generation.load(Ordering::Relaxed) == generation && !self.is_written(p) {
+                self.files_reused.fetch_add(1, Ordering::Relaxed);
+                return Some((e.fd.clone(), e.stamp, e.id));
+            }
+            // Else its size and modification time, cheaper than its full
+            // stamp (which opens it on Windows), tell it's the same version.
+            // What a rewrite restoring both would hide matters across builds,
+            // where the full stamp is taken again.
+            if ninja_os::size_and_mtime(p) == Some((e.stamp.len, e.stamp.mtime_ns)) {
+                e.generation.store(generation, Ordering::Relaxed);
+                self.files_reused.fetch_add(1, Ordering::Relaxed);
+                return Some((e.fd.clone(), e.stamp, e.id));
+            }
+        }
         let token = if volatile { None } else { self.token(p) };
         let (stamp, id) = stat(p)?;
         if let Some(e) = known
             && e.stamp == stamp
         {
+            e.generation.store(generation, Ordering::Relaxed);
             e.session.store(self.checked(token), Ordering::Relaxed);
             self.files_reused.fetch_add(1, Ordering::Relaxed);
             return Some((e.fd.clone(), stamp, id));
@@ -496,7 +651,10 @@ impl Cache {
                 // The token compared under the lock: an event counted after
                 // it drops the entry once it's in.
                 let mut files = self.files.write().unwrap();
-                files.insert(&version.0, Arc::new(Entry { stamp, id, session: AtomicU64::new(self.checked(token)), fd: fd.clone() }));
+                files.insert(
+                    &version.0,
+                    Arc::new(Entry { stamp, id, session: AtomicU64::new(self.checked(token)), generation: AtomicU64::new(generation), fd: fd.clone() }),
+                );
                 Some(fd)
             })
             .clone();
@@ -669,6 +827,8 @@ struct State<'a> {
     once_contents: HashMap<(u64, u64), PathBuf>,
     /// What lookups noted that makes the scan inexact (see `join`).
     notes: std::cell::RefCell<Vec<String>>,
+    /// The volatile directories looked in, listed once in the scan.
+    listings: ScanListings,
     seen: HashSet<String>,
     stack: Vec<Frame>,
     /// The main file's directory while forced includes are processed, an
@@ -859,11 +1019,11 @@ impl State<'_> {
     /// The real file a path names: through the overlays, else on disk.
     fn locate(&self, p: &Path) -> Option<PathBuf> {
         for o in self.cfg.overlays.iter().rev() {
-            if o.redirect == Redirect::Fallback && self.cache.exists(p) {
+            if o.redirect == Redirect::Fallback && self.cache.exists_in_scan(p, &self.listings) {
                 return Some(p.to_path_buf());
             }
             if let Some(real) = o.map(p)
-                && self.cache.exists(&real)
+                && self.cache.exists_in_scan(&real, &self.listings)
             {
                 return Some(real);
             }
@@ -871,7 +1031,7 @@ impl State<'_> {
                 return None;
             }
         }
-        self.cache.exists(p).then(|| p.to_path_buf())
+        self.cache.exists_in_scan(p, &self.listings).then(|| p.to_path_buf())
     }
 
     fn candidate(&self, path: PathBuf, at: Option<usize>) -> Option<Found> {
@@ -1829,6 +1989,7 @@ fn scanned<'a>(cache: &'a Cache, cfg: &'a Config, oracle: &'a dyn Oracle, main: 
         once_ids: HashMap::new(),
         once_contents: HashMap::new(),
         notes: Default::default(),
+        listings: Default::default(),
         seen: HashSet::new(),
         stack: Vec::new(),
         base: None,
@@ -2013,6 +2174,78 @@ pub(crate) mod tests {
     thread_local! {
         /// The lookups `Cache::is_volatile` made on this thread.
         pub(super) static VOLATILE_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Names in a volatile directory (dependencies fetched into the build
+    /// directory) come from its listing, kept while the directory's stamp
+    /// is the same. Outside the directories build edges write to, it is
+    /// checked again once a command on the host ended (`host_wrote`); in
+    /// those, on every scan.
+    #[test]
+    fn volatile_dirs_listed_by_stamp() {
+        let d = Dir::new("volatile_listed");
+        let a = d.file("dep/a.h", "");
+        let b = d.0.join("dep").join("b.h");
+        let out_b = d.0.join("out").join("b.h");
+        d.file("out/a.h", "");
+        let cache = Cache::new(vec![d.0.to_path_buf()], cfg!(windows));
+        cache.add_written(&d.0.join("out"));
+        cache.track_host_writes();
+        let scan_one = |p: &Path| cache.exists_in_scan(p, &ScanListings::default());
+        // Past the clock tick: the listing is kept, so only the stamp tells
+        // what follows.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert!(scan_one(&a) && !scan_one(&b) && !scan_one(&out_b));
+        assert!(cache.volatile_dirs.read().unwrap().values().all(|(_, trusted, _, _)| *trusted));
+        // Listed once in a scan, whatever the lookups.
+        let listings = ScanListings::default();
+        assert!(cache.exists_in_scan(&a, &listings) && !cache.exists_in_scan(&b, &listings));
+        assert_eq!(listings.borrow().len(), 1);
+        // Created by something that isn't a command on the host: kept
+        // outside written directories, seen in them (a remote result).
+        d.file("dep/b.h", "");
+        d.file("out/b.h", "");
+        assert!(!scan_one(&b) && scan_one(&out_b));
+        // Once a command on the host ended: the directory's stamp changed.
+        cache.host_wrote();
+        assert!(scan_one(&b));
+        // Removed: gone from the next scan after a command too.
+        std::fs::remove_file(&a).unwrap();
+        cache.host_wrote();
+        assert!(!scan_one(&a));
+        // Not a directory.
+        assert!(!scan_one(&d.0.join("nothing").join("x.h")));
+    }
+
+    /// A volatile file rewritten during a session is lexed again, whether
+    /// its size changed or only its modification time: in a directory build
+    /// edges write to, at once; elsewhere once a command on the host ended.
+    #[test]
+    fn volatile_files_rewritten() {
+        let d = Dir::new("volatile_rewritten");
+        let a = d.file("dep/a.h", "#define A 1\n");
+        let out = d.file("out/a.h", "#define A 1\n");
+        let cache = Cache::new(vec![d.0.to_path_buf()], cfg!(windows));
+        cache.add_written(&d.0.join("out"));
+        cache.track_host_writes();
+        let out_first = cache.directives(&out).unwrap();
+        d.file("out/a.h", "#define A 22\n");
+        assert!(!Arc::ptr_eq(&cache.directives(&out).unwrap(), &out_first));
+        let first = cache.directives(&a).unwrap();
+        assert!(Arc::ptr_eq(&cache.directives(&a).unwrap(), &first));
+        d.file("dep/a.h", "#define A 22\n");
+        assert!(Arc::ptr_eq(&cache.directives(&a).unwrap(), &first));
+        cache.host_wrote();
+        let second = cache.directives(&a).unwrap();
+        assert!(!Arc::ptr_eq(&second, &first));
+        // The same size, a later time.
+        d.file("dep/a.h", "#define A 33\n");
+        cache.host_wrote();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options().write(true).open(&a).unwrap().set_modified(later).unwrap();
+        assert!(!Arc::ptr_eq(&cache.directives(&a).unwrap(), &second));
+        // out/a.h twice, dep/a.h three times.
+        assert_eq!(cache.stats().files_lexed, 5);
     }
 
     #[test]

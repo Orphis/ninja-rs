@@ -81,6 +81,26 @@ pub fn stat(path: &Path) -> io::Result<(fs::Metadata, FileStamp)> {
     Ok((meta, stamp))
 }
 
+/// A file's size and modification time (as in `FileStamp`), cheaper than
+/// `stat`: on Windows without opening it, which `stat` (and
+/// `std::fs::metadata`) must. None for what isn't a regular file, a
+/// symbolic link on Windows (its target isn't followed there), or an
+/// error: callers then take the full stamp.
+pub fn size_and_mtime(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        // 100 ns since 1601 to nanoseconds since 1970, as `SystemTime` does.
+        const UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+        let (size, time) = windows::size_and_write_time(path)?;
+        Some((size, time.checked_sub(UNIX_EPOCH_100NS)?.checked_mul(100)?))
+    }
+    #[cfg(not(windows))]
+    {
+        let meta = fs::metadata(path).ok().filter(fs::Metadata::is_file)?;
+        Some((meta.len(), mtime_ns(&meta)))
+    }
+}
+
 /// A file's metadata (symlinks followed) and stamp.
 #[cfg(not(any(unix, windows)))]
 pub fn stat(path: &Path) -> io::Result<(fs::Metadata, FileStamp)> {
@@ -332,6 +352,18 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::Duration;
+
+    /// The cheap size and time are the full stamp's; not for a directory.
+    #[test]
+    fn size_and_mtime_as_the_stamp() {
+        let dir = test_dirs::TestDir::new("ninja_os_size_mtime");
+        let f = dir.join("a.h");
+        std::fs::write(&f, "#define A 1\n").unwrap();
+        let (_, stamp) = stat(&f).unwrap();
+        assert_eq!(size_and_mtime(&f), Some((stamp.len, stamp.mtime_ns)));
+        assert_eq!(size_and_mtime(&dir), None);
+        assert_eq!(size_and_mtime(&dir.join("missing.h")), None);
+    }
 
     /// Waits for the file system's clock to move past `change` (a file's):
     /// changes within one of its ticks get the same change time (Windows

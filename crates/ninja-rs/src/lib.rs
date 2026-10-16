@@ -1014,6 +1014,8 @@ impl Service {
             None => config.parallelism,
         };
         let racing = self.racing.clone().filter(|_| remote.is_some());
+        // Told when a command ran on the host (see `daemon::Telling`).
+        let told = remote.clone();
         let mut r = ExecRunner::new(parallelism, remote, self.interrupt.clone());
         r.verbose_remote = verbose_remote;
         r.racing = racing;
@@ -1050,10 +1052,10 @@ impl Service {
         if !env.is_empty() {
             r.set_env(env);
         }
-        match &self.daemon {
-            Some(client) => Box::new(daemon::Telling { inner: Box::new(r), client: client.clone() }),
-            None => Box::new(r),
+        if self.daemon.is_none() && told.is_none() {
+            return Box::new(r);
         }
+        Box::new(daemon::Telling { inner: Box::new(r), client: self.daemon.clone(), remote: told })
     }
 
     #[allow(clippy::too_many_arguments)]

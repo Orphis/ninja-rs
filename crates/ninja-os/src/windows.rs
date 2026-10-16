@@ -40,6 +40,26 @@ pub fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain([0]).collect()
 }
 
+/// A file's size and modification time (in 100 ns since 1601) without
+/// opening it (`GetFileAttributesExW`, which doesn't follow a symbolic link:
+/// None for one, as for a directory or an error).
+pub(crate) fn size_and_write_time(path: &Path) -> Option<(u64, u64)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesExW, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA,
+    };
+    let path = wide(path);
+    let mut data = WIN32_FILE_ATTRIBUTE_DATA::default();
+    // SAFETY: a NUL-terminated path, and a buffer of the type the info
+    // level writes.
+    let ok = unsafe { GetFileAttributesExW(path.as_ptr(), GetFileExInfoStandard, (&raw mut data).cast()) };
+    if ok == 0 || data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        return None;
+    }
+    let size = (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow);
+    let time = (u64::from(data.ftLastWriteTime.dwHighDateTime) << 32) | u64::from(data.ftLastWriteTime.dwLowDateTime);
+    Some((size, time))
+}
+
 /// Opens a file or directory (symlinks followed) for its attributes only:
 /// no sharing conflict with writers, nor with a directory in use.
 pub fn open_attributes(path: &Path) -> io::Result<File> {

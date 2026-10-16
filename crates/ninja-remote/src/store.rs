@@ -326,6 +326,14 @@ impl Store {
             .clone()
     }
 
+    /// A command run on the host ended: the preprocessor checks files in
+    /// the build directory again (see `cpp_deps::Cache::host_wrote`).
+    pub fn host_wrote(&self) {
+        if let Some(p) = self.preprocessor.lock().unwrap().as_ref() {
+            p.cache.host_wrote();
+        }
+    }
+
     /// A new build: the preprocessor checks headers and directories again.
     pub fn new_build(&self) {
         if let Some(p) = self.preprocessor.lock().unwrap().as_ref() {

@@ -272,6 +272,13 @@ impl Backend {
             for d in &shared.volatile {
                 p.cache.add_volatile(d);
             }
+            // The rest of the build directory (dependencies fetched there)
+            // is checked once per command run on the host, which the runner
+            // reports (`RemoteBackend::host_wrote`).
+            for d in std::iter::once(&config.build_dir).chain(&config.written) {
+                p.cache.add_written(d);
+            }
+            p.cache.track_host_writes();
         }
         Ok(Self {
             inner: Arc::new(Inner {
@@ -405,6 +412,10 @@ impl RemoteBackend for Backend {
     fn execute(&self, task: Task) -> RemoteFuture {
         let inner = self.inner.clone();
         Box::pin(async move { inner.execute(task, None).await })
+    }
+
+    fn host_wrote(&self) {
+        self.inner.shared.store.host_wrote();
     }
 
     fn execute_raced(&self, task: Task, race: Arc<Race>) -> RemoteFuture {
@@ -1229,6 +1240,8 @@ impl Inner {
         let stop = ninja_core::runner::host_stop();
         for argv in steps {
             let (status, out) = ninja_core::subprocess::run_argv(argv, &self.shared.build_dir, &[], &stop).await;
+            // A step on the host may write what the build doesn't name.
+            self.shared.store.host_wrote();
             output.extend_from_slice(&out);
             if status.success() {
                 continue;

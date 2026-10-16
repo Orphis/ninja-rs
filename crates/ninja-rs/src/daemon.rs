@@ -39,13 +39,16 @@ pub fn connect() -> io::Result<Client> {
     })
 }
 
-/// Runs commands with `inner`, telling the daemon when one ran on the
-/// host: what it wrote without naming it (a generator's tree, a step
-/// writing into the source tree), which the next action may read, is seen
-/// by the next requests (see `ninja_daemon::watch::Watcher::fence`).
+/// Runs commands with `inner`, telling the daemon and the remote backend
+/// when one ran on the host: what it wrote without naming it (a generator's
+/// tree, a step writing into the source tree or the build directory),
+/// which the next action may read, is seen by the next requests (see
+/// `ninja_daemon::watch::Watcher::fence`) and scans (see
+/// `cpp_deps::Cache::host_wrote`).
 pub struct Telling {
     pub inner: Box<dyn CommandRunner>,
-    pub client: Arc<Client>,
+    pub client: Option<Arc<Client>>,
+    pub remote: Option<Arc<dyn ninja_core::runner::RemoteBackend>>,
 }
 
 impl CommandRunner for Telling {
@@ -58,12 +61,17 @@ impl CommandRunner for Telling {
     }
 
     fn wait_for_command(&mut self) -> WaitFuture<'_> {
-        let client = self.client.clone();
+        let (client, remote) = (self.client.clone(), self.remote.clone());
         let next = self.inner.wait_for_command();
         Box::pin(async move {
             let done = next.await;
             if done.as_ref().is_some_and(|r| r.kind == ExecKind::Local) {
-                client.ran_locally();
+                if let Some(c) = client {
+                    c.ran_locally();
+                }
+                if let Some(r) = remote {
+                    r.host_wrote();
+                }
             }
             done
         })
@@ -332,7 +340,9 @@ mod tests {
             }
         });
         let client = Arc::new(Client::connect(&loc).unwrap());
-        let mut runner = Telling { inner: Box::new(Finishing(vec![ExecKind::Local, ExecKind::Remote])), client: client.clone() };
+        let backend = Arc::new(Wrote::default());
+        let mut runner =
+            Telling { inner: Box::new(Finishing(vec![ExecKind::Local, ExecKind::Remote])), client: Some(client.clone()), remote: Some(backend.clone()) };
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         let ask = || client.files(&[base.join("a.h")]).unwrap();
         rt.block_on(runner.wait_for_command()).unwrap();
@@ -341,5 +351,26 @@ mod tests {
         ask();
         ask();
         assert_eq!(*said.lock().unwrap(), [false, true, false]);
+        // The remote backend is told too, of the local command only.
+        assert_eq!(backend.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// A remote backend counting what it's told of commands on the host.
+    #[derive(Default)]
+    struct Wrote(std::sync::atomic::AtomicUsize);
+
+    impl ninja_core::runner::RemoteBackend for Wrote {
+        fn wants(&self, _: &Task) -> bool {
+            false
+        }
+        fn execute(&self, _: Task) -> ninja_core::runner::RemoteFuture {
+            unreachable!()
+        }
+        fn max_jobs(&self) -> usize {
+            1
+        }
+        fn host_wrote(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }

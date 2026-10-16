@@ -225,8 +225,26 @@ time, change time, identity: see [os.md](os.md)). A file is lexed once per versi
 scans wait for the one lexing (`Cache::lexing`). Within a session (a build) a file is checked
 once; across sessions it is checked again unless a watcher vouches for it (see
 [daemon.md](daemon.md)). Directories in the build tree, and the other directories the build
-writes to, are volatile: checked every time, as a generator may rewrite a header between two
-compiles.
+writes to, are volatile, as a generator may rewrite a header between two compiles. Checking
+every file and every candidate path there on every scan was costly where dependencies are fetched
+into the build directory (CMake's FetchContent, `_deps`): a libc++ compile took 359 ms to scan
+instead of 28 ms, slower than asking clang. So, in the build process's own scanner:
+
+- The directories build edges declare outputs in (`Cache::add_written`) are checked on every
+  scan: remote results land there with no command on the host.
+- The rest of the build tree is checked once per command run on the host. Only those write files
+  the build doesn't name: the runner reports each local task's end, and the backend each host step
+  it runs (`RemoteBackend::host_wrote`, `Cache::host_wrote`, a generation counter). A file or
+  listing checked since the last such command is reused.
+- Names come from directory listings checked by the directory's stamp (`Cache::exists_in_scan`),
+  taken once per scan rather than one stat per candidate path along the search path; a listing
+  whose stamp is within the clock tick isn't kept. A file is checked by its size and modification
+  time where the system gives them without opening it (`ninja_os::size_and_mtime`), its full stamp
+  otherwise.
+
+The daemon doesn't know the build's output directories, so its scans keep checking volatile files
+on every scan (with the cheaper listings); its watcher vouches for watched trees. Measured warm on
+RandoBlazer and libc++: 277 ms and 359 ms before, 51 ms and 54 ms after.
 
 ### Macros: the standard expander
 
