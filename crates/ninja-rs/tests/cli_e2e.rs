@@ -831,12 +831,18 @@ fn wait_at_most(child: &mut std::process::Child, limit: Duration) -> Option<std:
 }
 
 /// A directory only the user can enter in `dir`: the daemon's, where the
-/// secret flags file for nested builds goes, and their events' relay.
+/// secret flags file for nested builds goes, and their events' relay. On
+/// Windows it is left for ninja-rs to create, as it does for users: one it
+/// creates gets a protected DACL (the user and the system only), while one
+/// made here would inherit what `dir`'s ancestors grant (a sandbox group's
+/// read access on Bazel's output base, say), which ninja-rs rightly refuses.
 fn private_dir(dir: &Path) -> PathBuf {
     let private = dir.join("private");
-    std::fs::create_dir(&private).unwrap();
     #[cfg(unix)]
-    std::fs::set_permissions(&private, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    {
+        std::fs::create_dir(&private).unwrap();
+        std::fs::set_permissions(&private, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    }
     private
 }
 
